@@ -1,0 +1,36 @@
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: group2
+  namespace: homelab-autoscaler-system
+spec:
+  name: group2
+  maxSize: 3
+  nodeSelector:
+    node-role.kubernetes.io/worker: "true"
+  pricing:
+    hourlyRate: "0.75"
+    monthlyRate: "450.00"
+  startupPodSpec:
+    image: alpine:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo "Starting up group2"
+  shutdownPodSpec:
+    image: alpine:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo "Shutting down group2"
+  healthcheckPodSpec:
+    image: alpine:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo "Health check for group2"
+  healthcheckPeriod: 1
+  kubernetesNodeName: worker-node-2
