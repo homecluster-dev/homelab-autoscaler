@@ -37,6 +37,15 @@ import (
 	"github.com/homecluster-dev/homelab-autoscaler/internal/groupstore"
 )
 
+// Constants for healthcheck status values
+const (
+	HealthcheckStatusRunning      = "Running"
+	HealthcheckStatusFailed       = "Failed"
+	HealthcheckStatusUnknown      = "unknown"
+	HealthcheckStatusHealthy      = "Healthy"
+	HealthcheckStatusNotScheduled = "NotScheduled"
+)
+
 // GroupReconciler reconciles a Group object
 type GroupReconciler struct {
 	client.Client
@@ -106,7 +115,7 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			return ctrl.Result{}, err
 		}
 		// Ensure finalizers are handled
-		if len(group.ObjectMeta.Finalizers) > 0 {
+		if len(group.Finalizers) > 0 {
 			// Remove finalizers logic would go here
 			logger.Info("Group has finalizers that need to be handled", "group", req.Name)
 		}
@@ -202,7 +211,7 @@ func (r *GroupReconciler) generateHealthcheckCronJob(group *infrahomeclusterdevv
 	}
 
 	var volumes []corev1.Volume
-	var volumeMounts []corev1.VolumeMount
+	volumeMounts := make([]corev1.VolumeMount, 0, len(nodeSpec.HealthcheckPodSpec.Volumes))
 
 	// Process volume mounts
 	for _, vol := range nodeSpec.HealthcheckPodSpec.Volumes {
@@ -408,7 +417,7 @@ func (r *GroupReconciler) getHealthcheckStatus(cronJob *batchv1.CronJob) string 
 
 	// Check if there are any active jobs
 	if len(cronJob.Status.Active) > 0 {
-		return "Running"
+		return HealthcheckStatusRunning
 	}
 
 	// Check for failed jobs in the last schedule
@@ -418,10 +427,10 @@ func (r *GroupReconciler) getHealthcheckStatus(cronJob *batchv1.CronJob) string 
 		// Check if enough time has passed since last schedule to consider it failed
 		timeSinceLastSchedule := time.Since(cronJob.Status.LastScheduleTime.Time)
 		if cronJob.Spec.StartingDeadlineSeconds != nil && timeSinceLastSchedule > time.Duration(*cronJob.Spec.StartingDeadlineSeconds)*time.Second {
-			return "Failed"
+			return HealthcheckStatusFailed
 		}
 		// If no deadline set or still within deadline, consider it running
-		return "Running"
+		return HealthcheckStatusRunning
 	}
 
 	// Check if the last successful time is recent enough
@@ -430,14 +439,14 @@ func (r *GroupReconciler) getHealthcheckStatus(cronJob *batchv1.CronJob) string 
 	// Parse the schedule to determine the expected interval (simplified)
 	// For now, assume a reasonable default based on typical healthcheck periods
 	if timeSinceLastSuccess > 5*time.Minute {
-		return "Failed" // Too long since last success
+		return HealthcheckStatusFailed // Too long since last success
 	}
 
-	return "Healthy"
+	return HealthcheckStatusHealthy
 }
 
 // updateGroupstoreWithHealthcheckResults updates the healthcheckMap in groupstore with results and updates Group CRD status
-func (r *GroupReconciler) updateGroupstoreWithHealthcheckResults(ctx context.Context, cronJobs []*batchv1.CronJob) error {
+func (r *GroupReconciler) updateGroupstoreWithHealthcheckResults(ctx context.Context, cronJobs []*batchv1.CronJob) {
 	logger := log.FromContext(ctx)
 
 	// Group cronjobs by group name
@@ -489,10 +498,10 @@ func (r *GroupReconciler) updateGroupstoreWithHealthcheckResults(ctx context.Con
 				nodeHealthStatus = "healthy"
 			case "Failed":
 				nodeHealthStatus = "offline"
-			case "Running", "NotScheduled":
-				nodeHealthStatus = "unknown"
+			case HealthcheckStatusRunning, HealthcheckStatusNotScheduled:
+				nodeHealthStatus = HealthcheckStatusUnknown
 			default:
-				nodeHealthStatus = "unknown"
+				nodeHealthStatus = HealthcheckStatusUnknown
 			}
 
 			// Update the node health status in groupstore
@@ -522,7 +531,7 @@ func (r *GroupReconciler) updateGroupstoreWithHealthcheckResults(ctx context.Con
 		// Get the overall group health status from groupstore (calculated by SetNodeHealthcheckStatus)
 		overallHealthStatus, exists := r.GroupStore.GetHealthcheckStatus(groupName)
 		if !exists {
-			overallHealthStatus = "unknown"
+			overallHealthStatus = HealthcheckStatusUnknown
 		}
 
 		// Update group-level health status if it changed
@@ -549,7 +558,6 @@ func (r *GroupReconciler) updateGroupstoreWithHealthcheckResults(ctx context.Con
 		}
 	}
 
-	return nil
 }
 
 // syncHealthcheckStatuses periodically checks status of all healthcheck CronJobs and updates groupstore
@@ -566,11 +574,8 @@ func (r *GroupReconciler) syncHealthcheckStatuses(ctx context.Context) {
 	if err != nil {
 		logger.Error(err, "Failed to list healthcheck CronJobs during initial sync")
 	} else {
-		if err := r.updateGroupstoreWithHealthcheckResults(ctx, cronJobs); err != nil {
-			logger.Error(err, "Failed to update groupstore with healthcheck results during initial sync")
-		} else {
-			logger.Info("Completed initial healthcheck status sync", "cronJobs", len(cronJobs))
-		}
+		r.updateGroupstoreWithHealthcheckResults(ctx, cronJobs)
+		logger.Info("Completed initial healthcheck status sync", "cronJobs", len(cronJobs))
 	}
 
 	for {
@@ -589,10 +594,7 @@ func (r *GroupReconciler) syncHealthcheckStatuses(ctx context.Context) {
 			}
 
 			// Update groupstore with healthcheck results
-			if err := r.updateGroupstoreWithHealthcheckResults(ctx, cronJobs); err != nil {
-				logger.Error(err, "Failed to update groupstore with healthcheck results")
-				continue
-			}
+			r.updateGroupstoreWithHealthcheckResults(ctx, cronJobs)
 
 			logger.Info("Completed healthcheck status sync", "cronJobs", len(cronJobs))
 		}

@@ -100,7 +100,7 @@ func (sm *ServerManager) Start(ctx context.Context) error {
 			log.Printf("Attempting to verify gRPC server readiness (attempt %d/%d)", i+1, maxRetries)
 			conn, err := net.DialTimeout("tcp", sm.listener.Addr().String(), 500*time.Millisecond)
 			if err == nil {
-				conn.Close()
+				_ = conn.Close()
 				log.Printf("Mock CloudProvider gRPC server TCP connection verified as ready on %s", sm.address)
 
 				// Additional verification: wait a bit more to ensure gRPC service is fully registered

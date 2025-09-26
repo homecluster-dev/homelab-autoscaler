@@ -27,10 +27,6 @@ import (
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
 
-func warnError(err error) {
-	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
-}
-
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
 	dir, _ := GetProjectDir()

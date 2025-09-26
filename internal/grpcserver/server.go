@@ -167,21 +167,54 @@ func (s *MockCloudProviderServer) NodeGroupForNode(ctx context.Context, req *pb.
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupForNode called", "node", req.Node.Name)
 
-	// Check if node exists in our mock data
-	nodeGroupID, exists := s.nodeToNodeGroup[req.Node.Name]
-	if !exists {
-		return &pb.NodeGroupForNodeResponse{
-			NodeGroup: &pb.NodeGroup{Id: ""},
-		}, nil
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		logger.Error(ctx.Err(), "Context cancelled before starting NodeGroupForNode operation")
+		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
+	default:
 	}
 
-	nodeGroup, exists := s.nodeGroups[nodeGroupID]
-	if !exists {
-		return nil, status.Errorf(codes.Internal, "node group %s not found", nodeGroupID)
+	// Get all groups from the GroupStore
+	groups, err := s.groupStore.List()
+	if err != nil {
+		logger.Error(err, "failed to list groups from GroupStore")
+		return nil, status.Errorf(codes.Internal, "failed to list groups: %v", err)
 	}
 
+	// Search for the node in all groups
+	for _, group := range groups {
+		// Check if context is cancelled before processing each group
+		select {
+		case <-ctx.Done():
+			logger.Error(ctx.Err(), "Context cancelled while processing groups")
+			return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded while processing groups: %v", ctx.Err())
+		default:
+		}
+
+		// Check each node's KubernetesNodeName against the requested node name
+		for _, nodeSpec := range group.Spec.NodesSpecs {
+			if nodeSpec.KubernetesNodeName == req.Node.Name {
+				// Found the node, return the associated group
+				nodeGroup := &pb.NodeGroup{
+					Id:      group.Spec.Name,
+					MinSize: 0,
+					MaxSize: int32(group.Spec.MaxSize),
+					Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, group.Spec.MaxSize),
+				}
+
+				logger.Info("Found node group for node", "node", req.Node.Name, "group", group.Spec.Name)
+				return &pb.NodeGroupForNodeResponse{
+					NodeGroup: nodeGroup,
+				}, nil
+			}
+		}
+	}
+
+	// Node not found in any group, return empty string
+	logger.Info("Node not found in any group", "node", req.Node.Name)
 	return &pb.NodeGroupForNodeResponse{
-		NodeGroup: nodeGroup,
+		NodeGroup: &pb.NodeGroup{Id: ""},
 	}, nil
 }
 
@@ -232,8 +265,46 @@ func (s *MockCloudProviderServer) GetAvailableGPUTypes(ctx context.Context, req 
 // Cleanup cleans up open resources before the cloud provider is destroyed
 func (s *MockCloudProviderServer) Cleanup(ctx context.Context, req *pb.CleanupRequest) (*pb.CleanupResponse, error) {
 	logger := log.Log.WithName("grpc-server")
-	logger.Info("Cleanup called")
+	logger.Info("Cleanup called", "groupStoreAddr", fmt.Sprintf("%p", s.groupStore))
 
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		logger.Error(ctx.Err(), "Context cancelled before starting Cleanup operation")
+		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
+	default:
+	}
+
+	// In a real implementation, this would clean up resources like:
+	// - Delete all CronJobs associated with groups
+	// - Clean up any external resources
+	// - Clear caches and temporary data
+
+	// For this mock implementation, we'll clear our local mock data
+	// and log what would be cleaned up
+
+	// Get all groups to log what would be cleaned up
+	groups, err := s.groupStore.List()
+	if err != nil {
+		logger.Error(err, "failed to list groups for cleanup logging")
+		// Continue with cleanup even if we can't list groups
+	} else {
+		logger.Info("Cleanup would remove resources for groups", "groupCount", len(groups))
+		for _, group := range groups {
+			logger.Info("Cleanup would remove group resources", "group", group.Name, "nodeCount", len(group.Spec.NodesSpecs))
+		}
+	}
+
+	// Clear mock data
+	s.nodeGroups = make(map[string]*pb.NodeGroup)
+	s.nodeGroupSizes = make(map[string]int32)
+	s.nodes = make(map[string]*pb.ExternalGrpcNode)
+	s.nodeToNodeGroup = make(map[string]string)
+	s.instances = make(map[string][]*pb.Instance)
+	s.gpuTypes = make(map[string]*anypb.Any)
+	s.pricingData = make(map[string]float64)
+
+	logger.Info("Cleanup completed - mock data cleared")
 	return &pb.CleanupResponse{}, nil
 }
 
