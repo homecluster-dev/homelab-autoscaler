@@ -39,44 +39,6 @@ spec:
           spec:
             description: spec defines the desired state of Group
             properties:
-              healthcheckPeriod:
-                type: integer
-              healthcheckPodSpec:
-                properties:
-                  args:
-                    items:
-                      type: string
-                    type: array
-                  command:
-                    items:
-                      type: string
-                    type: array
-                  image:
-                    type: string
-                  volumes:
-                    description: Each volume mounts a Secret or ConfigMap
-                    items:
-                      properties:
-                        configMapName:
-                          type: string
-                        mountPath:
-                          type: string
-                        name:
-                          type: string
-                        secretName:
-                          description: Either SecretName or ConfigMapName should be
-                            set
-                          type: string
-                      required:
-                      - mountPath
-                      - name
-                      type: object
-                    type: array
-                required:
-                - image
-                type: object
-              kubernetesNodeName:
-                type: string
               maxSize:
                 type: integer
               name:
@@ -85,6 +47,138 @@ spec:
                 additionalProperties:
                   type: string
                 type: object
+              nodesSpecs:
+                items:
+                  description: NodeSpec defines the configuration for individual nodes
+                    in the group
+                  properties:
+                    healthcheckPeriod:
+                      type: integer
+                    healthcheckPodSpec:
+                      properties:
+                        args:
+                          items:
+                            type: string
+                          type: array
+                        command:
+                          items:
+                            type: string
+                          type: array
+                        image:
+                          type: string
+                        volumes:
+                          description: Each volume mounts a Secret or ConfigMap
+                          items:
+                            properties:
+                              configMapName:
+                                type: string
+                              mountPath:
+                                type: string
+                              name:
+                                type: string
+                              secretName:
+                                description: Either SecretName or ConfigMapName should
+                                  be set
+                                type: string
+                            required:
+                            - mountPath
+                            - name
+                            type: object
+                          type: array
+                      required:
+                      - image
+                      type: object
+                    kubernetesNodeName:
+                      type: string
+                    shutdownPodSpec:
+                      properties:
+                        args:
+                          items:
+                            type: string
+                          type: array
+                        command:
+                          items:
+                            type: string
+                          type: array
+                        image:
+                          type: string
+                        volumes:
+                          description: Each volume mounts a Secret or ConfigMap
+                          items:
+                            properties:
+                              configMapName:
+                                type: string
+                              mountPath:
+                                type: string
+                              name:
+                                type: string
+                              secretName:
+                                description: Either SecretName or ConfigMapName should
+                                  be set
+                                type: string
+                            required:
+                            - mountPath
+                            - name
+                            type: object
+                          type: array
+                      required:
+                      - image
+                      type: object
+                    startupPodSpec:
+                      properties:
+                        args:
+                          items:
+                            type: string
+                          type: array
+                        command:
+                          items:
+                            type: string
+                          type: array
+                        image:
+                          type: string
+                        volumes:
+                          description: Each volume mounts a Secret or ConfigMap
+                          items:
+                            properties:
+                              configMapName:
+                                type: string
+                              mountPath:
+                                type: string
+                              name:
+                                type: string
+                              secretName:
+                                description: Either SecretName or ConfigMapName should
+                                  be set
+                                type: string
+                            required:
+                            - mountPath
+                            - name
+                            type: object
+                          type: array
+                      required:
+                      - image
+                      type: object
+                    status:
+                      description: NodeSpecStatus defines the observed state of an
+                        individual node
+                      properties:
+                        health:
+                          description: Health status of the node (healthy, offline,
+                            unknown)
+                          enum:
+                          - healthy
+                          - offline
+                          - unknown
+                          type: string
+                      type: object
+                  required:
+                  - healthcheckPeriod
+                  - healthcheckPodSpec
+                  - kubernetesNodeName
+                  - shutdownPodSpec
+                  - startupPodSpec
+                  type: object
+                type: array
               pricing:
                 properties:
                   hourlyRate:
@@ -97,84 +191,12 @@ spec:
                 - hourlyRate
                 - monthlyRate
                 type: object
-              shutdownPodSpec:
-                properties:
-                  args:
-                    items:
-                      type: string
-                    type: array
-                  command:
-                    items:
-                      type: string
-                    type: array
-                  image:
-                    type: string
-                  volumes:
-                    description: Each volume mounts a Secret or ConfigMap
-                    items:
-                      properties:
-                        configMapName:
-                          type: string
-                        mountPath:
-                          type: string
-                        name:
-                          type: string
-                        secretName:
-                          description: Either SecretName or ConfigMapName should be
-                            set
-                          type: string
-                      required:
-                      - mountPath
-                      - name
-                      type: object
-                    type: array
-                required:
-                - image
-                type: object
-              startupPodSpec:
-                properties:
-                  args:
-                    items:
-                      type: string
-                    type: array
-                  command:
-                    items:
-                      type: string
-                    type: array
-                  image:
-                    type: string
-                  volumes:
-                    description: Each volume mounts a Secret or ConfigMap
-                    items:
-                      properties:
-                        configMapName:
-                          type: string
-                        mountPath:
-                          type: string
-                        name:
-                          type: string
-                        secretName:
-                          description: Either SecretName or ConfigMapName should be
-                            set
-                          type: string
-                      required:
-                      - mountPath
-                      - name
-                      type: object
-                    type: array
-                required:
-                - image
-                type: object
             required:
-            - healthcheckPeriod
-            - healthcheckPodSpec
-            - kubernetesNodeName
             - maxSize
             - name
             - nodeSelector
+            - nodesSpecs
             - pricing
-            - shutdownPodSpec
-            - startupPodSpec
             type: object
           status:
             description: status defines the observed state of Group
@@ -248,6 +270,13 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              health:
+                description: Health status of the group (healthy, offline, unknown)
+                enum:
+                - healthy
+                - offline
+                - unknown
+                type: string
             type: object
         required:
         - spec

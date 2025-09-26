@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -40,7 +41,7 @@ import (
 type GroupReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
-	groupstore *groupstore.GroupStore
+	GroupStore *groupstore.GroupStore
 }
 
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=groups,verbs=get;list;watch;create;update;patch;delete
@@ -63,10 +64,10 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	group := &infrahomeclusterdevv1alpha1.Group{}
 	if err := r.Get(ctx, req.NamespacedName, group); err != nil {
 		// The object was not found, return early
-		if err.Error() == "groups.infra.homecluster.dev \""+req.Name+"\" not found" {
+		if err.Error() == "Group.infra.homecluster.dev \""+req.Name+"\" not found" {
 			logger.Info("Group not found, will be removed from groupstore", "group", req.Name)
 			// Remove from groupstore if it exists
-			if err := r.groupstore.Remove(req.Name); err != nil {
+			if err := r.GroupStore.Remove(req.Name); err != nil {
 				logger.Error(err, "Failed to remove group from groupstore", "group", req.Name)
 				return ctrl.Result{}, err
 			}
@@ -75,6 +76,15 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		// Error reading the object - return with requeue
 		logger.Error(err, "Failed to get Group", "group", req.Name)
 		return ctrl.Result{}, err
+	}
+
+	// Check if this is a status-only update by comparing Generation
+	// If Generation hasn't changed, only status fields were updated
+	storedGroup, err := r.GroupStore.Get(group.Name)
+	if err == nil && storedGroup != nil && group.Generation == storedGroup.Generation {
+		// This is a status-only update, skip reconciliation to avoid infinite loops
+		logger.Info("Skipping reconciliation for status-only update", "group", group.Name, "generation", group.Generation)
+		return ctrl.Result{}, nil
 	}
 
 	// Handle deletion
@@ -86,7 +96,7 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			return ctrl.Result{}, err
 		}
 		// Remove from groupstore
-		if err := r.groupstore.Remove(req.Name); err != nil {
+		if err := r.GroupStore.Remove(req.Name); err != nil {
 			logger.Error(err, "Failed to remove group from groupstore during deletion", "group", req.Name)
 			return ctrl.Result{}, err
 		}
@@ -105,9 +115,19 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// Add/update the Group in the groupstore storage
-	if err := r.groupstore.AddOrUpdate(group); err != nil {
+	if err := r.GroupStore.AddOrUpdate(group); err != nil {
 		logger.Error(err, "Failed to add/update group in groupstore", "group", req.Name)
 		return ctrl.Result{}, err
+	}
+	logger.Info("Added/updated group in groupstore", "group", req.Name, "groupStoreAddr", fmt.Sprintf("%p", r.GroupStore), "groupCount", r.GroupStore.Count())
+
+	// Initialize healthcheck status for new groups
+	// Check if this group has a healthcheck status set
+	_, exists := r.GroupStore.GetHealthcheckStatus(group.Name)
+	if !exists {
+		// Set initial healthcheck status to "NotScheduled" for new groups
+		r.GroupStore.SetHealthcheckStatus(group.Name, "NotScheduled")
+		logger.Info("Initialized healthcheck status for new group", "group", group.Name, "status", "NotScheduled")
 	}
 
 	// Mark the Group status as "Loaded" using metav1.Condition
@@ -120,7 +140,7 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		Message:            "Group has been successfully loaded and is ready for use",
 	}
 
-	// Update the Group status
+	// Update the Group status conditions
 	group.Status.Conditions = []metav1.Condition{loadedCondition}
 
 	// Update the Group in the cluster
@@ -135,8 +155,11 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *GroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Initialize the groupstore
-	r.groupstore = groupstore.NewGroupStore()
+	// Note: GroupStore should already be initialized from main.go
+	// If it's nil, create a new one as fallback
+	if r.GroupStore == nil {
+		r.GroupStore = groupstore.NewGroupStore()
+	}
 
 	// Start the healthcheck status sync goroutine
 	// Pass a context that will be cancelled when the manager stops
@@ -150,18 +173,19 @@ func (r *GroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// generateHealthcheckCronJob creates a CronJob manifest for the Group's healthcheck
-func (r *GroupReconciler) generateHealthcheckCronJob(group *infrahomeclusterdevv1alpha1.Group) *batchv1.CronJob {
-	cronJobName := fmt.Sprintf("%s-healthcheck", group.Name)
-	schedule := fmt.Sprintf("*/%d * * * *", group.Spec.HealthcheckPeriod)
+// generateHealthcheckCronJob creates a CronJob manifest for a specific NodeSpec's healthcheck
+func (r *GroupReconciler) generateHealthcheckCronJob(group *infrahomeclusterdevv1alpha1.Group, nodeSpec *infrahomeclusterdevv1alpha1.NodeSpec, kubernetesNodeName string) *batchv1.CronJob {
+	cronJobName := fmt.Sprintf("%s-%s-healthcheck", group.Name, kubernetesNodeName)
+
+	schedule := fmt.Sprintf("*/%d * * * *", nodeSpec.HealthcheckPeriod)
 
 	// Convert MinimalPodSpec to corev1.PodSpec
 	containers := []corev1.Container{
 		{
 			Name:    "healthcheck",
-			Image:   group.Spec.HealthcheckPodSpec.Image,
-			Command: group.Spec.HealthcheckPodSpec.Command,
-			Args:    group.Spec.HealthcheckPodSpec.Args,
+			Image:   nodeSpec.HealthcheckPodSpec.Image,
+			Command: nodeSpec.HealthcheckPodSpec.Command,
+			Args:    nodeSpec.HealthcheckPodSpec.Args,
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: &[]bool{false}[0],
 				RunAsNonRoot:             &[]bool{true}[0],
@@ -176,7 +200,7 @@ func (r *GroupReconciler) generateHealthcheckCronJob(group *infrahomeclusterdevv
 	var volumeMounts []corev1.VolumeMount
 
 	// Process volume mounts
-	for _, vol := range group.Spec.HealthcheckPodSpec.Volumes {
+	for _, vol := range nodeSpec.HealthcheckPodSpec.Volumes {
 		volumeMount := corev1.VolumeMount{
 			Name:      vol.Name,
 			MountPath: vol.MountPath,
@@ -250,60 +274,72 @@ func (r *GroupReconciler) generateHealthcheckCronJob(group *infrahomeclusterdevv
 	return cronJob
 }
 
-// createOrUpdateHealthcheckCronJob creates or updates the healthcheck CronJob for a Group
+// createOrUpdateHealthcheckCronJob creates or updates healthcheck CronJobs for all NodeSpecs in a Group
 func (r *GroupReconciler) createOrUpdateHealthcheckCronJob(ctx context.Context, group *infrahomeclusterdevv1alpha1.Group) error {
 	logger := log.FromContext(ctx)
-	cronJob := r.generateHealthcheckCronJob(group)
 
-	// Create or update the CronJob
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cronJob, func() error {
-		// Only update the spec, not metadata
-		cronJob.Spec = r.generateHealthcheckCronJob(group).Spec
-		return nil
-	})
+	logger.Info("Creating/updating healthcheck CronJobs for group", "group", group.Name, "nodeSpecsCount", len(group.Spec.NodesSpecs))
 
-	if err != nil {
-		logger.Error(err, "Failed to create or update healthcheck CronJob", "cronJob", cronJob.Name)
-		return err
+	// If no nodes are specified, delete any existing cronjobs
+	if len(group.Spec.NodesSpecs) == 0 {
+		logger.Info("No NodeSpecs found, deleting existing cronjobs", "group", group.Name)
+		return r.deleteHealthcheckCronJob(ctx, group)
 	}
 
-	logger.Info("Successfully created/updated healthcheck CronJob", "cronJob", cronJob.Name)
+	// Create or update a CronJob for each NodeSpec
+	for i, nodeSpec := range group.Spec.NodesSpecs {
+		logger.Info("Processing NodeSpec", "group", group.Name, "index", i, "nodeName", nodeSpec.KubernetesNodeName, "healthcheckPeriod", nodeSpec.HealthcheckPeriod, "image", nodeSpec.HealthcheckPodSpec.Image)
+
+		cronJob := r.generateHealthcheckCronJob(group, &nodeSpec, nodeSpec.KubernetesNodeName)
+		if cronJob == nil {
+			logger.Info("Generated nil cronjob, skipping", "group", group.Name, "nodeName", nodeSpec.KubernetesNodeName)
+			continue
+		}
+
+		logger.Info("Generated cronjob", "group", group.Name, "cronJobName", cronJob.Name, "schedule", cronJob.Spec.Schedule)
+
+		// Create or update the CronJob
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cronJob, func() error {
+			// Only update the spec, not metadata
+			cronJob.Spec = r.generateHealthcheckCronJob(group, &nodeSpec, nodeSpec.KubernetesNodeName).Spec
+			return nil
+		})
+
+		if err != nil {
+			logger.Error(err, "Failed to create or update healthcheck CronJob", "cronJob", cronJob.Name)
+			return err
+		}
+
+		logger.Info("Successfully created/updated healthcheck CronJob", "cronJob", cronJob.Name)
+	}
+
 	return nil
 }
 
-// deleteHealthcheckCronJob deletes the healthcheck CronJob for a Group
+// deleteHealthcheckCronJob deletes all healthcheck CronJobs for a Group
 func (r *GroupReconciler) deleteHealthcheckCronJob(ctx context.Context, group *infrahomeclusterdevv1alpha1.Group) error {
 	logger := log.FromContext(ctx)
-	cronJobName := fmt.Sprintf("%s-healthcheck", group.Name)
-	cronJob := &batchv1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cronJobName,
-			Namespace: group.Namespace,
-		},
-	}
 
-	// Check if the CronJob exists before attempting to delete
-	err := r.Get(ctx, types.NamespacedName{Name: cronJobName, Namespace: group.Namespace}, cronJob)
+	// List all cronjobs that belong to this group
+	cronJobs, err := r.listHealthcheckCronJobsForGroup(ctx, group.Name)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			// CronJob doesn't exist, nothing to do
-			return nil
+		logger.Error(err, "Failed to list healthcheck CronJobs for group", "group", group.Name)
+		return err
+	}
+
+	// Delete each cronjob
+	for _, cronJob := range cronJobs {
+		if err := r.Delete(ctx, cronJob); err != nil {
+			logger.Error(err, "Failed to delete healthcheck CronJob", "cronJob", cronJob.Name)
+			return err
 		}
-		logger.Error(err, "Failed to get healthcheck CronJob for deletion", "cronJob", cronJobName)
-		return err
+		logger.Info("Successfully deleted healthcheck CronJob", "cronJob", cronJob.Name)
 	}
 
-	// Delete the CronJob
-	if err := r.Delete(ctx, cronJob); err != nil {
-		logger.Error(err, "Failed to delete healthcheck CronJob", "cronJob", cronJobName)
-		return err
-	}
-
-	logger.Info("Successfully deleted healthcheck CronJob", "cronJob", cronJobName)
 	return nil
 }
 
-// listHealthcheckCronJobs lists all CronJobs with names matching the pattern {groupname}-healthcheck
+// listHealthcheckCronJobs lists all CronJobs with names matching the pattern {groupname}-*-healthcheck
 func (r *GroupReconciler) listHealthcheckCronJobs(ctx context.Context) ([]*batchv1.CronJob, error) {
 	logger := log.FromContext(ctx)
 
@@ -316,7 +352,7 @@ func (r *GroupReconciler) listHealthcheckCronJobs(ctx context.Context) ([]*batch
 	var healthcheckCronJobs []*batchv1.CronJob
 	for i := range cronJobList.Items {
 		cronJob := &cronJobList.Items[i]
-		// Check if the CronJob name follows the pattern {groupname}-healthcheck
+		// Check if the CronJob name follows the pattern {groupname}-*-healthcheck
 		if len(cronJob.Name) > 12 && cronJob.Name[len(cronJob.Name)-12:] == "-healthcheck" {
 			healthcheckCronJobs = append(healthcheckCronJobs, cronJob)
 		}
@@ -324,6 +360,34 @@ func (r *GroupReconciler) listHealthcheckCronJobs(ctx context.Context) ([]*batch
 
 	logger.Info("Found healthcheck CronJobs", "count", len(healthcheckCronJobs))
 	return healthcheckCronJobs, nil
+}
+
+// listHealthcheckCronJobsForGroup lists all CronJobs for a specific group
+func (r *GroupReconciler) listHealthcheckCronJobsForGroup(ctx context.Context, groupName string) ([]*batchv1.CronJob, error) {
+	logger := log.FromContext(ctx)
+
+	var cronJobList batchv1.CronJobList
+	if err := r.List(ctx, &cronJobList, client.InNamespace("")); err != nil {
+		logger.Error(err, "Failed to list CronJobs")
+		return nil, err
+	}
+
+	var groupCronJobs []*batchv1.CronJob
+	for i := range cronJobList.Items {
+		cronJob := &cronJobList.Items[i]
+		// Check if the CronJob name follows the pattern {groupname}-*-healthcheck
+		if len(cronJob.Name) > 12 && cronJob.Name[len(cronJob.Name)-12:] == "-healthcheck" {
+			// Extract the group name from the cronjob name
+			// Format: {groupname}-{nodename}-healthcheck
+			parts := strings.Split(cronJob.Name, "-")
+			if len(parts) >= 3 && strings.Join(parts[:len(parts)-2], "-") == groupName {
+				groupCronJobs = append(groupCronJobs, cronJob)
+			}
+		}
+	}
+
+	logger.Info("Found healthcheck CronJobs for group", "group", groupName, "count", len(groupCronJobs))
+	return groupCronJobs, nil
 }
 
 // getHealthcheckStatus determines the healthcheck status from CronJob status
@@ -342,26 +406,142 @@ func (r *GroupReconciler) getHealthcheckStatus(cronJob *batchv1.CronJob) string 
 		return "Running"
 	}
 
-	// Check the most recent job status
-	// Note: In a real implementation, you might want to check the actual Job status
-	// This is a simplified version that assumes success if no active jobs and was scheduled
+	// Check for failed jobs in the last schedule
+	// If there are recent failures, mark as offline
+	if cronJob.Status.LastSuccessfulTime == nil {
+		// If never successful and was scheduled, it might have failed
+		// Check if enough time has passed since last schedule to consider it failed
+		timeSinceLastSchedule := time.Since(cronJob.Status.LastScheduleTime.Time)
+		if cronJob.Spec.StartingDeadlineSeconds != nil && timeSinceLastSchedule > time.Duration(*cronJob.Spec.StartingDeadlineSeconds)*time.Second {
+			return "Failed"
+		}
+		// If no deadline set or still within deadline, consider it running
+		return "Running"
+	}
+
+	// Check if the last successful time is recent enough
+	timeSinceLastSuccess := time.Since(cronJob.Status.LastSuccessfulTime.Time)
+
+	// Parse the schedule to determine the expected interval (simplified)
+	// For now, assume a reasonable default based on typical healthcheck periods
+	if timeSinceLastSuccess > 5*time.Minute {
+		return "Failed" // Too long since last success
+	}
+
 	return "Healthy"
 }
 
-// updateGroupstoreWithHealthcheckResults updates the healthcheckMap in groupstore with results
+// updateGroupstoreWithHealthcheckResults updates the healthcheckMap in groupstore with results and updates Group CRD status
 func (r *GroupReconciler) updateGroupstoreWithHealthcheckResults(ctx context.Context, cronJobs []*batchv1.CronJob) error {
 	logger := log.FromContext(ctx)
 
+	// Group cronjobs by group name
+	groupCronJobs := make(map[string][]*batchv1.CronJob)
 	for _, cronJob := range cronJobs {
-		// Extract group name from CronJob name (format: {groupname}-healthcheck)
-		groupName := cronJob.Name[:len(cronJob.Name)-12]
+		// Extract group name from CronJob name (format: {groupname}-{nodename}-healthcheck)
+		parts := strings.Split(cronJob.Name, "-")
+		if len(parts) >= 3 {
+			groupName := strings.Join(parts[:len(parts)-2], "-")
+			groupCronJobs[groupName] = append(groupCronJobs[groupName], cronJob)
+		}
+	}
 
-		// Get healthcheck status
-		status := r.getHealthcheckStatus(cronJob)
+	// Process each group
+	for groupName, groupJobs := range groupCronJobs {
+		// Get the Group CRD to update its status
+		group := &infrahomeclusterdevv1alpha1.Group{}
+		if err := r.Get(ctx, types.NamespacedName{Name: groupName, Namespace: groupJobs[0].Namespace}, group); err != nil {
+			if errors.IsNotFound(err) {
+				logger.Info("Group CRD not found, skipping status update", "group", groupName)
+				continue
+			}
+			logger.Error(err, "Failed to get Group CRD for status update", "group", groupName)
+			continue
+		}
 
-		// Update groupstore
-		r.groupstore.SetHealthcheckStatus(groupName, status)
-		logger.Info("Updated healthcheck status", "group", groupName, "status", status)
+		// Track if any node health status changed
+		nodeHealthChanged := false
+
+		// Process each cronjob to update individual node health status
+		for _, cronJob := range groupJobs {
+			// Extract node name from CronJob name (format: {groupname}-{nodename}-healthcheck)
+			parts := strings.Split(cronJob.Name, "-")
+			if len(parts) < 3 {
+				logger.Error(fmt.Errorf("invalid cronjob name format"), "Skipping cronjob with invalid name format", "cronJob", cronJob.Name)
+				continue
+			}
+
+			// Extract node name (everything between group name and "-healthcheck")
+			nodeName := parts[len(parts)-2]
+
+			// Get the healthcheck status for this node
+			healthcheckStatus := r.getHealthcheckStatus(cronJob)
+
+			// Convert healthcheck status to lowercase for consistency with CRD enum values
+			var nodeHealthStatus string
+			switch healthcheckStatus {
+			case "Healthy":
+				nodeHealthStatus = "healthy"
+			case "Failed":
+				nodeHealthStatus = "offline"
+			case "Running", "NotScheduled":
+				nodeHealthStatus = "unknown"
+			default:
+				nodeHealthStatus = "unknown"
+			}
+
+			// Update the node health status in groupstore
+			r.GroupStore.SetNodeHealthcheckStatus(groupName, nodeName, nodeHealthStatus)
+			logger.Info("Updated node healthcheck status in groupstore", "group", groupName, "node", nodeName, "status", nodeHealthStatus)
+
+			// Update the NodeSpec.Status.Health field in the Group CRD
+			nodeSpecUpdated := false
+			for i := range group.Spec.NodesSpecs {
+				if group.Spec.NodesSpecs[i].KubernetesNodeName == nodeName {
+					// Only update if the health status has changed
+					if group.Spec.NodesSpecs[i].Status.Health != nodeHealthStatus {
+						group.Spec.NodesSpecs[i].Status.Health = nodeHealthStatus
+						nodeHealthChanged = true
+						nodeSpecUpdated = true
+						logger.Info("Updated NodeSpec health status", "group", groupName, "node", nodeName, "health", nodeHealthStatus)
+					}
+					break
+				}
+			}
+
+			if !nodeSpecUpdated {
+				logger.Info("Warning: Could not find matching NodeSpec for node", "group", groupName, "node", nodeName)
+			}
+		}
+
+		// Get the overall group health status from groupstore (calculated by SetNodeHealthcheckStatus)
+		overallHealthStatus, exists := r.GroupStore.GetHealthcheckStatus(groupName)
+		if !exists {
+			overallHealthStatus = "unknown"
+		}
+
+		// Update group-level health status if it changed
+		if group.Status.Health != overallHealthStatus {
+			group.Status.Health = overallHealthStatus
+			nodeHealthChanged = true
+		}
+
+		// Only update the Group CRD if something changed
+		if nodeHealthChanged {
+			// Update the Group status in the cluster
+			if err := r.Status().Update(ctx, group); err != nil {
+				logger.Error(err, "Failed to update Group CRD health status", "group", groupName, "health", overallHealthStatus)
+				continue
+			}
+
+			// Also update the groupstore to keep it synchronized
+			if err := r.GroupStore.UpdateGroupHealth(groupName, overallHealthStatus); err != nil {
+				logger.Error(err, "Failed to update groupstore health status", "group", groupName, "health", overallHealthStatus)
+				// Continue even if groupstore update fails, as CRD update succeeded
+			}
+
+			logger.Info("Updated Group CRD and groupstore health status", "group", groupName, "health", overallHealthStatus, "groupStoreAddr", fmt.Sprintf("%p", r.GroupStore))
+		}
 	}
 
 	return nil
@@ -371,9 +551,22 @@ func (r *GroupReconciler) updateGroupstoreWithHealthcheckResults(ctx context.Con
 func (r *GroupReconciler) syncHealthcheckStatuses(ctx context.Context) {
 	logger := log.FromContext(ctx)
 
-	// Create a ticker that runs every 30 seconds
-	ticker := time.NewTicker(30 * time.Second)
+	// Create a ticker that runs every 10 seconds for more responsive health checks
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
+	// Run immediately on startup
+	logger.Info("Starting initial healthcheck status sync")
+	cronJobs, err := r.listHealthcheckCronJobs(ctx)
+	if err != nil {
+		logger.Error(err, "Failed to list healthcheck CronJobs during initial sync")
+	} else {
+		if err := r.updateGroupstoreWithHealthcheckResults(ctx, cronJobs); err != nil {
+			logger.Error(err, "Failed to update groupstore with healthcheck results during initial sync")
+		} else {
+			logger.Info("Completed initial healthcheck status sync", "cronJobs", len(cronJobs))
+		}
+	}
 
 	for {
 		select {

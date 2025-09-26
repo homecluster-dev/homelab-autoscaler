@@ -67,6 +67,9 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= homelab-autoscaler-test-e2e
 
+# Port forwarding process PID for cleanup
+GRPC_PORT_FORWARD_PID ?=
+
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	@command -v $(KIND) >/dev/null 2>&1 || { \
@@ -82,9 +85,82 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	esac
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e tests with full deployment pipeline.
+	@echo "Loading Docker image into Kind cluster..."
+	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
+	
+	@echo "Installing CRDs..."
+	$(MAKE) install
+	
+	@echo "Deploying operator..."
+	$(MAKE) deploy
+	
+	@echo "Waiting for deployment to be ready..."
+	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
+	
+	@echo "Creating test groups..."
+	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+	
+	@echo "Waiting for groups to be processed..."
+	@for i in {1..30}; do \
+		healthy_count=$$($(KUBECTL) get groups -n homelab-autoscaler-system -o json | jq '[.items[] | select(.status.Condition.Type == "Loaded")] | length' 2>/dev/null || echo "0"); \
+		if [ "$$healthy_count" -ge "2" ]; then \
+			echo "Groups are ready! Found $$healthy_count loaded groups"; \
+			break; \
+		fi; \
+		echo "Waiting for groups to become loaded... ($$i/30) - Found $$healthy_count loaded groups"; \
+		sleep 10; \
+	done
+	
+	@echo "Starting gRPC port forwarding for tests..."
+	$(MAKE) port-forward-grpc-e2e
+	@sleep 5  # Give port forwarding time to establish
+	
+	@echo "Running e2e tests..."
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	
+	@echo "Cleaning up port forwarding..."
+	$(MAKE) kill-port-forward-grpc-e2e
+	
+	@echo "Cleaning up test resources..."
+	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	
+	@echo "Cleaning up deployment and cluster..."
+	$(MAKE) undeploy ignore-not-found=true
 	$(MAKE) cleanup-test-e2e
+
+.PHONY: run-e2e
+run-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e tests without cleanup afterwards.
+	@echo "Loading Docker image into Kind cluster..."
+	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
+	
+	@echo "Installing CRDs..."
+	$(MAKE) install
+	
+	@echo "Deploying operator..."
+	$(MAKE) deploy
+	
+	@echo "Waiting for deployment to be ready..."
+	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
+	
+	@echo "Creating test groups..."
+	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+
+	
+	@echo "Starting gRPC port forwarding for tests..."
+	$(MAKE) port-forward-grpc-e2e
+	@sleep 5  # Give port forwarding time to establish
+	
+	@echo "Running e2e tests with DO_NOT_CLEANUP=true..."
+	DO_NOT_CLEANUP=true KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	
+	@echo "Cleaning up port forwarding..."
+	$(MAKE) kill-port-forward-grpc-e2e
+	
+	@echo "E2E tests completed! Resources are still deployed for inspection."
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
@@ -238,3 +314,121 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $$(realpath $(1)-$(3)) $(1)
 endef
+
+##@ gRPC Server Testing
+
+.PHONY: test-e2e-grpc
+test-e2e-grpc: setup-test-e2e manifests generate fmt vet docker-build ## Run the gRPC server e2e tests with full deployment pipeline.
+	@echo "Loading Docker image into Kind cluster..."
+	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
+	
+	@echo "Installing CRDs..."
+	$(MAKE) install
+	
+	@echo "Deploying operator with gRPC server enabled..."
+	$(MAKE) deploy
+	
+	@echo "Waiting for deployment to be ready..."
+	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
+	
+	@echo "Waiting for gRPC server to be ready..."
+	@for i in {1..30}; do \
+		if $(KUBECTL) get pods -n homelab-autoscaler-system -l control-plane=controller-manager -o jsonpath='{.items[0].status.phase}' | grep -q Running; then \
+			echo "Pod is running, checking gRPC server..."; \
+			if $(KUBECTL) logs -n homelab-autoscaler-system -l control-plane=controller-manager --tail=10 | grep -q "gRPC server started"; then \
+				echo "gRPC server is ready!"; \
+				break; \
+			fi; \
+		fi; \
+		echo "Waiting for gRPC server... ($$i/30)"; \
+		sleep 10; \
+	done
+	
+	@echo "Creating test groups..."
+	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+	
+	@echo "Waiting for groups to be processed..."
+	@for i in {1..30}; do \
+		healthy_count=$$($(KUBECTL) get groups -n homelab-autoscaler-system -o json | jq '[.items[] | select(.status.health == "healthy")] | length' 2>/dev/null || echo "0"); \
+		if [ "$$healthy_count" -ge "2" ]; then \
+			echo "Groups are ready! Found $$healthy_count healthy groups"; \
+			break; \
+		fi; \
+		echo "Waiting for groups to become healthy... ($$i/30) - Found $$healthy_count healthy groups"; \
+		sleep 10; \
+	done
+	
+	@echo "Running gRPC tests..."
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="gRPC Server"
+	
+	@echo "Cleaning up test resources..."
+	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	
+	@echo "Cleaning up deployment and cluster..."
+	$(MAKE) undeploy ignore-not-found=true
+	$(MAKE) cleanup-test-e2e
+
+.PHONY: test-grpc-server
+test-grpc-server: ## Test the gRPC server integration (requires running operator)
+	go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="gRPC Server" -timeout=5m
+
+.PHONY: port-forward-grpc
+port-forward-grpc: ## Port forward the gRPC server for manual testing
+	$(KUBECTL) port-forward deployment/homelab-autoscaler-controller-manager 50051:50051 -n homelab-autoscaler-system
+
+.PHONY: port-forward-grpc-e2e
+port-forward-grpc-e2e: ## Start port forwarding for gRPC server in background for e2e tests
+	@echo "Starting gRPC server port forwarding in background..."
+	@$(KUBECTL) port-forward deployment/homelab-autoscaler-controller-manager 50051:50051 -n homelab-autoscaler-system & \
+	GRPC_PORT_FORWARD_PID=$$!; \
+	echo "gRPC port forwarding started with PID: $$GRPC_PORT_FORWARD_PID"; \
+	echo "export GRPC_PORT_FORWARD_PID=$$GRPC_PORT_FORWARD_PID" > /tmp/grpc-port-forward.pid
+
+.PHONY: kill-port-forward-grpc-e2e
+kill-port-forward-grpc-e2e: ## Kill the background gRPC port forwarding process
+	@if [ -f /tmp/grpc-port-forward.pid ]; then \
+		source /tmp/grpc-port-forward.pid; \
+		if [ -n "$$GRPC_PORT_FORWARD_PID" ]; then \
+			echo "Killing gRPC port forwarding process with PID: $$GRPC_PORT_FORWARD_PID"; \
+			kill $$GRPC_PORT_FORWARD_PID 2>/dev/null || true; \
+			rm -f /tmp/grpc-port-forward.pid; \
+		fi; \
+	else \
+		echo "No gRPC port forwarding PID file found"; \
+	fi
+
+.PHONY: grpc-test-client
+grpc-test-client: ## Run a simple gRPC test client (requires port-forward-grpc)
+	@echo "Testing gRPC server endpoints..."
+	@echo "Available commands:"
+	@echo "  grpcurl -plaintext localhost:50051 list"
+	@echo "  grpcurl -plaintext localhost:50051 clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider/NodeGroups"
+	@echo "  grpcurl -plaintext localhost:50051 clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider/GPULabel"
+
+.PHONY: run-with-grpc
+run-with-grpc: manifests generate fmt vet ## Run the controller with gRPC server enabled
+	go run ./cmd/main.go --enable-grpc-server=true --grpc-server-address=:50051
+
+.PHONY: setup-grpc-dev
+setup-grpc-dev: setup-test-e2e docker-build ## Set up a development environment for gRPC testing
+	@echo "Setting up gRPC development environment..."
+	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
+	$(MAKE) install
+	$(MAKE) deploy
+	@echo "Waiting for deployment to be ready..."
+	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
+	@echo "Creating test groups..."
+	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+	@echo "Setup complete! Use 'make port-forward-grpc' to access the gRPC server."
+	@echo "Then use 'make grpc-test-client' to see available testing commands."
+
+.PHONY: cleanup-grpc-dev
+cleanup-grpc-dev: ## Clean up the gRPC development environment
+	@echo "Cleaning up gRPC development environment..."
+	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(MAKE) undeploy ignore-not-found=true
+	$(MAKE) cleanup-test-e2e

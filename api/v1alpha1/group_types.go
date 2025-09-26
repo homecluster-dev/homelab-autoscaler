@@ -29,15 +29,29 @@ type GroupSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	Name               string            `json:"name"`
-	MaxSize            int               `json:"maxSize"`
-	NodeSelector       map[string]string `json:"nodeSelector"`
-	Pricing            PricingSpec       `json:"pricing"`
-	StartupPodSpec     MinimalPodSpec    `json:"startupPodSpec"`
-	ShutdownPodSpec    MinimalPodSpec    `json:"shutdownPodSpec"`
-	HealthcheckPodSpec MinimalPodSpec    `json:"healthcheckPodSpec"`
-	HealthcheckPeriod  int               `json:"healthcheckPeriod"`
-	KubernetesNodeName string            `json:"kubernetesNodeName"`
+	Name         string            `json:"name"`
+	MaxSize      int               `json:"maxSize"`
+	NodeSelector map[string]string `json:"nodeSelector"`
+	Pricing      PricingSpec       `json:"pricing"`
+	NodesSpecs   []NodeSpec        `json:"nodesSpecs"`
+}
+
+// NodeSpecStatus defines the observed state of an individual node
+type NodeSpecStatus struct {
+	// Health status of the node (healthy, offline, unknown)
+	// +kubebuilder:validation:Enum=healthy;offline;unknown
+	// +optional
+	Health string `json:"health,omitempty"`
+}
+
+// NodeSpec defines the configuration for individual nodes in the group
+type NodeSpec struct {
+	StartupPodSpec     MinimalPodSpec `json:"startupPodSpec"`
+	ShutdownPodSpec    MinimalPodSpec `json:"shutdownPodSpec"`
+	HealthcheckPodSpec MinimalPodSpec `json:"healthcheckPodSpec"`
+	HealthcheckPeriod  int            `json:"healthcheckPeriod"`
+	KubernetesNodeName string         `json:"kubernetesNodeName"`
+	Status             NodeSpecStatus `json:"status,omitempty"`
 }
 
 type PricingSpec struct {
@@ -70,6 +84,11 @@ type GroupStatus struct {
 
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+
+	// Health status of the group (healthy, offline, unknown)
+	// +kubebuilder:validation:Enum=healthy;offline;unknown
+	// +optional
+	Health string `json:"health,omitempty"`
 
 	// conditions represent the current state of the Group resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
