@@ -350,7 +350,7 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("alpine:latest"), "group2-worker-node-3-healthcheck has incorrect container image")
 				g.Expect(output).To(ContainSubstring("/bin/sh"), "group2-worker-node-3-healthcheck has incorrect command")
 				g.Expect(output).To(ContainSubstring("-c"), "group2-worker-node-3-healthcheck has incorrect args")
-				g.Expect(output).To(ContainSubstring("Health check for group2 node1"), "group2-worker-node-3-healthcheck has incorrect args")
+				g.Expect(output).To(ContainSubstring("Health check for group2 node3"), "group2-worker-node-3-healthcheck has incorrect args")
 
 				// Get group2-worker-node-4-healthcheck cronjob containers array
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-4-healthcheck", "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
@@ -359,7 +359,7 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("alpine:latest"), "group2-worker-node-4-healthcheck has incorrect container image")
 				g.Expect(output).To(ContainSubstring("/bin/sh"), "group2-worker-node-4-healthcheck has incorrect command")
 				g.Expect(output).To(ContainSubstring("-c"), "group2-worker-node-4-healthcheck has incorrect args")
-				g.Expect(output).To(ContainSubstring("Health check for group2 node2"), "group2-worker-node-4-healthcheck has incorrect args")
+				g.Expect(output).To(ContainSubstring("Health check for group2 node4"), "group2-worker-node-4-healthcheck has incorrect args")
 			}
 			Eventually(verifyCronJobsContainers).Should(Succeed())
 
