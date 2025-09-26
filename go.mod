@@ -5,7 +5,6 @@ go 1.24.5
 require (
 	github.com/onsi/ginkgo/v2 v2.22.0
 	github.com/onsi/gomega v1.36.1
-	github.com/stretchr/testify v1.10.0
 	google.golang.org/grpc v1.72.1
 	google.golang.org/protobuf v1.36.5
 	k8s.io/api v0.34.0

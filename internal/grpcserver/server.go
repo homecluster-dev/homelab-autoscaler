@@ -19,7 +19,6 @@ package grpcserver
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -144,16 +143,20 @@ func (s *MockCloudProviderServer) NodeGroups(ctx context.Context, req *pb.NodeGr
 		default:
 		}
 
+		// Get nodes for this group using the new GetNodesForGroup method
+		nodeNames := s.groupStore.GetNodesForGroup(group.Name)
+		nodeCount := len(nodeNames)
+
 		// Create NodeGroup with: minSize=0, maxSize=GroupSpec.MaxSize, id=GroupSpec.Name
 		nodeGroup := &pb.NodeGroup{
 			Id:      group.Spec.Name,
 			MinSize: 0,
 			MaxSize: int32(group.Spec.MaxSize),
-			Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, group.Spec.MaxSize),
+			Debug:   fmt.Sprintf("Group %s - MaxSize: %d, Nodes: %d, Health: %s", group.Spec.Name, group.Spec.MaxSize, nodeCount, group.Status.Health),
 		}
 
 		nodeGroups = append(nodeGroups, nodeGroup)
-		logger.Info("Added group to NodeGroups response", "group", group.Name)
+		logger.Info("Added group to NodeGroups response", "group", group.Name, "nodeCount", nodeCount)
 	}
 
 	logger.Info("NodeGroups response completed", "totalGroups", len(nodeGroups))
@@ -175,46 +178,34 @@ func (s *MockCloudProviderServer) NodeGroupForNode(ctx context.Context, req *pb.
 	default:
 	}
 
-	// Get all groups from the GroupStore
-	groups, err := s.groupStore.List()
+	// Use the new GetGroupForNode method to find the group for this node
+	groupName, exists := s.groupStore.GetGroupForNode(req.Node.Name)
+	if !exists {
+		// Node not found in any group, return empty string
+		logger.Info("Node not found in any group", "node", req.Node.Name)
+		return &pb.NodeGroupForNodeResponse{
+			NodeGroup: &pb.NodeGroup{Id: ""},
+		}, nil
+	}
+
+	// Get the group details
+	group, err := s.groupStore.Get(groupName)
 	if err != nil {
-		logger.Error(err, "failed to list groups from GroupStore")
-		return nil, status.Errorf(codes.Internal, "failed to list groups: %v", err)
+		logger.Error(err, "failed to get group from GroupStore", "group", groupName)
+		return nil, status.Errorf(codes.Internal, "failed to get group %s: %v", groupName, err)
 	}
 
-	// Search for the node in all groups
-	for _, group := range groups {
-		// Check if context is cancelled before processing each group
-		select {
-		case <-ctx.Done():
-			logger.Error(ctx.Err(), "Context cancelled while processing groups")
-			return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded while processing groups: %v", ctx.Err())
-		default:
-		}
-
-		// Check each node's KubernetesNodeName against the requested node name
-		for _, nodeSpec := range group.Spec.NodesSpecs {
-			if nodeSpec.KubernetesNodeName == req.Node.Name {
-				// Found the node, return the associated group
-				nodeGroup := &pb.NodeGroup{
-					Id:      group.Spec.Name,
-					MinSize: 0,
-					MaxSize: int32(group.Spec.MaxSize),
-					Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, group.Spec.MaxSize),
-				}
-
-				logger.Info("Found node group for node", "node", req.Node.Name, "group", group.Spec.Name)
-				return &pb.NodeGroupForNodeResponse{
-					NodeGroup: nodeGroup,
-				}, nil
-			}
-		}
+	// Found the node in this group, return the associated group
+	nodeGroup := &pb.NodeGroup{
+		Id:      group.Spec.Name,
+		MinSize: 0,
+		MaxSize: int32(group.Spec.MaxSize),
+		Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, group.Spec.MaxSize),
 	}
 
-	// Node not found in any group, return empty string
-	logger.Info("Node not found in any group", "node", req.Node.Name)
+	logger.Info("Found node group for node", "node", req.Node.Name, "group", group.Spec.Name)
 	return &pb.NodeGroupForNodeResponse{
-		NodeGroup: &pb.NodeGroup{Id: ""},
+		NodeGroup: nodeGroup,
 	}, nil
 }
 
@@ -291,7 +282,7 @@ func (s *MockCloudProviderServer) Cleanup(ctx context.Context, req *pb.CleanupRe
 	} else {
 		logger.Info("Cleanup would remove resources for groups", "groupCount", len(groups))
 		for _, group := range groups {
-			logger.Info("Cleanup would remove group resources", "group", group.Name, "nodeCount", len(group.Spec.NodesSpecs))
+			logger.Info("Cleanup would remove group resources", "group", group.Name)
 		}
 	}
 
@@ -321,13 +312,13 @@ func (s *MockCloudProviderServer) NodeGroupTargetSize(ctx context.Context, req *
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupTargetSize called", "nodeGroup", req.Id)
 
-	size, exists := s.nodeGroupSizes[req.Id]
-	if !exists {
-		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
-	}
+	// Get nodes for this group using the new GetNodesForGroup method
+	nodeNames := s.groupStore.GetNodesForGroup(req.Id)
+	targetSize := int32(len(nodeNames))
 
+	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id, "targetSize", targetSize)
 	return &pb.NodeGroupTargetSizeResponse{
-		TargetSize: size,
+		TargetSize: targetSize,
 	}, nil
 }
 
@@ -336,34 +327,25 @@ func (s *MockCloudProviderServer) NodeGroupIncreaseSize(ctx context.Context, req
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupIncreaseSize called", "nodeGroup", req.Id, "delta", req.Delta)
 
-	nodeGroup, exists := s.nodeGroups[req.Id]
-	if !exists {
+	// Get the group to check max size
+	group, err := s.groupStore.Get(req.Id)
+	if err != nil {
+		logger.Error(err, "failed to get group from GroupStore", "group", req.Id)
 		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
 	}
 
-	currentSize := s.nodeGroupSizes[req.Id]
+	// Get current node count
+	currentNodes := s.groupStore.GetNodesForGroup(req.Id)
+	currentSize := int32(len(currentNodes))
 	newSize := currentSize + req.Delta
 
-	if newSize > nodeGroup.MaxSize {
-		return nil, status.Errorf(codes.InvalidArgument, "new size %d exceeds max size %d", newSize, nodeGroup.MaxSize)
+	if newSize > int32(group.Spec.MaxSize) {
+		return nil, status.Errorf(codes.InvalidArgument, "new size %d exceeds max size %d", newSize, group.Spec.MaxSize)
 	}
 
-	s.nodeGroupSizes[req.Id] = newSize
-
-	// Simulate adding new instances
-	for i := int32(0); i < req.Delta; i++ {
-		instanceID := fmt.Sprintf("instance-%s-%d", req.Id, time.Now().UnixNano())
-		s.instances[req.Id] = append(s.instances[req.Id], &pb.Instance{
-			Id: instanceID,
-			Status: &pb.InstanceStatus{
-				InstanceState: pb.InstanceStatus_instanceCreating,
-				ErrorInfo: &pb.InstanceErrorInfo{
-					ErrorCode:    "",
-					ErrorMessage: "",
-				},
-			},
-		})
-	}
+	// Note: In a real implementation, this would trigger the creation of new Node CRDs
+	// For now, we just log the operation and return success
+	logger.Info("NodeGroupIncreaseSize would create new nodes", "nodeGroup", req.Id, "currentSize", currentSize, "newSize", newSize, "delta", req.Delta)
 
 	return &pb.NodeGroupIncreaseSizeResponse{}, nil
 }
@@ -373,34 +355,26 @@ func (s *MockCloudProviderServer) NodeGroupDeleteNodes(ctx context.Context, req 
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDeleteNodes called", "nodeGroup", req.Id, "nodes", len(req.Nodes))
 
-	_, exists := s.nodeGroups[req.Id]
-	if !exists {
+	// Get the group to check if it exists
+	_, err := s.groupStore.Get(req.Id)
+	if err != nil {
+		logger.Error(err, "failed to get group from GroupStore", "group", req.Id)
 		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
 	}
 
-	// Remove nodes from the node group
-	for _, node := range req.Nodes {
-		delete(s.nodeToNodeGroup, node.Name)
-		delete(s.nodes, node.Name)
+	// Get current node count
+	currentNodes := s.groupStore.GetNodesForGroup(req.Id)
+	currentSize := int32(len(currentNodes))
+
+	// Check if we're trying to delete more nodes than exist
+	if int32(len(req.Nodes)) > currentSize {
+		logger.Info("Attempting to delete more nodes than exist", "nodeGroup", req.Id, "requested", len(req.Nodes), "current", currentSize)
+		return nil, status.Errorf(codes.InvalidArgument, "cannot delete %d nodes when only %d exist", len(req.Nodes), currentSize)
 	}
 
-	// Update node group size
-	currentSize := s.nodeGroupSizes[req.Id]
-	newSize := currentSize - int32(len(req.Nodes))
-	if newSize < 0 {
-		newSize = 0
-	}
-	s.nodeGroupSizes[req.Id] = newSize
-
-	// Remove instances
-	instances := s.instances[req.Id]
-	newInstances := make([]*pb.Instance, 0, len(instances)-len(req.Nodes))
-	for i, instance := range instances {
-		if i < len(instances)-len(req.Nodes) {
-			newInstances = append(newInstances, instance)
-		}
-	}
-	s.instances[req.Id] = newInstances
+	// Note: In a real implementation, this would trigger the deletion of Node CRDs
+	// For now, we just log the operation and return success
+	logger.Info("NodeGroupDeleteNodes would delete nodes", "nodeGroup", req.Id, "currentSize", currentSize, "nodesToDelete", len(req.Nodes))
 
 	return &pb.NodeGroupDeleteNodesResponse{}, nil
 }
@@ -410,8 +384,10 @@ func (s *MockCloudProviderServer) NodeGroupDecreaseTargetSize(ctx context.Contex
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDecreaseTargetSize called", "nodeGroup", req.Id, "delta", req.Delta)
 
-	nodeGroup, exists := s.nodeGroups[req.Id]
-	if !exists {
+	// Check if the group exists
+	_, err := s.groupStore.Get(req.Id)
+	if err != nil {
+		logger.Error(err, "failed to get group from GroupStore", "group", req.Id)
 		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
 	}
 
@@ -419,14 +395,16 @@ func (s *MockCloudProviderServer) NodeGroupDecreaseTargetSize(ctx context.Contex
 		return nil, status.Errorf(codes.InvalidArgument, "delta must be negative, got %d", req.Delta)
 	}
 
-	currentSize := s.nodeGroupSizes[req.Id]
+	// Get current node count
+	currentNodes := s.groupStore.GetNodesForGroup(req.Id)
+	currentSize := int32(len(currentNodes))
 	newSize := currentSize + req.Delta // req.Delta is negative
 
-	if newSize < nodeGroup.MinSize {
-		return nil, status.Errorf(codes.InvalidArgument, "new size %d is below min size %d", newSize, nodeGroup.MinSize)
+	if newSize < 0 {
+		newSize = 0
 	}
 
-	s.nodeGroupSizes[req.Id] = newSize
+	logger.Info("NodeGroupDecreaseTargetSize would decrease target size", "nodeGroup", req.Id, "currentSize", currentSize, "newSize", newSize, "delta", req.Delta)
 
 	return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 }
@@ -436,13 +414,26 @@ func (s *MockCloudProviderServer) NodeGroupNodes(ctx context.Context, req *pb.No
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupNodes called", "nodeGroup", req.Id)
 
-	instances, exists := s.instances[req.Id]
-	if !exists {
-		return &pb.NodeGroupNodesResponse{
-			Instances: []*pb.Instance{},
-		}, nil
+	// Get nodes for this group using the new GetNodesForGroup method
+	nodeNames := s.groupStore.GetNodesForGroup(req.Id)
+
+	// Convert node names to instances
+	instances := make([]*pb.Instance, 0, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		instance := &pb.Instance{
+			Id: nodeName,
+			Status: &pb.InstanceStatus{
+				InstanceState: pb.InstanceStatus_instanceRunning,
+				ErrorInfo: &pb.InstanceErrorInfo{
+					ErrorCode:    "",
+					ErrorMessage: "",
+				},
+			},
+		}
+		instances = append(instances, instance)
 	}
 
+	logger.Info("NodeGroupNodes response completed", "nodeGroup", req.Id, "nodeCount", len(instances))
 	return &pb.NodeGroupNodesResponse{
 		Instances: instances,
 	}, nil

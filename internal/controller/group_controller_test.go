@@ -59,21 +59,6 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "0.5",
 						MonthlyRate: "300",
 					},
-					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
-						{
-							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/startup:latest",
-							},
-							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/shutdown:latest",
-							},
-							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/healthcheck:latest",
-							},
-							HealthcheckPeriod:  30,
-							KubernetesNodeName: "test-node",
-						},
-					},
 				},
 			}
 			Expect(k8sClient.Create(ctx, group)).To(Succeed())
@@ -222,21 +207,6 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "0.0", // Edge case: zero rate
 						MonthlyRate: "0.0", // Edge case: zero rate
 					},
-					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
-						{
-							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/startup:latest",
-							},
-							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/shutdown:latest",
-							},
-							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/healthcheck:latest",
-							},
-							HealthcheckPeriod:  1, // Edge case: very short period
-							KubernetesNodeName: "edge-case-node",
-						},
-					},
 				},
 			}
 			Expect(k8sClient.Create(ctx, edgeCaseGroup)).To(Succeed())
@@ -289,21 +259,6 @@ var _ = Describe("Group Controller", func() {
 					Pricing: infrahomeclusterdevv1alpha1.PricingSpec{
 						HourlyRate:  "1.0",
 						MonthlyRate: "600",
-					},
-					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
-						{
-							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/startup:latest",
-							},
-							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/shutdown:latest",
-							},
-							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/healthcheck:latest",
-							},
-							HealthcheckPeriod:  30,
-							KubernetesNodeName: "test-node",
-						},
 					},
 				},
 			}
@@ -416,21 +371,6 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "0.1",
 						MonthlyRate: "60",
 					},
-					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
-						{
-							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/image:latest",
-							},
-							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/image:latest",
-							},
-							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "test/image:latest",
-							},
-							HealthcheckPeriod:  10,
-							KubernetesNodeName: "node-1",
-						},
-					},
 				},
 				false),
 			Entry("Group with complex node selector",
@@ -446,24 +386,6 @@ var _ = Describe("Group Controller", func() {
 					Pricing: infrahomeclusterdevv1alpha1.PricingSpec{
 						HourlyRate:  "2.5",
 						MonthlyRate: "1500",
-					},
-					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
-						{
-							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image:   "startup/image:latest",
-								Command: []string{"/bin/startup"},
-								Args:    []string{"--verbose"},
-							},
-							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image:   "shutdown/image:latest",
-								Command: []string{"/bin/shutdown"},
-							},
-							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "healthcheck/image:latest",
-							},
-							HealthcheckPeriod:  60,
-							KubernetesNodeName: "k8s-node-1",
-						},
 					},
 				},
 				false),

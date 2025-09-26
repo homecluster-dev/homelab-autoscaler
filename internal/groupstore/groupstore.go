@@ -26,15 +26,17 @@ import (
 
 // Constants for health status values
 const (
-	statusUnknown = "unknown"
-	statusHealthy = "healthy"
-	statusOffline = "offline"
+	statusUnknown  = "unknown"
+	statusHealthy  = "healthy"
+	statusOffline  = "offline"
+	groupStatusKey = "_group" // Key for storing group-level health status
 )
 
 // GroupStore provides a thread-safe storage for Group resources using sync.Map
 type GroupStore struct {
-	store          sync.Map
-	healthcheckMap sync.Map // Now stores map[string]map[string]string for group->node->status
+	store          sync.Map // Stores Group resources by name
+	healthcheckMap sync.Map // Stores map[string]map[string]string for group->node->status
+	nodeToGroupMap sync.Map // Stores node-to-group mapping: nodeName -> groupName
 }
 
 // NewGroupStore creates a new GroupStore instance
@@ -42,6 +44,7 @@ func NewGroupStore() *GroupStore {
 	return &GroupStore{
 		store:          sync.Map{},
 		healthcheckMap: sync.Map{},
+		nodeToGroupMap: sync.Map{},
 	}
 }
 
@@ -107,6 +110,18 @@ func (s *GroupStore) Remove(key string) error {
 	_, ok := s.store.Load(key)
 	if !ok {
 		return fmt.Errorf("group %q not found", key)
+	}
+
+	// Clean up node-to-group mappings for nodes in this group
+	if healthData, exists := s.healthcheckMap.Load(key); exists {
+		if nodeHealth, ok := healthData.(map[string]string); ok {
+			// Remove all nodes from this group from the node-to-group mapping
+			for nodeName := range nodeHealth {
+				if nodeName != groupStatusKey { // Skip the group-level status key
+					s.nodeToGroupMap.Delete(nodeName)
+				}
+			}
+		}
 	}
 
 	s.store.Delete(key)
@@ -175,7 +190,7 @@ func (s *GroupStore) SetHealthcheckStatus(groupName string, status string) {
 	// For backward compatibility, store group-level status
 	// In the new structure, this represents the overall group health
 	groupHealth := make(map[string]string)
-	groupHealth["_group"] = status
+	groupHealth[groupStatusKey] = status
 	s.healthcheckMap.Store(groupName, groupHealth)
 	log.Printf("GroupStore: Set healthcheck status for group %q to %q", groupName, status)
 }
@@ -227,7 +242,7 @@ func (s *GroupStore) GetHealthcheckStatus(groupName string) (string, bool) {
 		return v, true
 	case map[string]string:
 		// New format - map of node statuses
-		if groupStatus, exists := v["_group"]; exists {
+		if groupStatus, exists := v[groupStatusKey]; exists {
 			log.Printf("GroupStore: Found group healthcheck status %q for group %q", groupStatus, groupName)
 			return groupStatus, true
 		}
@@ -246,6 +261,9 @@ func (s *GroupStore) SetNodeHealthcheckStatus(groupName, nodeName, status string
 		return
 	}
 
+	// Update node-to-group mapping
+	s.nodeToGroupMap.Store(nodeName, groupName)
+
 	// Load existing health data or create new map
 	var nodeHealth map[string]string
 	value, exists := s.healthcheckMap.Load(groupName)
@@ -256,7 +274,7 @@ func (s *GroupStore) SetNodeHealthcheckStatus(groupName, nodeName, status string
 			// Convert old format to new format
 			nodeHealth = make(map[string]string)
 			if oldStatus, ok := value.(string); ok {
-				nodeHealth["_group"] = oldStatus
+				nodeHealth[groupStatusKey] = oldStatus
 			}
 		}
 	} else {
@@ -267,7 +285,7 @@ func (s *GroupStore) SetNodeHealthcheckStatus(groupName, nodeName, status string
 	nodeHealth[nodeName] = status
 
 	// Update the overall group health based on all nodes
-	nodeHealth["_group"] = s.calculateGroupHealth(nodeHealth)
+	nodeHealth[groupStatusKey] = s.calculateGroupHealth(nodeHealth)
 
 	s.healthcheckMap.Store(groupName, nodeHealth)
 	log.Printf("GroupStore: Set healthcheck status for node %q in group %q to %q", nodeName, groupName, status)
@@ -315,7 +333,7 @@ func (s *GroupStore) calculateGroupHealth(nodeHealth map[string]string) string {
 	totalNodes := 0
 
 	for node, status := range nodeHealth {
-		if node == "_group" {
+		if node == groupStatusKey {
 			continue // Skip the group-level status
 		}
 		totalNodes++
@@ -343,4 +361,70 @@ func (s *GroupStore) calculateGroupHealth(nodeHealth map[string]string) string {
 
 	// Otherwise, group is unknown
 	return statusUnknown
+}
+
+// GetGroupForNode retrieves the group name that a node belongs to
+func (s *GroupStore) GetGroupForNode(nodeName string) (string, bool) {
+	if nodeName == "" {
+		return "", false
+	}
+
+	value, ok := s.nodeToGroupMap.Load(nodeName)
+	if !ok {
+		return "", false
+	}
+
+	groupName, ok := value.(string)
+	if !ok {
+		log.Printf("GroupStore: Invalid type assertion for node-to-group mapping of node %q", nodeName)
+		return "", false
+	}
+
+	return groupName, true
+}
+
+// GetNodesForGroup retrieves all node names that belong to a specific group
+func (s *GroupStore) GetNodesForGroup(groupName string) []string {
+	if groupName == "" {
+		return []string{}
+	}
+
+	var nodes []string
+
+	// Get the health data for the group
+	value, ok := s.healthcheckMap.Load(groupName)
+	if !ok {
+		return nodes
+	}
+
+	nodeHealth, ok := value.(map[string]string)
+	if !ok {
+		log.Printf("GroupStore: Invalid type assertion for health data of group %q", groupName)
+		return nodes
+	}
+
+	// Extract all node names (excluding the _group key)
+	for nodeName := range nodeHealth {
+		if nodeName != groupStatusKey {
+			nodes = append(nodes, nodeName)
+		}
+	}
+
+	return nodes
+}
+
+// GetAllNodeToGroupMappings returns a map of all node-to-group relationships
+func (s *GroupStore) GetAllNodeToGroupMappings() map[string]string {
+	mappings := make(map[string]string)
+
+	s.nodeToGroupMap.Range(func(key, value interface{}) bool {
+		nodeName, ok1 := key.(string)
+		groupName, ok2 := value.(string)
+		if ok1 && ok2 {
+			mappings[nodeName] = groupName
+		}
+		return true
+	})
+
+	return mappings
 }

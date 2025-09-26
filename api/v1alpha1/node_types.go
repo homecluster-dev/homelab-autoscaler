@@ -23,55 +23,24 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// GroupSpec defines the desired state of Group
-type GroupSpec struct {
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	Name         string            `json:"name"`
-	MaxSize      int               `json:"maxSize"`
-	NodeSelector map[string]string `json:"nodeSelector"`
-	Pricing      PricingSpec       `json:"pricing"`
+// NodeSpec defines the desired state of Node
+type NodeSpec struct {
+	StartupPodSpec     MinimalPodSpec `json:"startupPodSpec"`
+	ShutdownPodSpec    MinimalPodSpec `json:"shutdownPodSpec"`
+	HealthcheckPodSpec MinimalPodSpec `json:"healthcheckPodSpec"`
+	HealthcheckPeriod  int            `json:"healthcheckPeriod"`
+	KubernetesNodeName string         `json:"kubernetesNodeName"`
 }
 
-type PricingSpec struct {
-	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
-	HourlyRate string `json:"hourlyRate"`
-	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
-	MonthlyRate string `json:"monthlyRate"`
-}
-
-type MinimalPodSpec struct {
-	Image   string   `json:"image"`
-	Command []string `json:"command,omitempty"`
-	Args    []string `json:"args,omitempty"`
-	// Each volume mounts a Secret or ConfigMap
-	Volumes []VolumeMountSpec `json:"volumes,omitempty"`
-}
-
-type VolumeMountSpec struct {
-	Name      string `json:"name"`
-	MountPath string `json:"mountPath"`
-	// Either SecretName or ConfigMapName should be set
-	SecretName    string `json:"secretName,omitempty"`
-	ConfigMapName string `json:"configMapName,omitempty"`
-}
-
-// GroupStatus defines the observed state of Group.
-type GroupStatus struct {
+// NodeStatus defines the observed state of Node.
+type NodeStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
-	// Health status of the group (healthy, offline, unknown)
-	// +kubebuilder:validation:Enum=healthy;offline;unknown
-	// +optional
-	Health string `json:"health,omitempty"`
-
-	// conditions represent the current state of the Group resource.
+	// conditions represent the current state of the Node resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
 	//
 	// Standard condition types include:
@@ -84,37 +53,41 @@ type GroupStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// +kubebuilder:validation:Enum=healthy;offline;unknown
+	// +optional
+	Health string `json:"health,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
-// Group is the Schema for the groups API
-type Group struct {
+// Node is the Schema for the nodes API
+type Node struct {
 	metav1.TypeMeta `json:",inline"`
 
 	// metadata is a standard object metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty,omitzero"`
 
-	// spec defines the desired state of Group
+	// spec defines the desired state of Node
 	// +required
-	Spec GroupSpec `json:"spec"`
+	Spec NodeSpec `json:"spec"`
 
-	// status defines the observed state of Group
+	// status defines the observed state of Node
 	// +optional
-	Status GroupStatus `json:"status,omitempty,omitzero"`
+	Status NodeStatus `json:"status,omitempty,omitzero"`
 }
 
 // +kubebuilder:object:root=true
 
-// GroupList contains a list of Group
-type GroupList struct {
+// NodeList contains a list of Node
+type NodeList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []Group `json:"items"`
+	Items           []Node `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&Group{}, &GroupList{})
+	SchemeBuilder.Register(&Node{}, &NodeList{})
 }
