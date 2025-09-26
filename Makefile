@@ -102,17 +102,6 @@ test-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e 
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
 	
-	@echo "Waiting for groups to be processed..."
-	@for i in {1..30}; do \
-		healthy_count=$$($(KUBECTL) get groups -n homelab-autoscaler-system -o json | jq '[.items[] | select(.status.Condition.Type == "Loaded")] | length' 2>/dev/null || echo "0"); \
-		if [ "$$healthy_count" -ge "2" ]; then \
-			echo "Groups are ready! Found $$healthy_count loaded groups"; \
-			break; \
-		fi; \
-		echo "Waiting for groups to become loaded... ($$i/30) - Found $$healthy_count loaded groups"; \
-		sleep 10; \
-	done
-	
 	@echo "Starting gRPC port forwarding for tests..."
 	$(MAKE) port-forward-grpc-e2e
 	@sleep 5  # Give port forwarding time to establish

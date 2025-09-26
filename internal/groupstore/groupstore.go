@@ -24,6 +24,13 @@ import (
 	v1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/v1alpha1"
 )
 
+// Constants for health status values
+const (
+	statusUnknown = "unknown"
+	statusHealthy = "healthy"
+	statusOffline = "offline"
+)
+
 // GroupStore provides a thread-safe storage for Group resources using sync.Map
 type GroupStore struct {
 	store          sync.Map
@@ -300,7 +307,7 @@ func (s *GroupStore) GetNodeHealthcheckStatus(groupName, nodeName string) (strin
 // calculateGroupHealth calculates the overall group health based on individual node healths
 func (s *GroupStore) calculateGroupHealth(nodeHealth map[string]string) string {
 	if len(nodeHealth) == 0 {
-		return "unknown"
+		return statusUnknown
 	}
 
 	healthyCount := 0
@@ -313,27 +320,27 @@ func (s *GroupStore) calculateGroupHealth(nodeHealth map[string]string) string {
 		}
 		totalNodes++
 		switch status {
-		case "healthy":
+		case statusHealthy:
 			healthyCount++
-		case "offline":
+		case statusOffline:
 			offlineCount++
 		}
 	}
 
 	if totalNodes == 0 {
-		return "unknown"
+		return statusUnknown
 	}
 
 	// If all nodes are healthy, group is healthy
 	if healthyCount == totalNodes {
-		return "healthy"
+		return statusHealthy
 	}
 
 	// If any node is offline, group is offline
 	if offlineCount > 0 {
-		return "offline"
+		return statusOffline
 	}
 
 	// Otherwise, group is unknown
-	return "unknown"
+	return statusUnknown
 }

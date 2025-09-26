@@ -23,6 +23,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Constants for health status values used in tests
+const (
+	testStatusHealthy = "healthy"
+	testStatusOffline = "offline"
+	testStatusUnknown = "unknown"
+)
+
 func TestUpdateGroupHealth(t *testing.T) {
 	store := NewGroupStore()
 
@@ -57,7 +64,7 @@ func TestUpdateGroupHealth(t *testing.T) {
 		t.Fatalf("Failed to get group from store: %v", err)
 	}
 
-	if updatedGroup.Status.Health != "healthy" {
+	if updatedGroup.Status.Health != testStatusHealthy {
 		t.Errorf("Expected health status 'healthy', got '%s'", updatedGroup.Status.Health)
 	}
 
@@ -73,7 +80,7 @@ func TestUpdateGroupHealth(t *testing.T) {
 		t.Fatalf("Failed to get group from store: %v", err)
 	}
 
-	if updatedGroup.Status.Health != "offline" {
+	if updatedGroup.Status.Health != testStatusOffline {
 		t.Errorf("Expected health status 'offline', got '%s'", updatedGroup.Status.Health)
 	}
 
@@ -137,7 +144,7 @@ func TestSetHealthcheckStatus(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for backward compatibility test")
 	}
-	if status != "healthy" {
+	if status != testStatusHealthy {
 		t.Errorf("Expected healthcheck status 'healthy' for backward compatibility, got '%s'", status)
 	}
 }
@@ -155,7 +162,7 @@ func TestSetNodeHealthcheckStatus(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for node1")
 	}
-	if status != "healthy" {
+	if status != testStatusHealthy {
 		t.Errorf("Expected healthcheck status 'healthy' for node1, got '%s'", status)
 	}
 
@@ -163,7 +170,7 @@ func TestSetNodeHealthcheckStatus(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for node2")
 	}
-	if status != "healthy" {
+	if status != testStatusHealthy {
 		t.Errorf("Expected healthcheck status 'healthy' for node2, got '%s'", status)
 	}
 
@@ -171,12 +178,12 @@ func TestSetNodeHealthcheckStatus(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for node3")
 	}
-	if status != "offline" {
+	if status != testStatusOffline {
 		t.Errorf("Expected healthcheck status 'offline' for node3, got '%s'", status)
 	}
 
 	// Test getting status for non-existent node
-	status, found = store.GetNodeHealthcheckStatus("test-group", "non-existent-node")
+	_, found = store.GetNodeHealthcheckStatus("test-group", "non-existent-node")
 	if found {
 		t.Error("Expected not to find healthcheck status for non-existent node")
 	}
@@ -241,7 +248,7 @@ func TestNodeLevelHealthCalculation(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for group1")
 	}
-	if status != "healthy" {
+	if status != testStatusHealthy {
 		t.Errorf("Expected group health 'healthy' when all nodes are healthy, got '%s'", status)
 	}
 
@@ -254,7 +261,7 @@ func TestNodeLevelHealthCalculation(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for group2")
 	}
-	if status != "offline" {
+	if status != testStatusOffline {
 		t.Errorf("Expected group health 'offline' when one node is offline, got '%s'", status)
 	}
 
@@ -267,7 +274,7 @@ func TestNodeLevelHealthCalculation(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for group3")
 	}
-	if status != "unknown" {
+	if status != testStatusUnknown {
 		t.Errorf("Expected group health 'unknown' when mixed statuses without offline nodes, got '%s'", status)
 	}
 
@@ -276,7 +283,7 @@ func TestNodeLevelHealthCalculation(t *testing.T) {
 	store.SetNodeHealthcheckStatus("group4", "node1", "") // Remove node1 by setting empty status
 
 	status, found = store.GetHealthcheckStatus("group4")
-	if found && status != "unknown" {
+	if found && status != testStatusUnknown {
 		t.Errorf("Expected group health 'unknown' for empty group, got '%s'", status)
 	}
 
@@ -298,7 +305,7 @@ func TestNodeLevelHealthCalculation(t *testing.T) {
 	if !found {
 		t.Error("Expected to find healthcheck status for group6")
 	}
-	if status != "offline" {
+	if status != testStatusOffline {
 		t.Errorf("Expected group health 'offline' when node method overrides group method, got '%s'", status)
 	}
 }

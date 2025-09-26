@@ -99,9 +99,10 @@ func TestNodeGroups_SimpleOperations(t *testing.T) {
 		var healthyGroup *pb.NodeGroup
 		var unhealthyGroup *pb.NodeGroup
 		for _, ng := range resp.NodeGroups {
-			if ng.Id == "healthy-group" {
+			switch ng.Id {
+			case "healthy-group":
 				healthyGroup = ng
-			} else if ng.Id == "unhealthy-group" {
+			case "unhealthy-group":
 				unhealthyGroup = ng
 			}
 		}
