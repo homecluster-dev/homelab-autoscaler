@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/infra.homecluster.dev_groups.yaml
+- bases/infra.homecluster.dev_nodes.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

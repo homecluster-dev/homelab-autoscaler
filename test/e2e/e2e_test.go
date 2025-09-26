@@ -117,7 +117,7 @@ var _ = Describe("Manager", Ordered, func() {
 	})
 
 	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
+	SetDefaultEventuallyPollingInterval(5 * time.Second)
 
 	Context("Manager", func() {
 		It("should run successfully", func() {
@@ -152,25 +152,49 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyControllerUp).Should(Succeed())
 		})
 
-		It("should create cronjobs for each NodeSpec in Group CRs", func() {
-			By("verifying that cronjobs are created for each NodeSpec")
+		It("should create Node CRs and their associated cronjobs", func() {
+			By("verifying that Node CRs are created")
+			verifyNodeCRsCreated := func(g Gomega) {
+				// Check if group1-worker-node-1 CR exists (from nodes1.yaml)
+				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", "group1-worker-node-1", "-n", namespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "group1-worker-node-1 CR does not exist")
+
+				// Check if group1-worker-node-2 CR exists (from nodes1.yaml)
+				cmd = exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", "group1-worker-node-2", "-n", namespace)
+				_, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "group1-worker-node-2 CR does not exist")
+
+				// Check if group2-worker-node-3 CR exists (from nodes2.yaml)
+				cmd = exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", "group2-worker-node-3", "-n", namespace)
+				_, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "group2-worker-node-3 CR does not exist")
+
+				// Check if group2-worker-node-4 CR exists (from nodes2.yaml)
+				cmd = exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", "group2-worker-node-4", "-n", namespace)
+				_, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "group2-worker-node-4 CR does not exist")
+			}
+			Eventually(verifyNodeCRsCreated).Should(Succeed())
+
+			By("verifying that cronjobs are created for each Node CR")
 			verifyCronJobsCreated := func(g Gomega) {
-				// Check if group1-worker-node-1-healthcheck cronjob exists (from group1.yaml)
+				// Check if group1-worker-node-1-healthcheck cronjob exists (from node1 CR)
 				cmd := exec.Command("kubectl", "get", "cronjob", "group1-worker-node-1-healthcheck", "-n", namespace)
 				_, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "group1-worker-node-1-healthcheck cronjob does not exist")
 
-				// Check if group1-worker-node-2-healthcheck cronjob exists (from group1.yaml)
+				// Check if group1-worker-node-2-healthcheck cronjob exists (from node2 CR)
 				cmd = exec.Command("kubectl", "get", "cronjob", "group1-worker-node-2-healthcheck", "-n", namespace)
 				_, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "group1-worker-node-2-healthcheck cronjob does not exist")
 
-				// Check if group2-worker-node-3-healthcheck cronjob exists (from group2.yaml)
+				// Check if group2-worker-node-3-healthcheck cronjob exists (from node3 CR)
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-3-healthcheck", "-n", namespace)
 				_, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "group2-worker-node-3-healthcheck cronjob does not exist")
 
-				// Check if group2-worker-node-4-healthcheck cronjob exists (from group2.yaml)
+				// Check if group2-worker-node-4-healthcheck cronjob exists (from node4 CR)
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-4-healthcheck", "-n", namespace)
 				_, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "group2-worker-node-4-healthcheck cronjob does not exist")
@@ -213,23 +237,23 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group1-worker-node-1-healthcheck schedule")
 				g.Expect(output).To(Equal("*/1 * * * *"), "group1-worker-node-1-healthcheck has incorrect schedule")
 
-				// Get group1-worker-node-2-healthcheck cronjob schedule (should be "*/2 * * * *" based on healthcheckPeriod: 2)
+				// Get group1-worker-node-2-healthcheck cronjob schedule (should be "*/1 * * * *" based on healthcheckPeriod: 1)
 				cmd = exec.Command("kubectl", "get", "cronjob", "group1-worker-node-2-healthcheck", "-o", "jsonpath={.spec.schedule}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group1-worker-node-2-healthcheck schedule")
-				g.Expect(output).To(Equal("*/2 * * * *"), "group1-worker-node-2-healthcheck has incorrect schedule")
+				g.Expect(output).To(Equal("*/1 * * * *"), "group1-worker-node-2-healthcheck has incorrect schedule")
 
-				// Get group2-worker-node-3-healthcheck cronjob schedule (should be "*/1 * * * *" based on healthcheckPeriod: 1)
+				// Get group2-worker-node-3-healthcheck cronjob schedule (should be "*/2 * * * *" based on healthcheckPeriod: 2)
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-3-healthcheck", "-o", "jsonpath={.spec.schedule}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group2-worker-node-3-healthcheck schedule")
-				g.Expect(output).To(Equal("*/1 * * * *"), "group2-worker-node-3-healthcheck has incorrect schedule")
+				g.Expect(output).To(Equal("*/2 * * * *"), "group2-worker-node-3-healthcheck has incorrect schedule")
 
-				// Get group2-worker-node-4-healthcheck cronjob schedule (should be "*/3 * * * *" based on healthcheckPeriod: 3)
+				// Get group2-worker-node-4-healthcheck cronjob schedule (should be "*/2 * * * *" based on healthcheckPeriod: 2)
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-4-healthcheck", "-o", "jsonpath={.spec.schedule}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group2-worker-node-4-healthcheck schedule")
-				g.Expect(output).To(Equal("*/3 * * * *"), "group2-worker-node-4-healthcheck has incorrect schedule")
+				g.Expect(output).To(Equal("*/2 * * * *"), "group2-worker-node-4-healthcheck has incorrect schedule")
 			}
 			Eventually(verifyCronJobsSchedule).Should(Succeed())
 
@@ -242,7 +266,7 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("busybox:latest"), "group1-worker-node-1-healthcheck has incorrect container image")
 				g.Expect(output).To(ContainSubstring("/bin/sh"), "group1-worker-node-1-healthcheck has incorrect command")
 				g.Expect(output).To(ContainSubstring("-c"), "group1-worker-node-1-healthcheck has incorrect args")
-				g.Expect(output).To(ContainSubstring("Health check for group1 node1"), "group1-worker-node-1-healthcheck has incorrect args")
+				g.Expect(output).To(ContainSubstring("echo healthy"), "group1-worker-node-1-healthcheck has incorrect args")
 
 				// Get group1-worker-node-2-healthcheck cronjob containers array
 				cmd = exec.Command("kubectl", "get", "cronjob", "group1-worker-node-2-healthcheck", "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
@@ -251,57 +275,57 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("busybox:latest"), "group1-worker-node-2-healthcheck has incorrect container image")
 				g.Expect(output).To(ContainSubstring("/bin/sh"), "group1-worker-node-2-healthcheck has incorrect command")
 				g.Expect(output).To(ContainSubstring("-c"), "group1-worker-node-2-healthcheck has incorrect args")
-				g.Expect(output).To(ContainSubstring("Health check for group1 node2"), "group1-worker-node-2-healthcheck has incorrect args")
+				g.Expect(output).To(ContainSubstring("echo healthy"), "group1-worker-node-2-healthcheck has incorrect args")
 
 				// Get group2-worker-node-3-healthcheck cronjob containers array
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-3-healthcheck", "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group2-worker-node-3-healthcheck containers")
-				g.Expect(output).To(ContainSubstring("alpine:latest"), "group2-worker-node-3-healthcheck has incorrect container image")
+				g.Expect(output).To(ContainSubstring("busybox:latest"), "group2-worker-node-3-healthcheck has incorrect container image")
 				g.Expect(output).To(ContainSubstring("/bin/sh"), "group2-worker-node-3-healthcheck has incorrect command")
 				g.Expect(output).To(ContainSubstring("-c"), "group2-worker-node-3-healthcheck has incorrect args")
-				g.Expect(output).To(ContainSubstring("Health check for group2 node3"), "group2-worker-node-3-healthcheck has incorrect args")
+				g.Expect(output).To(ContainSubstring("echo healthy"), "group2-worker-node-3-healthcheck has incorrect args")
 
 				// Get group2-worker-node-4-healthcheck cronjob containers array
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-4-healthcheck", "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group2-worker-node-4-healthcheck containers")
-				g.Expect(output).To(ContainSubstring("alpine:latest"), "group2-worker-node-4-healthcheck has incorrect container image")
+				g.Expect(output).To(ContainSubstring("busybox:latest"), "group2-worker-node-4-healthcheck has incorrect container image")
 				g.Expect(output).To(ContainSubstring("/bin/sh"), "group2-worker-node-4-healthcheck has incorrect command")
 				g.Expect(output).To(ContainSubstring("-c"), "group2-worker-node-4-healthcheck has incorrect args")
-				g.Expect(output).To(ContainSubstring("Health check for group2 node4"), "group2-worker-node-4-healthcheck has incorrect args")
+				g.Expect(output).To(ContainSubstring("echo healthy"), "group2-worker-node-4-healthcheck has incorrect args")
 			}
 			Eventually(verifyCronJobsContainers).Should(Succeed())
 
-			By("verifying that cronjobs are properly labeled to associate them with their respective Group CRs")
+			By("verifying that cronjobs are properly labeled to associate them with their respective Node CRs")
 			verifyCronJobsLabels := func(g Gomega) {
 				// Get group1-worker-node-1-healthcheck cronjob owner references array
 				cmd := exec.Command("kubectl", "get", "cronjob", "group1-worker-node-1-healthcheck", "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group1-worker-node-1-healthcheck owner references")
-				g.Expect(output).To(ContainSubstring("Group"), "group1-worker-node-1-healthcheck does not have Group as owner reference")
-				g.Expect(output).To(ContainSubstring("group1"), "group1-worker-node-1-healthcheck does not have group1 as owner reference")
+				g.Expect(output).To(ContainSubstring("Node"), "group1-worker-node-1-healthcheck does not have Node as owner reference")
+				g.Expect(output).To(ContainSubstring("group1-worker-node-1"), "group1-worker-node-1-healthcheck does not have group1-worker-node-1 as owner reference")
 
 				// Get group1-worker-node-2-healthcheck cronjob owner references array
 				cmd = exec.Command("kubectl", "get", "cronjob", "group1-worker-node-2-healthcheck", "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group1-worker-node-2-healthcheck owner references")
-				g.Expect(output).To(ContainSubstring("Group"), "group1-worker-node-2-healthcheck does not have Group as owner reference")
-				g.Expect(output).To(ContainSubstring("group1"), "group1-worker-node-2-healthcheck does not have group1 as owner reference")
+				g.Expect(output).To(ContainSubstring("Node"), "group1-worker-node-2-healthcheck does not have Node as owner reference")
+				g.Expect(output).To(ContainSubstring("group1-worker-node-2"), "group1-worker-node-2-healthcheck does not have group1-worker-node-2 as owner reference")
 
 				// Get group2-worker-node-3-healthcheck cronjob owner references array
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-3-healthcheck", "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group2-worker-node-3-healthcheck owner references")
-				g.Expect(output).To(ContainSubstring("Group"), "group2-worker-node-3-healthcheck does not have Group as owner reference")
-				g.Expect(output).To(ContainSubstring("group2"), "group2-worker-node-3-healthcheck does not have group2 as owner reference")
+				g.Expect(output).To(ContainSubstring("Node"), "group2-worker-node-3-healthcheck does not have Node as owner reference")
+				g.Expect(output).To(ContainSubstring("group2-worker-node-3"), "group2-worker-node-3-healthcheck does not have group2-worker-node-3 as owner reference")
 
 				// Get group2-worker-node-4-healthcheck cronjob owner references array
 				cmd = exec.Command("kubectl", "get", "cronjob", "group2-worker-node-4-healthcheck", "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get group2-worker-node-4-healthcheck owner references")
-				g.Expect(output).To(ContainSubstring("Group"), "group2-worker-node-4-healthcheck does not have Group as owner reference")
-				g.Expect(output).To(ContainSubstring("group2"), "group2-worker-node-4-healthcheck does not have group2 as owner reference")
+				g.Expect(output).To(ContainSubstring("Node"), "group2-worker-node-4-healthcheck does not have Node as owner reference")
+				g.Expect(output).To(ContainSubstring("group2-worker-node-4"), "group2-worker-node-4-healthcheck does not have group2-worker-node-4 as owner reference")
 			}
 			Eventually(verifyCronJobsLabels).Should(Succeed())
 		})
@@ -320,9 +344,9 @@ var _ = Describe("Manager", Ordered, func() {
 	})
 })
 
-// deployGroupCRs deploys the Group CRs using kubectl apply command.
+// deployGroupCRs deploys the Group and Node CRs using kubectl apply command.
 func deployGroupCRs() {
-	By("waiting for Group CRD to be established")
+	By("waiting for Group and Node CRDs to be established")
 	verifyCRDEstablished := func(g Gomega) {
 		// Wait for the Group CRD to be established
 		cmd := exec.Command("kubectl", "wait", "--for=condition=established",
@@ -330,6 +354,13 @@ func deployGroupCRs() {
 			"--timeout=60s")
 		_, err := utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred(), "Group CRD was not established within timeout")
+
+		// Wait for the Node CRD to be established
+		cmd = exec.Command("kubectl", "wait", "--for=condition=established",
+			"crd/nodes.infra.homecluster.dev",
+			"--timeout=60s")
+		_, err = utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred(), "Node CRD was not established within timeout")
 	}
 	Eventually(verifyCRDEstablished).Should(Succeed())
 
@@ -343,8 +374,23 @@ func deployGroupCRs() {
 	_, err = utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred(), "Failed to deploy group2 CR")
 
-	By("waiting for Group CRs to be properly applied")
-	verifyGroupCRsApplied := func(g Gomega) {
+	By("deploying nodes1 CRs")
+	cmd = exec.Command("kubectl", "apply", "-f", "test/e2e/manifests/nodes1.yaml", "-n", namespace)
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to deploy nodes1 CRs")
+
+	By("deploying nodes2 CRs")
+	cmd = exec.Command("kubectl", "apply", "-f", "test/e2e/manifests/nodes2.yaml", "-n", namespace)
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to deploy nodes2 CRs")
+
+	By("deploying unhealthy group Node CR")
+	cmd = exec.Command("kubectl", "apply", "-f", "test/e2e/manifests/unhealthy.yaml", "-n", namespace)
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to deploy unhealthy group Node CR")
+
+	By("waiting for Group and Node CRs to be properly applied")
+	verifyCRsApplied := func(g Gomega) {
 		// Check if group1 CR is applied
 		cmd := exec.Command("kubectl", "get", "group", "group1", "-n", namespace)
 		_, err := utils.Run(cmd)
@@ -354,8 +400,30 @@ func deployGroupCRs() {
 		cmd = exec.Command("kubectl", "get", "group", "group2", "-n", namespace)
 		_, err = utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred(), "Group2 CR is not applied")
+
+		// Check if Node CRs are applied
+		cmd = exec.Command("kubectl", "get", "node", "group1-worker-node-1", "-n", namespace)
+		_, err = utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred(), "group1-worker-node-1 CR is not applied")
+
+		cmd = exec.Command("kubectl", "get", "node", "group1-worker-node-2", "-n", namespace)
+		_, err = utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred(), "group1-worker-node-2 CR is not applied")
+
+		cmd = exec.Command("kubectl", "get", "node", "group2-worker-node-3", "-n", namespace)
+		_, err = utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred(), "group2-worker-node-3 CR is not applied")
+
+		cmd = exec.Command("kubectl", "get", "node", "group2-worker-node-4", "-n", namespace)
+		_, err = utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred(), "group2-worker-node-4 CR is not applied")
+
+		// Check if unhealthy group Node CR is applied
+		cmd = exec.Command("kubectl", "get", "node", "unhealthy-group-unhealthy-node", "-n", namespace)
+		_, err = utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred(), "unhealthy-group-unhealthy-node CR is not applied")
 	}
-	Eventually(verifyGroupCRsApplied).Should(Succeed())
+	Eventually(verifyCRsApplied).Should(Succeed())
 }
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.

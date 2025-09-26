@@ -1,0 +1,63 @@
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: group2-worker-node-3
+  namespace: homelab-autoscaler-system
+  labels:
+    group: group2
+spec:
+  kubernetesNodeName: worker-node-3
+  healthcheckPeriod: 2
+  startupPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo startup
+  shutdownPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo shutdown
+  healthcheckPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo healthy
+---
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: group2-worker-node-4
+  namespace: homelab-autoscaler-system
+  labels:
+    group: group2
+spec:
+  kubernetesNodeName: worker-node-4
+  healthcheckPeriod: 2
+  startupPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo startup
+  shutdownPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo shutdown
+  healthcheckPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo healthy

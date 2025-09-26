@@ -11,27 +11,35 @@ spec:
   pricing:
     hourlyRate: "1.00"
     monthlyRate: "500.00"
-  nodesSpecs:
-    - startupPodSpec:
-        image: busybox:latest
-        command:
-          - /bin/sh
-        args:
-          - -c
-          - echo startup
-      shutdownPodSpec:
-        image: busybox:latest
-        command:
-          - /bin/sh
-        args:
-          - -c
-          - exit -1
-      healthcheckPodSpec:
-        image: busybox:latest
-        command:
-          - /bin/sh
-        args:
-          - -c
-          - exit 1
-      healthcheckPeriod: 1
-      kubernetesNodeName: unhealthy-node
+---
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: unhealthy-group-unhealthy-node
+  namespace: homelab-autoscaler-system
+  labels:
+    group: unhealthy-group
+spec:
+  kubernetesNodeName: unhealthy-node
+  healthcheckPeriod: 1
+  startupPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - echo startup
+  shutdownPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - exit -1
+  healthcheckPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - exit 1

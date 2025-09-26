@@ -102,6 +102,10 @@ test-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e 
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
 	
+	@echo "Creating test nodes..."
+	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
+	
 	@echo "Starting gRPC port forwarding for tests..."
 	$(MAKE) port-forward-grpc-e2e
 	@sleep 5  # Give port forwarding time to establish
@@ -115,6 +119,8 @@ test-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e 
 	@echo "Cleaning up test resources..."
 	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	
 	@echo "Cleaning up deployment and cluster..."
 	$(MAKE) undeploy ignore-not-found=true
@@ -137,8 +143,12 @@ run-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e t
 	@echo "Creating test groups..."
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
-
 	
+	@echo "Creating test nodes..."
+	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/unhealthy.yaml -n homelab-autoscaler-system
+
 	@echo "Starting gRPC port forwarding for tests..."
 	$(MAKE) port-forward-grpc-e2e
 	@sleep 5  # Give port forwarding time to establish
@@ -337,6 +347,10 @@ test-e2e-grpc: setup-test-e2e manifests generate fmt vet docker-build ## Run the
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
 	
+	@echo "Creating test nodes..."
+	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
+	
 	@echo "Waiting for groups to be processed..."
 	@for i in {1..30}; do \
 		healthy_count=$$($(KUBECTL) get groups -n homelab-autoscaler-system -o json | jq '[.items[] | select(.status.health == "healthy")] | length' 2>/dev/null || echo "0"); \
@@ -354,6 +368,8 @@ test-e2e-grpc: setup-test-e2e manifests generate fmt vet docker-build ## Run the
 	@echo "Cleaning up test resources..."
 	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	
 	@echo "Cleaning up deployment and cluster..."
 	$(MAKE) undeploy ignore-not-found=true
@@ -411,12 +427,18 @@ setup-grpc-dev: setup-test-e2e docker-build ## Set up a development environment 
 	@echo "Creating test groups..."
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+	
+	@echo "Creating test nodes..."
+	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
+	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
 	@echo "Setup complete! Use 'make port-forward-grpc' to access the gRPC server."
 	@echo "Then use 'make grpc-test-client' to see available testing commands."
 
 .PHONY: cleanup-grpc-dev
 cleanup-grpc-dev: ## Clean up the gRPC development environment
 	@echo "Cleaning up gRPC development environment..."
+	$(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	$(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	$(MAKE) undeploy ignore-not-found=true

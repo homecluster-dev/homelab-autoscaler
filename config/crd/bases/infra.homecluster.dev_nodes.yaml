@@ -4,20 +4,20 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.19.0
-  name: groups.infra.homecluster.dev
+  name: nodes.infra.homecluster.dev
 spec:
   group: infra.homecluster.dev
   names:
-    kind: Group
-    listKind: GroupList
-    plural: groups
-    singular: group
+    kind: Node
+    listKind: NodeList
+    plural: nodes
+    singular: node
   scope: Namespaced
   versions:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Group is the Schema for the groups API
+        description: Node is the Schema for the nodes API
         properties:
           apiVersion:
             description: |-
@@ -37,40 +37,127 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of Group
+            description: spec defines the desired state of Node
             properties:
-              maxSize:
+              healthcheckPeriod:
                 type: integer
-              name:
-                type: string
-              nodeSelector:
-                additionalProperties:
-                  type: string
-                type: object
-              pricing:
+              healthcheckPodSpec:
                 properties:
-                  hourlyRate:
-                    pattern: ^[0-9]+(\.[0-9]+)?$
+                  args:
+                    items:
+                      type: string
+                    type: array
+                  command:
+                    items:
+                      type: string
+                    type: array
+                  image:
                     type: string
-                  monthlyRate:
-                    pattern: ^[0-9]+(\.[0-9]+)?$
-                    type: string
+                  volumes:
+                    description: Each volume mounts a Secret or ConfigMap
+                    items:
+                      properties:
+                        configMapName:
+                          type: string
+                        mountPath:
+                          type: string
+                        name:
+                          type: string
+                        secretName:
+                          description: Either SecretName or ConfigMapName should be
+                            set
+                          type: string
+                      required:
+                      - mountPath
+                      - name
+                      type: object
+                    type: array
                 required:
-                - hourlyRate
-                - monthlyRate
+                - image
+                type: object
+              kubernetesNodeName:
+                type: string
+              shutdownPodSpec:
+                properties:
+                  args:
+                    items:
+                      type: string
+                    type: array
+                  command:
+                    items:
+                      type: string
+                    type: array
+                  image:
+                    type: string
+                  volumes:
+                    description: Each volume mounts a Secret or ConfigMap
+                    items:
+                      properties:
+                        configMapName:
+                          type: string
+                        mountPath:
+                          type: string
+                        name:
+                          type: string
+                        secretName:
+                          description: Either SecretName or ConfigMapName should be
+                            set
+                          type: string
+                      required:
+                      - mountPath
+                      - name
+                      type: object
+                    type: array
+                required:
+                - image
+                type: object
+              startupPodSpec:
+                properties:
+                  args:
+                    items:
+                      type: string
+                    type: array
+                  command:
+                    items:
+                      type: string
+                    type: array
+                  image:
+                    type: string
+                  volumes:
+                    description: Each volume mounts a Secret or ConfigMap
+                    items:
+                      properties:
+                        configMapName:
+                          type: string
+                        mountPath:
+                          type: string
+                        name:
+                          type: string
+                        secretName:
+                          description: Either SecretName or ConfigMapName should be
+                            set
+                          type: string
+                      required:
+                      - mountPath
+                      - name
+                      type: object
+                    type: array
+                required:
+                - image
                 type: object
             required:
-            - maxSize
-            - name
-            - nodeSelector
-            - pricing
+            - healthcheckPeriod
+            - healthcheckPodSpec
+            - kubernetesNodeName
+            - shutdownPodSpec
+            - startupPodSpec
             type: object
           status:
-            description: status defines the observed state of Group
+            description: status defines the observed state of Node
             properties:
               conditions:
                 description: |-
-                  conditions represent the current state of the Group resource.
+                  conditions represent the current state of the Node resource.
                   Each condition has a unique type and reflects the status of a specific aspect of the resource.
 
                   Standard condition types include:
@@ -138,7 +225,6 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               health:
-                description: Health status of the group (healthy, offline, unknown)
                 enum:
                 - healthy
                 - offline
