@@ -63,9 +63,15 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --enable-grpc-server=true
+          - --grpc-server-address=:50051
         image: controller:latest
+        imagePullPolicy: IfNotPresent
         name: manager
-        ports: []
+        ports:
+        - containerPort: 50051
+          name: grpc
+          protocol: TCP
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false

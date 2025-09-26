@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -37,6 +39,8 @@ import (
 
 	infrahomeclusterdevv1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/controller"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/groupstore"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +65,8 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var enableGRPCServer bool
+	var grpcServerAddr string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -79,6 +85,9 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.BoolVar(&enableGRPCServer, "enable-grpc-server", true,
+		"Enable the mock gRPC CloudProvider server")
+	flag.StringVar(&grpcServerAddr, "grpc-server-address", ":50051", "The address the gRPC server binds to")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -178,9 +187,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create GroupStore for sharing between controller and gRPC server
+	groupStore := groupstore.NewGroupStore()
+	setupLog.Info("Created GroupStore instance", "groupStoreAddr", fmt.Sprintf("%p", groupStore))
+
 	if err := (&controller.GroupReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		GroupStore: groupStore,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Group")
 		os.Exit(1)
@@ -194,6 +208,29 @@ func main() {
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
+	}
+
+	// Start gRPC server if enabled
+	var grpcServerManager *grpcserver.ServerManager
+	if enableGRPCServer {
+		setupLog.Info("starting gRPC server", "address", grpcServerAddr, "groupStoreAddr", fmt.Sprintf("%p", groupStore))
+		grpcServerManager = grpcserver.NewServerManager(grpcServerAddr, groupStore)
+
+		// Create a context for the gRPC server
+		grpcCtx, grpcCancel := context.WithCancel(context.Background())
+		defer grpcCancel()
+
+		if err := grpcServerManager.Start(grpcCtx); err != nil {
+			setupLog.Error(err, "unable to start gRPC server")
+			os.Exit(1)
+		}
+
+		// Ensure gRPC server is stopped when manager stops
+		defer func() {
+			if err := grpcServerManager.Stop(); err != nil {
+				setupLog.Error(err, "error stopping gRPC server")
+			}
+		}()
 	}
 
 	setupLog.Info("starting manager")

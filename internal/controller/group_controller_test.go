@@ -59,17 +59,21 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "0.5",
 						MonthlyRate: "300",
 					},
-					StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/startup:latest",
+					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
+						{
+							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/startup:latest",
+							},
+							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/shutdown:latest",
+							},
+							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/healthcheck:latest",
+							},
+							HealthcheckPeriod:  30,
+							KubernetesNodeName: "test-node",
+						},
 					},
-					ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/shutdown:latest",
-					},
-					HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/healthcheck:latest",
-					},
-					HealthcheckPeriod:  30,
-					KubernetesNodeName: "test-node",
 				},
 			}
 			Expect(k8sClient.Create(ctx, group)).To(Succeed())
@@ -88,7 +92,7 @@ var _ = Describe("Group Controller", func() {
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
-				groupstore: groupstore.NewGroupStore(),
+				GroupStore: groupstore.NewGroupStore(),
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -97,7 +101,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group was stored in groupstore")
-			storedGroup, err := controllerReconciler.groupstore.Get(groupName)
+			storedGroup, err := controllerReconciler.GroupStore.Get(groupName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(storedGroup).NotTo(BeNil())
 			Expect(storedGroup.Spec.Name).To(Equal("test-group-name"))
@@ -117,7 +121,7 @@ var _ = Describe("Group Controller", func() {
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
-				groupstore: groupstore.NewGroupStore(),
+				GroupStore: groupstore.NewGroupStore(),
 			}
 
 			By("Reconciling a non-existent Group")
@@ -136,7 +140,7 @@ var _ = Describe("Group Controller", func() {
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
-				groupstore: groupstore.NewGroupStore(),
+				GroupStore: groupstore.NewGroupStore(),
 			}
 
 			By("First reconciling the Group to ensure it's in groupstore")
@@ -146,7 +150,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group exists in groupstore")
-			_, err = controllerReconciler.groupstore.Get(groupName)
+			_, err = controllerReconciler.GroupStore.Get(groupName)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Marking the Group for deletion")
@@ -165,7 +169,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group was removed from groupstore")
-			_, err = controllerReconciler.groupstore.Get(groupName)
+			_, err = controllerReconciler.GroupStore.Get(groupName)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("not found"))
 		})
@@ -175,7 +179,7 @@ var _ = Describe("Group Controller", func() {
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
-				groupstore: groupstore.NewGroupStore(),
+				GroupStore: groupstore.NewGroupStore(),
 			}
 
 			By("First reconciling the Group")
@@ -197,7 +201,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group was updated in groupstore")
-			storedGroup, err := controllerReconciler.groupstore.Get(groupName)
+			storedGroup, err := controllerReconciler.GroupStore.Get(groupName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(storedGroup.Spec.MaxSize).To(Equal(10))
 		})
@@ -219,17 +223,21 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "invalid", // Invalid: not a number
 						MonthlyRate: "invalid", // Invalid: not a number
 					},
-					StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "",
+					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
+						{
+							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "",
+							},
+							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "",
+							},
+							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "",
+							},
+							HealthcheckPeriod:  -1, // Invalid: negative period
+							KubernetesNodeName: "",
+						},
 					},
-					ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "",
-					},
-					HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "",
-					},
-					HealthcheckPeriod:  -1, // Invalid: negative period
-					KubernetesNodeName: "",
 				},
 			}
 			Expect(k8sClient.Create(ctx, invalidGroup)).To(Succeed())
@@ -246,7 +254,7 @@ var _ = Describe("Group Controller", func() {
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
-				groupstore: groupstore.NewGroupStore(),
+				GroupStore: groupstore.NewGroupStore(),
 			}
 
 			invalidGroupName := types.NamespacedName{
@@ -260,7 +268,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the invalid Group was stored in groupstore")
-			storedGroup, err := controllerReconciler.groupstore.Get("invalid-group")
+			storedGroup, err := controllerReconciler.GroupStore.Get("invalid-group")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(storedGroup).NotTo(BeNil())
 		})
@@ -280,17 +288,21 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "1.0",
 						MonthlyRate: "600",
 					},
-					StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/startup:latest",
+					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
+						{
+							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/startup:latest",
+							},
+							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/shutdown:latest",
+							},
+							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/healthcheck:latest",
+							},
+							HealthcheckPeriod:  30,
+							KubernetesNodeName: "test-node",
+						},
 					},
-					ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/shutdown:latest",
-					},
-					HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/healthcheck:latest",
-					},
-					HealthcheckPeriod:  30,
-					KubernetesNodeName: "test-node",
 				},
 			}
 			Expect(k8sClient.Create(ctx, groupWithFinalizers)).To(Succeed())
@@ -307,7 +319,7 @@ var _ = Describe("Group Controller", func() {
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
-				groupstore: groupstore.NewGroupStore(),
+				GroupStore: groupstore.NewGroupStore(),
 			}
 
 			groupWithFinalizersName := types.NamespacedName{
@@ -320,7 +332,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group with finalizers was stored in groupstore")
-			storedGroup, err := controllerReconciler.groupstore.Get("group-with-finalizers")
+			storedGroup, err := controllerReconciler.GroupStore.Get("group-with-finalizers")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(storedGroup).NotTo(BeNil())
 
@@ -340,7 +352,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group with finalizers was removed from groupstore")
-			_, err = controllerReconciler.groupstore.Get("group-with-finalizers")
+			_, err = controllerReconciler.GroupStore.Get("group-with-finalizers")
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("not found"))
 		})
@@ -369,7 +381,7 @@ var _ = Describe("Group Controller", func() {
 				controllerReconciler := &GroupReconciler{
 					Client:     k8sClient,
 					Scheme:     k8sClient.Scheme(),
-					groupstore: groupstore.NewGroupStore(),
+					GroupStore: groupstore.NewGroupStore(),
 				}
 
 				testGroupName := types.NamespacedName{
@@ -386,7 +398,7 @@ var _ = Describe("Group Controller", func() {
 					Expect(err).NotTo(HaveOccurred())
 
 					By("Verifying the Group was stored in groupstore")
-					storedGroup, err := controllerReconciler.groupstore.Get(groupName)
+					storedGroup, err := controllerReconciler.GroupStore.Get(groupName)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(storedGroup).NotTo(BeNil())
 				}
@@ -400,17 +412,21 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "0.1",
 						MonthlyRate: "60",
 					},
-					StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/image:latest",
+					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
+						{
+							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/image:latest",
+							},
+							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/image:latest",
+							},
+							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "test/image:latest",
+							},
+							HealthcheckPeriod:  10,
+							KubernetesNodeName: "node-1",
+						},
 					},
-					ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/image:latest",
-					},
-					HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "test/image:latest",
-					},
-					HealthcheckPeriod:  10,
-					KubernetesNodeName: "node-1",
 				},
 				false),
 			Entry("Group with complex node selector",
@@ -427,20 +443,24 @@ var _ = Describe("Group Controller", func() {
 						HourlyRate:  "2.5",
 						MonthlyRate: "1500",
 					},
-					StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image:   "startup/image:latest",
-						Command: []string{"/bin/startup"},
-						Args:    []string{"--verbose"},
+					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
+						{
+							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image:   "startup/image:latest",
+								Command: []string{"/bin/startup"},
+								Args:    []string{"--verbose"},
+							},
+							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image:   "shutdown/image:latest",
+								Command: []string{"/bin/shutdown"},
+							},
+							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
+								Image: "healthcheck/image:latest",
+							},
+							HealthcheckPeriod:  60,
+							KubernetesNodeName: "k8s-node-1",
+						},
 					},
-					ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image:   "shutdown/image:latest",
-						Command: []string{"/bin/shutdown"},
-					},
-					HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-						Image: "healthcheck/image:latest",
-					},
-					HealthcheckPeriod:  60,
-					KubernetesNodeName: "k8s-node-1",
 				},
 				false),
 		)
@@ -450,7 +470,7 @@ var _ = Describe("Group Controller", func() {
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
-				groupstore: groupstore.NewGroupStore(),
+				GroupStore: groupstore.NewGroupStore(),
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{

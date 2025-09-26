@@ -27,7 +27,7 @@ import (
 // GroupStore provides a thread-safe storage for Group resources using sync.Map
 type GroupStore struct {
 	store          sync.Map
-	healthcheckMap sync.Map
+	healthcheckMap sync.Map // Now stores map[string]map[string]string for group->node->status
 }
 
 // NewGroupStore creates a new GroupStore instance
@@ -103,6 +103,7 @@ func (s *GroupStore) Remove(key string) error {
 	}
 
 	s.store.Delete(key)
+	s.healthcheckMap.Delete(key)
 	log.Printf("GroupStore: Removed group %q", key)
 	return nil
 }
@@ -157,29 +158,182 @@ func (s *GroupStore) Exists(key string) bool {
 	return ok
 }
 
-// SetHealthcheckStatus sets the healthcheck status for a group
+// SetHealthcheckStatus sets the healthcheck status for a group (backward compatibility)
+// This function now sets the overall group health status based on all nodes
 func (s *GroupStore) SetHealthcheckStatus(groupName string, status string) {
 	if groupName == "" {
 		return
 	}
-	s.healthcheckMap.Store(groupName, status)
+
+	// For backward compatibility, store group-level status
+	// In the new structure, this represents the overall group health
+	groupHealth := make(map[string]string)
+	groupHealth["_group"] = status
+	s.healthcheckMap.Store(groupName, groupHealth)
 	log.Printf("GroupStore: Set healthcheck status for group %q to %q", groupName, status)
 }
 
-// GetHealthcheckStatus retrieves the healthcheck status for a group
-// Returns the status and a boolean indicating if the status was found
+// UpdateGroupHealth updates the health status in the stored Group object
+func (s *GroupStore) UpdateGroupHealth(groupName string, health string) error {
+	if groupName == "" {
+		return fmt.Errorf("group name cannot be empty")
+	}
+
+	value, ok := s.store.Load(groupName)
+	if !ok {
+		return fmt.Errorf("group %q not found", groupName)
+	}
+
+	group, ok := value.(*v1alpha1.Group)
+	if !ok {
+		return fmt.Errorf("invalid type assertion for group %q", groupName)
+	}
+
+	// Update the health status
+	group.Status.Health = health
+	s.store.Store(groupName, group)
+	log.Printf("GroupStore: Updated health status for group %q to %q", groupName, health)
+	return nil
+}
+
+// GetHealthcheckStatus retrieves the healthcheck status for a group (backward compatibility)
+// Returns the overall group health status
 func (s *GroupStore) GetHealthcheckStatus(groupName string) (string, bool) {
 	if groupName == "" {
+		log.Printf("GroupStore: GetHealthcheckStatus called with empty group name")
 		return "", false
 	}
+
+	log.Printf("GroupStore: Getting healthcheck status for group %q", groupName)
+
 	value, ok := s.healthcheckMap.Load(groupName)
 	if !ok {
+		log.Printf("GroupStore: No healthcheck status found for group %q", groupName)
 		return "", false
 	}
-	status, ok := value.(string)
-	if !ok {
+
+	// Handle both old (string) and new (map[string]string) formats for backward compatibility
+	switch v := value.(type) {
+	case string:
+		// Old format - direct string status
+		log.Printf("GroupStore: Found healthcheck status %q for group %q", v, groupName)
+		return v, true
+	case map[string]string:
+		// New format - map of node statuses
+		if groupStatus, exists := v["_group"]; exists {
+			log.Printf("GroupStore: Found group healthcheck status %q for group %q", groupStatus, groupName)
+			return groupStatus, true
+		}
+		// If no _group key exists, return empty string
+		log.Printf("GroupStore: No group-level healthcheck status found for group %q", groupName)
+		return "", false
+	default:
 		log.Printf("GroupStore: Invalid type assertion for healthcheck status of group %q", groupName)
 		return "", false
 	}
-	return status, true
+}
+
+// SetNodeHealthcheckStatus sets the healthcheck status for a specific node within a group
+func (s *GroupStore) SetNodeHealthcheckStatus(groupName, nodeName, status string) {
+	if groupName == "" || nodeName == "" {
+		return
+	}
+
+	// Load existing health data or create new map
+	var nodeHealth map[string]string
+	value, exists := s.healthcheckMap.Load(groupName)
+	if exists {
+		if existingMap, ok := value.(map[string]string); ok {
+			nodeHealth = existingMap
+		} else {
+			// Convert old format to new format
+			nodeHealth = make(map[string]string)
+			if oldStatus, ok := value.(string); ok {
+				nodeHealth["_group"] = oldStatus
+			}
+		}
+	} else {
+		nodeHealth = make(map[string]string)
+	}
+
+	// Set the node status
+	nodeHealth[nodeName] = status
+
+	// Update the overall group health based on all nodes
+	nodeHealth["_group"] = s.calculateGroupHealth(nodeHealth)
+
+	s.healthcheckMap.Store(groupName, nodeHealth)
+	log.Printf("GroupStore: Set healthcheck status for node %q in group %q to %q", nodeName, groupName, status)
+}
+
+// GetNodeHealthcheckStatus retrieves the healthcheck status for a specific node within a group
+// Returns the status and a boolean indicating if the status was found
+func (s *GroupStore) GetNodeHealthcheckStatus(groupName, nodeName string) (string, bool) {
+	if groupName == "" || nodeName == "" {
+		log.Printf("GroupStore: GetNodeHealthcheckStatus called with empty group or node name")
+		return "", false
+	}
+
+	log.Printf("GroupStore: Getting healthcheck status for node %q in group %q", nodeName, groupName)
+
+	value, ok := s.healthcheckMap.Load(groupName)
+	if !ok {
+		log.Printf("GroupStore: No healthcheck status found for group %q", groupName)
+		return "", false
+	}
+
+	// Handle both old (string) and new (map[string]string) formats
+	switch v := value.(type) {
+	case map[string]string:
+		if nodeStatus, exists := v[nodeName]; exists {
+			log.Printf("GroupStore: Found healthcheck status %q for node %q in group %q", nodeStatus, nodeName, groupName)
+			return nodeStatus, true
+		}
+		log.Printf("GroupStore: No healthcheck status found for node %q in group %q", nodeName, groupName)
+		return "", false
+	default:
+		log.Printf("GroupStore: Invalid data structure for healthcheck status of group %q", groupName)
+		return "", false
+	}
+}
+
+// calculateGroupHealth calculates the overall group health based on individual node healths
+func (s *GroupStore) calculateGroupHealth(nodeHealth map[string]string) string {
+	if len(nodeHealth) == 0 {
+		return "unknown"
+	}
+
+	healthyCount := 0
+	offlineCount := 0
+	totalNodes := 0
+
+	for node, status := range nodeHealth {
+		if node == "_group" {
+			continue // Skip the group-level status
+		}
+		totalNodes++
+		switch status {
+		case "healthy":
+			healthyCount++
+		case "offline":
+			offlineCount++
+		}
+	}
+
+	if totalNodes == 0 {
+		return "unknown"
+	}
+
+	// If all nodes are healthy, group is healthy
+	if healthyCount == totalNodes {
+		return "healthy"
+	}
+
+	// If any node is offline, group is offline
+	if offlineCount > 0 {
+		return "offline"
+	}
+
+	// Otherwise, group is unknown
+	return "unknown"
 }
