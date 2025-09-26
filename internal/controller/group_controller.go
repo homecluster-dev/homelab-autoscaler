@@ -64,12 +64,17 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	group := &infrahomeclusterdevv1alpha1.Group{}
 	if err := r.Get(ctx, req.NamespacedName, group); err != nil {
 		// The object was not found, return early
-		if err.Error() == "Group.infra.homecluster.dev \""+req.Name+"\" not found" {
+		if errors.IsNotFound(err) {
 			logger.Info("Group not found, will be removed from groupstore", "group", req.Name)
-			// Remove from groupstore if it exists
+			// Remove from groupstore if it exists (ignore error if it doesn't exist)
 			if err := r.GroupStore.Remove(req.Name); err != nil {
-				logger.Error(err, "Failed to remove group from groupstore", "group", req.Name)
-				return ctrl.Result{}, err
+				// Only log the error if it's not a "not found" error
+				if !strings.Contains(err.Error(), "not found") {
+					logger.Error(err, "Failed to remove group from groupstore", "group", req.Name)
+					return ctrl.Result{}, err
+				}
+				// Group wasn't in groupstore, which is fine
+				logger.Info("Group was not in groupstore, nothing to remove", "group", req.Name)
 			}
 			return ctrl.Result{}, nil
 		}

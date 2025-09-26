@@ -154,8 +154,8 @@ run-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e t
 	$(MAKE) port-forward-grpc-e2e
 	@sleep 5  # Give port forwarding time to establish
 	
-	@echo "Running e2e tests with DO_NOT_CLEANUP=true..."
-	DO_NOT_CLEANUP=true KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	@echo "Running e2e tests..."
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	
 	@echo "Cleaning up port forwarding..."
 	$(MAKE) kill-port-forward-grpc-e2e

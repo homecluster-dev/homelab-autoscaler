@@ -157,15 +157,14 @@ var _ = Describe("Group Controller", func() {
 			groupToDelete := &infrahomeclusterdevv1alpha1.Group{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, groupToDelete)).To(Succeed())
 
-			// Set deletion timestamp
-			now := metav1.Now()
-			groupToDelete.DeletionTimestamp = &now
-			Expect(k8sClient.Update(ctx, groupToDelete)).To(Succeed())
+			// Delete the Group using Kubernetes client to properly set deletion timestamp
+			Expect(k8sClient.Delete(ctx, groupToDelete)).To(Succeed())
 
 			By("Reconciling the deleted Group")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
+			// The controller should handle the "not found" case gracefully
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group was removed from groupstore")
@@ -206,69 +205,69 @@ var _ = Describe("Group Controller", func() {
 			Expect(storedGroup.Spec.MaxSize).To(Equal(10))
 		})
 
-		It("should handle Group resources with invalid specifications gracefully", func() {
-			By("Creating a Group with invalid specification")
-			invalidGroup := &infrahomeclusterdevv1alpha1.Group{
+		It("should handle Group resources with edge case specifications gracefully", func() {
+			By("Creating a Group with edge case specification")
+			edgeCaseGroup := &infrahomeclusterdevv1alpha1.Group{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "invalid-group",
+					Name:      "edge-case-group",
 					Namespace: groupNamespace,
 				},
 				Spec: infrahomeclusterdevv1alpha1.GroupSpec{
-					Name:    "", // Invalid: empty name
-					MaxSize: -1, // Invalid: negative size
+					Name:    "edge-case-group-name",
+					MaxSize: 0, // Edge case: zero size (valid for CRD but may be problematic for business logic)
 					NodeSelector: map[string]string{
 						"node-type": "worker",
 					},
 					Pricing: infrahomeclusterdevv1alpha1.PricingSpec{
-						HourlyRate:  "invalid", // Invalid: not a number
-						MonthlyRate: "invalid", // Invalid: not a number
+						HourlyRate:  "0.0", // Edge case: zero rate
+						MonthlyRate: "0.0", // Edge case: zero rate
 					},
 					NodesSpecs: []infrahomeclusterdevv1alpha1.NodeSpec{
 						{
 							StartupPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "",
+								Image: "test/startup:latest",
 							},
 							ShutdownPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "",
+								Image: "test/shutdown:latest",
 							},
 							HealthcheckPodSpec: infrahomeclusterdevv1alpha1.MinimalPodSpec{
-								Image: "",
+								Image: "test/healthcheck:latest",
 							},
-							HealthcheckPeriod:  -1, // Invalid: negative period
-							KubernetesNodeName: "",
+							HealthcheckPeriod:  1, // Edge case: very short period
+							KubernetesNodeName: "edge-case-node",
 						},
 					},
 				},
 			}
-			Expect(k8sClient.Create(ctx, invalidGroup)).To(Succeed())
+			Expect(k8sClient.Create(ctx, edgeCaseGroup)).To(Succeed())
 
 			defer func() {
-				By("Cleaning up invalid Group")
-				err := k8sClient.Delete(ctx, invalidGroup)
+				By("Cleaning up edge case Group")
+				err := k8sClient.Delete(ctx, edgeCaseGroup)
 				if err == nil || !errors.IsNotFound(err) {
 					Expect(err).NotTo(HaveOccurred())
 				}
 			}()
 
-			By("Reconciling the invalid Group")
+			By("Reconciling the edge case Group")
 			controllerReconciler := &GroupReconciler{
 				Client:     k8sClient,
 				Scheme:     k8sClient.Scheme(),
 				GroupStore: groupstore.NewGroupStore(),
 			}
 
-			invalidGroupName := types.NamespacedName{
-				Name:      "invalid-group",
+			edgeCaseGroupName := types.NamespacedName{
+				Name:      "edge-case-group",
 				Namespace: groupNamespace,
 			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: invalidGroupName,
+				NamespacedName: edgeCaseGroupName,
 			})
-			// The controller should not error even with invalid specs
+			// The controller should not error even with edge case specs
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying the invalid Group was stored in groupstore")
-			storedGroup, err := controllerReconciler.GroupStore.Get("invalid-group")
+			By("Verifying the edge case Group was stored in groupstore")
+			storedGroup, err := controllerReconciler.GroupStore.Get("edge-case-group")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(storedGroup).NotTo(BeNil())
 		})
@@ -284,6 +283,9 @@ var _ = Describe("Group Controller", func() {
 				Spec: infrahomeclusterdevv1alpha1.GroupSpec{
 					Name:    "test-group-with-finalizers",
 					MaxSize: 3,
+					NodeSelector: map[string]string{
+						"node-type": "worker",
+					},
 					Pricing: infrahomeclusterdevv1alpha1.PricingSpec{
 						HourlyRate:  "1.0",
 						MonthlyRate: "600",
@@ -340,15 +342,14 @@ var _ = Describe("Group Controller", func() {
 			groupToDelete := &infrahomeclusterdevv1alpha1.Group{}
 			Expect(k8sClient.Get(ctx, groupWithFinalizersName, groupToDelete)).To(Succeed())
 
-			// Set deletion timestamp
-			now := metav1.Now()
-			groupToDelete.DeletionTimestamp = &now
-			Expect(k8sClient.Update(ctx, groupToDelete)).To(Succeed())
+			// Delete the Group using Kubernetes client to properly set deletion timestamp
+			Expect(k8sClient.Delete(ctx, groupToDelete)).To(Succeed())
 
 			By("Reconciling the deleted Group with finalizers")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: groupWithFinalizersName,
 			})
+			// The controller should handle the "not found" case gracefully
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Group with finalizers was removed from groupstore")
@@ -408,6 +409,9 @@ var _ = Describe("Group Controller", func() {
 				infrahomeclusterdevv1alpha1.GroupSpec{
 					Name:    "minimal-group-name",
 					MaxSize: 1,
+					NodeSelector: map[string]string{
+						"node-type": "worker",
+					},
 					Pricing: infrahomeclusterdevv1alpha1.PricingSpec{
 						HourlyRate:  "0.1",
 						MonthlyRate: "60",
@@ -488,7 +492,7 @@ var _ = Describe("Group Controller", func() {
 			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
 			Expect(condition.Reason).To(Equal("GroupLoaded"))
 			Expect(condition.Message).To(Equal("Group has been successfully loaded and is ready for use"))
-			Expect(condition.LastTransitionTime).To(BeTemporally("~", time.Now(), time.Second*10))
+			Expect(condition.LastTransitionTime.Time).To(BeTemporally("~", time.Now(), time.Second*10))
 		})
 	})
 })
