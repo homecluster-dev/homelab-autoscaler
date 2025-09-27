@@ -141,8 +141,6 @@ var _ = Describe("gRPC Server", Ordered, func() {
 			Expect(groupIDs).To(ContainElement("group1"), "group1 should be present")
 			Expect(groupIDs).To(ContainElement("group2"), "group2 should be present")
 
-			// Note: The gRPC server now returns all groups regardless of health status
-			// Health filtering is handled by the cluster autoscaler itself, not the cloud provider
 		})
 
 		It("should respond to GPULabel request", func() {
