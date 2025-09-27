@@ -23,8 +23,15 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/groupstore"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
@@ -35,6 +42,10 @@ type MockCloudProviderServer struct {
 
 	// GroupStore for managing Group resources
 	groupStore *groupstore.GroupStore
+
+	// Kubernetes client for creating resources
+	Client client.Client
+	Scheme *runtime.Scheme
 
 	// Mock data storage (kept for compatibility with other methods)
 	nodeGroups      map[string]*pb.NodeGroup
@@ -47,9 +58,11 @@ type MockCloudProviderServer struct {
 }
 
 // NewMockCloudProviderServer creates a new mock server with GroupStore integration
-func NewMockCloudProviderServer(groupStore *groupstore.GroupStore) *MockCloudProviderServer {
+func NewMockCloudProviderServer(groupStore *groupstore.GroupStore, k8sClient client.Client, scheme *runtime.Scheme) *MockCloudProviderServer {
 	server := &MockCloudProviderServer{
 		groupStore:      groupStore,
+		Client:          k8sClient,
+		Scheme:          scheme,
 		nodeGroups:      make(map[string]*pb.NodeGroup),
 		nodeGroupSizes:  make(map[string]int32),
 		nodes:           make(map[string]*pb.ExternalGrpcNode),
@@ -322,30 +335,143 @@ func (s *MockCloudProviderServer) NodeGroupTargetSize(ctx context.Context, req *
 	}, nil
 }
 
-// NodeGroupIncreaseSize increases the size of the node group
+// NodeGroupIncreaseSize increases the size of the node group by finding an unhealthy node and starting a new job
 func (s *MockCloudProviderServer) NodeGroupIncreaseSize(ctx context.Context, req *pb.NodeGroupIncreaseSizeRequest) (*pb.NodeGroupIncreaseSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupIncreaseSize called", "nodeGroup", req.Id, "delta", req.Delta)
 
-	// Get the group to check max size
-	group, err := s.groupStore.Get(req.Id)
+	// Check for context cancellation
+	if ctx.Err() != nil {
+		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
+	}
+
+	// Validate delta is positive
+	if req.Delta <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "delta must be positive, got %d", req.Delta)
+	}
+
+	// Get the group from GroupStore
+	_, err := s.groupStore.Get(req.Id)
 	if err != nil {
 		logger.Error(err, "failed to get group from GroupStore", "group", req.Id)
 		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
 	}
 
-	// Get current node count
-	currentNodes := s.groupStore.GetNodesForGroup(req.Id)
-	currentSize := int32(len(currentNodes))
-	newSize := currentSize + req.Delta
-
-	if newSize > int32(group.Spec.MaxSize) {
-		return nil, status.Errorf(codes.InvalidArgument, "new size %d exceeds max size %d", newSize, group.Spec.MaxSize)
+	// Get all nodes for this group from the nodeToGroupMap
+	kubernetesNodeNames := s.groupStore.GetNodesForGroup(req.Id)
+	if len(kubernetesNodeNames) == 0 {
+		return nil, status.Errorf(codes.NotFound, "no nodes found for group %s", req.Id)
 	}
 
-	// Note: In a real implementation, this would trigger the creation of new Node CRDs
-	// For now, we just log the operation and return success
-	logger.Info("NodeGroupIncreaseSize would create new nodes", "nodeGroup", req.Id, "currentSize", currentSize, "newSize", newSize, "delta", req.Delta)
+	// Find an unhealthy node
+	var unhealthyNode *infrav1alpha1.Node
+	var unhealthyNodeName string
+
+	for _, k8sNodeName := range kubernetesNodeNames {
+		// Get the health status from healthcheckMap using the Kubernetes node name
+		healthStatus, exists := s.groupStore.GetNodeHealthcheckStatus(req.Id, k8sNodeName)
+		if !exists {
+			logger.Info("No health status found for node, treating as unknown", "k8sNode", k8sNodeName)
+			healthStatus = "unknown"
+		}
+
+		// Check if node is unhealthy (offline or unknown)
+		if healthStatus == "offline" || healthStatus == "unknown" {
+			// Find the Node CR that corresponds to this Kubernetes node name
+			// We need to iterate through all nodes to find the one with matching KubernetesNodeName
+			nodes, err := s.groupStore.ListNode()
+			if err != nil {
+				logger.Error(err, "Failed to list nodes from groupstore")
+				continue
+			}
+
+			for _, node := range nodes {
+				if node.Spec.KubernetesNodeName == k8sNodeName {
+					unhealthyNode = node
+					unhealthyNodeName = node.Name
+					break
+				}
+			}
+
+			if unhealthyNode != nil {
+				break
+			}
+		}
+	}
+
+	if unhealthyNode == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "no unhealthy nodes found in group %s", req.Id)
+	}
+
+	logger.Info("Found unhealthy node, starting job", "node", unhealthyNodeName, "group", req.Id)
+
+	// Create a Job to start the unhealthy node
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-startup-%s", unhealthyNode.Name, fmt.Sprintf("%d", metav1.Now().Unix())),
+			Namespace: unhealthyNode.Namespace,
+			Labels: map[string]string{
+				"app":   "homelab-autoscaler",
+				"group": req.Id,
+				"node":  unhealthyNode.Spec.KubernetesNodeName,
+				"type":  "startup",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app":   "homelab-autoscaler",
+						"group": req.Id,
+						"node":  unhealthyNode.Spec.KubernetesNodeName,
+						"type":  "startup",
+					},
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers: []corev1.Container{
+						{
+							Name:    "startup",
+							Image:   unhealthyNode.Spec.StartupPodSpec.Image,
+							Command: unhealthyNode.Spec.StartupPodSpec.Command,
+							Args:    unhealthyNode.Spec.StartupPodSpec.Args,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Set owner reference to the Node CR
+	if err := ctrl.SetControllerReference(unhealthyNode, job, s.Scheme); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to set controller reference for job: %v", err)
+	}
+
+	// Create the Job
+	if err := s.Client.Create(ctx, job); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create startup job: %v", err)
+	}
+
+	logger.Info("Successfully created startup job", "job", job.Name, "node", unhealthyNodeName)
+
+	// Update the Node status condition to "progressing"
+	unhealthyNode.Status.Conditions = []metav1.Condition{
+		{
+			Type:               "progressing",
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "NodeGroupIncreaseSize",
+			Message:            fmt.Sprintf("Starting node via job %s", job.Name),
+		},
+	}
+
+	// Update the Node status
+	if err := s.Client.Status().Update(ctx, unhealthyNode); err != nil {
+		logger.Error(err, "Failed to update node status", "node", unhealthyNodeName)
+		// Don't fail the entire operation if status update fails
+	}
+
+	logger.Info("Successfully updated node status to progressing", "node", unhealthyNodeName)
 
 	return &pb.NodeGroupIncreaseSizeResponse{}, nil
 }
@@ -354,6 +480,11 @@ func (s *MockCloudProviderServer) NodeGroupIncreaseSize(ctx context.Context, req
 func (s *MockCloudProviderServer) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDeleteNodesRequest) (*pb.NodeGroupDeleteNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDeleteNodes called", "nodeGroup", req.Id, "nodes", len(req.Nodes))
+
+	// Check for context cancellation
+	if ctx.Err() != nil {
+		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
+	}
 
 	// Get the group to check if it exists
 	_, err := s.groupStore.Get(req.Id)
@@ -372,10 +503,93 @@ func (s *MockCloudProviderServer) NodeGroupDeleteNodes(ctx context.Context, req 
 		return nil, status.Errorf(codes.InvalidArgument, "cannot delete %d nodes when only %d exist", len(req.Nodes), currentSize)
 	}
 
-	// Note: In a real implementation, this would trigger the deletion of Node CRDs
-	// For now, we just log the operation and return success
-	logger.Info("NodeGroupDeleteNodes would delete nodes", "nodeGroup", req.Id, "currentSize", currentSize, "nodesToDelete", len(req.Nodes))
+	// Process each node to be deleted
+	for _, node := range req.Nodes {
+		// Check for context cancellation before processing each node
+		if ctx.Err() != nil {
+			return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded while processing nodes: %v", ctx.Err())
+		}
 
+		// Get the Node CR from the GroupStore
+		nodeCR, err := s.groupStore.GetNode(node.Name)
+		if err != nil {
+			logger.Error(err, "failed to get node from GroupStore", "node", node.Name)
+			return nil, status.Errorf(codes.Internal, "failed to get node %s: %v", node.Name, err)
+		}
+
+		logger.Info("Found node to delete", "node", node.Name, "group", req.Id)
+
+		// Mark the Kubernetes node as not schedulable before starting shutdown
+		k8sNode := &corev1.Node{}
+		if err := s.Client.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
+			logger.Error(err, "failed to get Kubernetes node", "nodeName", nodeCR.Spec.KubernetesNodeName)
+			return nil, status.Errorf(codes.Internal, "failed to get Kubernetes node %s: %v", nodeCR.Spec.KubernetesNodeName, err)
+		}
+
+		// Mark the node as unschedulable
+		k8sNode.Spec.Unschedulable = true
+		if err := s.Client.Update(ctx, k8sNode); err != nil {
+			logger.Error(err, "failed to mark Kubernetes node as unschedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
+			return nil, status.Errorf(codes.Internal, "failed to mark node %s as unschedulable: %v", nodeCR.Spec.KubernetesNodeName, err)
+		}
+
+		logger.Info("Successfully marked Kubernetes node as unschedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
+
+		// Create a Job to shutdown the node
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-shutdown-%s", nodeCR.Name, fmt.Sprintf("%d", metav1.Now().Unix())),
+				Namespace: nodeCR.Namespace,
+				Labels: map[string]string{
+					"app":   "homelab-autoscaler",
+					"group": req.Id,
+					"node":  nodeCR.Spec.KubernetesNodeName,
+					"type":  "shutdown",
+				},
+			},
+			Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app":   "homelab-autoscaler",
+							"group": req.Id,
+							"node":  nodeCR.Spec.KubernetesNodeName,
+							"type":  "shutdown",
+						},
+					},
+					Spec: corev1.PodSpec{
+						RestartPolicy: corev1.RestartPolicyOnFailure,
+						Containers: []corev1.Container{
+							{
+								Name:    "shutdown",
+								Image:   nodeCR.Spec.ShutdownPodSpec.Image,
+								Command: nodeCR.Spec.ShutdownPodSpec.Command,
+								Args:    nodeCR.Spec.ShutdownPodSpec.Args,
+							},
+						},
+					},
+				},
+			},
+		}
+
+		// Set owner reference to the Node CR
+		if err := ctrl.SetControllerReference(nodeCR, job, s.Scheme); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to set controller reference for shutdown job: %v", err)
+		}
+
+		// Create the Job
+		if err := s.Client.Create(ctx, job); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to create shutdown job: %v", err)
+		}
+
+		logger.Info("Successfully created shutdown job", "job", job.Name, "node", node.Name)
+
+		// Note: The Node status condition update to "terminating" should be handled by the node controller
+		// via the SetNodeConditionTerminatingForShutdown method. The gRPC server should not directly
+		// update node status to avoid conflicts with the controller's reconciliation loop.
+	}
+
+	logger.Info("NodeGroupDeleteNodes completed successfully", "nodeGroup", req.Id, "nodesDeleted", len(req.Nodes))
 	return &pb.NodeGroupDeleteNodesResponse{}, nil
 }
 

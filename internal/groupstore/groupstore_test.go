@@ -368,3 +368,319 @@ func TestRemoveGroupWithNodeHealth(t *testing.T) {
 		t.Error("Node healthcheck status should be removed along with the group")
 	}
 }
+
+func TestAddOrUpdateNode(t *testing.T) {
+	store := NewGroupStore()
+
+	// Create a test node
+	node := &v1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+		},
+		Spec: v1alpha1.NodeSpec{
+			KubernetesNodeName: "test-k8s-node",
+		},
+	}
+
+	// Test adding a new node
+	err := store.AddOrUpdateNode(node)
+	if err != nil {
+		t.Fatalf("Failed to add node to store: %v", err)
+	}
+
+	// Verify the node was added
+	retrievedNode, err := store.GetNode("test-node")
+	if err != nil {
+		t.Fatalf("Failed to get node from store: %v", err)
+	}
+
+	if retrievedNode.Name != "test-node" {
+		t.Errorf("Expected node name 'test-node', got '%s'", retrievedNode.Name)
+	}
+
+	// Test updating an existing node
+	node.Spec.KubernetesNodeName = "updated-k8s-node"
+	err = store.AddOrUpdateNode(node)
+	if err != nil {
+		t.Fatalf("Failed to update node in store: %v", err)
+	}
+
+	// Verify the node was updated
+	updatedNode, err := store.GetNode("test-node")
+	if err != nil {
+		t.Fatalf("Failed to get updated node from store: %v", err)
+	}
+
+	if updatedNode.Spec.KubernetesNodeName != "updated-k8s-node" {
+		t.Errorf("Expected KubernetesNodeName 'updated-k8s-node', got '%s'", updatedNode.Spec.KubernetesNodeName)
+	}
+}
+
+func TestAddOrUpdateNodeValidation(t *testing.T) {
+	store := NewGroupStore()
+
+	// Test adding nil node
+	err := store.AddOrUpdateNode(nil)
+	if err == nil {
+		t.Error("Expected error when adding nil node, got nil")
+	}
+
+	// Test adding node with empty name
+	node := &v1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "",
+		},
+	}
+	err = store.AddOrUpdateNode(node)
+	if err == nil {
+		t.Error("Expected error when adding node with empty name, got nil")
+	}
+}
+
+func TestGetNode(t *testing.T) {
+	store := NewGroupStore()
+
+	// Test getting non-existent node
+	_, err := store.GetNode("non-existent")
+	if err == nil {
+		t.Error("Expected error when getting non-existent node, got nil")
+	}
+
+	// Test getting node with empty key
+	_, err = store.GetNode("")
+	if err == nil {
+		t.Error("Expected error when getting node with empty key, got nil")
+	}
+}
+
+func TestListNode(t *testing.T) {
+	store := NewGroupStore()
+
+	// Add some test nodes
+	node1 := &v1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node1",
+		},
+	}
+	node2 := &v1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node2",
+		},
+	}
+
+	err := store.AddOrUpdateNode(node1)
+	if err != nil {
+		t.Fatalf("Failed to add node1: %v", err)
+	}
+	err = store.AddOrUpdateNode(node2)
+	if err != nil {
+		t.Fatalf("Failed to add node2: %v", err)
+	}
+
+	// List all nodes
+	nodes, err := store.ListNode()
+	if err != nil {
+		t.Fatalf("Failed to list nodes: %v", err)
+	}
+
+	if len(nodes) != 2 {
+		t.Errorf("Expected 2 nodes, got %d", len(nodes))
+	}
+
+	// Verify node names
+	nodeNames := make(map[string]bool)
+	for _, node := range nodes {
+		nodeNames[node.Name] = true
+	}
+	if !nodeNames["node1"] || !nodeNames["node2"] {
+		t.Error("Expected to find both node1 and node2 in the list")
+	}
+}
+
+func TestRemoveNode(t *testing.T) {
+	store := NewGroupStore()
+
+	// Create and add a test node
+	node := &v1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node-remove",
+		},
+	}
+	err := store.AddOrUpdateNode(node)
+	if err != nil {
+		t.Fatalf("Failed to add node: %v", err)
+	}
+
+	// Verify the node exists
+	_, err = store.GetNode("test-node-remove")
+	if err != nil {
+		t.Fatalf("Node should exist before removal: %v", err)
+	}
+
+	// Remove the node
+	err = store.RemoveNode("test-node-remove")
+	if err != nil {
+		t.Fatalf("Failed to remove node: %v", err)
+	}
+
+	// Verify the node is removed
+	_, err = store.GetNode("test-node-remove")
+	if err == nil {
+		t.Error("Expected node to be removed, but it still exists")
+	}
+
+	// Test removing non-existent node
+	err = store.RemoveNode("non-existent")
+	if err == nil {
+		t.Error("Expected error when removing non-existent node, got nil")
+	}
+
+	// Test removing node with empty key
+	err = store.RemoveNode("")
+	if err == nil {
+		t.Error("Expected error when removing node with empty key, got nil")
+	}
+}
+
+func TestNodeExists(t *testing.T) {
+	store := NewGroupStore()
+
+	// Test non-existent node
+	exists := store.NodeExists("non-existent")
+	if exists {
+		t.Error("Expected NodeExists to return false for non-existent node")
+	}
+
+	// Add a node
+	node := &v1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node-exists",
+		},
+	}
+	err := store.AddOrUpdateNode(node)
+	if err != nil {
+		t.Fatalf("Failed to add node: %v", err)
+	}
+
+	// Test existing node
+	exists = store.NodeExists("test-node-exists")
+	if !exists {
+		t.Error("Expected NodeExists to return true for existing node")
+	}
+
+	// Test with empty key
+	exists = store.NodeExists("")
+	if exists {
+		t.Error("Expected NodeExists to return false for empty key")
+	}
+}
+
+func TestGetGroupForNode(t *testing.T) {
+	store := NewGroupStore()
+
+	// Test getting group for non-existent node
+	groupName, found := store.GetGroupForNode("non-existent-node")
+	if found {
+		t.Error("Expected GetGroupForNode to return false for non-existent node")
+	}
+	if groupName != "" {
+		t.Error("Expected empty group name for non-existent node")
+	}
+
+	// Set up node-to-group mapping via SetNodeHealthcheckStatus
+	store.SetNodeHealthcheckStatus("test-group", "node1", "healthy")
+	store.SetNodeHealthcheckStatus("test-group", "node2", "offline")
+
+	// Test getting group for existing node
+	groupName, found = store.GetGroupForNode("node1")
+	if !found {
+		t.Error("Expected GetGroupForNode to return true for existing node")
+	}
+	if groupName != "test-group" {
+		t.Errorf("Expected group name 'test-group', got '%s'", groupName)
+	}
+
+	// Test with empty node name
+	_, found = store.GetGroupForNode("")
+	if found {
+		t.Error("Expected GetGroupForNode to return false for empty node name")
+	}
+}
+
+func TestGetNodesForGroup(t *testing.T) {
+	store := NewGroupStore()
+
+	// Test getting nodes for non-existent group
+	nodes := store.GetNodesForGroup("non-existent-group")
+	if len(nodes) != 0 {
+		t.Error("Expected empty slice for non-existent group")
+	}
+
+	// Set up node health statuses for a group
+	store.SetNodeHealthcheckStatus("test-group", "node1", "healthy")
+	store.SetNodeHealthcheckStatus("test-group", "node2", "offline")
+	store.SetNodeHealthcheckStatus("test-group", "node3", "unknown")
+
+	// Test getting nodes for existing group
+	nodes = store.GetNodesForGroup("test-group")
+	if len(nodes) != 3 {
+		t.Errorf("Expected 3 nodes, got %d", len(nodes))
+	}
+
+	// Verify all nodes are present
+	nodeMap := make(map[string]bool)
+	for _, node := range nodes {
+		nodeMap[node] = true
+	}
+	expectedNodes := []string{"node1", "node2", "node3"}
+	for _, expected := range expectedNodes {
+		if !nodeMap[expected] {
+			t.Errorf("Expected to find node %s in the list", expected)
+		}
+	}
+
+	// Test with empty group name
+	nodes = store.GetNodesForGroup("")
+	if len(nodes) != 0 {
+		t.Error("Expected empty slice for empty group name")
+	}
+}
+
+func TestGetAllNodeToGroupMappings(t *testing.T) {
+	store := NewGroupStore()
+
+	// Test with no mappings
+	mappings := store.GetAllNodeToGroupMappings()
+	if len(mappings) != 0 {
+		t.Error("Expected empty map when no mappings exist")
+	}
+
+	// Set up multiple node-to-group mappings
+	store.SetNodeHealthcheckStatus("group1", "node1", "healthy")
+	store.SetNodeHealthcheckStatus("group1", "node2", "offline")
+	store.SetNodeHealthcheckStatus("group2", "node3", "healthy")
+	store.SetNodeHealthcheckStatus("group2", "node4", "healthy")
+
+	// Test getting all mappings
+	mappings = store.GetAllNodeToGroupMappings()
+	if len(mappings) != 4 {
+		t.Errorf("Expected 4 mappings, got %d", len(mappings))
+	}
+
+	// Verify all mappings are correct
+	expectedMappings := map[string]string{
+		"node1": "group1",
+		"node2": "group1",
+		"node3": "group2",
+		"node4": "group2",
+	}
+	for node, expectedGroup := range expectedMappings {
+		actualGroup, exists := mappings[node]
+		if !exists {
+			t.Errorf("Expected to find mapping for node %s", node)
+		}
+		if actualGroup != expectedGroup {
+			t.Errorf("Expected node %s to be in group %s, got %s", node, expectedGroup, actualGroup)
+		}
+	}
+}

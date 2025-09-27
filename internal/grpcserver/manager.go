@@ -26,6 +26,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/homecluster-dev/homelab-autoscaler/internal/groupstore"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
@@ -38,13 +40,17 @@ type ServerManager struct {
 	address    string
 	wg         sync.WaitGroup
 	groupStore *groupstore.GroupStore
+	client     client.Client
+	scheme     *runtime.Scheme
 }
 
 // NewServerManager creates a new gRPC server manager
-func NewServerManager(address string, groupStore *groupstore.GroupStore) *ServerManager {
+func NewServerManager(address string, groupStore *groupstore.GroupStore, k8sClient client.Client, scheme *runtime.Scheme) *ServerManager {
 	return &ServerManager{
 		address:    address,
 		groupStore: groupStore,
+		client:     k8sClient,
+		scheme:     scheme,
 	}
 }
 
@@ -68,7 +74,7 @@ func (sm *ServerManager) Start(ctx context.Context) error {
 	reflection.Register(sm.server)
 
 	// Register the mock cloud provider service
-	mockServer := NewMockCloudProviderServer(sm.groupStore)
+	mockServer := NewMockCloudProviderServer(sm.groupStore, sm.client, sm.scheme)
 	pb.RegisterCloudProviderServer(sm.server, mockServer)
 
 	log.Printf("Starting Mock CloudProvider gRPC server on %s", sm.address)

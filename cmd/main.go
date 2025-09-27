@@ -222,7 +222,7 @@ func main() {
 	var grpcServerManager *grpcserver.ServerManager
 	if enableGRPCServer {
 		setupLog.Info("starting gRPC server", "address", grpcServerAddr, "groupStoreAddr", fmt.Sprintf("%p", groupStore))
-		grpcServerManager = grpcserver.NewServerManager(grpcServerAddr, groupStore)
+		grpcServerManager = grpcserver.NewServerManager(grpcServerAddr, groupStore, mgr.GetClient(), mgr.GetScheme())
 
 		// Create a context for the gRPC server
 		grpcCtx, grpcCancel := context.WithCancel(context.Background())

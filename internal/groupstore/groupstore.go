@@ -35,6 +35,7 @@ const (
 // GroupStore provides a thread-safe storage for Group resources using sync.Map
 type GroupStore struct {
 	store          sync.Map // Stores Group resources by name
+	nodeStore      sync.Map // Stores Node resources by name
 	healthcheckMap sync.Map // Stores map[string]map[string]string for group->node->status
 	nodeToGroupMap sync.Map // Stores node-to-group mapping: nodeName -> groupName
 }
@@ -43,6 +44,7 @@ type GroupStore struct {
 func NewGroupStore() *GroupStore {
 	return &GroupStore{
 		store:          sync.Map{},
+		nodeStore:      sync.Map{},
 		healthcheckMap: sync.Map{},
 		nodeToGroupMap: sync.Map{},
 	}
@@ -65,6 +67,23 @@ func (s *GroupStore) AddOrUpdate(group *v1alpha1.Group) error {
 	return nil
 }
 
+// AddOrUpdateNode adds or updates a Node resource in the store
+// The key is generated from the Node's metadata.Name
+func (s *GroupStore) AddOrUpdateNode(node *v1alpha1.Node) error {
+	if node == nil {
+		return fmt.Errorf("node cannot be nil")
+	}
+
+	key := node.Name
+	if key == "" {
+		return fmt.Errorf("node name cannot be empty")
+	}
+
+	s.nodeStore.Store(key, node)
+	log.Printf("GroupStore: Added/updated node %q", key)
+	return nil
+}
+
 // Get retrieves a Group resource by key (name)
 func (s *GroupStore) Get(key string) (*v1alpha1.Group, error) {
 	if key == "" {
@@ -84,6 +103,25 @@ func (s *GroupStore) Get(key string) (*v1alpha1.Group, error) {
 	return group, nil
 }
 
+// GetNode retrieves a Node resource by key (name)
+func (s *GroupStore) GetNode(key string) (*v1alpha1.Node, error) {
+	if key == "" {
+		return nil, fmt.Errorf("key cannot be empty")
+	}
+
+	value, ok := s.nodeStore.Load(key)
+	if !ok {
+		return nil, fmt.Errorf("node %q not found", key)
+	}
+
+	node, ok := value.(*v1alpha1.Node)
+	if !ok {
+		return nil, fmt.Errorf("invalid type assertion for node %q", key)
+	}
+
+	return node, nil
+}
+
 // List returns all Group resources in the store
 func (s *GroupStore) List() ([]*v1alpha1.Group, error) {
 	var groups []*v1alpha1.Group
@@ -99,6 +137,23 @@ func (s *GroupStore) List() ([]*v1alpha1.Group, error) {
 	})
 
 	return groups, nil
+}
+
+// ListNode returns all Node resources in the store
+func (s *GroupStore) ListNode() ([]*v1alpha1.Node, error) {
+	var nodes []*v1alpha1.Node
+
+	s.nodeStore.Range(func(key, value interface{}) bool {
+		node, ok := value.(*v1alpha1.Node)
+		if !ok {
+			log.Printf("GroupStore: Invalid type assertion for key %v", key)
+			return true
+		}
+		nodes = append(nodes, node)
+		return true
+	})
+
+	return nodes, nil
 }
 
 // Remove removes a Group resource by key (name)
@@ -127,6 +182,22 @@ func (s *GroupStore) Remove(key string) error {
 	s.store.Delete(key)
 	s.healthcheckMap.Delete(key)
 	log.Printf("GroupStore: Removed group %q", key)
+	return nil
+}
+
+// RemoveNode removes a Node resource by key (name)
+func (s *GroupStore) RemoveNode(key string) error {
+	if key == "" {
+		return fmt.Errorf("key cannot be empty")
+	}
+
+	_, ok := s.nodeStore.Load(key)
+	if !ok {
+		return fmt.Errorf("node %q not found", key)
+	}
+
+	s.nodeStore.Delete(key)
+	log.Printf("GroupStore: Removed node %q", key)
 	return nil
 }
 
@@ -177,6 +248,16 @@ func (s *GroupStore) Exists(key string) bool {
 	}
 
 	_, ok := s.store.Load(key)
+	return ok
+}
+
+// NodeExists checks if a Node with the given key exists in the store
+func (s *GroupStore) NodeExists(key string) bool {
+	if key == "" {
+		return false
+	}
+
+	_, ok := s.nodeStore.Load(key)
 	return ok
 }
 
