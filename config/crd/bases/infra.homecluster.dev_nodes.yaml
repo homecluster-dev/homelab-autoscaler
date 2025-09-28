@@ -53,6 +53,8 @@ spec:
                     type: array
                   image:
                     type: string
+                  serviceAccount:
+                    type: string
                   volumes:
                     description: Each volume mounts a Secret or ConfigMap
                     items:
@@ -89,6 +91,8 @@ spec:
                     type: array
                   image:
                     type: string
+                  serviceAccount:
+                    type: string
                   volumes:
                     description: Each volume mounts a Secret or ConfigMap
                     items:
@@ -122,6 +126,8 @@ spec:
                       type: string
                     type: array
                   image:
+                    type: string
+                  serviceAccount:
                     type: string
                   volumes:
                     description: Each volume mounts a Secret or ConfigMap

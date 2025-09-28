@@ -306,7 +306,7 @@ func extractNodeNameFromCronJob(cronJobName string, cronJobLabels map[string]str
 }
 
 // generateHealthcheckCronJob creates a CronJob for healthchecking a specific node
-func (r *NodeReconciler) generateHealthcheckCronJob(node *infrav1alpha1.Node, groupName string) *batchv1.CronJob {
+func (r *NodeReconciler) generateHealthcheckCronJob(node *infrav1alpha1.Node, groupName string, scheme *runtime.Scheme) (*batchv1.CronJob, error) {
 	// Convert healthcheck period to cron schedule format
 	// Period is in seconds, convert to cron format: "*/{period} * * * *"
 	cronSchedule := fmt.Sprintf("*/%d * * * *", node.Spec.HealthcheckPeriod)
@@ -314,7 +314,7 @@ func (r *NodeReconciler) generateHealthcheckCronJob(node *infrav1alpha1.Node, gr
 	// Generate a shortened CronJob name
 	cronJobName := generateShortCronJobName(groupName, node.Spec.KubernetesNodeName)
 
-	return &batchv1.CronJob{
+	cronJob := &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cronJobName,
 			Namespace: node.Namespace,
@@ -340,6 +340,12 @@ func (r *NodeReconciler) generateHealthcheckCronJob(node *infrav1alpha1.Node, gr
 						},
 						Spec: corev1.PodSpec{
 							RestartPolicy: corev1.RestartPolicyOnFailure,
+							ServiceAccountName: func() string {
+								if node.Spec.HealthcheckPodSpec.ServiceAccount != nil {
+									return *node.Spec.HealthcheckPodSpec.ServiceAccount
+								}
+								return ""
+							}(),
 							Containers: []corev1.Container{
 								{
 									Name:    "healthcheck",
@@ -354,6 +360,13 @@ func (r *NodeReconciler) generateHealthcheckCronJob(node *infrav1alpha1.Node, gr
 			},
 		},
 	}
+
+	// Set owner reference to the Node CR (not Group CR)
+	if err := ctrl.SetControllerReference(node, cronJob, scheme); err != nil {
+		return nil, err
+	}
+
+	return cronJob, nil
 }
 
 // createOrUpdateHealthcheckCronJob creates or updates a healthcheck CronJob for a specific node
@@ -361,17 +374,15 @@ func (r *NodeReconciler) createOrUpdateHealthcheckCronJob(ctx context.Context, n
 	logger := log.FromContext(ctx)
 
 	// Generate the desired CronJob
-	desiredCronJob := r.generateHealthcheckCronJob(node, groupName)
-
-	// Set owner reference to the Node CR (not Group CR)
-	if err := ctrl.SetControllerReference(node, desiredCronJob, r.Scheme); err != nil {
-		logger.Error(err, "Failed to set controller reference for CronJob", "cronJob", desiredCronJob.Name)
+	desiredCronJob, err := r.generateHealthcheckCronJob(node, groupName, r.Scheme)
+	if err != nil {
+		logger.Error(err, "Failed to generate healthcheck CronJob", "node", node.Name)
 		return err
 	}
 
 	// Try to get the existing CronJob
 	existingCronJob := &batchv1.CronJob{}
-	err := r.Get(ctx, types.NamespacedName{Name: desiredCronJob.Name, Namespace: desiredCronJob.Namespace}, existingCronJob)
+	err = r.Get(ctx, types.NamespacedName{Name: desiredCronJob.Name, Namespace: desiredCronJob.Namespace}, existingCronJob)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Create the CronJob
@@ -857,14 +868,14 @@ func (r *NodeReconciler) validateNewNode(ctx context.Context, node *infrav1alpha
 	_, err := r.GroupStore.GetNode(node.Name)
 	if err != nil && strings.Contains(err.Error(), "not found") {
 		// This is a new node, validate the referenced Kubernetes node
-		return r.validateKubernetesNode(ctx, node.Name, node.Spec.KubernetesNodeName)
+		return r.validateKubernetesNode(ctx, node, node.Name, node.Spec.KubernetesNodeName)
 	}
 
 	return nil
 }
 
 // validateKubernetesNode validates that the referenced Kubernetes node exists and is schedulable
-func (r *NodeReconciler) validateKubernetesNode(ctx context.Context, nodeName, kubernetesNodeName string) error {
+func (r *NodeReconciler) validateKubernetesNode(ctx context.Context, node *infrav1alpha1.Node, nodeName, kubernetesNodeName string) error {
 	logger := log.FromContext(ctx)
 
 	// Get the referenced Kubernetes node
@@ -873,6 +884,15 @@ func (r *NodeReconciler) validateKubernetesNode(ctx context.Context, nodeName, k
 		if errors.IsNotFound(err) {
 			logger.Error(err, "Referenced Kubernetes node does not exist",
 				"node", nodeName, "kubernetesNodeName", kubernetesNodeName)
+			// Set error condition on the Node CR
+			errorCondition := metav1.Condition{
+				Type:               "Error",
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+				Reason:             "InvalidKubernetesNode",
+				Message:            "invalid kubernetesNodeName",
+			}
+			r.updateOrAppendCondition(node, errorCondition)
 			return fmt.Errorf("referenced Kubernetes node %q does not exist", kubernetesNodeName)
 		}
 		logger.Error(err, "Failed to get referenced Kubernetes node",
@@ -884,6 +904,15 @@ func (r *NodeReconciler) validateKubernetesNode(ctx context.Context, nodeName, k
 	if kubernetesNode.Spec.Unschedulable {
 		logger.Error(nil, "Referenced Kubernetes node is unschedulable",
 			"node", nodeName, "kubernetesNodeName", kubernetesNodeName)
+		// Set error condition on the Node CR
+		errorCondition := metav1.Condition{
+			Type:               "Error",
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "InvalidKubernetesNode",
+			Message:            "invalid kubernetesNodeName",
+		}
+		r.updateOrAppendCondition(node, errorCondition)
 		return fmt.Errorf("referenced Kubernetes node %q is unschedulable", kubernetesNodeName)
 	}
 

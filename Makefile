@@ -80,8 +80,8 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 		*"$(KIND_CLUSTER)"*) \
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			echo "Creating Kind cluster '$(KIND_CLUSTER)' with custom configuration..."; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) --config hack/kind-config.yaml ;; \
 	esac
 
 .PHONY: test-e2e
@@ -101,6 +101,9 @@ test-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e 
 	@echo "Creating test groups..."
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+
+	@echo "Creating serviceaccount for nodes healthcheck"
+	$(KUBECTL) apply -f test/e2e/manifests/healthcheck-serviceaccount.yaml -n homelab-autoscaler-system
 	
 	@echo "Creating test nodes..."
 	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
@@ -143,6 +146,9 @@ run-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e t
 	@echo "Creating test groups..."
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+	
+	@echo "Creating serviceaccount for nodes healthcheck"
+	$(KUBECTL) apply -f test/e2e/manifests/healthcheck-serviceaccount.yaml -n homelab-autoscaler-system
 	
 	@echo "Creating test nodes..."
 	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system

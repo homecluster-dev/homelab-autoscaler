@@ -42,30 +42,30 @@ func generateExpectedCronJobName(groupName, nodeName string) string {
 	// We need to reserve space for: {prefix}-{hash}-healthcheck
 	// Let's use: {truncatedGroup}-{truncatedNode}-{hash}-healthcheck
 	// Reserve 12 chars for "-healthcheck", 9 chars for "-{hash}", and some buffer
-	
+
 	maxNameLength := 52 - 12 - 9 - 2 // 29 chars total for group + node names
-	
+
 	// Create a unique identifier by combining group and node names
 	combined := fmt.Sprintf("%s-%s", groupName, nodeName)
-	
+
 	// Generate a short hash (8 characters) of the combined string
 	hash := sha256.Sum256([]byte(combined))
 	hashStr := fmt.Sprintf("%x", hash)[:8]
-	
+
 	// Truncate group and node names if they're too long
 	truncatedGroup := groupName
 	truncatedNode := nodeName
-	
+
 	// If the combined length is too long, truncate proportionally
 	if len(groupName)+len(nodeName) > maxNameLength {
 		// Split the available space proportionally
 		totalLen := len(groupName) + len(nodeName)
 		groupRatio := float64(len(groupName)) / float64(totalLen)
 		nodeRatio := float64(len(nodeName)) / float64(totalLen)
-		
+
 		groupMaxLen := int(float64(maxNameLength) * groupRatio)
 		nodeMaxLen := int(float64(maxNameLength) * nodeRatio)
-		
+
 		// Ensure we don't truncate to 0
 		if groupMaxLen < 1 {
 			groupMaxLen = 1
@@ -75,7 +75,7 @@ func generateExpectedCronJobName(groupName, nodeName string) string {
 			nodeMaxLen = 1
 			groupMaxLen = maxNameLength - 1
 		}
-		
+
 		if len(groupName) > groupMaxLen {
 			truncatedGroup = groupName[:groupMaxLen]
 		}
@@ -83,7 +83,7 @@ func generateExpectedCronJobName(groupName, nodeName string) string {
 			truncatedNode = nodeName[:nodeMaxLen]
 		}
 	}
-	
+
 	return fmt.Sprintf("%s-%s-%s-healthcheck", truncatedGroup, truncatedNode, hashStr)
 }
 
@@ -237,21 +237,21 @@ var _ = Describe("Manager", Ordered, func() {
 				cmd := exec.Command("kubectl", "get", "cronjob", "-n", namespace, "-o", "jsonpath={.items[*].metadata.name}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to get cronjobs list")
-				
+
 				// Parse the cronjob names from the output (space-separated)
 				var cronjobNames []string
 				if output != "" {
 					cronjobNames = strings.Fields(output)
 				}
-				
+
 				// Generate expected cronjob names
 				expectedCronJobs := []string{
-					generateExpectedCronJobName("group1", "worker-node-1"),
-					generateExpectedCronJobName("group1", "worker-node-2"),
-					generateExpectedCronJobName("group2", "worker-node-3"),
-					generateExpectedCronJobName("group2", "worker-node-4"),
+					generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker"),
+					generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker2"),
+					generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker3"),
+					generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker4"),
 				}
-				
+
 				// Verify all expected cronjobs are present
 				for _, expectedCronJob := range expectedCronJobs {
 					g.Expect(cronjobNames).To(ContainElement(expectedCronJob), fmt.Sprintf("Expected cronjob %s not found in namespace", expectedCronJob))
@@ -262,28 +262,28 @@ var _ = Describe("Manager", Ordered, func() {
 			By("verifying that cronjobs are in the correct namespace")
 			verifyCronJobsNamespace := func(g Gomega) {
 				// Get group1-worker-node-1-healthcheck cronjob details
-				cronjobName1 := generateExpectedCronJobName("group1", "worker-node-1")
+				cronjobName1 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker")
 				cmd := exec.Command("kubectl", "get", "cronjob", cronjobName1, "-o", "jsonpath={.metadata.namespace}", "-n", namespace)
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s namespace", cronjobName1))
 				g.Expect(output).To(Equal(namespace), fmt.Sprintf("%s is not in the correct namespace", cronjobName1))
 
 				// Get group1-worker-node-2-healthcheck cronjob details
-				cronjobName2 := generateExpectedCronJobName("group1", "worker-node-2")
+				cronjobName2 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker2")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName2, "-o", "jsonpath={.metadata.namespace}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s namespace", cronjobName2))
 				g.Expect(output).To(Equal(namespace), fmt.Sprintf("%s is not in the correct namespace", cronjobName2))
 
 				// Get group2-worker-node-3-healthcheck cronjob details
-				cronjobName3 := generateExpectedCronJobName("group2", "worker-node-3")
+				cronjobName3 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker3")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName3, "-o", "jsonpath={.metadata.namespace}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s namespace", cronjobName3))
 				g.Expect(output).To(Equal(namespace), fmt.Sprintf("%s is not in the correct namespace", cronjobName3))
 
 				// Get group2-worker-node-4-healthcheck cronjob details
-				cronjobName4 := generateExpectedCronJobName("group2", "worker-node-4")
+				cronjobName4 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker4")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName4, "-o", "jsonpath={.metadata.namespace}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s namespace", cronjobName4))
@@ -294,28 +294,28 @@ var _ = Describe("Manager", Ordered, func() {
 			By("verifying that cronjobs have the correct schedule")
 			verifyCronJobsSchedule := func(g Gomega) {
 				// Get group1-worker-node-1-healthcheck cronjob schedule (should be "*/1 * * * *" based on healthcheckPeriod: 1)
-				cronjobName1 := generateExpectedCronJobName("group1", "worker-node-1")
+				cronjobName1 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker")
 				cmd := exec.Command("kubectl", "get", "cronjob", cronjobName1, "-o", "jsonpath={.spec.schedule}", "-n", namespace)
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s schedule", cronjobName1))
 				g.Expect(output).To(Equal("*/1 * * * *"), fmt.Sprintf("%s has incorrect schedule", cronjobName1))
 
 				// Get group1-worker-node-2-healthcheck cronjob schedule (should be "*/1 * * * *" based on healthcheckPeriod: 1)
-				cronjobName2 := generateExpectedCronJobName("group1", "worker-node-2")
+				cronjobName2 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker2")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName2, "-o", "jsonpath={.spec.schedule}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s schedule", cronjobName2))
 				g.Expect(output).To(Equal("*/1 * * * *"), fmt.Sprintf("%s has incorrect schedule", cronjobName2))
 
 				// Get group2-worker-node-3-healthcheck cronjob schedule (should be "*/2 * * * *" based on healthcheckPeriod: 2)
-				cronjobName3 := generateExpectedCronJobName("group2", "worker-node-3")
+				cronjobName3 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker3")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName3, "-o", "jsonpath={.spec.schedule}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s schedule", cronjobName3))
 				g.Expect(output).To(Equal("*/2 * * * *"), fmt.Sprintf("%s has incorrect schedule", cronjobName3))
 
 				// Get group2-worker-node-4-healthcheck cronjob schedule (should be "*/2 * * * *" based on healthcheckPeriod: 2)
-				cronjobName4 := generateExpectedCronJobName("group2", "worker-node-4")
+				cronjobName4 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker4")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName4, "-o", "jsonpath={.spec.schedule}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s schedule", cronjobName4))
@@ -325,52 +325,73 @@ var _ = Describe("Manager", Ordered, func() {
 
 			By("verifying that cronjobs have the correct container configuration")
 			verifyCronJobsContainers := func(g Gomega) {
-				// Get group1-worker-node-1-healthcheck cronjob containers array
-				cronjobName1 := generateExpectedCronJobName("group1", "worker-node-1")
-				cmd := exec.Command("kubectl", "get", "cronjob", cronjobName1, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
+				// Get group1-worker-node-1-healthcheck cronjob container details
+				cronjobName1 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker")
+				
+				// Verify container image
+				cmd := exec.Command("kubectl", "get", "cronjob", cronjobName1, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
 				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s containers", cronjobName1))
-				g.Expect(output).To(ContainSubstring("busybox:latest"), fmt.Sprintf("%s has incorrect container image", cronjobName1))
-				g.Expect(output).To(ContainSubstring("/bin/sh"), fmt.Sprintf("%s has incorrect command", cronjobName1))
-				g.Expect(output).To(ContainSubstring("-c"), fmt.Sprintf("%s has incorrect args", cronjobName1))
-				g.Expect(output).To(ContainSubstring("echo healthy"), fmt.Sprintf("%s has incorrect args", cronjobName1))
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s container image", cronjobName1))
+				g.Expect(output).To(Equal("alpine/k8s:1.34.1"), fmt.Sprintf("%s has incorrect container image", cronjobName1))
 
-				// Get group1-worker-node-2-healthcheck cronjob containers array
-				cronjobName2 := generateExpectedCronJobName("group1", "worker-node-2")
-				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName2, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
+				// Verify service account
+				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName1, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.serviceAccountName}", "-n", namespace)
 				output, err = utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s containers", cronjobName2))
-				g.Expect(output).To(ContainSubstring("busybox:latest"), fmt.Sprintf("%s has incorrect container image", cronjobName2))
-				g.Expect(output).To(ContainSubstring("/bin/sh"), fmt.Sprintf("%s has incorrect command", cronjobName2))
-				g.Expect(output).To(ContainSubstring("-c"), fmt.Sprintf("%s has incorrect args", cronjobName2))
-				g.Expect(output).To(ContainSubstring("echo healthy"), fmt.Sprintf("%s has incorrect args", cronjobName2))
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s service account", cronjobName1))
+				g.Expect(output).To(Equal("kubectl-sa"), fmt.Sprintf("%s has incorrect service account", cronjobName1))
 
-				// Get group2-worker-node-3-healthcheck cronjob containers array
-				cronjobName3 := generateExpectedCronJobName("group2", "worker-node-3")
-				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName3, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
+				// Verify group1-worker-node-2-healthcheck cronjob container details
+				cronjobName2 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker2")
+				
+				// Verify container image
+				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName2, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
 				output, err = utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s containers", cronjobName3))
-				g.Expect(output).To(ContainSubstring("busybox:latest"), fmt.Sprintf("%s has incorrect container image", cronjobName3))
-				g.Expect(output).To(ContainSubstring("/bin/sh"), fmt.Sprintf("%s has incorrect command", cronjobName3))
-				g.Expect(output).To(ContainSubstring("-c"), fmt.Sprintf("%s has incorrect args", cronjobName3))
-				g.Expect(output).To(ContainSubstring("echo healthy"), fmt.Sprintf("%s has incorrect args", cronjobName3))
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s container image", cronjobName2))
+				g.Expect(output).To(Equal("alpine/k8s:1.34.1"), fmt.Sprintf("%s has incorrect container image", cronjobName2))
 
-				// Get group2-worker-node-4-healthcheck cronjob containers array
-				cronjobName4 := generateExpectedCronJobName("group2", "worker-node-4")
-				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName4, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers}", "-n", namespace)
+				// Verify service account
+				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName2, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.serviceAccountName}", "-n", namespace)
 				output, err = utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s containers", cronjobName4))
-				g.Expect(output).To(ContainSubstring("busybox:latest"), fmt.Sprintf("%s has incorrect container image", cronjobName4))
-				g.Expect(output).To(ContainSubstring("/bin/sh"), fmt.Sprintf("%s has incorrect command", cronjobName4))
-				g.Expect(output).To(ContainSubstring("-c"), fmt.Sprintf("%s has incorrect args", cronjobName4))
-				g.Expect(output).To(ContainSubstring("echo healthy"), fmt.Sprintf("%s has incorrect args", cronjobName4))
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s service account", cronjobName2))
+				g.Expect(output).To(Equal("kubectl-sa"), fmt.Sprintf("%s has incorrect service account", cronjobName2))
+
+				// Verify group2-worker-node-3-healthcheck cronjob container details
+				cronjobName3 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker3")
+				
+				// Verify container image
+				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName3, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s container image", cronjobName3))
+				g.Expect(output).To(Equal("alpine/k8s:1.34.1"), fmt.Sprintf("%s has incorrect container image", cronjobName3))
+
+				// Verify service account
+				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName3, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.serviceAccountName}", "-n", namespace)
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s service account", cronjobName3))
+				g.Expect(output).To(Equal("kubectl-sa"), fmt.Sprintf("%s has incorrect service account", cronjobName3))
+
+				// Verify group2-worker-node-4-healthcheck cronjob container details
+				cronjobName4 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker4")
+				
+				// Verify container image
+				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName4, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s container image", cronjobName4))
+				g.Expect(output).To(Equal("alpine/k8s:1.34.1"), fmt.Sprintf("%s has incorrect container image", cronjobName4))
+
+				// Verify service account
+				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName4, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.serviceAccountName}", "-n", namespace)
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s service account", cronjobName4))
+				g.Expect(output).To(Equal("kubectl-sa"), fmt.Sprintf("%s has incorrect service account", cronjobName4))
+
 			}
 			Eventually(verifyCronJobsContainers).Should(Succeed())
 
 			By("verifying that cronjobs are properly labeled to associate them with their respective Node CRs")
 			verifyCronJobsLabels := func(g Gomega) {
 				// Get group1-worker-node-1-healthcheck cronjob owner references array
-				cronjobName1 := generateExpectedCronJobName("group1", "worker-node-1")
+				cronjobName1 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker")
 				cmd := exec.Command("kubectl", "get", "cronjob", cronjobName1, "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s owner references", cronjobName1))
@@ -378,7 +399,7 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("group1-worker-node-1"), fmt.Sprintf("%s does not have group1-worker-node-1 as owner reference", cronjobName1))
 
 				// Get group1-worker-node-2-healthcheck cronjob owner references array
-				cronjobName2 := generateExpectedCronJobName("group1", "worker-node-2")
+				cronjobName2 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker2")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName2, "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s owner references", cronjobName2))
@@ -386,7 +407,7 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("group1-worker-node-2"), fmt.Sprintf("%s does not have group1-worker-node-2 as owner reference", cronjobName2))
 
 				// Get group2-worker-node-3-healthcheck cronjob owner references array
-				cronjobName3 := generateExpectedCronJobName("group2", "worker-node-3")
+				cronjobName3 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker3")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName3, "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s owner references", cronjobName3))
@@ -394,7 +415,7 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("group2-worker-node-3"), fmt.Sprintf("%s does not have group2-worker-node-3 as owner reference", cronjobName3))
 
 				// Get group2-worker-node-4-healthcheck cronjob owner references array
-				cronjobName4 := generateExpectedCronJobName("group2", "worker-node-4")
+				cronjobName4 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker4")
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName4, "-o", "jsonpath={.metadata.ownerReferences}", "-n", namespace)
 				output, err = utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get %s owner references", cronjobName4))

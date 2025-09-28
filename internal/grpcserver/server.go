@@ -405,6 +405,22 @@ func (s *MockCloudProviderServer) NodeGroupIncreaseSize(ctx context.Context, req
 
 	logger.Info("Found unhealthy node, starting job", "node", unhealthyNodeName, "group", req.Id)
 
+	// Get the Kubernetes node object and set it as schedulable
+	k8sNode := &corev1.Node{}
+	if err := s.Client.Get(ctx, client.ObjectKey{Name: unhealthyNode.Spec.KubernetesNodeName}, k8sNode); err != nil {
+		logger.Error(err, "failed to get Kubernetes node", "nodeName", unhealthyNode.Spec.KubernetesNodeName)
+		return nil, status.Errorf(codes.Internal, "failed to get Kubernetes node %s: %v", unhealthyNode.Spec.KubernetesNodeName, err)
+	}
+
+	// Set the node as schedulable
+	k8sNode.Spec.Unschedulable = false
+	if err := s.Client.Update(ctx, k8sNode); err != nil {
+		logger.Error(err, "failed to mark Kubernetes node as schedulable", "nodeName", unhealthyNode.Spec.KubernetesNodeName)
+		return nil, status.Errorf(codes.Internal, "failed to mark node %s as schedulable: %v", unhealthyNode.Spec.KubernetesNodeName, err)
+	}
+
+	logger.Info("Successfully marked Kubernetes node as schedulable", "nodeName", unhealthyNode.Spec.KubernetesNodeName)
+
 	// Create a Job to start the unhealthy node
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
