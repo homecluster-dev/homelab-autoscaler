@@ -22,6 +22,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"time"
 
 	"google.golang.org/grpc"
@@ -183,17 +184,57 @@ var _ = Describe("gRPC Server", Ordered, func() {
 			// Instances can be empty or nil, just verify we get a response
 		})
 
+		It("should handle NodeGroupDeleteNodes correctly", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			// Call NodeGroupDeleteNodes with group1 and group1-worker-node-1
+			_, err := grpcClient.NodeGroupDeleteNodes(ctx, &pb.NodeGroupDeleteNodesRequest{
+				Id: "group1",
+				Nodes: []*pb.ExternalGrpcNode{
+					{
+						Name: "group1-worker-node-1",
+					},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify that the Kubernetes node "homelab-autoscaler-test-e2e-worker" is marked as unschedulable
+			Eventually(func() bool {
+				// Use kubectl to check if the node is unschedulable
+				cmd := exec.Command("kubectl", "get", "node", "homelab-autoscaler-test-e2e-worker", "-o", "jsonpath={.spec.unschedulable}")
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					GinkgoWriter.Printf("Failed to get node status: %v, output: %s\n", err, string(output))
+					return false
+				}
+				return string(output) == "true"
+			}, 30*time.Second, 2*time.Second).Should(BeTrue(), "Kubernetes node homelab-autoscaler-test-e2e-worker should be unschedulable")
+		})
+
 		It("should handle NodeGroupIncreaseSize correctly", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			// Try to increase size of non-existent node group - expect NotFound error
+			// Increase size of group1 which had a node deleted in the previous test
 			_, err := grpcClient.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{
-				Id:    "ng-1",
+				Id:    "group1",
 				Delta: 1,
 			})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("node group ng-1 not found"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify that the Kubernetes node "homelab-autoscaler-test-e2e-worker" becomes schedulable again
+			Eventually(func() bool {
+				// Use kubectl to check if the node is schedulable
+				cmd := exec.Command("kubectl", "get", "node", "homelab-autoscaler-test-e2e-worker", "-o", "jsonpath={.spec.unschedulable}")
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					GinkgoWriter.Printf("Failed to get node status: %v, output: %s\n", err, string(output))
+					return false
+				}
+				// If unschedulable is empty or false, the node is schedulable
+				return string(output) == "" || string(output) == "false"
+			}, 30*time.Second, 2*time.Second).Should(BeTrue(), "Kubernetes node homelab-autoscaler-test-e2e-worker should be schedulable")
 		})
 
 		It("should handle NodeGroupDecreaseTargetSize correctly", func() {

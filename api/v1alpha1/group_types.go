@@ -42,22 +42,6 @@ type PricingSpec struct {
 	MonthlyRate string `json:"monthlyRate"`
 }
 
-type MinimalPodSpec struct {
-	Image   string   `json:"image"`
-	Command []string `json:"command,omitempty"`
-	Args    []string `json:"args,omitempty"`
-	// Each volume mounts a Secret or ConfigMap
-	Volumes []VolumeMountSpec `json:"volumes,omitempty"`
-}
-
-type VolumeMountSpec struct {
-	Name      string `json:"name"`
-	MountPath string `json:"mountPath"`
-	// Either SecretName or ConfigMapName should be set
-	SecretName    string `json:"secretName,omitempty"`
-	ConfigMapName string `json:"configMapName,omitempty"`
-}
-
 // GroupStatus defines the observed state of Group.
 type GroupStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster

@@ -6,7 +6,7 @@ metadata:
   labels:
     group: group2
 spec:
-  kubernetesNodeName: worker-node-3
+  kubernetesNodeName: homelab-autoscaler-test-e2e-worker3
   healthcheckPeriod: 2
   startupPodSpec:
     image: busybox:latest
@@ -23,12 +23,19 @@ spec:
       - -c
       - echo shutdown
   healthcheckPodSpec:
-    image: busybox:latest
+    serviceAccount: kubectl-sa
+    image: alpine/k8s:1.34.1
     command:
       - /bin/sh
-    args:
       - -c
-      - echo healthy
+      - |
+        NODE="homelab-autoscaler-test-e2e-worker3"
+        STATUS=$(kubectl get node "$NODE" -o json)
+        if echo "$STATUS" | grep -q '"unschedulable":true'; then
+          echo "Node $NODE is unschedulable"
+          exit 1
+        fi
+        echo "Node $NODE is schedulable"
 ---
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -38,7 +45,7 @@ metadata:
   labels:
     group: group2
 spec:
-  kubernetesNodeName: worker-node-4
+  kubernetesNodeName: homelab-autoscaler-test-e2e-worker4
   healthcheckPeriod: 2
   startupPodSpec:
     image: busybox:latest
@@ -55,9 +62,16 @@ spec:
       - -c
       - echo shutdown
   healthcheckPodSpec:
-    image: busybox:latest
+    serviceAccount: kubectl-sa
+    image: alpine/k8s:1.34.1
     command:
       - /bin/sh
-    args:
       - -c
-      - echo healthy
+      - |
+        NODE="homelab-autoscaler-test-e2e-worker4"
+        STATUS=$(kubectl get node "$NODE" -o json)
+        if echo "$STATUS" | grep -q '"unschedulable":true'; then
+          echo "Node $NODE is unschedulable"
+          exit 1
+        fi
+        echo "Node $NODE is schedulable"
