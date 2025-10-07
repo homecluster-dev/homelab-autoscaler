@@ -21,7 +21,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"strings"
-	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -169,12 +168,6 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	// Update the health status for this node
-	if err := r.updateNodeHealthStatus(ctx, node, groupName); err != nil {
-		logger.Error(err, "Failed to update node health status", "node", node.Name)
-		return ctrl.Result{}, err
-	}
-
 	logger.Info("Successfully reconciled Node", "node", node.Name)
 	return ctrl.Result{}, nil
 }
@@ -186,12 +179,6 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.GroupStore == nil {
 		r.GroupStore = groupstore.NewGroupStore()
 	}
-
-	// Start the healthcheck status sync goroutine
-	// Pass a context that will be cancelled when the manager stops
-	// to avoid the "close of closed channel" panic from duplicate signal handler setup
-	ctx := context.Background()
-	go r.syncHealthcheckStatuses(ctx)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1alpha1.Node{}).
@@ -461,317 +448,19 @@ func (r *NodeReconciler) deleteHealthcheckCronJob(ctx context.Context, node *inf
 	return nil
 }
 
-// getHealthcheckStatus determines the healthcheck status from CronJob status
-func (r *NodeReconciler) getHealthcheckStatus(cronJob *batchv1.CronJob) string {
-	if cronJob == nil {
-		return "Unknown"
-	}
-
-	// Check if the CronJob has been scheduled
-	if cronJob.Status.LastScheduleTime == nil {
-		return "NotScheduled"
-	}
-
-	// Check if there are any active jobs
-	if len(cronJob.Status.Active) > 0 {
-		return HealthcheckStatusRunning
-	}
-
-	// Check for failed jobs in the last schedule
-	// If there are recent failures, mark as offline
-	if cronJob.Status.LastSuccessfulTime == nil {
-		// If never successful and was scheduled, it might have failed
-		// Check if enough time has passed since last schedule to consider it failed
-		timeSinceLastSchedule := time.Since(cronJob.Status.LastScheduleTime.Time)
-		if cronJob.Spec.StartingDeadlineSeconds != nil && timeSinceLastSchedule > time.Duration(*cronJob.Spec.StartingDeadlineSeconds)*time.Second {
-			return HealthcheckStatusFailed
-		}
-		// If no deadline set or still within deadline, consider it running
-		return HealthcheckStatusRunning
-	}
-
-	// Check if the last successful time is recent enough
-	timeSinceLastSuccess := time.Since(cronJob.Status.LastSuccessfulTime.Time)
-
-	// Parse the schedule to determine the expected interval (simplified)
-	// For now, assume a reasonable default based on typical healthcheck periods
-	if timeSinceLastSuccess > 5*time.Minute {
-		return HealthcheckStatusFailed // Too long since last success
-	}
-
-	return HealthcheckStatusHealthy
-}
-
-// listHealthcheckCronJobsForNode lists all CronJobs for a specific node
-func (r *NodeReconciler) listHealthcheckCronJobsForNode(ctx context.Context, nodeName string) (*batchv1.CronJob, error) {
-	logger := log.FromContext(ctx)
-
-	// First try the new approach: find CronJobs by node label
-	var cronJobList batchv1.CronJobList
-	if err := r.List(ctx, &cronJobList, client.InNamespace(""), client.MatchingLabels{"node": nodeName}); err != nil {
-		logger.Error(err, "Failed to list CronJobs by node label")
-		return nil, err
-	}
-
-	// If we found CronJobs with the new labels, return the first one
-	if len(cronJobList.Items) > 0 {
-		return &cronJobList.Items[0], nil
-	}
-
-	// Fallback: try the old approach by parsing names for backward compatibility
-	if err := r.List(ctx, &cronJobList, client.InNamespace("")); err != nil {
-		logger.Error(err, "Failed to list CronJobs for fallback search")
-		return nil, err
-	}
-
-	for i := range cronJobList.Items {
-		cronJob := &cronJobList.Items[i]
-		// Use the extractNodeNameFromCronJob function for consistent parsing
-		extractedNodeName := extractNodeNameFromCronJob(cronJob.Name, cronJob.Labels)
-		if extractedNodeName == nodeName {
-			return cronJob, nil
-		}
-	}
-
-	return nil, nil // Not found
-}
-
-// updateNodeHealthStatus updates the health status of a node based on its CronJob status and GroupStore status
-func (r *NodeReconciler) updateNodeHealthStatus(ctx context.Context, node *infrav1alpha1.Node, groupName string) error {
-	logger := log.FromContext(ctx)
-
-	// Store the previous health status to detect changes
-	previousHealthStatus := node.Status.Health
-
-	// First check if there's a health status in the GroupStore (used by tests and background sync)
-	groupStoreHealthStatus := ""
-	if r.GroupStore != nil {
-		if status, exists := r.GroupStore.GetNodeHealthcheckStatus(groupName, node.Spec.KubernetesNodeName); exists {
-			groupStoreHealthStatus = status
-		}
-	}
-
-	// Get the CronJob for this node
-	cronJob, err := r.listHealthcheckCronJobsForNode(ctx, node.Spec.KubernetesNodeName)
-	if err != nil {
-		logger.Error(err, "Failed to get CronJob for node", "node", node.Spec.KubernetesNodeName)
-		return err
-	}
-
-	// Determine the health status - prioritize GroupStore status if available, otherwise use CronJob status
-	if groupStoreHealthStatus != "" {
-		// Use GroupStore status (this is what tests expect)
-		node.Status.Health = groupStoreHealthStatus
-	} else if cronJob == nil {
-		// No CronJob found, set status to unknown
-		node.Status.Health = HealthcheckStatusUnknown
-	} else {
-		// Get the healthcheck status from the CronJob
-		healthcheckStatus := r.getHealthcheckStatus(cronJob)
-
-		// Convert healthcheck status to lowercase for consistency with CRD enum values
-		var nodeHealthStatus string
-		switch healthcheckStatus {
-		case "Healthy":
-			nodeHealthStatus = "healthy"
-		case "Failed":
-			nodeHealthStatus = "offline"
-		case HealthcheckStatusRunning, HealthcheckStatusNotScheduled:
-			nodeHealthStatus = HealthcheckStatusUnknown
-		default:
-			nodeHealthStatus = HealthcheckStatusUnknown
-		}
-
-		node.Status.Health = nodeHealthStatus
-	}
-
-	// Set conditions based on health status
-	// Check if the health status is "unknown" (scaling scenario)
-	if node.Status.Health == "unknown" {
-		// Set the Progressing condition when node is scaling (unknown health)
-		progressingCondition := metav1.Condition{
-			Type:               "Progressing",
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "NodeScaling",
-			Message:            "Node is being scaled",
-		}
-		r.updateOrAppendCondition(node, progressingCondition)
-		logger.Info("Set Node condition to Progressing", "node", node.Name, "health", node.Status.Health)
-	} else {
-		// Clear the Progressing condition when health is no longer unknown
-		progressingCondition := metav1.Condition{
-			Type:               "Progressing",
-			Status:             metav1.ConditionFalse,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "NodeStable",
-			Message:            "Node is no longer scaling",
-		}
-		r.updateOrAppendCondition(node, progressingCondition)
-	}
-
-	// Check if the health status changed to "healthy"
-	if previousHealthStatus != node.Status.Health && node.Status.Health == HealthStatusHealthy {
-		// Set the Available condition when node becomes healthy
-		availableCondition := metav1.Condition{
-			Type:               "Available",
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "NodeHealthy",
-			Message:            "Node is healthy and available",
-		}
-		r.updateOrAppendCondition(node, availableCondition)
-		logger.Info("Set Node condition to Available", "node", node.Name, "health", node.Status.Health)
-	} else if node.Status.Health != HealthStatusHealthy {
-		// Clear the Available condition when health is not healthy
-		availableCondition := metav1.Condition{
-			Type:               "Available",
-			Status:             metav1.ConditionFalse,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "NodeUnhealthy",
-			Message:            fmt.Sprintf("Node is %s", node.Status.Health),
-		}
-		r.updateOrAppendCondition(node, availableCondition)
-	}
-
-	// Check if the node has a terminating condition and health status changed from healthy to unhealthy
-	if r.hasTerminatingCondition(node) && previousHealthStatus == HealthStatusHealthy && (node.Status.Health == HealthStatusFailed || node.Status.Health == "unknown") {
-		// Set the Offline condition when terminating node becomes unhealthy
-		offlineCondition := metav1.Condition{
-			Type:               "Offline",
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "NodeUnhealthy",
-			Message:            "Node is unhealthy and has been marked offline",
-		}
-		r.updateOrAppendCondition(node, offlineCondition)
-		logger.Info("Set Node condition to Offline for terminating node", "node", node.Name, "health", node.Status.Health)
-	}
-
-	// Update the Node status in the cluster
-	if err := r.Status().Update(ctx, node); err != nil {
-		logger.Error(err, "Failed to update Node health status", "node", node.Name)
-		return err
-	}
-
-	// Also update the groupstore to keep it synchronized
-	if cronJob != nil {
-		r.GroupStore.SetNodeHealthcheckStatus(groupName, node.Spec.KubernetesNodeName, node.Status.Health)
-		logger.Info("Updated node healthcheck status in groupstore", "group", groupName, "node", node.Spec.KubernetesNodeName, "status", node.Status.Health)
-	}
-
-	// Check if health status changed from "offline" to "healthy" and mark Kubernetes node as schedulable
-	if previousHealthStatus == HealthStatusFailed && node.Status.Health == HealthStatusHealthy {
-		logger.Info("Detected health status change from offline to healthy, marking Kubernetes node as schedulable",
-			"node", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
-
-		// Get the corresponding Kubernetes Node object
-		kubernetesNode := &corev1.Node{}
-		if err := r.Get(ctx, types.NamespacedName{Name: node.Spec.KubernetesNodeName}, kubernetesNode); err != nil {
-			if errors.IsNotFound(err) {
-				logger.Info("Kubernetes Node not found, skipping schedulable update",
-					"node", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
-			} else {
-				logger.Error(err, "Failed to get Kubernetes Node",
-					"node", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
-				return err
-			}
-		} else {
-			// Check if the node is currently unschedulable
-			if kubernetesNode.Spec.Unschedulable {
-				// Mark the node as schedulable
-				kubernetesNode.Spec.Unschedulable = false
-
-				// Update the Kubernetes Node object
-				if err := r.Update(ctx, kubernetesNode); err != nil {
-					logger.Error(err, "Failed to update Kubernetes Node as schedulable",
-						"node", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
-					return err
-				}
-
-				logger.Info("Successfully marked Kubernetes node as schedulable",
-					"node", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
-			} else {
-				logger.Info("Kubernetes node is already schedulable",
-					"node", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
-			}
-		}
-	}
-
-	return nil
-}
-
-// syncHealthcheckStatuses periodically checks status of all healthcheck CronJobs and updates node status
-func (r *NodeReconciler) syncHealthcheckStatuses(ctx context.Context) {
-	logger := log.FromContext(ctx)
-
-	// Create a ticker that runs every 10 seconds for more responsive health checks
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	// Run immediately on startup
-	logger.Info("Starting initial healthcheck status sync")
-	if err := r.updateAllNodeHealthStatuses(ctx); err != nil {
-		logger.Error(err, "Failed to update node health statuses during initial sync")
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("Stopping healthcheck status sync")
-			return
-		case <-ticker.C:
-			logger.Info("Starting periodic healthcheck status sync")
-
-			if err := r.updateAllNodeHealthStatuses(ctx); err != nil {
-				logger.Error(err, "Failed to update node health statuses during periodic sync")
-			}
-
-			logger.Info("Completed healthcheck status sync")
-		}
-	}
-}
-
-// updateAllNodeHealthStatuses updates health status for all nodes
-func (r *NodeReconciler) updateAllNodeHealthStatuses(ctx context.Context) error {
-	logger := log.FromContext(ctx)
-
-	// List all Node CRs
-	nodeList := &infrav1alpha1.NodeList{}
-	if err := r.List(ctx, nodeList); err != nil {
-		logger.Error(err, "Failed to list nodes")
-		return err
-	}
-
-	for _, node := range nodeList.Items {
-		// Check if the node has a group label
-		groupName, hasGroupLabel := node.Labels["group"]
-		if !hasGroupLabel {
-			continue
-		}
-
-		// Update the health status for this node
-		if err := r.updateNodeHealthStatus(ctx, &node, groupName); err != nil {
-			logger.Error(err, "Failed to update node health status", "node", node.Name)
-			// Continue with other nodes even if one fails
-		}
-	}
-
-	return nil
-}
-
-// updateOrAppendCondition updates or appends a condition to the node's conditions slice
-func (r *NodeReconciler) updateOrAppendCondition(node *infrav1alpha1.Node, newCondition metav1.Condition) {
-	// Check if condition already exists
-	for i, condition := range node.Status.Conditions {
-		if condition.Type == newCondition.Type {
-			// Update existing condition
+// prependCondition prepends a condition to the node's conditions slice
+func (r *NodeReconciler) prependCondition(node *infrav1alpha1.Node, newCondition metav1.Condition) {
+	// Check if a condition of the same type already exists
+	for i, existingCondition := range node.Status.Conditions {
+		if existingCondition.Type == newCondition.Type {
+			// Update the existing condition
 			node.Status.Conditions[i] = newCondition
 			return
 		}
 	}
-	// Append new condition
-	node.Status.Conditions = append(node.Status.Conditions, newCondition)
+	
+	// If no condition of the same type exists, prepend the new condition
+	node.Status.Conditions = append([]metav1.Condition{newCondition}, node.Status.Conditions...)
 }
 
 // updateNodeConditionProgressing updates the Node status condition to "Progressing" when scaling is initiated
@@ -788,7 +477,7 @@ func (r *NodeReconciler) updateNodeConditionProgressing(ctx context.Context, nod
 	}
 
 	// Update or add the condition manually since we don't have meta.SetStatusCondition
-	r.updateOrAppendCondition(node, progressingCondition)
+	r.prependCondition(node, progressingCondition)
 
 	// Update the Node status in the cluster
 	if err := r.Status().Update(ctx, node); err != nil {
@@ -836,7 +525,7 @@ func (r *NodeReconciler) SetNodeConditionTerminatingForShutdown(ctx context.Cont
 	}
 
 	// Update or add the condition manually since we don't have meta.SetStatusCondition
-	r.updateOrAppendCondition(node, terminatingCondition)
+	r.prependCondition(node, terminatingCondition)
 
 	// Update the Node status in the cluster
 	if err := r.Status().Update(ctx, node); err != nil {
@@ -892,7 +581,7 @@ func (r *NodeReconciler) validateKubernetesNode(ctx context.Context, node *infra
 				Reason:             "InvalidKubernetesNode",
 				Message:            "invalid kubernetesNodeName",
 			}
-			r.updateOrAppendCondition(node, errorCondition)
+			r.prependCondition(node, errorCondition)
 			return fmt.Errorf("referenced Kubernetes node %q does not exist", kubernetesNodeName)
 		}
 		logger.Error(err, "Failed to get referenced Kubernetes node",
@@ -912,7 +601,7 @@ func (r *NodeReconciler) validateKubernetesNode(ctx context.Context, node *infra
 			Reason:             "InvalidKubernetesNode",
 			Message:            "invalid kubernetesNodeName",
 		}
-		r.updateOrAppendCondition(node, errorCondition)
+		r.prependCondition(node, errorCondition)
 		return fmt.Errorf("referenced Kubernetes node %q is unschedulable", kubernetesNodeName)
 	}
 
