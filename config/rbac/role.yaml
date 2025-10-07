@@ -28,6 +28,20 @@ rules:
   - update
   - watch
 - apiGroups:
+  - batch
+  resources:
+  - cronjobs/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
   - infra.homecluster.dev
   resources:
   - groups
