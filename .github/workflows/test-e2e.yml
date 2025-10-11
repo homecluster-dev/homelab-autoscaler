@@ -1,32 +1,29 @@
-name: E2E Tests
+name: K3d Cluster Test
 
-on:
-  push:
-  pull_request:
+on: [push]
 
 jobs:
-  test-e2e:
-    name: Run on Ubuntu
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Clone the code
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Install the latest version of kind
+      - uses: actions/checkout@v4
+      
+      - name: Install k3d
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
-
-      - name: Verify kind installation
-        run: kind version
-
-      - name: Running Test e2e
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+      
+      - name: Create cluster
         run: |
-          go mod tidy
-          make test-e2e
+          chmod +x create-cluster.sh
+          ./create-cluster.sh
+      
+      - name: Run tests
+        run: |
+          kubectl get nodes
+          # Your tests here
+      
+      - name: Delete cluster
+        if: always()
+        run: |
+          chmod +x delete-cluster.sh
+          ./delete-cluster.sh

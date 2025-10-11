@@ -19,29 +19,25 @@ package grpcserver
 import (
 	"context"
 	"fmt"
+	"sort"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/v1alpha1"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/groupstore"
+	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
 
-// MockCloudProviderServer implements the CloudProviderServer interface
-type MockCloudProviderServer struct {
+// HomeClusterProviderServer implements the CloudProviderServer interface
+type HomeClusterProviderServer struct {
 	pb.UnimplementedCloudProviderServer
-
-	// GroupStore for managing Group resources
-	groupStore *groupstore.GroupStore
 
 	// Kubernetes client for creating resources
 	Client client.Client
@@ -57,10 +53,9 @@ type MockCloudProviderServer struct {
 	pricingData     map[string]float64
 }
 
-// NewMockCloudProviderServer creates a new mock server with GroupStore integration
-func NewMockCloudProviderServer(groupStore *groupstore.GroupStore, k8sClient client.Client, scheme *runtime.Scheme) *MockCloudProviderServer {
-	server := &MockCloudProviderServer{
-		groupStore:      groupStore,
+// NewHomeClusterProviderServer creates a new mock server with GroupStore integration
+func NewHomeClusterProviderServer(k8sClient client.Client, scheme *runtime.Scheme) *HomeClusterProviderServer {
+	server := &HomeClusterProviderServer{
 		Client:          k8sClient,
 		Scheme:          scheme,
 		nodeGroups:      make(map[string]*pb.NodeGroup),
@@ -79,7 +74,7 @@ func NewMockCloudProviderServer(groupStore *groupstore.GroupStore, k8sClient cli
 }
 
 // initializeMockData sets up basic mock data for testing
-func (s *MockCloudProviderServer) initializeMockData() {
+func (s *HomeClusterProviderServer) initializeMockData() {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("Initializing mock data for CloudProvider server")
 
@@ -122,54 +117,45 @@ func (s *MockCloudProviderServer) initializeMockData() {
 }
 
 // NodeGroups returns all node groups from the GroupStore
-func (s *MockCloudProviderServer) NodeGroups(ctx context.Context, req *pb.NodeGroupsRequest) (*pb.NodeGroupsResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.NodeGroupsRequest) (*pb.NodeGroupsResponse, error) {
 	logger := log.Log.WithName("grpc-server")
-	logger.Info("NodeGroups called", "groupStoreAddr", fmt.Sprintf("%p", s.groupStore))
 
-	// Check if context is already cancelled
-	select {
-	case <-ctx.Done():
-		logger.Error(ctx.Err(), "Context cancelled before starting NodeGroups operation")
-		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
-	default:
-	}
-
-	// Get all groups from the GroupStore - this is a simple sync.Map iteration
-	groups, err := s.groupStore.List()
+	groups := &infrav1alpha1.GroupList{}
+	err := s.Client.List(ctx, groups, &client.ListOptions{})
 	if err != nil {
-		logger.Error(err, "failed to list groups from GroupStore")
+		logger.Error(err, "failed to list groups")
 		return nil, status.Errorf(codes.Internal, "failed to list groups: %v", err)
 	}
 
-	logger.Info("Retrieved groups from GroupStore", "count", len(groups))
+	logger.Info("Retrieved groups from GroupStore", "count", len(groups.Items))
 
 	// Create NodeGroup messages for all groups
-	nodeGroups := make([]*pb.NodeGroup, 0, len(groups))
+	nodeGroups := make([]*pb.NodeGroup, 0, len(groups.Items))
 
-	// Process each group - no health filtering, include all groups
-	for _, group := range groups {
-		// Check if context is cancelled before processing each group
-		select {
-		case <-ctx.Done():
-			logger.Error(ctx.Err(), "Context cancelled while processing groups")
-			return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded while processing groups: %v", ctx.Err())
-		default:
+	// Process each group
+	for _, group := range groups.Items {
+
+		var maxSize int32 = 0
+		labelSelector := labels.SelectorFromSet(map[string]string{"group": group.Name})
+		listOpts := &client.ListOptions{LabelSelector: labelSelector}
+		nodes := &infrav1alpha1.NodeList{}
+		err = s.Client.List(ctx, nodes, listOpts)
+		if err != nil {
+			maxSize = 0
+		} else {
+			maxSize = int32(len(nodes.Items))
 		}
-
-		// Get nodes for this group using the new GetNodesForGroup method
-		nodeNames := s.groupStore.GetNodesForGroup(group.Name)
-		nodeCount := len(nodeNames)
 
 		// Create NodeGroup with: minSize=0, maxSize=GroupSpec.MaxSize, id=GroupSpec.Name
 		nodeGroup := &pb.NodeGroup{
 			Id:      group.Spec.Name,
 			MinSize: 0,
-			MaxSize: int32(group.Spec.MaxSize),
-			Debug:   fmt.Sprintf("Group %s - MaxSize: %d, Nodes: %d, Health: %s", group.Spec.Name, group.Spec.MaxSize, nodeCount, group.Status.Health),
+			MaxSize: maxSize,
+			Debug:   fmt.Sprintf("Group %s - MaxSize: %d, Nodes: %d", group.Spec.Name, group.Spec.MaxSize, maxSize),
 		}
 
 		nodeGroups = append(nodeGroups, nodeGroup)
-		logger.Info("Added group to NodeGroups response", "group", group.Name, "nodeCount", nodeCount)
+		logger.Info("Added group to NodeGroups response", "group", group.Name, "nodeCount", maxSize)
 	}
 
 	logger.Info("NodeGroups response completed", "totalGroups", len(nodeGroups))
@@ -179,40 +165,45 @@ func (s *MockCloudProviderServer) NodeGroups(ctx context.Context, req *pb.NodeGr
 }
 
 // NodeGroupForNode returns the node group for the given node
-func (s *MockCloudProviderServer) NodeGroupForNode(ctx context.Context, req *pb.NodeGroupForNodeRequest) (*pb.NodeGroupForNodeResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *pb.NodeGroupForNodeRequest) (*pb.NodeGroupForNodeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupForNode called", "node", req.Node.Name)
 
-	// Check if context is already cancelled
-	select {
-	case <-ctx.Done():
-		logger.Error(ctx.Err(), "Context cancelled before starting NodeGroupForNode operation")
-		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
-	default:
-	}
-
-	// Use the new GetGroupForNode method to find the group for this node
-	groupName, exists := s.groupStore.GetGroupForNode(req.Node.Name)
-	if !exists {
+	node := &corev1.Node{}
+	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Node.Name}, node)
+	if err != nil {
 		// Node not found in any group, return empty string
-		logger.Info("Node not found in any group", "node", req.Node.Name)
+		logger.Info("Kubernetes node not found", "node", req.Node.Name)
 		return &pb.NodeGroupForNodeResponse{
 			NodeGroup: &pb.NodeGroup{Id: ""},
 		}, nil
 	}
 
-	// Get the group details
-	group, err := s.groupStore.Get(groupName)
+	groupName := node.Labels["infra.homecluster.dev/group"]
+	group := &infrav1alpha1.Group{}
+	err = s.Client.Get(ctx, client.ObjectKey{Name: groupName}, group)
 	if err != nil {
-		logger.Error(err, "failed to get group from GroupStore", "group", groupName)
-		return nil, status.Errorf(codes.Internal, "failed to get group %s: %v", groupName, err)
+		// Node not found in any group, return empty string
+		logger.Info("Group not found", "group", groupName)
+		return &pb.NodeGroupForNodeResponse{
+			NodeGroup: &pb.NodeGroup{Id: ""},
+		}, nil
 	}
 
-	// Found the node in this group, return the associated group
+	var maxSize int32 = 0
+	labelSelector := labels.SelectorFromSet(map[string]string{"group": groupName})
+	listOpts := &client.ListOptions{LabelSelector: labelSelector}
+	nodes := &infrav1alpha1.NodeList{}
+	err = s.Client.List(ctx, nodes, listOpts)
+	if err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			maxSize = 0
+		}
+	}
 	nodeGroup := &pb.NodeGroup{
-		Id:      group.Spec.Name,
+		Id:      groupName,
 		MinSize: 0,
-		MaxSize: int32(group.Spec.MaxSize),
+		MaxSize: maxSize,
 		Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, group.Spec.MaxSize),
 	}
 
@@ -223,16 +214,29 @@ func (s *MockCloudProviderServer) NodeGroupForNode(ctx context.Context, req *pb.
 }
 
 // PricingNodePrice returns a theoretical minimum price of running a node
-func (s *MockCloudProviderServer) PricingNodePrice(ctx context.Context, req *pb.PricingNodePriceRequest) (*pb.PricingNodePriceResponse, error) {
+func (s *HomeClusterProviderServer) PricingNodePrice(ctx context.Context, req *pb.PricingNodePriceRequest) (*pb.PricingNodePriceResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("PricingNodePrice called", "node", req.Node.Name)
 
-	// This is an optional method - return Unimplemented
-	return nil, status.Errorf(codes.Unimplemented, "PricingNodePrice not implemented")
+	node := &infrav1alpha1.Node{}
+	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Node.Name}, node)
+	if err != nil {
+		// Node not found in any group
+		logger.Info("Node not found", "node", req.Node.Name)
+		return &pb.PricingNodePriceResponse{
+			Price: 0,
+		}, nil
+	}
+
+	price := node.Spec.Pricing.HourlyRate
+
+	return &pb.PricingNodePriceResponse{
+		Price: price,
+	}, nil
 }
 
 // PricingPodPrice returns a theoretical minimum price of running a pod
-func (s *MockCloudProviderServer) PricingPodPrice(ctx context.Context, req *pb.PricingPodPriceRequest) (*pb.PricingPodPriceResponse, error) {
+func (s *HomeClusterProviderServer) PricingPodPrice(ctx context.Context, req *pb.PricingPodPriceRequest) (*pb.PricingPodPriceResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("PricingPodPrice called", "pod", req.Pod.Name)
 
@@ -241,15 +245,9 @@ func (s *MockCloudProviderServer) PricingPodPrice(ctx context.Context, req *pb.P
 }
 
 // GPULabel returns the label added to nodes with GPU resource
-func (s *MockCloudProviderServer) GPULabel(ctx context.Context, req *pb.GPULabelRequest) (*pb.GPULabelResponse, error) {
+func (s *HomeClusterProviderServer) GPULabel(ctx context.Context, req *pb.GPULabelRequest) (*pb.GPULabelResponse, error) {
 	logger := log.Log.WithName("grpc-server")
-	logger.Info("GPULabel called", "groupStoreAddr", fmt.Sprintf("%p", s.groupStore))
-
-	// Simple health check for the service
-	if s.groupStore == nil {
-		logger.Error(nil, "GroupStore is nil in GPULabel call")
-		return nil, status.Errorf(codes.Internal, "GroupStore not initialized")
-	}
+	logger.Info("GPULabel called")
 
 	return &pb.GPULabelResponse{
 		Label: "accelerator",
@@ -257,7 +255,7 @@ func (s *MockCloudProviderServer) GPULabel(ctx context.Context, req *pb.GPULabel
 }
 
 // GetAvailableGPUTypes return all available GPU types cloud provider supports
-func (s *MockCloudProviderServer) GetAvailableGPUTypes(ctx context.Context, req *pb.GetAvailableGPUTypesRequest) (*pb.GetAvailableGPUTypesResponse, error) {
+func (s *HomeClusterProviderServer) GetAvailableGPUTypes(ctx context.Context, req *pb.GetAvailableGPUTypesRequest) (*pb.GetAvailableGPUTypesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("GetAvailableGPUTypes called")
 
@@ -267,53 +265,19 @@ func (s *MockCloudProviderServer) GetAvailableGPUTypes(ctx context.Context, req 
 }
 
 // Cleanup cleans up open resources before the cloud provider is destroyed
-func (s *MockCloudProviderServer) Cleanup(ctx context.Context, req *pb.CleanupRequest) (*pb.CleanupResponse, error) {
+func (s *HomeClusterProviderServer) Cleanup(ctx context.Context, req *pb.CleanupRequest) (*pb.CleanupResponse, error) {
 	logger := log.Log.WithName("grpc-server")
-	logger.Info("Cleanup called", "groupStoreAddr", fmt.Sprintf("%p", s.groupStore))
-
-	// Check if context is already cancelled
-	select {
-	case <-ctx.Done():
-		logger.Error(ctx.Err(), "Context cancelled before starting Cleanup operation")
-		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
-	default:
-	}
+	logger.Info("Cleanup called")
 
 	// In a real implementation, this would clean up resources like:
-	// - Delete all CronJobs associated with groups
 	// - Clean up any external resources
 	// - Clear caches and temporary data
 
-	// For this mock implementation, we'll clear our local mock data
-	// and log what would be cleaned up
-
-	// Get all groups to log what would be cleaned up
-	groups, err := s.groupStore.List()
-	if err != nil {
-		logger.Error(err, "failed to list groups for cleanup logging")
-		// Continue with cleanup even if we can't list groups
-	} else {
-		logger.Info("Cleanup would remove resources for groups", "groupCount", len(groups))
-		for _, group := range groups {
-			logger.Info("Cleanup would remove group resources", "group", group.Name)
-		}
-	}
-
-	// Clear mock data
-	s.nodeGroups = make(map[string]*pb.NodeGroup)
-	s.nodeGroupSizes = make(map[string]int32)
-	s.nodes = make(map[string]*pb.ExternalGrpcNode)
-	s.nodeToNodeGroup = make(map[string]string)
-	s.instances = make(map[string][]*pb.Instance)
-	s.gpuTypes = make(map[string]*anypb.Any)
-	s.pricingData = make(map[string]float64)
-
-	logger.Info("Cleanup completed - mock data cleared")
 	return &pb.CleanupResponse{}, nil
 }
 
 // Refresh is called before every main loop and can be used to dynamically update cloud provider state
-func (s *MockCloudProviderServer) Refresh(ctx context.Context, req *pb.RefreshRequest) (*pb.RefreshResponse, error) {
+func (s *HomeClusterProviderServer) Refresh(ctx context.Context, req *pb.RefreshRequest) (*pb.RefreshResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("Refresh called")
 
@@ -321,22 +285,43 @@ func (s *MockCloudProviderServer) Refresh(ctx context.Context, req *pb.RefreshRe
 }
 
 // NodeGroupTargetSize returns the current target size of the node group
-func (s *MockCloudProviderServer) NodeGroupTargetSize(ctx context.Context, req *pb.NodeGroupTargetSizeRequest) (*pb.NodeGroupTargetSizeResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupTargetSize(ctx context.Context, req *pb.NodeGroupTargetSizeRequest) (*pb.NodeGroupTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupTargetSize called", "nodeGroup", req.Id)
 
-	// Get nodes for this group using the new GetNodesForGroup method
-	nodeNames := s.groupStore.GetNodesForGroup(req.Id)
-	targetSize := int32(len(nodeNames))
+	// Check for context cancellation
+	if ctx.Err() != nil {
+		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
+	}
 
-	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id, "targetSize", targetSize)
+	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
+	listOpts := &client.ListOptions{LabelSelector: labelSelector}
+	nodes := &infrav1alpha1.NodeList{}
+	err := s.Client.List(ctx, nodes, listOpts)
+	if err != nil {
+		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
+	}
+
+	// Count nodes that should be running (target size = nodes not shutting down or shutdown)
+	// This represents the desired number of active nodes in the group
+	var targetSize int32 = 0
+	for _, node := range nodes.Items {
+		// Count nodes that are not in shutdown states
+		if node.Status.Progress != infrav1alpha1.ProgressShuttingDown &&
+		   node.Status.Progress != infrav1alpha1.ProgressShutdown {
+			targetSize++
+		}
+	}
+
+	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id, "targetSize", targetSize, "totalNodes", len(nodes.Items))
 	return &pb.NodeGroupTargetSizeResponse{
 		TargetSize: targetSize,
 	}, nil
 }
 
 // NodeGroupIncreaseSize increases the size of the node group by finding an unhealthy node and starting a new job
-func (s *MockCloudProviderServer) NodeGroupIncreaseSize(ctx context.Context, req *pb.NodeGroupIncreaseSizeRequest) (*pb.NodeGroupIncreaseSizeResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupIncreaseSize(ctx context.Context, req *pb.NodeGroupIncreaseSizeRequest) (*pb.NodeGroupIncreaseSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupIncreaseSize called", "nodeGroup", req.Id, "delta", req.Delta)
 
@@ -350,173 +335,56 @@ func (s *MockCloudProviderServer) NodeGroupIncreaseSize(ctx context.Context, req
 		return nil, status.Errorf(codes.InvalidArgument, "delta must be positive, got %d", req.Delta)
 	}
 
-	// Get the group from GroupStore
-	_, err := s.groupStore.Get(req.Id)
+	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
+	listOpts := &client.ListOptions{LabelSelector: labelSelector}
+	nodes := &infrav1alpha1.NodeList{}
+	err := s.Client.List(ctx, nodes, listOpts)
 	if err != nil {
-		logger.Error(err, "failed to get group from GroupStore", "group", req.Id)
-		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
-	}
-
-	// Get all nodes for this group from the nodeToGroupMap
-	kubernetesNodeNames := s.groupStore.GetNodesForGroup(req.Id)
-	if len(kubernetesNodeNames) == 0 {
-		return nil, status.Errorf(codes.NotFound, "no nodes found for group %s", req.Id)
+		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
 	}
 
 	// Find an unhealthy node
-	var unhealthyNode *infrav1alpha1.Node
-	var unhealthyNodeName string
+	var node *infrav1alpha1.Node
+	var nodeName string
 
-	for _, k8sNodeName := range kubernetesNodeNames {
-		// Get the health status from healthcheckMap using the Kubernetes node name
-		healthStatus, exists := s.groupStore.GetNodeHealthcheckStatus(req.Id, k8sNodeName)
-		if !exists {
-			logger.Info("No health status found for node, treating as unknown", "k8sNode", k8sNodeName)
-			healthStatus = "unknown"
-		}
+	for _, nodeCR := range nodes.Items {
+		powerState := nodeCR.Status.PowerState
+		progress := nodeCR.Status.Progress
 
-		// Check if node is unhealthy (offline or unknown)
-		if healthStatus == "offline" || healthStatus == "unknown" {
-			// Find the Node CR that corresponds to this Kubernetes node name
-			// We need to iterate through all nodes to find the one with matching KubernetesNodeName
-			nodes, err := s.groupStore.ListNode()
-			if err != nil {
-				logger.Error(err, "Failed to list nodes from groupstore")
-				continue
-			}
-
-			for _, node := range nodes {
-				if node.Spec.KubernetesNodeName == k8sNodeName {
-					unhealthyNode = node
-					unhealthyNodeName = node.Name
-					break
-				}
-			}
-
-			if unhealthyNode != nil {
-				break
-			}
+		if powerState == infrav1alpha1.PowerStateOff && progress == infrav1alpha1.ProgressShutdown {
+			node = &nodeCR
+			nodeName = nodeCR.Name
+			break
 		}
 	}
 
-	if unhealthyNode == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "no unhealthy nodes found in group %s", req.Id)
+	if node == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "no powered off nodes found in group %s", req.Id)
 	}
 
-	logger.Info("Found unhealthy node, starting job", "node", unhealthyNodeName, "group", req.Id)
+	logger.Info("Found powered off node, setting desired state", "node", nodeName, "group", req.Id)
 
-	// Get the Kubernetes node object and set it as schedulable
-	k8sNode := &corev1.Node{}
-	if err := s.Client.Get(ctx, client.ObjectKey{Name: unhealthyNode.Spec.KubernetesNodeName}, k8sNode); err != nil {
-		logger.Error(err, "failed to get Kubernetes node", "nodeName", unhealthyNode.Spec.KubernetesNodeName)
-		return nil, status.Errorf(codes.Internal, "failed to get Kubernetes node %s: %v", unhealthyNode.Spec.KubernetesNodeName, err)
+	node.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+
+	if err := s.Client.Update(ctx, node); err != nil {
+		logger.Error(err, "failed to update node DesiredPowerState", "node", nodeName)
+		return nil, status.Errorf(codes.Internal, "failed to update node %s DesiredPowerState to on: %v", nodeName, err)
 	}
 
-	// Set the node as schedulable
-	k8sNode.Spec.Unschedulable = false
-	if err := s.Client.Update(ctx, k8sNode); err != nil {
-		logger.Error(err, "failed to mark Kubernetes node as schedulable", "nodeName", unhealthyNode.Spec.KubernetesNodeName)
-		return nil, status.Errorf(codes.Internal, "failed to mark node %s as schedulable: %v", unhealthyNode.Spec.KubernetesNodeName, err)
-	}
-
-	logger.Info("Successfully marked Kubernetes node as schedulable", "nodeName", unhealthyNode.Spec.KubernetesNodeName)
-
-	// Create a Job to start the unhealthy node
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-startup-%s", unhealthyNode.Name, fmt.Sprintf("%d", metav1.Now().Unix())),
-			Namespace: unhealthyNode.Namespace,
-			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"group": req.Id,
-				"node":  unhealthyNode.Spec.KubernetesNodeName,
-				"type":  "startup",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"group": req.Id,
-						"node":  unhealthyNode.Spec.KubernetesNodeName,
-						"type":  "startup",
-					},
-				},
-				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
-					Containers: []corev1.Container{
-						{
-							Name:    "startup",
-							Image:   unhealthyNode.Spec.StartupPodSpec.Image,
-							Command: unhealthyNode.Spec.StartupPodSpec.Command,
-							Args:    unhealthyNode.Spec.StartupPodSpec.Args,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// Set owner reference to the Node CR
-	if err := ctrl.SetControllerReference(unhealthyNode, job, s.Scheme); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to set controller reference for job: %v", err)
-	}
-
-	// Create the Job
-	if err := s.Client.Create(ctx, job); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create startup job: %v", err)
-	}
-
-	logger.Info("Successfully created startup job", "job", job.Name, "node", unhealthyNodeName)
-
-	// Update the Node status condition to "progressing"
-	unhealthyNode.Status.Conditions = []metav1.Condition{
-		{
-			Type:               "progressing",
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "NodeGroupIncreaseSize",
-			Message:            fmt.Sprintf("Starting node via job %s", job.Name),
-		},
-	}
-
-	// Update the Node status
-	if err := s.Client.Status().Update(ctx, unhealthyNode); err != nil {
-		logger.Error(err, "Failed to update node status", "node", unhealthyNodeName)
-		// Don't fail the entire operation if status update fails
-	}
-
-	logger.Info("Successfully updated node status to progressing", "node", unhealthyNodeName)
+	logger.Info("Successfully updated node DesiredPowerState to PowerStateOn", "node", nodeName)
 
 	return &pb.NodeGroupIncreaseSizeResponse{}, nil
 }
 
 // NodeGroupDeleteNodes deletes nodes from this node group
-func (s *MockCloudProviderServer) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDeleteNodesRequest) (*pb.NodeGroupDeleteNodesResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDeleteNodesRequest) (*pb.NodeGroupDeleteNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDeleteNodes called", "nodeGroup", req.Id, "nodes", len(req.Nodes))
 
 	// Check for context cancellation
 	if ctx.Err() != nil {
 		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
-	}
-
-	// Get the group to check if it exists
-	_, err := s.groupStore.Get(req.Id)
-	if err != nil {
-		logger.Error(err, "failed to get group from GroupStore", "group", req.Id)
-		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
-	}
-
-	// Get current node count
-	currentNodes := s.groupStore.GetNodesForGroup(req.Id)
-	currentSize := int32(len(currentNodes))
-
-	// Check if we're trying to delete more nodes than exist
-	if int32(len(req.Nodes)) > currentSize {
-		logger.Info("Attempting to delete more nodes than exist", "nodeGroup", req.Id, "requested", len(req.Nodes), "current", currentSize)
-		return nil, status.Errorf(codes.InvalidArgument, "cannot delete %d nodes when only %d exist", len(req.Nodes), currentSize)
 	}
 
 	// Process each node to be deleted
@@ -527,82 +395,21 @@ func (s *MockCloudProviderServer) NodeGroupDeleteNodes(ctx context.Context, req 
 		}
 
 		// Get the Node CR from the GroupStore
-		nodeCR, err := s.groupStore.GetNode(node.Name)
+		nodeCR := &infrav1alpha1.Node{}
+		err := s.Client.Get(ctx, client.ObjectKey{Name: node.Name}, nodeCR)
 		if err != nil {
-			logger.Error(err, "failed to get node from GroupStore", "node", node.Name)
+			logger.Error(err, "failed to get nodeCR", "node", node.Name)
 			return nil, status.Errorf(codes.Internal, "failed to get node %s: %v", node.Name, err)
 		}
 
 		logger.Info("Found node to delete", "node", node.Name, "group", req.Id)
+		nodeCR.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
 
-		// Mark the Kubernetes node as not schedulable before starting shutdown
-		k8sNode := &corev1.Node{}
-		if err := s.Client.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
-			logger.Error(err, "failed to get Kubernetes node", "nodeName", nodeCR.Spec.KubernetesNodeName)
-			return nil, status.Errorf(codes.Internal, "failed to get Kubernetes node %s: %v", nodeCR.Spec.KubernetesNodeName, err)
+		if err := s.Client.Update(ctx, nodeCR); err != nil {
+			logger.Error(err, "failed to update node DesiredPowerState", "node", node.Name)
+			return nil, status.Errorf(codes.Internal, "failed to update node %s DesiredPowerState to off: %v", node.Name, err)
 		}
 
-		// Mark the node as unschedulable
-		k8sNode.Spec.Unschedulable = true
-		if err := s.Client.Update(ctx, k8sNode); err != nil {
-			logger.Error(err, "failed to mark Kubernetes node as unschedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
-			return nil, status.Errorf(codes.Internal, "failed to mark node %s as unschedulable: %v", nodeCR.Spec.KubernetesNodeName, err)
-		}
-
-		logger.Info("Successfully marked Kubernetes node as unschedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
-
-		// Create a Job to shutdown the node
-		job := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("%s-shutdown-%s", nodeCR.Name, fmt.Sprintf("%d", metav1.Now().Unix())),
-				Namespace: nodeCR.Namespace,
-				Labels: map[string]string{
-					"app":   "homelab-autoscaler",
-					"group": req.Id,
-					"node":  nodeCR.Spec.KubernetesNodeName,
-					"type":  "shutdown",
-				},
-			},
-			Spec: batchv1.JobSpec{
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: map[string]string{
-							"app":   "homelab-autoscaler",
-							"group": req.Id,
-							"node":  nodeCR.Spec.KubernetesNodeName,
-							"type":  "shutdown",
-						},
-					},
-					Spec: corev1.PodSpec{
-						RestartPolicy: corev1.RestartPolicyOnFailure,
-						Containers: []corev1.Container{
-							{
-								Name:    "shutdown",
-								Image:   nodeCR.Spec.ShutdownPodSpec.Image,
-								Command: nodeCR.Spec.ShutdownPodSpec.Command,
-								Args:    nodeCR.Spec.ShutdownPodSpec.Args,
-							},
-						},
-					},
-				},
-			},
-		}
-
-		// Set owner reference to the Node CR
-		if err := ctrl.SetControllerReference(nodeCR, job, s.Scheme); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to set controller reference for shutdown job: %v", err)
-		}
-
-		// Create the Job
-		if err := s.Client.Create(ctx, job); err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to create shutdown job: %v", err)
-		}
-
-		logger.Info("Successfully created shutdown job", "job", job.Name, "node", node.Name)
-
-		// Note: The Node status condition update to "terminating" should be handled by the node controller
-		// via the SetNodeConditionTerminatingForShutdown method. The gRPC server should not directly
-		// update node status to avoid conflicts with the controller's reconciliation loop.
 	}
 
 	logger.Info("NodeGroupDeleteNodes completed successfully", "nodeGroup", req.Id, "nodesDeleted", len(req.Nodes))
@@ -610,48 +417,115 @@ func (s *MockCloudProviderServer) NodeGroupDeleteNodes(ctx context.Context, req 
 }
 
 // NodeGroupDecreaseTargetSize decreases the target size of the node group
-func (s *MockCloudProviderServer) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.NodeGroupDecreaseTargetSizeRequest) (*pb.NodeGroupDecreaseTargetSizeResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.NodeGroupDecreaseTargetSizeRequest) (*pb.NodeGroupDecreaseTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDecreaseTargetSize called", "nodeGroup", req.Id, "delta", req.Delta)
 
-	// Check if the group exists
-	_, err := s.groupStore.Get(req.Id)
-	if err != nil {
-		logger.Error(err, "failed to get group from GroupStore", "group", req.Id)
-		return nil, status.Errorf(codes.NotFound, "node group %s not found", req.Id)
+	// Check for context cancellation
+	if ctx.Err() != nil {
+		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
 	}
 
+	// Validate delta is negative
 	if req.Delta >= 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "delta must be negative, got %d", req.Delta)
 	}
 
-	// Get current node count
-	currentNodes := s.groupStore.GetNodesForGroup(req.Id)
-	currentSize := int32(len(currentNodes))
-	newSize := currentSize + req.Delta // req.Delta is negative
-
-	if newSize < 0 {
-		newSize = 0
+	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
+	listOpts := &client.ListOptions{LabelSelector: labelSelector}
+	nodes := &infrav1alpha1.NodeList{}
+	err := s.Client.List(ctx, nodes, listOpts)
+	if err != nil {
+		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
 	}
 
-	logger.Info("NodeGroupDecreaseTargetSize would decrease target size", "nodeGroup", req.Id, "currentSize", currentSize, "newSize", newSize, "delta", req.Delta)
+	// Separate nodes by their current state
+	var poweredOnNodes []infrav1alpha1.Node
+	var startingUpNodes []infrav1alpha1.Node
+
+	for _, node := range nodes.Items {
+		if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
+			node.Status.PowerState == infrav1alpha1.PowerStateOn &&
+			node.Status.Progress == infrav1alpha1.ProgressReady {
+			poweredOnNodes = append(poweredOnNodes, node)
+		} else if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
+			node.Status.PowerState == infrav1alpha1.PowerStateOff &&
+			node.Status.Progress == infrav1alpha1.ProgressStartingUp {
+			startingUpNodes = append(startingUpNodes, node)
+		}
+	}
+
+	currentSize := int32(len(poweredOnNodes) + len(startingUpNodes))
+	newDesiredSize := int32(len(poweredOnNodes)) + req.Delta // req.Delta is negative
+
+	if newDesiredSize < 0 {
+		newDesiredSize = 0
+	}
+
+	// Sort starting up nodes by last startup time (oldest first)
+	sort.Slice(startingUpNodes, func(i, j int) bool {
+		if startingUpNodes[i].Status.LastStartupTime == nil {
+			return false
+		}
+		if startingUpNodes[j].Status.LastStartupTime == nil {
+			return true
+		}
+		return startingUpNodes[i].Status.LastStartupTime.Before(startingUpNodes[j].Status.LastStartupTime)
+	})
+
+	// Calculate how many starting up nodes to shut down
+	nodesToShutdown := int32(len(startingUpNodes)) - newDesiredSize
+	if nodesToShutdown < 0 {
+		nodesToShutdown = 0
+	}
+
+	// Shut down the required number of starting up nodes
+	for i := 0; i < int(nodesToShutdown) && i < len(startingUpNodes); i++ {
+		node := &startingUpNodes[i]
+		
+		// Update spec (desired state)
+		node.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
+		if err := s.Client.Update(ctx, node); err != nil {
+			logger.Error(err, "failed to update node spec", "node", node.Name)
+			return nil, status.Errorf(codes.Internal, "failed to update node %s spec: %v", node.Name, err)
+		}
+
+		// Update status separately
+		node.Status.Progress = infrav1alpha1.ProgressShuttingDown
+		if err := s.Client.Status().Update(ctx, node); err != nil {
+			logger.Error(err, "failed to update node status", "node", node.Name)
+			return nil, status.Errorf(codes.Internal, "failed to update node %s status: %v", node.Name, err)
+		}
+
+		logger.Info("Successfully marked node for shutdown", "node", node.Name, "group", req.Id)
+	}
+
+	logger.Info("NodeGroupDecreaseTargetSize completed", "nodeGroup", req.Id, "currentSize", currentSize, "newSize", newDesiredSize, "delta", req.Delta, "nodesShutdown", nodesToShutdown)
 
 	return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 }
 
 // NodeGroupNodes returns a list of all nodes that belong to this node group
-func (s *MockCloudProviderServer) NodeGroupNodes(ctx context.Context, req *pb.NodeGroupNodesRequest) (*pb.NodeGroupNodesResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.NodeGroupNodesRequest) (*pb.NodeGroupNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupNodes called", "nodeGroup", req.Id)
 
-	// Get nodes for this group using the new GetNodesForGroup method
-	nodeNames := s.groupStore.GetNodesForGroup(req.Id)
+	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
+	listOpts := &client.ListOptions{LabelSelector: labelSelector}
+	nodes := &infrav1alpha1.NodeList{}
+	err := s.Client.List(ctx, nodes, listOpts)
+	if err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			return nil, status.Errorf(codes.InvalidArgument, "group not found: %s", req.Id)
+		}
+	}
 
-	// Convert node names to instances
-	instances := make([]*pb.Instance, 0, len(nodeNames))
-	for _, nodeName := range nodeNames {
+	// Convert nodes to instances
+	instances := make([]*pb.Instance, 0, len(nodes.Items))
+	for _, node := range nodes.Items {
 		instance := &pb.Instance{
-			Id: nodeName,
+			Id: node.Name,
 			Status: &pb.InstanceStatus{
 				InstanceState: pb.InstanceStatus_instanceRunning,
 				ErrorInfo: &pb.InstanceErrorInfo{
@@ -669,20 +543,132 @@ func (s *MockCloudProviderServer) NodeGroupNodes(ctx context.Context, req *pb.No
 	}, nil
 }
 
-// NodeGroupTemplateNodeInfo returns a structure of an empty node
-func (s *MockCloudProviderServer) NodeGroupTemplateNodeInfo(ctx context.Context, req *pb.NodeGroupTemplateNodeInfoRequest) (*pb.NodeGroupTemplateNodeInfoResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Context, req *pb.NodeGroupTemplateNodeInfoRequest) (*pb.NodeGroupTemplateNodeInfoResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupTemplateNodeInfo called", "nodeGroup", req.Id)
 
-	// This is an optional method - return Unimplemented
-	return nil, status.Errorf(codes.Unimplemented, "NodeGroupTemplateNodeInfo not implemented")
+	// Get nodes from this group
+	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
+	listOpts := &client.ListOptions{LabelSelector: labelSelector}
+	nodes := &infrav1alpha1.NodeList{}
+	err := s.Client.List(ctx, nodes, listOpts)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list nodes: %v", err)
+	}
+
+	if len(nodes.Items) == 0 {
+		// No nodes in group - return nil (valid response for scale-from-zero)
+		return &pb.NodeGroupTemplateNodeInfoResponse{
+			NodeInfo: nil,
+		}, nil
+	}
+
+	// Find a representative node (prefer powered off nodes)
+	var representativeNodeCR *infrav1alpha1.Node
+	for i := range nodes.Items {
+		if nodes.Items[i].Status.PowerState == infrav1alpha1.PowerStateOff {
+			representativeNodeCR = &nodes.Items[i]
+			break
+		}
+	}
+	if representativeNodeCR == nil {
+		// No powered on nodes, use first node
+		representativeNodeCR = &nodes.Items[0]
+	}
+
+	// Get the corresponding Kubernetes node
+	k8sNode := &corev1.Node{}
+	err = s.Client.Get(ctx, client.ObjectKey{Name: representativeNodeCR.Name}, k8sNode)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get kubernetes node: %v", err)
+	}
+
+	// Create template node by copying the representative node
+	templateNode := k8sNode.DeepCopy()
+
+	// Generate a unique template name
+	templateNode.Name = fmt.Sprintf("%s-template-%d", req.Id, time.Now().Unix())
+	templateNode.UID = ""
+	templateNode.ResourceVersion = ""
+
+	// Remove node-specific labels that shouldn't be in template
+	delete(templateNode.Labels, "kubernetes.io/hostname")
+
+	// Set Ready conditions (remove NotReady status)
+	templateNode.Status.Conditions = []corev1.NodeCondition{
+		{
+			Type:    corev1.NodeReady,
+			Status:  corev1.ConditionTrue,
+			Reason:  "KubeletReady",
+			Message: "kubelet is posting ready status",
+		},
+		{
+			Type:   corev1.NodeMemoryPressure,
+			Status: corev1.ConditionFalse,
+			Reason: "KubeletHasSufficientMemory",
+		},
+		{
+			Type:   corev1.NodeDiskPressure,
+			Status: corev1.ConditionFalse,
+			Reason: "KubeletHasNoDiskPressure",
+		},
+		{
+			Type:   corev1.NodePIDPressure,
+			Status: corev1.ConditionFalse,
+			Reason: "KubeletHasSufficientPID",
+		},
+		{
+			Type:   corev1.NodeNetworkUnavailable,
+			Status: corev1.ConditionFalse,
+			Reason: "RouteCreated",
+		},
+	}
+
+	// Remove unschedulable taints
+	var sanitizedTaints []corev1.Taint
+	for _, taint := range templateNode.Spec.Taints {
+		// Filter out common unschedulable taints
+		if taint.Key == "node.kubernetes.io/unschedulable" ||
+			taint.Key == "node.kubernetes.io/not-ready" ||
+			taint.Key == "node.kubernetes.io/unreachable" ||
+			taint.Key == "ToBeDeletedByClusterAutoscaler" {
+			continue
+		}
+		sanitizedTaints = append(sanitizedTaints, taint)
+	}
+	templateNode.Spec.Taints = sanitizedTaints
+
+	// Ensure node is schedulable
+	templateNode.Spec.Unschedulable = false
+
+	return &pb.NodeGroupTemplateNodeInfoResponse{
+		NodeInfo: templateNode,
+	}, nil
 }
 
 // NodeGroupGetOptions returns NodeGroupAutoscalingOptions for the node group
-func (s *MockCloudProviderServer) NodeGroupGetOptions(ctx context.Context, req *pb.NodeGroupAutoscalingOptionsRequest) (*pb.NodeGroupAutoscalingOptionsResponse, error) {
+func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req *pb.NodeGroupAutoscalingOptionsRequest) (*pb.NodeGroupAutoscalingOptionsResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupGetOptions called", "nodeGroup", req.Id)
 
-	// This is an optional method - return Unimplemented
-	return nil, status.Errorf(codes.Unimplemented, "NodeGroupGetOptions not implemented")
+	group := &infrav1alpha1.Group{}
+	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Id}, group)
+	if err != nil {
+		// Node not found in any group, return empty string
+		logger.Info("Group not found", "group", req.Id)
+		return &pb.NodeGroupAutoscalingOptionsResponse{}, nil
+
+	}
+
+	return &pb.NodeGroupAutoscalingOptionsResponse{
+		NodeGroupAutoscalingOptions: &pb.NodeGroupAutoscalingOptions{
+			ScaleDownUtilizationThreshold:    group.Spec.ScaleDownUtilizationThreshold,
+			ScaleDownGpuUtilizationThreshold: group.Spec.ScaleDownGpuUtilizationThreshold,
+			ScaleDownUnneededTime:            group.Spec.ScaleDownUnneededTime,
+			ScaleDownUnreadyTime:             group.Spec.ScaleDownUnreadyTime,
+			MaxNodeProvisionTime:             group.Spec.MaxNodeProvisionTime,
+			ZeroOrMaxNodeScaling:             group.Spec.ZeroOrMaxNodeScaling,
+			IgnoreDaemonSetsUtilization:      group.Spec.IgnoreDaemonSetsUtilization,
+		},
+	}, nil
 }

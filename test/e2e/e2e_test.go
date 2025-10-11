@@ -327,7 +327,7 @@ var _ = Describe("Manager", Ordered, func() {
 			verifyCronJobsContainers := func(g Gomega) {
 				// Get group1-worker-node-1-healthcheck cronjob container details
 				cronjobName1 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker")
-				
+
 				// Verify container image
 				cmd := exec.Command("kubectl", "get", "cronjob", cronjobName1, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
 				output, err := utils.Run(cmd)
@@ -342,7 +342,7 @@ var _ = Describe("Manager", Ordered, func() {
 
 				// Verify group1-worker-node-2-healthcheck cronjob container details
 				cronjobName2 := generateExpectedCronJobName("group1", "homelab-autoscaler-test-e2e-worker2")
-				
+
 				// Verify container image
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName2, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
 				output, err = utils.Run(cmd)
@@ -357,7 +357,7 @@ var _ = Describe("Manager", Ordered, func() {
 
 				// Verify group2-worker-node-3-healthcheck cronjob container details
 				cronjobName3 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker3")
-				
+
 				// Verify container image
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName3, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
 				output, err = utils.Run(cmd)
@@ -372,7 +372,7 @@ var _ = Describe("Manager", Ordered, func() {
 
 				// Verify group2-worker-node-4-healthcheck cronjob container details
 				cronjobName4 := generateExpectedCronJobName("group2", "homelab-autoscaler-test-e2e-worker4")
-				
+
 				// Verify container image
 				cmd = exec.Command("kubectl", "get", "cronjob", cronjobName4, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].image}", "-n", namespace)
 				output, err = utils.Run(cmd)
@@ -423,6 +423,30 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("group2-worker-node-4"), fmt.Sprintf("%s does not have group2-worker-node-4 as owner reference", cronjobName4))
 			}
 			Eventually(verifyCronJobsLabels).Should(Succeed())
+		})
+
+		It("should provisioned cert-manager", func() {
+			By("validating that cert-manager has the certificate Secret")
+			verifyCertManager := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "secrets", "webhook-server-cert", "-n", namespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+			Eventually(verifyCertManager).Should(Succeed())
+		})
+
+		It("should have CA injection for validating webhooks", func() {
+			By("checking CA injection for validating webhooks")
+			verifyCAInjection := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get",
+					"validatingwebhookconfigurations.admissionregistration.k8s.io",
+					"homelab-autoscaler-validating-webhook-configuration",
+					"-o", "go-template={{ range .webhooks }}{{ .clientConfig.caBundle }}{{ end }}")
+				vwhOutput, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(len(vwhOutput)).To(BeNumerically(">", 10))
+			}
+			Eventually(verifyCAInjection).Should(Succeed())
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks

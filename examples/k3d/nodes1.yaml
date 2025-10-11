@@ -1,0 +1,22 @@
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: group1-worker-node-1
+  labels:
+    group: group1
+spec:
+  kubernetesNodeName: k3d-homelab-autoscaler-agent-0
+  startupPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-0
+  shutdownPodSpec:
+    image: busybox:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-0
