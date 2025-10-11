@@ -47,7 +47,7 @@ spec:
           - --health-probe-bind-address=:8081
           - --enable-grpc-server=true
           - --grpc-server-address=:50051
-        image: controller:latest
+        image: homeclusterdev/homelabautoscaler-controller:latest
         imagePullPolicy: Never
         name: manager
         ports:
