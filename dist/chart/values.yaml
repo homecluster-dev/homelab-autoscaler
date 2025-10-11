@@ -3,7 +3,7 @@ controllerManager:
   replicas: 1
   container:
     image:
-      repository: controller
+      repository: homeclusterdev/homelabautoscaler-controller
       tag: latest
     imagePullPolicy: IfNotPresent
     args:
