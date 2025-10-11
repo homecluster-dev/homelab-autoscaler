@@ -3,7 +3,7 @@
 > ⚠️ **CRITICAL WARNING: NOT PRODUCTION READY** ⚠️
 > 
 > This system contains critical bugs and missing functionality. Do NOT use in production environments.
-> See [Known Issues](troubleshooting/known-issues.md) for details.
+> See [Known Issues](docs/troubleshooting/known-issues.md) for details.
 
 ## Overview
 
