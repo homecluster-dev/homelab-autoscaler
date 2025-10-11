@@ -7,6 +7,8 @@ domain: homecluster.dev
 layout:
 - go.kubebuilder.io/v4
 multigroup: true
+plugins:
+  helm.kubebuilder.io/v1-alpha: {}
 projectName: homelab-autoscaler
 repo: github.com/homecluster-dev/homelab-autoscaler
 resources:

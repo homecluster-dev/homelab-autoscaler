@@ -39,6 +39,10 @@ spec:
           spec:
             description: spec defines the desired state of Group
             properties:
+              ignoreDaemonSetsUtilization:
+                type: boolean
+              maxNodeProvisionTime:
+                type: string
               maxSize:
                 type: integer
               name:
@@ -47,23 +51,27 @@ spec:
                 additionalProperties:
                   type: string
                 type: object
-              pricing:
-                properties:
-                  hourlyRate:
-                    pattern: ^[0-9]+(\.[0-9]+)?$
-                    type: string
-                  monthlyRate:
-                    pattern: ^[0-9]+(\.[0-9]+)?$
-                    type: string
-                required:
-                - hourlyRate
-                - monthlyRate
-                type: object
+              scaleDownGpuUtilizationThreshold:
+                type: string
+              scaleDownUnneededTime:
+                type: string
+              scaleDownUnreadyTime:
+                type: string
+              scaleDownUtilizationThreshold:
+                type: string
+              zeroOrMaxNodeScaling:
+                type: boolean
             required:
+            - ignoreDaemonSetsUtilization
+            - maxNodeProvisionTime
             - maxSize
             - name
             - nodeSelector
-            - pricing
+            - scaleDownGpuUtilizationThreshold
+            - scaleDownUnneededTime
+            - scaleDownUnreadyTime
+            - scaleDownUtilizationThreshold
+            - zeroOrMaxNodeScaling
             type: object
           status:
             description: status defines the observed state of Group
