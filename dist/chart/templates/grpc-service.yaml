@@ -1,0 +1,20 @@
+{{- if .Values.grpcService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+    control-plane: controller-manager
+  name: {{ include "chart.name" . }}-grpc-service
+  namespace: {{ .Release.Namespace }}
+spec:
+  ports:
+  - name: grpc
+    port: {{ .Values.grpcService.port }}
+    protocol: TCP
+    targetPort: {{ .Values.grpcService.port }}
+  selector:
+    {{- include "chart.selectorLabels" . | nindent 4 }}
+    control-plane: controller-manager
+  type: {{ .Values.grpcService.type }}
+{{- end }}

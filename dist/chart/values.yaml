@@ -82,3 +82,82 @@ certmanager:
 # [NETWORK POLICIES]: To enable NetworkPolicies set true
 networkPolicy:
   enable: false
+
+# [GRPC SERVICE]: gRPC service configuration (always available for cluster autoscaler)
+grpcService:
+  enabled: true
+  type: ClusterIP
+  port: 50051
+
+# [CLUSTER AUTOSCALER]: Cluster autoscaler integration (optional, disabled by default)
+clusterAutoscaler:
+  enabled: false
+  image:
+    repository: registry.k8s.io/autoscaling/cluster-autoscaler
+    tag: v1.28.2
+    pullPolicy: IfNotPresent
+  
+  # Node groups configuration - list of node groups to manage
+  nodeGroups: []
+  # Example:
+  # nodeGroups:
+  #   - name: worker-nodes
+  #     minSize: 1
+  #     maxSize: 10
+  #     desiredSize: 3
+  
+  # gRPC provider configuration
+  grpcProvider:
+    endpoint: "{{ include \"chart.name\" . }}-grpc-service:50051"
+  
+  # Scaling policies
+  scaleDownDelay: "10m"
+  scaleDownUnneededTime: "10m"
+  scaleDownUtilizationThreshold: 0.5
+  skipNodesWithLocalStorage: true
+  skipNodesWithSystemPods: true
+  
+  # Additional cluster autoscaler arguments
+  extraArgs: []
+  # Example:
+  # extraArgs:
+  #   - --balance-similar-node-groups
+  #   - --skip-nodes-with-local-storage=false
+  
+  # Resource limits and requests
+  resources:
+    limits:
+      cpu: 100m
+      memory: 300Mi
+    requests:
+      cpu: 100m
+      memory: 300Mi
+  
+  # Security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+  
+  # Pod security context
+  podSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - "ALL"
+    readOnlyRootFilesystem: true
+  
+  # Service account configuration
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  
+  # Node selector, tolerations, and affinity
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  
+  # Pod annotations and labels
+  podAnnotations: {}
+  podLabels: {}

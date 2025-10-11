@@ -1,0 +1,85 @@
+{{- if .Values.clusterAutoscaler.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "chart.name" . }}-cluster-autoscaler
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "chart.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: cluster-autoscaler
+  template:
+    metadata:
+      labels:
+        {{- include "chart.labels" . | nindent 8 }}
+        app.kubernetes.io/component: cluster-autoscaler
+        {{- with .Values.clusterAutoscaler.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.clusterAutoscaler.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "chart.name" . }}-cluster-autoscaler
+      securityContext:
+        {{- toYaml .Values.clusterAutoscaler.securityContext | nindent 8 }}
+      containers:
+      - name: cluster-autoscaler
+        image: {{ .Values.clusterAutoscaler.image.repository }}:{{ .Values.clusterAutoscaler.image.tag }}
+        imagePullPolicy: {{ .Values.clusterAutoscaler.image.pullPolicy }}
+        command:
+        - ./cluster-autoscaler
+        args:
+        - --v=4
+        - --stderrthreshold=info
+        - --cloud-provider=externalgrpc
+        - --cloud-config=/etc/cluster-autoscaler/config.yaml
+        - --scale-down-delay-after-add={{ .Values.clusterAutoscaler.scaleDownDelay }}
+        - --scale-down-unneeded-time={{ .Values.clusterAutoscaler.scaleDownUnneededTime }}
+        - --scale-down-utilization-threshold={{ .Values.clusterAutoscaler.scaleDownUtilizationThreshold }}
+        {{- if .Values.clusterAutoscaler.skipNodesWithLocalStorage }}
+        - --skip-nodes-with-local-storage=true
+        {{- end }}
+        {{- if .Values.clusterAutoscaler.skipNodesWithSystemPods }}
+        - --skip-nodes-with-system-pods=true
+        {{- end }}
+        {{- range .Values.clusterAutoscaler.nodeGroups }}
+        - --nodes={{ .minSize }}:{{ .maxSize }}:{{ .name }}
+        {{- end }}
+        {{- range .Values.clusterAutoscaler.extraArgs }}
+        - {{ . }}
+        {{- end }}
+        env:
+        - name: GRPC_PROVIDER_ENDPOINT
+          value: {{ .Values.clusterAutoscaler.grpcProvider.endpoint | quote }}
+        resources:
+          {{- toYaml .Values.clusterAutoscaler.resources | nindent 10 }}
+        securityContext:
+          {{- toYaml .Values.clusterAutoscaler.podSecurityContext | nindent 10 }}
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cluster-autoscaler
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: {{ include "chart.name" . }}-cluster-autoscaler-config
+      {{- with .Values.clusterAutoscaler.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.clusterAutoscaler.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.clusterAutoscaler.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

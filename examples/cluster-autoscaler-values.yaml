@@ -1,0 +1,157 @@
+# Example configuration for homelab-autoscaler with cluster autoscaler integration
+# This file demonstrates how to configure the homelab-autoscaler Helm chart
+# with cluster autoscaler enabled for automatic node scaling.
+
+# Enable cluster autoscaler integration
+clusterAutoscaler:
+  enabled: true
+  
+  # Cluster autoscaler image configuration
+  image:
+    repository: registry.k8s.io/autoscaling/cluster-autoscaler
+    tag: v1.28.2
+    pullPolicy: IfNotPresent
+  
+  # Node groups configuration - define your node groups here
+  # Each node group represents a scalable pool of nodes
+  nodeGroups:
+    - name: worker-nodes
+      minSize: 1
+      maxSize: 10
+      desiredSize: 3
+    - name: gpu-nodes
+      minSize: 0
+      maxSize: 5
+      desiredSize: 1
+    - name: memory-optimized
+      minSize: 0
+      maxSize: 3
+      desiredSize: 0
+  
+  # gRPC provider configuration (automatically configured to use the homelab-autoscaler gRPC service)
+  grpcProvider:
+    endpoint: "homelab-autoscaler-grpc-service:50051"
+  
+  # Scaling policies - fine-tune autoscaling behavior
+  scaleDownDelay: "10m"                    # Wait time after scale up before considering scale down
+  scaleDownUnneededTime: "10m"             # How long a node should be unneeded before it is eligible for scale down
+  scaleDownUtilizationThreshold: 0.5       # Node utilization level below which a node can be considered for scale down
+  skipNodesWithLocalStorage: true          # Skip nodes with local storage when scaling down
+  skipNodesWithSystemPods: true            # Skip nodes with system pods when scaling down
+  
+  # Additional cluster autoscaler arguments
+  extraArgs:
+    - --balance-similar-node-groups        # Balance similar node groups
+    - --skip-nodes-with-local-storage=false # Override local storage check if needed
+    - --max-node-provision-time=15m        # Maximum time to wait for node provisioning
+    - --scale-down-delay-after-failure=3m  # Delay after failed scale down
+  
+  # Resource limits and requests for cluster autoscaler pod
+  resources:
+    limits:
+      cpu: 200m
+      memory: 500Mi
+    requests:
+      cpu: 100m
+      memory: 300Mi
+  
+  # Security context for cluster autoscaler
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+  
+  # Pod security context
+  podSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - "ALL"
+    readOnlyRootFilesystem: true
+  
+  # Service account configuration
+  serviceAccount:
+    create: true
+    name: ""
+    annotations:
+      # Add any required annotations for your cloud provider
+      # eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/cluster-autoscaler
+  
+  # Node selector for cluster autoscaler pod placement
+  nodeSelector:
+    kubernetes.io/os: linux
+  
+  # Tolerations for cluster autoscaler pod
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+  
+  # Affinity rules for cluster autoscaler pod
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+  
+  # Pod annotations and labels
+  podAnnotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+  
+  podLabels:
+    app.kubernetes.io/component: cluster-autoscaler
+
+# Controller manager configuration
+controllerManager:
+  replicas: 1
+  container:
+    image:
+      repository: homeclusterdev/autoscaler
+      tag: latest
+    imagePullPolicy: IfNotPresent
+    args:
+      - "--leader-elect"
+      - "--metrics-bind-address=:8443"
+      - "--health-probe-bind-address=:8081"
+      - "--enable-grpc-server=true"  # Ensure gRPC server is enabled
+    resources:
+      limits:
+        cpu: 500m
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 64Mi
+
+# gRPC service configuration (required for cluster autoscaler)
+grpcService:
+  enabled: true
+  type: ClusterIP
+  port: 50051
+
+# Enable required components
+rbac:
+  enable: true
+
+crd:
+  enable: true
+  keep: true
+
+metrics:
+  enable: true
+
+webhook:
+  enable: true
+
+certmanager:
+  enable: true
+
+# Optional: Enable Prometheus monitoring
+prometheus:
+  enable: false
+
+# Optional: Enable network policies
+networkPolicy:
+  enable: false
