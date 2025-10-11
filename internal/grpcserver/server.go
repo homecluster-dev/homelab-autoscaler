@@ -229,7 +229,11 @@ func (s *HomeClusterProviderServer) PricingNodePrice(ctx context.Context, req *p
 		}, nil
 	}
 
-	price := node.Spec.Pricing.HourlyRate
+	price, err := strconv.ParseFloat(node.Spec.Pricing.HourlyRate, 64)
+	if err != nil {
+		logger.Info("error converting node.Spec.Pricing.HourlyRate", "node", node.Name, "HourlyRate", node.Spec.Pricing.HourlyRate)
+		price = 0
+	}
 
 	return &pb.PricingNodePriceResponse{
 		Price: price,
