@@ -29,5 +29,5 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/homelabautoscaler-controller:latest
-            ${{ secrets.DOCKER_USERNAME }}/homelabautoscaler-controller:${{ github.sha }}
+            ${{ secrets.DOCKER_USERNAME }}/autoscaler:latest
+            ${{ secrets.DOCKER_USERNAME }}/autoscaler:${{ github.sha }}
