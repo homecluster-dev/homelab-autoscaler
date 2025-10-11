@@ -55,6 +55,16 @@ spec:
                 - "on"
                 - "off"
                 type: string
+              pricing:
+                properties:
+                  hourlyRate:
+                    type: string
+                  podRate:
+                    type: string
+                required:
+                - hourlyRate
+                - podRate
+                type: object
               shutdownPodSpec:
                 properties:
                   args:
@@ -130,6 +140,7 @@ spec:
             required:
             - kubernetesNodeName
             - powerState
+            - pricing
             - shutdownPodSpec
             - startupPodSpec
             type: object

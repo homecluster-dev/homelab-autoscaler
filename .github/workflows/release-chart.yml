@@ -38,11 +38,6 @@ jobs:
       - name: Verify Kubebuilder installation
         run: kubebuilder version
 
-      - name: Regenerate Helm chart
-        run: |
-          make manifests
-          kubebuilder edit --plugins=helm/v1-alpha --force
-
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.6.0
         with:
