@@ -1,0 +1,42 @@
+name: Release Chart
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'dist/chart/**'
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Regenerate Helm chart
+        run: |
+          make manifests
+          kubebuilder edit --plugins=helm/v1-alpha --force
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          charts_dir: dist
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
