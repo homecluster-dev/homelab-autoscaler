@@ -33,8 +33,8 @@ type GroupSpec struct {
 	Name                             string            `json:"name"`
 	MaxSize                          int               `json:"maxSize"`
 	NodeSelector                     map[string]string `json:"nodeSelector"`
-	ScaleDownUtilizationThreshold    float64           `json:"scaleDownUtilizationThreshold"`
-	ScaleDownGpuUtilizationThreshold float64           `json:"scaleDownGpuUtilizationThreshold"`
+	ScaleDownUtilizationThreshold    string            `json:"scaleDownUtilizationThreshold"`
+	ScaleDownGpuUtilizationThreshold string            `json:"scaleDownGpuUtilizationThreshold"`
 	ScaleDownUnneededTime            *v1.Duration      `json:"scaleDownUnneededTime"`
 	ScaleDownUnreadyTime             *v1.Duration      `json:"scaleDownUnreadyTime"`
 	MaxNodeProvisionTime             *v1.Duration      `json:"maxNodeProvisionTime"`

@@ -15,7 +15,7 @@ jobs:
       - name: Create cluster
         run: |
           chmod +x create-cluster.sh
-          ./create-cluster.sh
+          ./examples/k3d/create-cluster.sh
       
       - name: Run tests
         run: |
@@ -26,4 +26,4 @@ jobs:
         if: always()
         run: |
           chmod +x delete-cluster.sh
-          ./delete-cluster.sh
+          ./examples/k3d/delete-cluster.sh
