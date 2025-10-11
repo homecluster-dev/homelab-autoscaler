@@ -47,10 +47,8 @@ type NodeSpec struct {
 }
 
 type PricingSpec struct {
-	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
-	HourlyRate float64 `json:"hourlyRate"`
-	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
-	PodRate float64 `json:"podRate"`
+	HourlyRate string `json:"hourlyRate"`
+	PodRate    string `json:"podRate"`
 }
 
 type MinimalPodSpec struct {
