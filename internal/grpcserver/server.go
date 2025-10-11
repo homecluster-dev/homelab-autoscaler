@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -309,7 +310,7 @@ func (s *HomeClusterProviderServer) NodeGroupTargetSize(ctx context.Context, req
 	for _, node := range nodes.Items {
 		// Count nodes that are not in shutdown states
 		if node.Status.Progress != infrav1alpha1.ProgressShuttingDown &&
-		   node.Status.Progress != infrav1alpha1.ProgressShutdown {
+			node.Status.Progress != infrav1alpha1.ProgressShutdown {
 			targetSize++
 		}
 	}
@@ -483,7 +484,7 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 	// Shut down the required number of starting up nodes
 	for i := 0; i < int(nodesToShutdown) && i < len(startingUpNodes); i++ {
 		node := &startingUpNodes[i]
-		
+
 		// Update spec (desired state)
 		node.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
 		if err := s.Client.Update(ctx, node); err != nil {
@@ -660,10 +661,22 @@ func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req
 
 	}
 
+	scaleDownUtilizationThreshold, err := strconv.ParseFloat(group.Spec.ScaleDownUtilizationThreshold, 64)
+	if err != nil {
+		logger.Info("error converting ScaleDownUtilizationThreshold", "group", group.Name, "ScaleDownUtilizationThreshold", group.Spec.ScaleDownUtilizationThreshold)
+		scaleDownUtilizationThreshold = 0
+	}
+
+	scaleDownGpuUtilizationThreshold, err := strconv.ParseFloat(group.Spec.ScaleDownGpuUtilizationThreshold, 64)
+	if err != nil {
+		logger.Info("error converting ScaleDownGpuUtilizationThreshold", "group", group.Name, "ScaleDownGpuUtilizationThreshold", group.Spec.ScaleDownGpuUtilizationThreshold)
+		scaleDownGpuUtilizationThreshold = 0
+	}
+
 	return &pb.NodeGroupAutoscalingOptionsResponse{
 		NodeGroupAutoscalingOptions: &pb.NodeGroupAutoscalingOptions{
-			ScaleDownUtilizationThreshold:    group.Spec.ScaleDownUtilizationThreshold,
-			ScaleDownGpuUtilizationThreshold: group.Spec.ScaleDownGpuUtilizationThreshold,
+			ScaleDownUtilizationThreshold:    scaleDownUtilizationThreshold,
+			ScaleDownGpuUtilizationThreshold: scaleDownGpuUtilizationThreshold,
 			ScaleDownUnneededTime:            group.Spec.ScaleDownUnneededTime,
 			ScaleDownUnreadyTime:             group.Spec.ScaleDownUnreadyTime,
 			MaxNodeProvisionTime:             group.Spec.MaxNodeProvisionTime,
