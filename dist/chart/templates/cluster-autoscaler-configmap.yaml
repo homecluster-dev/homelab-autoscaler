@@ -1,0 +1,40 @@
+{{- if .Values.clusterAutoscaler.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chart.name" . }}-cluster-autoscaler-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cluster-autoscaler
+data:
+  config.yaml: |
+    # Cluster autoscaler configuration for external gRPC provider
+    provider:
+      type: externalgrpc
+      grpc:
+        endpoint: {{ include "chart.name" . }}-grpc-service:50051
+        # Connection timeout in seconds
+        timeout: 30
+        # Enable TLS (set to false for internal cluster communication)
+        tls: false
+    
+    # Node group configurations
+    nodeGroups:
+    {{- range .Values.clusterAutoscaler.nodeGroups }}
+    - name: {{ .name | quote }}
+      minSize: {{ .minSize }}
+      maxSize: {{ .maxSize }}
+      {{- if .desiredSize }}
+      desiredSize: {{ .desiredSize }}
+      {{- end }}
+    {{- end }}
+    
+    # Scaling policies
+    scaling:
+      scaleDownDelay: {{ .Values.clusterAutoscaler.scaleDownDelay | quote }}
+      scaleDownUnneededTime: {{ .Values.clusterAutoscaler.scaleDownUnneededTime | quote }}
+      scaleDownUtilizationThreshold: {{ .Values.clusterAutoscaler.scaleDownUtilizationThreshold }}
+      skipNodesWithLocalStorage: {{ .Values.clusterAutoscaler.skipNodesWithLocalStorage }}
+      skipNodesWithSystemPods: {{ .Values.clusterAutoscaler.skipNodesWithSystemPods }}
+{{- end }}
