@@ -20,16 +20,12 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
-	"fmt"
 	"os"
-
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -37,11 +33,11 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	infrahomeclusterdevv1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/v1alpha1"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/controller"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/groupstore"
+	infrahomeclusterdevv1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	corecontroller "github.com/homecluster-dev/homelab-autoscaler/internal/controller/core"
+	controller "github.com/homecluster-dev/homelab-autoscaler/internal/controller/infra"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
-	// +kubebuilder:scaffold:imports
+	webhookinfrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/internal/webhook/infra/v1alpha1"
 )
 
 var (
@@ -187,33 +183,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create GroupStore for sharing between controller and gRPC server
-	groupStore := groupstore.NewGroupStore()
-	setupLog.Info("Created GroupStore instance", "groupStoreAddr", fmt.Sprintf("%p", groupStore))
-
 	if err := (&controller.GroupReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		GroupStore: groupStore,
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Group")
 		os.Exit(1)
 	}
 	if err := (&controller.NodeReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		GroupStore: groupStore,
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Node")
 		os.Exit(1)
 	}
-	if err := (&controller.CronJobReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		GroupStore: groupStore,
+	if err := (&corecontroller.KubernetesNodeReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CronJob")
+		setupLog.Error(err, "unable to create kubernetes node controller", "controller", "KubernetesNode")
 		os.Exit(1)
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookinfrav1alpha1.SetupNodeWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "Node")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 
@@ -229,8 +225,8 @@ func main() {
 	// Start gRPC server if enabled
 	var grpcServerManager *grpcserver.ServerManager
 	if enableGRPCServer {
-		setupLog.Info("starting gRPC server", "address", grpcServerAddr, "groupStoreAddr", fmt.Sprintf("%p", groupStore))
-		grpcServerManager = grpcserver.NewServerManager(grpcServerAddr, groupStore, mgr.GetClient(), mgr.GetScheme())
+		setupLog.Info("starting gRPC server", "address", grpcServerAddr)
+		grpcServerManager = grpcserver.NewServerManager(grpcServerAddr, mgr.GetClient(), mgr.GetScheme())
 
 		// Create a context for the gRPC server
 		grpcCtx, grpcCancel := context.WithCancel(context.Background())

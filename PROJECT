@@ -6,6 +6,7 @@ cliVersion: 4.9.0
 domain: homecluster.dev
 layout:
 - go.kubebuilder.io/v4
+multigroup: true
 projectName: homelab-autoscaler
 repo: github.com/homecluster-dev/homelab-autoscaler
 resources:
@@ -16,7 +17,7 @@ resources:
   domain: homecluster.dev
   group: infra
   kind: Group
-  path: github.com/homecluster-dev/homelab-autoscaler/api/v1alpha1
+  path: github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1
   version: v1alpha1
 - api:
     crdVersion: v1
@@ -25,6 +26,15 @@ resources:
   domain: homecluster.dev
   group: infra
   kind: Node
-  path: github.com/homecluster-dev/homelab-autoscaler/api/v1alpha1
+  path: github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1
   version: v1alpha1
+  webhooks:
+    validation: true
+    webhookVersion: v1
+- controller: true
+  core: true
+  group: core
+  kind: Node
+  path: k8s.io/api/core/v1
+  version: v1
 version: "3"

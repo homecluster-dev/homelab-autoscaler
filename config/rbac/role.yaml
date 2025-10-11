@@ -9,11 +9,27 @@ rules:
   resources:
   - nodes
   verbs:
+  - create
+  - delete
   - get
   - list
   - patch
   - update
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - nodes/status
+  verbs:
+  - get
+  - patch
+  - update
 - apiGroups:
   - batch
   resources:
@@ -27,20 +43,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - batch
-  resources:
-  - cronjobs/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - batch
-  resources:
-  - cronjobs/status
-  verbs:
-  - get
-  - patch
-  - update
 - apiGroups:
   - infra.homecluster.dev
   resources:

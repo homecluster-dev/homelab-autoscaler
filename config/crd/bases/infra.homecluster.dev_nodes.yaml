@@ -48,45 +48,12 @@ spec:
           spec:
             description: spec defines the desired state of Node
             properties:
-              healthcheckPeriod:
-                type: integer
-              healthcheckPodSpec:
-                properties:
-                  args:
-                    items:
-                      type: string
-                    type: array
-                  command:
-                    items:
-                      type: string
-                    type: array
-                  image:
-                    type: string
-                  serviceAccount:
-                    type: string
-                  volumes:
-                    description: Each volume mounts a Secret or ConfigMap
-                    items:
-                      properties:
-                        configMapName:
-                          type: string
-                        mountPath:
-                          type: string
-                        name:
-                          type: string
-                        secretName:
-                          description: Either SecretName or ConfigMapName should be
-                            set
-                          type: string
-                      required:
-                      - mountPath
-                      - name
-                      type: object
-                    type: array
-                required:
-                - image
-                type: object
               kubernetesNodeName:
+                type: string
+              powerState:
+                enum:
+                - "on"
+                - "off"
                 type: string
               shutdownPodSpec:
                 properties:
@@ -161,9 +128,8 @@ spec:
                 - image
                 type: object
             required:
-            - healthcheckPeriod
-            - healthcheckPodSpec
             - kubernetesNodeName
+            - powerState
             - shutdownPodSpec
             - startupPodSpec
             type: object
@@ -245,6 +211,23 @@ spec:
                 - offline
                 - unknown
                 type: string
+              lastShutdownTime:
+                description: LastShutdownTime is the last time the node was successfully
+                  shut down.
+                format: date-time
+                type: string
+              lastStartupTime:
+                description: LastStartupTime is the last time the node was successfully
+                  started up.
+                format: date-time
+                type: string
+              powerState:
+                type: string
+              progress:
+                type: string
+            required:
+            - powerState
+            - progress
             type: object
         required:
         - spec

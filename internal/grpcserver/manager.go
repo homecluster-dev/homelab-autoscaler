@@ -22,35 +22,31 @@ import (
 	"log"
 	"net"
 	"sync"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/homecluster-dev/homelab-autoscaler/internal/groupstore"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
 
 // ServerManager manages the lifecycle of the gRPC server
 type ServerManager struct {
-	server     *grpc.Server
-	listener   net.Listener
-	address    string
-	wg         sync.WaitGroup
-	groupStore *groupstore.GroupStore
-	client     client.Client
-	scheme     *runtime.Scheme
+	server   *grpc.Server
+	listener net.Listener
+	address  string
+	wg       sync.WaitGroup
+	client   client.Client
+	scheme   *runtime.Scheme
 }
 
 // NewServerManager creates a new gRPC server manager
-func NewServerManager(address string, groupStore *groupstore.GroupStore, k8sClient client.Client, scheme *runtime.Scheme) *ServerManager {
+func NewServerManager(address string, k8sClient client.Client, scheme *runtime.Scheme) *ServerManager {
 	return &ServerManager{
-		address:    address,
-		groupStore: groupStore,
-		client:     k8sClient,
-		scheme:     scheme,
+		address: address,
+		client:  k8sClient,
+		scheme:  scheme,
 	}
 }
 
@@ -74,7 +70,7 @@ func (sm *ServerManager) Start(ctx context.Context) error {
 	reflection.Register(sm.server)
 
 	// Register the mock cloud provider service
-	mockServer := NewMockCloudProviderServer(sm.groupStore, sm.client, sm.scheme)
+	mockServer := NewHomeClusterProviderServer(sm.client, sm.scheme)
 	pb.RegisterCloudProviderServer(sm.server, mockServer)
 
 	log.Printf("Starting Mock CloudProvider gRPC server on %s", sm.address)
@@ -91,40 +87,6 @@ func (sm *ServerManager) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Wait for server to be ready with better error handling
-	// Try to establish a connection to verify the server is ready
-	maxRetries := 20              // Increased retries for better reliability
-	retryDelay := 1 * time.Second // Increased delay
-
-	for i := 0; i < maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			log.Printf("gRPC server startup cancelled due to context: %v", ctx.Err())
-			return ctx.Err()
-		default:
-			// Try to establish a connection to verify server is ready
-			log.Printf("Attempting to verify gRPC server readiness (attempt %d/%d)", i+1, maxRetries)
-			conn, err := net.DialTimeout("tcp", sm.listener.Addr().String(), 500*time.Millisecond)
-			if err == nil {
-				_ = conn.Close()
-				log.Printf("Mock CloudProvider gRPC server TCP connection verified as ready on %s", sm.address)
-
-				// Additional verification: wait a bit more to ensure gRPC service is fully registered
-				time.Sleep(2 * time.Second)
-				log.Printf("Mock CloudProvider gRPC server should be fully ready on %s", sm.address)
-				break
-			}
-
-			if i < maxRetries-1 {
-				log.Printf("gRPC server not ready yet, retrying in %v (attempt %d/%d): %v", retryDelay, i+1, maxRetries, err)
-				time.Sleep(retryDelay)
-			} else {
-				return fmt.Errorf("gRPC server failed to become ready after %d attempts: %v", maxRetries, err)
-			}
-		}
-	}
-
-	log.Printf("Mock CloudProvider gRPC server started successfully on %s", sm.address)
 	return nil
 }
 

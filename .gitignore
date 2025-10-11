@@ -27,3 +27,16 @@ go.work
 *.swo
 *~
 AGENTS.md
+
+
+**/.furyctl
+**/.vagrant
+**/*.tar
+
+**/__debug*
+
+**/*.cpython*
+
+**/.DS_Store
+
+**/kubeconfig

@@ -1,0 +1,12 @@
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: group1
+spec:
+  name: group1
+  maxSize: 5
+  nodeSelector:
+    node-role.kubernetes.io/worker: "true"
+  pricing:
+    hourlyRate: "0.50"
+    monthlyRate: "300.00"

@@ -1,135 +1,83 @@
-# homelab-autoscaler
-// TODO(user): Add simple overview of use/purpose
+# Homelab Autoscaler Documentation
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+> ⚠️ **CRITICAL WARNING: NOT PRODUCTION READY** ⚠️
+> 
+> This system contains critical bugs and missing functionality. Do NOT use in production environments.
+> See [Known Issues](troubleshooting/known-issues.md) for details.
 
-## Getting Started
+## Overview
 
-### Prerequisites
-- go version v1.24.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+The Homelab Autoscaler is a Kubernetes operator designed to provide cluster autoscaling capabilities for homelab environments with physical nodes. It manages the power state of physical machines based on workload demands, similar to how cloud providers scale virtual instances.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## Current Status
 
-```sh
-make docker-build docker-push IMG=<some-registry>/homelab-autoscaler:tag
-```
+**🚨 DEVELOPMENT PHASE 🚨**
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+## Documentation Structure
 
-**Install the CRDs into the cluster:**
+### Getting Started
+- [Overview](docs/getting-started/overview.md) - System concepts and design
+- [Quick Start](docs/getting-started/quick-start.md) - Fast setup for testing
+- [Installation](docs/getting-started/installation.md) - Complete installation guide
+- [First Deployment](docs/getting-started/first-deployment.md) - Deploy your first autoscaling group
 
-```sh
-make install
-```
+### Architecture
+- [Overview](docs/architecture/overview.md) - High-level system design
+- [Components](docs/architecture/components.md) - Detailed component breakdown
+- [Controllers](docs/architecture/controllers.md) - Controller responsibilities
+- [gRPC Interface](docs/architecture/grpc-interface.md) - External API specification
+- [Data Flow](docs/architecture/data-flow.md) - How data moves through the system
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### API Reference
+- [Group CRD](docs/api-reference/crds/group.md) - Autoscaling group configuration
+- [Node CRD](docs/api-reference/crds/node.md) - Physical node management
+- [Examples](docs/api-reference/examples/) - Sample configurations
 
-```sh
-make deploy IMG=<some-registry>/homelab-autoscaler:tag
-```
+### Troubleshooting
+- [Known Issues](docs/troubleshooting/known-issues.md) - **READ THIS FIRST**
+- [Common Problems](docs/troubleshooting/common-problems.md) - Frequent issues and solutions
+- [Debugging Guide](docs/troubleshooting/debugging-guide.md) - How to debug the system
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+### Development
+- [Setup](docs/development/setup.md) - Development environment setup
+- [Architecture Deep Dive](docs/development/architecture-deep-dive.md) - Internal implementation details
+- [Contributing](docs/development/contributing.md) - How to contribute
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Key Concepts
 
-```sh
-kubectl apply -k config/samples/
-```
+### Groups
+Define autoscaling policies and node selection criteria. Groups specify:
+- Maximum node count
+- Scaling thresholds
+- Node selection labels
+- Timing parameters
 
->**NOTE**: Ensure that the samples has default values to test it out.
+### Nodes
+Represent physical machines with:
+- Power state management
+- Startup/shutdown job specifications
+- Health monitoring
+- Pricing information
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+### Controllers
+- **Group Controller**: Manages Group CRDs (currently incomplete)
+- **Node Controller**: Manages Node CRDs and power states
+- **Core Controller**: Handles Kubernetes node lifecycle
 
-```sh
-kubectl delete -k config/samples/
-```
+### gRPC Server
+Implements the Cluster Autoscaler CloudProvider interface for external integration.
 
-**Delete the APIs(CRDs) from the cluster:**
+## Quick Navigation
 
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/homelab-autoscaler:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/homelab-autoscaler/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v1-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+| I want to... | Go to... |
+|--------------|----------|
+| Understand the system | [Architecture Overview](docs/architecture/overview.md) |
+| See what's broken | [Known Issues](docs/troubleshooting/known-issues.md) |
+| Try it out | [Quick Start](docs/getting-started/quick-start.md) |
+| Configure groups | [Group CRD](docs/api-reference/crds/group.md) |
+| Debug problems | [Debugging Guide](docs/troubleshooting/debugging-guide.md) |
+| Contribute fixes | [Development Setup](docs/development/setup.md) |
 
 ## License
 
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Copyright 2025. Licensed under the Apache License, Version 2.0.

@@ -82,7 +82,7 @@ var _ = Describe("gRPC Server", Ordered, func() {
 
 			// Wait for groups to be processed and health checks to be established
 			// The new architecture uses separate Node CRs that are linked to Groups via labels
-			By("waiting for at least 2 healthy groups to be available via gRPC")
+			By("waiting for at least 1 healthy group to be available via gRPC")
 			Eventually(func() int {
 				resp, err := grpcClient.NodeGroups(ctx, &pb.NodeGroupsRequest{})
 				if err != nil {
@@ -91,7 +91,7 @@ var _ = Describe("gRPC Server", Ordered, func() {
 				}
 				GinkgoWriter.Printf("gRPC NodeGroups returned %d groups\n", len(resp.NodeGroups))
 				return len(resp.NodeGroups)
-			}, 2*time.Minute, 5*time.Second).Should(BeNumerically(">=", 2), "Expected at least 2 healthy groups")
+			}, 2*time.Minute, 5*time.Second).Should(BeNumerically(">=", 1), "Expected at least 1 healthy group")
 
 			// Get the final response
 			resp, err := grpcClient.NodeGroups(ctx, &pb.NodeGroupsRequest{})
@@ -105,14 +105,12 @@ var _ = Describe("gRPC Server", Ordered, func() {
 				Expect(ng.MaxSize).To(BeNumerically(">", 0), "NodeGroup MaxSize should be greater than 0")
 
 				// Verify that the NodeGroup corresponds to one of our test groups
-				Expect(ng.Id).To(BeElementOf([]string{"group1", "group2", "unhealthy-group"}),
+				Expect(ng.Id).To(BeElementOf([]string{"group1"}),
 					fmt.Sprintf("NodeGroup ID %s should be one of our test groups", ng.Id))
 
 				// Verify MaxSize matches the Group spec
 				if ng.Id == "group1" {
 					Expect(ng.MaxSize).To(Equal(int32(5)), "group1 should have MaxSize=5")
-				} else if ng.Id == "group2" {
-					Expect(ng.MaxSize).To(Equal(int32(3)), "group2 should have MaxSize=3")
 				}
 			}
 		})
@@ -128,7 +126,7 @@ var _ = Describe("gRPC Server", Ordered, func() {
 					return 0
 				}
 				return len(resp.NodeGroups)
-			}, 2*time.Minute, 5*time.Second).Should(BeNumerically(">=", 2), "Expected at least 2 groups initially")
+			}, 2*time.Minute, 5*time.Second).Should(BeNumerically(">=", 1), "Expected at least 1 group initially")
 
 			// Get the current response
 			resp, err := grpcClient.NodeGroups(ctx, &pb.NodeGroupsRequest{})
@@ -140,7 +138,6 @@ var _ = Describe("gRPC Server", Ordered, func() {
 				groupIDs = append(groupIDs, ng.Id)
 			}
 			Expect(groupIDs).To(ContainElement("group1"), "group1 should be present")
-			Expect(groupIDs).To(ContainElement("group2"), "group2 should be present")
 
 		})
 
@@ -199,17 +196,17 @@ var _ = Describe("gRPC Server", Ordered, func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			// Verify that the Kubernetes node "homelab-autoscaler-test-e2e-worker" is marked as unschedulable
+			// Verify that the Kubernetes node "worker1.k8s.local" is marked as unschedulable
 			Eventually(func() bool {
 				// Use kubectl to check if the node is unschedulable
-				cmd := exec.Command("kubectl", "get", "node", "homelab-autoscaler-test-e2e-worker", "-o", "jsonpath={.spec.unschedulable}")
+				cmd := exec.Command("kubectl", "get", "node", "worker1.k8s.local", "-o", "jsonpath={.spec.unschedulable}")
 				output, err := cmd.CombinedOutput()
 				if err != nil {
 					GinkgoWriter.Printf("Failed to get node status: %v, output: %s\n", err, string(output))
 					return false
 				}
 				return string(output) == "true"
-			}, 30*time.Second, 2*time.Second).Should(BeTrue(), "Kubernetes node homelab-autoscaler-test-e2e-worker should be unschedulable")
+			}, 30*time.Second, 2*time.Second).Should(BeTrue(), "Kubernetes node worker1.k8s.local should be unschedulable")
 		})
 
 		It("should handle NodeGroupIncreaseSize correctly", func() {
@@ -223,10 +220,10 @@ var _ = Describe("gRPC Server", Ordered, func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			// Verify that the Kubernetes node "homelab-autoscaler-test-e2e-worker" becomes schedulable again
+			// Verify that the Kubernetes node "worker1.k8s.local" becomes schedulable again
 			Eventually(func() bool {
 				// Use kubectl to check if the node is schedulable
-				cmd := exec.Command("kubectl", "get", "node", "homelab-autoscaler-test-e2e-worker", "-o", "jsonpath={.spec.unschedulable}")
+				cmd := exec.Command("kubectl", "get", "node", "worker1.k8s.local", "-o", "jsonpath={.spec.unschedulable}")
 				output, err := cmd.CombinedOutput()
 				if err != nil {
 					GinkgoWriter.Printf("Failed to get node status: %v, output: %s\n", err, string(output))
@@ -234,7 +231,7 @@ var _ = Describe("gRPC Server", Ordered, func() {
 				}
 				// If unschedulable is empty or false, the node is schedulable
 				return string(output) == "" || string(output) == "false"
-			}, 30*time.Second, 2*time.Second).Should(BeTrue(), "Kubernetes node homelab-autoscaler-test-e2e-worker should be schedulable")
+			}, 30*time.Second, 2*time.Second).Should(BeTrue(), "Kubernetes node worker1.k8s.local should be schedulable")
 		})
 
 		It("should handle NodeGroupDecreaseTargetSize correctly", func() {

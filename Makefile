@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= homelabautoscaler-controller:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -66,9 +66,13 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= homelab-autoscaler-test-e2e
+VBOX_CLUSTER ?= homelab-autoscaler-vbox
 
 # Port forwarding process PID for cleanup
 GRPC_PORT_FORWARD_PID ?=
+
+# VM control server PID for cleanup
+VM_CONTROL_SERVER_PID ?=
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -101,9 +105,6 @@ test-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e 
 	@echo "Creating test groups..."
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
-
-	@echo "Creating serviceaccount for nodes healthcheck"
-	$(KUBECTL) apply -f test/e2e/manifests/healthcheck-serviceaccount.yaml -n homelab-autoscaler-system
 	
 	@echo "Creating test nodes..."
 	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
@@ -147,13 +148,8 @@ run-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e t
 	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
 	
-	@echo "Creating serviceaccount for nodes healthcheck"
-	$(KUBECTL) apply -f test/e2e/manifests/healthcheck-serviceaccount.yaml -n homelab-autoscaler-system
-	
 	@echo "Creating test nodes..."
-	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
 	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/unhealthy.yaml -n homelab-autoscaler-system
 
 	@echo "Starting gRPC port forwarding for tests..."
 	$(MAKE) port-forward-grpc-e2e
@@ -245,6 +241,7 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	cd test/virtualbox && ./deploy.sh $(IMG)
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 
@@ -449,3 +446,129 @@ cleanup-grpc-dev: ## Clean up the gRPC development environment
 	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
 	$(MAKE) undeploy ignore-not-found=true
 	$(MAKE) cleanup-test-e2e
+
+##@ VirtualBox E2E Testing
+
+.PHONY: setup-vbox-cluster
+setup-vbox-cluster: ## Set up VirtualBox cluster for e2e tests
+	@echo "Checking for existing VirtualBox cluster..."
+	@if vagrant status --machine-readable 2>/dev/null | grep -q "state,running"; then \
+		echo "VirtualBox cluster is already running. Skipping setup."; \
+	else \
+		echo "Setting up VirtualBox cluster..."; \
+		cd test/virtualbox && vagrant up; \
+	fi
+
+	cd test/virtualbox/ && furyctl apply --config ./furyctl.yaml --outdir "$PWD" --disable-analytics -D
+
+.PHONY: cleanup-vbox-cluster
+cleanup-vbox-cluster: ## Clean up VirtualBox cluster
+	@echo "Cleaning up VirtualBox cluster..."
+	@cd test/virtualbox && vagrant destroy -f || true
+
+.PHONY: start-vm-control-server
+start-vm-control-server: ## Start the VM control server with PID tracking
+	@echo "Starting VM control server..."
+	@cd test/virtualbox && python3 vm_control_server.py & \
+	VM_CONTROL_SERVER_PID=$$!; \
+	echo "VM control server started with PID: $$VM_CONTROL_SERVER_PID"; \
+	echo "export VM_CONTROL_SERVER_PID=$$VM_CONTROL_SERVER_PID" > /tmp/vm-control-server.pid
+
+.PHONY: stop-vm-control-server
+stop-vm-control-server: ## Stop the VM control server
+	@if [ -f /tmp/vm-control-server.pid ]; then \
+		source /tmp/vm-control-server.pid; \
+		if [ -n "$$VM_CONTROL_SERVER_PID" ]; then \
+			echo "Stopping VM control server with PID: $$VM_CONTROL_SERVER_PID"; \
+			kill $$VM_CONTROL_SERVER_PID 2>/dev/null || true; \
+			rm -f /tmp/vm-control-server.pid; \
+		fi; \
+	else \
+		echo "No VM control server PID file found"; \
+	fi
+
+.PHONY: test-e2e-vbox
+test-e2e-vbox: setup-vbox-cluster manifests generate fmt vet ## Run the VirtualBox e2e tests with full deployment pipeline and cleanup.
+
+	@echo "Installing CRDs to VirtualBox cluster..."
+	KUBECONFIG=test/virtualbox/kubeconfig $(MAKE) install
+	
+	@echo "Creating test groups..."
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/group1.yaml
+	
+	@echo "Creating test nodes..."
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml
+	
+	@echo "Starting VM control server..."
+	$(MAKE) start-vm-control-server
+	@sleep 3  # Give VM control server time to start
+	
+	@echo "Starting local controller with VirtualBox kubeconfig..."
+	@KUBECONFIG=test/virtualbox/kubeconfig go run ./cmd/main.go --enable-grpc-server=true --grpc-server-address=:50051 & \
+	CONTROLLER_PID=$$!; \
+	echo "Controller started with PID: $$CONTROLLER_PID"; \
+	echo "export CONTROLLER_PID=$$CONTROLLER_PID" > /tmp/vbox-controller.pid; \
+	sleep 10  # Give controller time to start and process resources
+	
+	@echo "Running VirtualBox e2e tests..."
+	@KUBECONFIG=test/virtualbox/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v || TEST_FAILED=true
+	
+	@echo "Cleaning up controller..."
+	@if [ -f /tmp/vbox-controller.pid ]; then \
+		source /tmp/vbox-controller.pid; \
+		if [ -n "$$CONTROLLER_PID" ]; then \
+			echo "Stopping controller with PID: $$CONTROLLER_PID"; \
+			kill $$CONTROLLER_PID 2>/dev/null || true; \
+			rm -f /tmp/vbox-controller.pid; \
+		fi; \
+	fi
+	
+	@echo "Cleaning up VM control server..."
+	$(MAKE) stop-vm-control-server
+	
+	@echo "Cleaning up test resources..."
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	
+	@echo "Cleaning up VirtualBox cluster..."
+	$(MAKE) cleanup-vbox-cluster
+	
+	@if [ "$$TEST_FAILED" = "true" ]; then \
+		echo "VirtualBox e2e tests failed!"; \
+		exit 1; \
+	fi
+
+.PHONY: run-e2e-vbox
+run-e2e-vbox: setup-vbox-cluster manifests generate fmt vet ## Run the VirtualBox e2e tests without cleanup afterwards.
+	@echo "Installing CRDs to VirtualBox cluster..."
+	KUBECONFIG=test/virtualbox/kubeconfig $(MAKE) install
+	
+	@echo "Creating test groups..."
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
+	
+	@echo "Creating test nodes..."
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
+	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
+	
+	@echo "Starting VM control server..."
+	$(MAKE) start-vm-control-server
+	@sleep 3  # Give VM control server time to start
+	
+	@echo "Starting local controller with VirtualBox kubeconfig..."
+	@KUBECONFIG=test/virtualbox/kubeconfig go run ./cmd/main.go --enable-grpc-server=true --grpc-server-address=:50051 & \
+	CONTROLLER_PID=$$!; \
+	echo "Controller started with PID: $$CONTROLLER_PID"; \
+	echo "export CONTROLLER_PID=$$CONTROLLER_PID" > /tmp/vbox-controller.pid; \
+	sleep 10  # Give controller time to start and process resources
+	
+	@echo "Running VirtualBox e2e tests..."
+	KUBECONFIG=test/virtualbox/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	
+	@echo "VirtualBox e2e tests completed! Resources are still deployed for inspection."
+	@echo "Use the following commands to clean up manually:"
+	@echo "  make stop-vm-control-server"
+	@echo "  kill \$$(cat /tmp/vbox-controller.pid | cut -d'=' -f2) 2>/dev/null || true"
+	@echo "  make cleanup-vbox-cluster"
