@@ -57,7 +57,7 @@ spec:
         {{- end }}
         env:
         - name: GRPC_PROVIDER_ENDPOINT
-          value: {{ .Values.clusterAutoscaler.grpcProvider.endpoint | quote }}
+          value: "{{ include "chart.name" . }}-grpc-service:50051"
         resources:
           {{- toYaml .Values.clusterAutoscaler.resources | nindent 10 }}
         securityContext:
