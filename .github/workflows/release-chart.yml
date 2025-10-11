@@ -29,15 +29,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install Kubebuilder
-        run: |
-          curl -L -o kubebuilder "https://go.kubebuilder.io/dl/latest/$(go env GOOS)/$(go env GOARCH)"
-          chmod +x kubebuilder
-          sudo mv kubebuilder /usr/local/bin/
-
-      - name: Verify Kubebuilder installation
-        run: kubebuilder version
-
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.6.0
         with:
