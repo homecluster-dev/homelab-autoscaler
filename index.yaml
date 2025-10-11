@@ -3,6 +3,17 @@ entries:
   homelab-autoscaler:
   - apiVersion: v2
     appVersion: 0.1.0
+    created: "2025-10-11T13:35:21.549450082Z"
+    description: A Helm chart to distribute the project homelab-autoscaler
+    digest: 086ff936104cb92e611de7958970172feddd61447fc0050b846b20099cc2e1ab
+    icon: https://example.com/icon.png
+    name: homelab-autoscaler
+    type: application
+    urls:
+    - https://github.com/homecluster-dev/homelab-autoscaler/releases/download/homelab-autoscaler-0.1.6/homelab-autoscaler-0.1.6.tgz
+    version: 0.1.6
+  - apiVersion: v2
+    appVersion: 0.1.0
     created: "2025-10-11T13:20:27.664366992Z"
     description: A Helm chart to distribute the project homelab-autoscaler
     digest: 832f64934ac1c8612892f7442c9cba90a340f438347ccba4ce225915c846b4e5
@@ -67,4 +78,4 @@ entries:
     urls:
     - https://github.com/homecluster-dev/homelab-autoscaler/releases/download/homelab-autoscaler-0.1.0/homelab-autoscaler-0.1.0.tgz
     version: 0.1.0
-generated: "2025-10-11T13:20:27.664389684Z"
+generated: "2025-10-11T13:35:21.549498192Z"
