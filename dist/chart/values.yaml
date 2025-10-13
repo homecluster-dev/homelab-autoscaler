@@ -1,5 +1,6 @@
 # [MANAGER]: Manager Deployment Configurations
 controllerManager:
+  enabled: true
   replicas: 1
   container:
     image:
@@ -96,15 +97,6 @@ clusterAutoscaler:
     repository: registry.k8s.io/autoscaling/cluster-autoscaler
     tag: v1.28.2
     pullPolicy: IfNotPresent
-  
-  # Node groups configuration - list of node groups to manage
-  nodeGroups: []
-  # Example:
-  # nodeGroups:
-  #   - name: worker-nodes
-  #     minSize: 1
-  #     maxSize: 10
-  #     desiredSize: 3
   
   # gRPC provider configuration
   grpcProvider:
