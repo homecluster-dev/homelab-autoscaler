@@ -4,7 +4,7 @@ CLUSTER_NAME="homelab-autoscaler"
 
 echo "Creating k3d cluster: ${CLUSTER_NAME}"
 k3d cluster create ${CLUSTER_NAME} \
-  --servers 1 \
+  --servers 3 \
   --agents 2 \
   --wait
 

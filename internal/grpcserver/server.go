@@ -214,9 +214,9 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 	}
 
 	for _, node := range nodes.Items {
-		if node.Name == req.Node.Name && node.Status.PowerState == infrav1alpha1.PowerStateOff {
+		if node.Name == req.Node.Name && node.Status.PowerState == infrav1alpha1.PowerStateOn {
 			return &pb.NodeGroupForNodeResponse{
-				NodeGroup: &pb.NodeGroup{Id: ""},
+				NodeGroup: &pb.NodeGroup{Id: groupName},
 			}, nil
 		}
 	}
@@ -549,8 +549,13 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 	// Convert nodes to instances
 	instances := make([]*pb.Instance, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
+		kubernetesNode := &corev1.Node{}
+		err = s.Client.Get(ctx, client.ObjectKey{Name: node.Spec.KubernetesNodeName}, kubernetesNode)
+		if err != nil {
+			logger.Error(err, "Node not found", "node", node.Spec.KubernetesNodeName, "nodeCR", node.Name)
+		}
 		instance := &pb.Instance{
-			Id: node.Name,
+			Id: kubernetesNode.Spec.ProviderID,
 			Status: &pb.InstanceStatus{
 				InstanceState: pb.InstanceStatus_instanceRunning,
 				ErrorInfo: &pb.InstanceErrorInfo{

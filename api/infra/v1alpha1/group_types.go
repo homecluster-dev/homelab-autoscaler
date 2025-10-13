@@ -30,15 +30,15 @@ type GroupSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	Name                             string            `json:"name"`
-	NodeSelector                     map[string]string `json:"nodeSelector"`
-	ScaleDownUtilizationThreshold    string            `json:"scaleDownUtilizationThreshold"`
-	ScaleDownGpuUtilizationThreshold string            `json:"scaleDownGpuUtilizationThreshold"`
-	ScaleDownUnneededTime            *v1.Duration      `json:"scaleDownUnneededTime"`
-	ScaleDownUnreadyTime             *v1.Duration      `json:"scaleDownUnreadyTime"`
-	MaxNodeProvisionTime             *v1.Duration      `json:"maxNodeProvisionTime"`
-	ZeroOrMaxNodeScaling             bool              `json:"zeroOrMaxNodeScaling"`
-	IgnoreDaemonSetsUtilization      bool              `json:"ignoreDaemonSetsUtilization"`
+	Name string `json:"name"`
+	// NodeSelector                     map[string]string `json:"nodeSelector"`
+	ScaleDownUtilizationThreshold    string       `json:"scaleDownUtilizationThreshold"`
+	ScaleDownGpuUtilizationThreshold string       `json:"scaleDownGpuUtilizationThreshold"`
+	ScaleDownUnneededTime            *v1.Duration `json:"scaleDownUnneededTime"`
+	ScaleDownUnreadyTime             *v1.Duration `json:"scaleDownUnreadyTime"`
+	MaxNodeProvisionTime             *v1.Duration `json:"maxNodeProvisionTime"`
+	ZeroOrMaxNodeScaling             bool         `json:"zeroOrMaxNodeScaling"`
+	IgnoreDaemonSetsUtilization      bool         `json:"ignoreDaemonSetsUtilization"`
 }
 
 // GroupStatus defines the observed state of Group.
