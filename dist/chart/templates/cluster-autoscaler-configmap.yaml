@@ -11,6 +11,6 @@ data:
   config.yaml: |
     # External gRPC cloud provider configuration
     # Required format for cluster autoscaler external gRPC provider
-    address: {{ include "chart.name" . }}-grpc-service:50051
+    address: {{ .Values.clusterAutoscaler.grpcProvider.endpoint | default (printf "%s-grpc-service:50051" (include "chart.name" .)) }}
     grpc_timeout: 30s
 {{- end }}

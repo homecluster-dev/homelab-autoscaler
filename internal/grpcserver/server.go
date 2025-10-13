@@ -152,7 +152,7 @@ func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.Node
 			Id:      group.Spec.Name,
 			MinSize: 0,
 			MaxSize: maxSize,
-			Debug:   fmt.Sprintf("Group %s - MaxSize: %d, Nodes: %d", group.Spec.Name, group.Spec.MaxSize, maxSize),
+			Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, maxSize),
 		}
 
 		nodeGroups = append(nodeGroups, nodeGroup)
@@ -181,11 +181,18 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 	}
 
 	groupName := node.Labels["infra.homecluster.dev/group"]
+
+	if groupName == "" {
+		return &pb.NodeGroupForNodeResponse{
+			NodeGroup: &pb.NodeGroup{Id: ""},
+		}, nil
+	}
+
 	group := &infrav1alpha1.Group{}
-	err = s.Client.Get(ctx, client.ObjectKey{Name: groupName}, group)
+	err = s.Client.Get(ctx, client.ObjectKey{Name: groupName, Namespace: "homelab-autoscaler-system"}, group)
 	if err != nil {
 		// Node not found in any group, return empty string
-		logger.Info("Group not found", "group", groupName)
+		logger.Error(err, "Group not found", "group", groupName)
 		return &pb.NodeGroupForNodeResponse{
 			NodeGroup: &pb.NodeGroup{Id: ""},
 		}, nil
@@ -199,13 +206,26 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 	if err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			maxSize = 0
+		} else {
+			logger.Error(err, "error listing nodes", "group", groupName)
+		}
+	} else {
+		maxSize = int32(len(nodes.Items))
+	}
+
+	for _, node := range nodes.Items {
+		if node.Name == req.Node.Name && node.Status.PowerState == infrav1alpha1.PowerStateOff {
+			return &pb.NodeGroupForNodeResponse{
+				NodeGroup: &pb.NodeGroup{Id: ""},
+			}, nil
 		}
 	}
+
 	nodeGroup := &pb.NodeGroup{
 		Id:      groupName,
 		MinSize: 0,
 		MaxSize: maxSize,
-		Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, group.Spec.MaxSize),
+		Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, len(nodes.Items)),
 	}
 
 	logger.Info("Found node group for node", "node", req.Node.Name, "group", group.Spec.Name)
@@ -220,7 +240,7 @@ func (s *HomeClusterProviderServer) PricingNodePrice(ctx context.Context, req *p
 	logger.Info("PricingNodePrice called", "node", req.Node.Name)
 
 	node := &infrav1alpha1.Node{}
-	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Node.Name}, node)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Node.Name, Namespace: "homelab-autoscaler-system"}, node)
 	if err != nil {
 		// Node not found in any group
 		logger.Info("Node not found", "node", req.Node.Name)
@@ -401,7 +421,7 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 
 		// Get the Node CR from the GroupStore
 		nodeCR := &infrav1alpha1.Node{}
-		err := s.Client.Get(ctx, client.ObjectKey{Name: node.Name}, nodeCR)
+		err := s.Client.Get(ctx, client.ObjectKey{Name: node.Name, Namespace: "homelab-autoscaler-system"}, nodeCR)
 		if err != nil {
 			logger.Error(err, "failed to get nodeCR", "node", node.Name)
 			return nil, status.Errorf(codes.Internal, "failed to get node %s: %v", node.Name, err)
@@ -563,9 +583,7 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 
 	if len(nodes.Items) == 0 {
 		// No nodes in group - return nil (valid response for scale-from-zero)
-		return &pb.NodeGroupTemplateNodeInfoResponse{
-			NodeInfo: nil,
-		}, nil
+		return nil, status.Error(codes.Unimplemented, "scale from zero not supported")
 	}
 
 	// Find a representative node (prefer powered off nodes)
@@ -657,7 +675,7 @@ func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req
 	logger.Info("NodeGroupGetOptions called", "nodeGroup", req.Id)
 
 	group := &infrav1alpha1.Group{}
-	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Id}, group)
+	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Id, Namespace: "homelab-autoscaler-system"}, group)
 	if err != nil {
 		// Node not found in any group, return empty string
 		logger.Info("Group not found", "group", req.Id)

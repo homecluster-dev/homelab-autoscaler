@@ -6,7 +6,11 @@ spec:
   name: group1
   maxSize: 5
   nodeSelector:
-    node-role.kubernetes.io/worker: "true"
-  pricing:
-    hourlyRate: "0.50"
-    monthlyRate: "300.00"
+    node.kubernetes.io/instance-type: "k3s"
+  ignoreDaemonSetsUtilization: true
+  maxNodeProvisionTime: 2m
+  scaleDownGpuUtilizationThreshold: "30"
+  scaleDownUnneededTime: 1m
+  scaleDownUnreadyTime: 2m
+  scaleDownUtilizationThreshold: "70"
+  zeroOrMaxNodeScaling: false

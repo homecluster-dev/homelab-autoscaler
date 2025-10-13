@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: homelab-autoscaler-grpc-local
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    app.kubernetes.io/component: grpc-forwarder
+    app.kubernetes.io/part-of: homelab-autoscaler-dev
+spec:
+  ports:
+  - port: 50051
+    targetPort: 50052
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: homelab-autoscaler-grpc-local
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    app.kubernetes.io/component: grpc-forwarder
+    app.kubernetes.io/part-of: homelab-autoscaler-dev
+subsets:
+- addresses:
+  - ip: 192.168.65.254
+  ports:
+  - port: 50052
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: homelab-autoscaler-webhook-local
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    app.kubernetes.io/component: webhook-forwarder
+    app.kubernetes.io/part-of: homelab-autoscaler-dev
+spec:
+  type: ExternalName
+  externalName: host.k3d.internal
+  ports:
+  - port: 443
+    targetPort: 9443

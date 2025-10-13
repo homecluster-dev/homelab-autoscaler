@@ -49,9 +49,6 @@ spec:
         {{- if .Values.clusterAutoscaler.skipNodesWithSystemPods }}
         - --skip-nodes-with-system-pods=true
         {{- end }}
-        {{- range .Values.clusterAutoscaler.nodeGroups }}
-        - --nodes={{ .minSize }}:{{ .maxSize }}:{{ .name }}
-        {{- end }}
         {{- range .Values.clusterAutoscaler.extraArgs }}
         - {{ . }}
         {{- end }}

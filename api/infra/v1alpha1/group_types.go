@@ -31,7 +31,6 @@ type GroupSpec struct {
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
 	Name                             string            `json:"name"`
-	MaxSize                          int               `json:"maxSize"`
 	NodeSelector                     map[string]string `json:"nodeSelector"`
 	ScaleDownUtilizationThreshold    string            `json:"scaleDownUtilizationThreshold"`
 	ScaleDownGpuUtilizationThreshold string            `json:"scaleDownGpuUtilizationThreshold"`

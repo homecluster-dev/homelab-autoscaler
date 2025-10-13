@@ -131,6 +131,13 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Register field index for pods by node name
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.nodeName", func(rawObj client.Object) []string {
+		pod := rawObj.(*corev1.Pod)
+		return []string{pod.Spec.NodeName}
+	}); err != nil {
+		return err
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1alpha1.Node{}).
@@ -283,7 +290,7 @@ func (r *NodeReconciler) shutdownNode(ctx context.Context, nodeCR *infrav1alpha1
 		Message:            fmt.Sprintf("Shutting down node via job %s", job.Name),
 	},
 	)
-	nodeCR.Status.LastStartupTime = &metav1.Time{Time: time.Now().UTC()}
+	nodeCR.Status.LastShutdownTime = &metav1.Time{Time: time.Now().UTC()}
 	nodeCR.Status.Progress = infrav1alpha1.ProgressShuttingDown
 	// Update the Node with the new status info
 	if err := r.Update(ctx, nodeCR); err != nil {
@@ -421,26 +428,17 @@ func (r *NodeReconciler) validateStateTransition(ctx context.Context, node *infr
 // drainNode drains all pods from the specified node using the Kubernetes eviction API
 func (r *NodeReconciler) drainNode(ctx context.Context, nodeName string) error {
 	logger := log.FromContext(ctx)
-	
+
 	// Set a timeout for the entire drain operation (5 minutes)
 	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	// Get all pods running on the node
 	podList := &corev1.PodList{}
-	if err := r.Client.List(drainCtx, podList); err != nil {
-		logger.Error(err, "failed to list pods", "nodeName", nodeName)
+	if err := r.Client.List(drainCtx, podList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
+		logger.Error(err, "failed to list pods on node", "nodeName", nodeName)
 		return err
 	}
-
-	// Filter pods by node name
-	var nodePodsItems []corev1.Pod
-	for _, pod := range podList.Items {
-		if pod.Spec.NodeName == nodeName {
-			nodePodsItems = append(nodePodsItems, pod)
-		}
-	}
-	podList.Items = nodePodsItems
 
 	logger.Info("Found pods to evict", "nodeName", nodeName, "podCount", len(podList.Items))
 
@@ -508,7 +506,7 @@ func (r *NodeReconciler) evictPod(ctx context.Context, pod *corev1.Pod) error {
 // waitForPodsToTerminate waits for evicted pods to be terminated
 func (r *NodeReconciler) waitForPodsToTerminate(ctx context.Context, nodeName string, evictedPods []corev1.Pod) error {
 	logger := log.FromContext(ctx)
-	
+
 	// Create a map for quick lookup
 	evictedPodMap := make(map[string]bool)
 	for _, pod := range evictedPods {
@@ -527,21 +525,13 @@ func (r *NodeReconciler) waitForPodsToTerminate(ctx context.Context, nodeName st
 		case <-ticker.C:
 			// Check if any evicted pods are still running
 			podList := &corev1.PodList{}
-			if err := r.Client.List(ctx, podList); err != nil {
+			if err := r.Client.List(ctx, podList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
 				logger.Error(err, "failed to list pods while waiting for termination", "nodeName", nodeName)
 				continue
 			}
 
-			// Filter pods by node name
-			var nodePodsItems []corev1.Pod
-			for _, pod := range podList.Items {
-				if pod.Spec.NodeName == nodeName {
-					nodePodsItems = append(nodePodsItems, pod)
-				}
-			}
-
 			stillRunning := 0
-			for _, pod := range nodePodsItems {
+			for _, pod := range podList.Items {
 				podKey := pod.Namespace + "/" + pod.Name
 				if evictedPodMap[podKey] && pod.DeletionTimestamp == nil {
 					stillRunning++
@@ -594,11 +584,11 @@ func (r *NodeReconciler) isCriticalSystemPod(pod *corev1.Pod) bool {
 			"flannel",
 			"weave-net",
 		}
-		
+
 		for _, component := range criticalComponents {
 			if pod.Name == component ||
-			   (len(pod.Labels) > 0 && pod.Labels["k8s-app"] == component) ||
-			   (len(pod.Labels) > 0 && pod.Labels["app"] == component) {
+				(len(pod.Labels) > 0 && pod.Labels["k8s-app"] == component) ||
+				(len(pod.Labels) > 0 && pod.Labels["app"] == component) {
 				return true
 			}
 		}

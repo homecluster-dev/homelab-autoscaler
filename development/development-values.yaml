@@ -1,0 +1,124 @@
+# Development configuration for homelab-autoscaler
+# This file is optimized for local development where the controller manager
+# runs locally outside the cluster, while the cluster autoscaler runs in-cluster.
+
+# Enable cluster autoscaler integration (keep enabled for development)
+clusterAutoscaler:
+  enabled: true
+  
+  # Cluster autoscaler image configuration
+  image:
+    repository: registry.k8s.io/autoscaling/cluster-autoscaler
+    tag: v1.28.2
+    pullPolicy: IfNotPresent
+  
+  # gRPC provider configuration (points to local service forwarder)
+  grpcProvider:
+    endpoint: "homelab-autoscaler-grpc-local:50051"
+  
+  # Scaling policies - same as production
+  scaleDownDelay: "10m"
+  scaleDownUnneededTime: "10m"
+  scaleDownUtilizationThreshold: 0.5
+  skipNodesWithLocalStorage: true
+  skipNodesWithSystemPods: true
+  
+  # Additional cluster autoscaler arguments
+  extraArgs:
+    - --balance-similar-node-groups
+    - --skip-nodes-with-local-storage=false
+    - --max-node-provision-time=15m
+    - --scale-down-delay-after-failure=3m
+  
+  # Resource limits and requests for cluster autoscaler pod
+  resources:
+    limits:
+      cpu: 200m
+      memory: 500Mi
+    requests:
+      cpu: 100m
+      memory: 300Mi
+  
+  # Security context for cluster autoscaler
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+  
+  # Pod security context
+  podSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - "ALL"
+    readOnlyRootFilesystem: true
+  
+  # Service account configuration
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  
+  # Node selector for cluster autoscaler pod placement
+  nodeSelector:
+    kubernetes.io/os: linux
+  
+  # Tolerations for cluster autoscaler pod
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+  
+  # Affinity rules for cluster autoscaler pod
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+  
+  # Pod annotations and labels
+  podAnnotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+  
+  podLabels:
+    app.kubernetes.io/component: cluster-autoscaler
+
+# DISABLED: Controller manager (runs locally during development)
+controllerManager:
+  enabled: false
+
+# gRPC service configuration (disabled in development - using local forwarder instead)
+grpcService:
+  enabled: false
+  type: ClusterIP
+  port: 50051
+
+# Enable required components for cluster autoscaler
+rbac:
+  enable: true
+
+crd:
+  enable: true
+  keep: true
+
+metrics:
+  enable: true
+
+# DISABLED: Webhook validator (not needed for development)
+webhook:
+  enable: false
+
+# DISABLED: Cert-manager (not needed without webhook)
+certmanager:
+  enable: false
+
+# Optional: Disable Prometheus monitoring for development
+prometheus:
+  enable: false
+
+# Optional: Disable network policies for development
+networkPolicy:
+  enable: false
