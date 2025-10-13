@@ -26,7 +26,7 @@ spec:
         - |
           while true; do
             echo "hello world"
-            sleep 30
+            sleep 5
           done
         resources:
           requests:
