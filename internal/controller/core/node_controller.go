@@ -68,7 +68,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Get the corresponding Node CR
 	nodeCR := &infrav1alpha1.Node{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Name: nodeLabel, Namespace: "homelab-autoscaler-system"}, nodeCR); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeLabel, Namespace: "homelab-autoscaler-system"}, nodeCR); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			logger.Info("Node CR not found for Kubernetes node", "nodeName", node.Name, "nodeCR", nodeLabel)
 			return ctrl.Result{}, nil
@@ -90,7 +90,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Create a copy for status update to avoid race conditions
 	nodeCRCopy := nodeCR.DeepCopy()
 	nodeCRCopy.Status.PowerState = nodeStatus
-	
+
 	// Update progress based on power state, but only if not already in a transitional state
 	if nodeCRCopy.Status.Progress != infrav1alpha1.ProgressStartingUp &&
 		nodeCRCopy.Status.Progress != infrav1alpha1.ProgressShuttingDown {

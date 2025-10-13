@@ -24,7 +24,6 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -88,14 +87,18 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	if node.Labels["group"] != "" || node.Labels["infra.homecluster.dev/group"] != node.Labels["group"] {
-		r.addLabelToKubernetesNodeWithPatch(ctx, node.Spec.KubernetesNodeName, "infra.homecluster.dev/group", node.Labels["group"])
-		r.addLabelToKubernetesNodeWithPatch(ctx, node.Spec.KubernetesNodeName, "infra.homecluster.dev/node", node.Name)
+		if err := r.addLabelToKubernetesNodeWithPatch(ctx, node.Spec.KubernetesNodeName, "infra.homecluster.dev/group", node.Labels["group"]); err != nil {
+			logger.Error(err, "Failed to add group label to Kubernetes node", "node", node.Spec.KubernetesNodeName)
+		}
+		if err := r.addLabelToKubernetesNodeWithPatch(ctx, node.Spec.KubernetesNodeName, "infra.homecluster.dev/node", node.Name); err != nil {
+			logger.Error(err, "Failed to add node label to Kubernetes node", "node", node.Spec.KubernetesNodeName)
+		}
 	}
 	// Check if the Node has a group label
 	groupName, hasGroupLabel := node.Labels["group"]
 	if !hasGroupLabel {
 		logger.Info("Node does not have a group label, skipping owner reference management", "node", node.Name)
-		return ctrl.Result{}, fmt.Errorf("Node %s has no group label, skipping", node.Name)
+		return ctrl.Result{}, fmt.Errorf("node %s has no group label, skipping", node.Name)
 	}
 
 	// Get the Group CR referenced by the label
@@ -109,7 +112,10 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	r.SetControllerReference(ctx, node, group)
+	if err := r.SetControllerReference(ctx, node, group); err != nil {
+		logger.Error(err, "Failed to set controller reference", "node", node.Name, "group", group.Name)
+		return ctrl.Result{}, err
+	}
 
 	if !node.DeletionTimestamp.IsZero() {
 		return r.handleNodeDeletion(ctx, node, groupName, req.Name)
@@ -190,28 +196,6 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// validateKubernetesNode validates that the referenced Kubernetes node exists and is schedulable
-func (r *NodeReconciler) validateKubernetesNode(ctx context.Context, node *infrav1alpha1.Node, nodeName, kubernetesNodeName string) (*corev1.Node, error) {
-	logger := log.FromContext(ctx)
-
-	// Get the referenced Kubernetes node
-	kubernetesNode := &corev1.Node{}
-	if err := r.Get(ctx, types.NamespacedName{Name: kubernetesNodeName}, kubernetesNode); err != nil {
-		if errors.IsNotFound(err) {
-			logger.Error(err, "Referenced Kubernetes node does not exist",
-				"node", nodeName, "kubernetesNodeName", kubernetesNodeName)
-			return nil, fmt.Errorf("referenced Kubernetes node %q does not exist", kubernetesNodeName)
-		}
-		logger.Error(err, "Failed to get referenced Kubernetes node",
-			"node", nodeName, "kubernetesNodeName", kubernetesNodeName)
-		return nil, err
-	}
-
-	logger.Info("Successfully validated referenced Kubernetes node",
-		"node", nodeName, "kubernetesNodeName", kubernetesNodeName)
-	return kubernetesNode, nil
-}
-
 // handleNodeDeletion handles the deletion of a node
 func (r *NodeReconciler) handleNodeDeletion(ctx context.Context, node *infrav1alpha1.Node, groupName, nodeName string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -267,7 +251,7 @@ func (r *NodeReconciler) shutdownNode(ctx context.Context, nodeCR *infrav1alpha1
 
 	// Mark the Kubernetes node as not schedulable before starting shutdown
 	k8sNode := &corev1.Node{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
 		logger.Error(err, "failed to get Kubernetes node", "nodeName", nodeCR.Spec.KubernetesNodeName)
 		// Release lock on error
 		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
@@ -278,7 +262,7 @@ func (r *NodeReconciler) shutdownNode(ctx context.Context, nodeCR *infrav1alpha1
 
 	// Mark the node as unschedulable
 	k8sNode.Spec.Unschedulable = true
-	if err := r.Client.Update(ctx, k8sNode); err != nil {
+	if err := r.Update(ctx, k8sNode); err != nil {
 		logger.Error(err, "failed to mark Kubernetes node as unschedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
 		// Release lock on error
 		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
@@ -348,7 +332,7 @@ func (r *NodeReconciler) shutdownNode(ctx context.Context, nodeCR *infrav1alpha1
 	}
 
 	// Create the Job
-	if err := r.Client.Create(ctx, job); err != nil {
+	if err := r.Create(ctx, job); err != nil {
 		// Release lock on error
 		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
 			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
@@ -396,7 +380,7 @@ func (r *NodeReconciler) startNode(ctx context.Context, nodeCR *infrav1alpha1.No
 
 	// Get the Kubernetes node object and set it as schedulable
 	k8sNode := &corev1.Node{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
 		logger.Error(err, "failed to get Kubernetes node", "nodeName", nodeCR.Spec.KubernetesNodeName)
 		// Release lock on error
 		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
@@ -407,7 +391,7 @@ func (r *NodeReconciler) startNode(ctx context.Context, nodeCR *infrav1alpha1.No
 
 	// Set the node as schedulable
 	k8sNode.Spec.Unschedulable = false
-	
+
 	// Remove cluster autoscaler taints by key
 	var filteredTaints []corev1.Taint
 	for _, taint := range k8sNode.Spec.Taints {
@@ -416,8 +400,8 @@ func (r *NodeReconciler) startNode(ctx context.Context, nodeCR *infrav1alpha1.No
 		}
 	}
 	k8sNode.Spec.Taints = filteredTaints
-	
-	if err := r.Client.Update(ctx, k8sNode); err != nil {
+
+	if err := r.Update(ctx, k8sNode); err != nil {
 		logger.Error(err, "failed to mark Kubernetes node as schedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
 		// Release lock on error
 		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
@@ -475,7 +459,7 @@ func (r *NodeReconciler) startNode(ctx context.Context, nodeCR *infrav1alpha1.No
 	}
 
 	// Create the Job
-	if err := r.Client.Create(ctx, job); err != nil {
+	if err := r.Create(ctx, job); err != nil {
 		// Release lock on error
 		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
 			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
@@ -637,7 +621,8 @@ func (r *NodeReconciler) updateNodeStatusAfterJobSuccess(ctx context.Context, no
 		}
 
 		// Update status based on operation
-		if operation == "startup" {
+		switch operation {
+		case "startup":
 			fresh.Status.PowerState = infrav1alpha1.PowerStateOn
 			fresh.Status.Progress = ""
 			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
@@ -647,7 +632,7 @@ func (r *NodeReconciler) updateNodeStatusAfterJobSuccess(ctx context.Context, no
 				Reason:             "NodeStartupCompleted",
 				Message:            "Node startup job completed successfully",
 			})
-		} else if operation == "shutdown" {
+		case "shutdown":
 			fresh.Status.PowerState = infrav1alpha1.PowerStateOff
 			fresh.Status.Progress = ""
 			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
@@ -809,177 +794,6 @@ func (r *NodeReconciler) validateStateTransition(ctx context.Context, node *infr
 
 	// Node is not in transitional state, allow normal processing
 	return ctrl.Result{}, nil
-}
-
-// // drainNode drains all pods from the specified node using the Kubernetes eviction API
-// func (r *NodeReconciler) drainNode(ctx context.Context, nodeName string) error {
-// 	logger := log.FromContext(ctx)
-
-// 	// Set a timeout for the entire drain operation (5 minutes)
-// 	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-// 	defer cancel()
-
-// 	// Get all pods running on the node
-// 	podList := &corev1.PodList{}
-// 	if err := r.Client.List(drainCtx, podList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
-// 		logger.Error(err, "failed to list pods on node", "nodeName", nodeName)
-// 		return err
-// 	}
-
-// 	logger.Info("Found pods to evict", "nodeName", nodeName, "podCount", len(podList.Items))
-
-// 	// Track pods that need eviction
-// 	var podsToEvict []corev1.Pod
-// 	for _, pod := range podList.Items {
-// 		// Skip pods that are already terminating
-// 		if pod.DeletionTimestamp != nil {
-// 			continue
-// 		}
-
-// 		// Skip DaemonSet pods (they shouldn't be evicted)
-// 		if r.isDaemonSetPod(&pod) {
-// 			logger.Info("Skipping DaemonSet pod", "pod", pod.Name, "namespace", pod.Namespace)
-// 			continue
-// 		}
-
-// 		// Skip static pods (managed by kubelet)
-// 		if r.isStaticPod(&pod) {
-// 			logger.Info("Skipping static pod", "pod", pod.Name, "namespace", pod.Namespace)
-// 			continue
-// 		}
-
-// 		// Skip pods in kube-system namespace that are critical
-// 		if r.isCriticalSystemPod(&pod) {
-// 			logger.Info("Skipping critical system pod", "pod", pod.Name, "namespace", pod.Namespace)
-// 			continue
-// 		}
-
-// 		podsToEvict = append(podsToEvict, pod)
-// 	}
-
-// 	if len(podsToEvict) == 0 {
-// 		logger.Info("No pods to evict", "nodeName", nodeName)
-// 		return nil
-// 	}
-
-// 	// Evict pods using the eviction API
-// 	for _, pod := range podsToEvict {
-// 		if err := r.evictPod(drainCtx, &pod); err != nil {
-// 			logger.Error(err, "failed to evict pod", "pod", pod.Name, "namespace", pod.Namespace)
-// 			// Continue with other pods even if one fails
-// 		} else {
-// 			logger.Info("Successfully evicted pod", "pod", pod.Name, "namespace", pod.Namespace)
-// 		}
-// 	}
-
-// 	// Wait for pods to be terminated (with timeout)
-// 	return r.waitForPodsToTerminate(drainCtx, nodeName, podsToEvict)
-// }
-
-// evictPod evicts a single pod using the Kubernetes eviction API
-func (r *NodeReconciler) evictPod(ctx context.Context, pod *corev1.Pod) error {
-	eviction := &policyv1beta1.Eviction{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-		},
-	}
-
-	// Create the eviction (this is a special subresource)
-	return r.Client.SubResource("eviction").Create(ctx, pod, eviction)
-}
-
-// waitForPodsToTerminate waits for evicted pods to be terminated
-func (r *NodeReconciler) waitForPodsToTerminate(ctx context.Context, nodeName string, evictedPods []corev1.Pod) error {
-	logger := log.FromContext(ctx)
-
-	// Create a map for quick lookup
-	evictedPodMap := make(map[string]bool)
-	for _, pod := range evictedPods {
-		evictedPodMap[pod.Namespace+"/"+pod.Name] = true
-	}
-
-	// Poll every 10 seconds to check if pods are terminated
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("Timeout waiting for pods to terminate", "nodeName", nodeName)
-			return ctx.Err()
-		case <-ticker.C:
-			// Check if any evicted pods are still running
-			podList := &corev1.PodList{}
-			if err := r.Client.List(ctx, podList, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
-				logger.Error(err, "failed to list pods while waiting for termination", "nodeName", nodeName)
-				continue
-			}
-
-			stillRunning := 0
-			for _, pod := range podList.Items {
-				podKey := pod.Namespace + "/" + pod.Name
-				if evictedPodMap[podKey] && pod.DeletionTimestamp == nil {
-					stillRunning++
-				}
-			}
-
-			if stillRunning == 0 {
-				logger.Info("All evicted pods have terminated", "nodeName", nodeName)
-				return nil
-			}
-
-			logger.Info("Waiting for pods to terminate", "nodeName", nodeName, "stillRunning", stillRunning)
-		}
-	}
-}
-
-// isDaemonSetPod checks if a pod is managed by a DaemonSet
-func (r *NodeReconciler) isDaemonSetPod(pod *corev1.Pod) bool {
-	for _, ownerRef := range pod.OwnerReferences {
-		if ownerRef.Kind == "DaemonSet" {
-			return true
-		}
-	}
-	return false
-}
-
-// isStaticPod checks if a pod is a static pod (managed by kubelet)
-func (r *NodeReconciler) isStaticPod(pod *corev1.Pod) bool {
-	// Static pods have a specific annotation
-	if _, exists := pod.Annotations["kubernetes.io/config.source"]; exists {
-		return true
-	}
-	// Also check for mirror pod annotation
-	if _, exists := pod.Annotations["kubernetes.io/config.mirror"]; exists {
-		return true
-	}
-	return false
-}
-
-// isCriticalSystemPod checks if a pod is a critical system pod that shouldn't be evicted
-func (r *NodeReconciler) isCriticalSystemPod(pod *corev1.Pod) bool {
-	// Skip pods in kube-system namespace that are critical
-	if pod.Namespace == "kube-system" {
-		// List of critical system components that shouldn't be evicted
-		criticalComponents := []string{
-			"kube-proxy",
-			"kube-dns",
-			"coredns",
-			"calico-node",
-			"flannel",
-			"weave-net",
-		}
-
-		for _, component := range criticalComponents {
-			if pod.Name == component ||
-				(len(pod.Labels) > 0 && pod.Labels["k8s-app"] == component) ||
-				(len(pod.Labels) > 0 && pod.Labels["app"] == component) {
-				return true
-			}
-		}
-	}
-	return false
 }
 func (r *NodeReconciler) SetControllerReference(ctx context.Context, node *infrav1alpha1.Node, group *infrav1alpha1.Group) error {
 	logger := log.FromContext(ctx)

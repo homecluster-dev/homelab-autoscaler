@@ -124,7 +124,7 @@ func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.Node
 	groups := &infrav1alpha1.GroupList{}
 	err := s.Client.List(ctx, groups, &client.ListOptions{})
 	if err != nil {
-		logger.Error(err, "failed to list groups")
+		logger.Error(err, "Failed to list groups")
 		return nil, status.Errorf(codes.Internal, "failed to list groups: %v", err)
 	}
 
@@ -136,7 +136,7 @@ func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.Node
 	// Process each group
 	for _, group := range groups.Items {
 
-		var maxSize int32 = 0
+		var maxSize int32
 		labelSelector := labels.SelectorFromSet(map[string]string{"group": group.Name})
 		listOpts := &client.ListOptions{LabelSelector: labelSelector}
 		nodes := &infrav1alpha1.NodeList{}
@@ -653,7 +653,7 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	}
 
 	// Remove unschedulable taints
-	var sanitizedTaints []corev1.Taint
+	sanitizedTaints := make([]corev1.Taint, 0, len(templateNode.Spec.Taints))
 	for _, taint := range templateNode.Spec.Taints {
 		// Filter out common unschedulable taints
 		if taint.Key == "node.kubernetes.io/unschedulable" ||
