@@ -10,7 +10,7 @@ spec:
   ignoreDaemonSetsUtilization: true
   maxNodeProvisionTime: 2m
   scaleDownGpuUtilizationThreshold: "30"
-  scaleDownUnneededTime: 1m
-  scaleDownUnreadyTime: 2m
+  scaleDownUnneededTime: 30s
+  scaleDownUnreadyTime: 30s
   scaleDownUtilizationThreshold: "70"
   zeroOrMaxNodeScaling: false
