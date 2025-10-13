@@ -168,7 +168,7 @@ func main() {
 
 	// Debug: Log KUBECONFIG environment variable
 	setupLog.Info("KUBECONFIG environment variable", "value", os.Getenv("KUBECONFIG"))
-	
+
 	// Create manager options
 	mgrOptions := ctrl.Options{
 		Scheme:                 scheme,

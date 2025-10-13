@@ -43,14 +43,8 @@ spec:
                 type: boolean
               maxNodeProvisionTime:
                 type: string
-              maxSize:
-                type: integer
               name:
                 type: string
-              nodeSelector:
-                additionalProperties:
-                  type: string
-                type: object
               scaleDownGpuUtilizationThreshold:
                 type: string
               scaleDownUnneededTime:
@@ -58,15 +52,14 @@ spec:
               scaleDownUnreadyTime:
                 type: string
               scaleDownUtilizationThreshold:
+                description: NodeSelector                     map[string]string `json:"nodeSelector"`
                 type: string
               zeroOrMaxNodeScaling:
                 type: boolean
             required:
             - ignoreDaemonSetsUtilization
             - maxNodeProvisionTime
-            - maxSize
             - name
-            - nodeSelector
             - scaleDownGpuUtilizationThreshold
             - scaleDownUnneededTime
             - scaleDownUnreadyTime

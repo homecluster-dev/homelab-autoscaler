@@ -18,7 +18,6 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -32,13 +31,13 @@ type GroupSpec struct {
 
 	Name string `json:"name"`
 	// NodeSelector                     map[string]string `json:"nodeSelector"`
-	ScaleDownUtilizationThreshold    string       `json:"scaleDownUtilizationThreshold"`
-	ScaleDownGpuUtilizationThreshold string       `json:"scaleDownGpuUtilizationThreshold"`
-	ScaleDownUnneededTime            *v1.Duration `json:"scaleDownUnneededTime"`
-	ScaleDownUnreadyTime             *v1.Duration `json:"scaleDownUnreadyTime"`
-	MaxNodeProvisionTime             *v1.Duration `json:"maxNodeProvisionTime"`
-	ZeroOrMaxNodeScaling             bool         `json:"zeroOrMaxNodeScaling"`
-	IgnoreDaemonSetsUtilization      bool         `json:"ignoreDaemonSetsUtilization"`
+	ScaleDownUtilizationThreshold    string           `json:"scaleDownUtilizationThreshold"`
+	ScaleDownGpuUtilizationThreshold string           `json:"scaleDownGpuUtilizationThreshold"`
+	ScaleDownUnneededTime            *metav1.Duration `json:"scaleDownUnneededTime"`
+	ScaleDownUnreadyTime             *metav1.Duration `json:"scaleDownUnreadyTime"`
+	MaxNodeProvisionTime             *metav1.Duration `json:"maxNodeProvisionTime"`
+	ZeroOrMaxNodeScaling             bool             `json:"zeroOrMaxNodeScaling"`
+	IgnoreDaemonSetsUtilization      bool             `json:"ignoreDaemonSetsUtilization"`
 }
 
 // GroupStatus defines the observed state of Group.
