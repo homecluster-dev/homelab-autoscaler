@@ -43,8 +43,6 @@ spec:
                 type: boolean
               maxNodeProvisionTime:
                 type: string
-              name:
-                type: string
               scaleDownGpuUtilizationThreshold:
                 type: string
               scaleDownUnneededTime:
@@ -59,7 +57,6 @@ spec:
             required:
             - ignoreDaemonSetsUtilization
             - maxNodeProvisionTime
-            - name
             - scaleDownGpuUtilizationThreshold
             - scaleDownUnneededTime
             - scaleDownUnreadyTime

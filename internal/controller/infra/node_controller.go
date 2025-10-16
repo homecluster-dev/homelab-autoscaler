@@ -623,23 +623,19 @@ func (r *NodeReconciler) updateNodeStatusAfterJobSuccess(ctx context.Context, no
 		// Update status based on operation
 		switch operation {
 		case "startup":
-			fresh.Status.PowerState = infrav1alpha1.PowerStateOn
-			fresh.Status.Progress = ""
 			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               "StartupJobCompleted",
 				Status:             metav1.ConditionTrue,
 				LastTransitionTime: metav1.Now(),
-				Reason:             "NodeStartupCompleted",
+				Reason:             "NodeStartupJobCompleted",
 				Message:            "Node startup job completed successfully",
 			})
 		case "shutdown":
-			fresh.Status.PowerState = infrav1alpha1.PowerStateOff
-			fresh.Status.Progress = ""
 			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               "ShutdownJobCompleted",
 				Status:             metav1.ConditionFalse,
 				LastTransitionTime: metav1.Now(),
-				Reason:             "NodeShutdownCompleted",
+				Reason:             "NodeShutdownJobCompleted",
 				Message:            "Node shutdown job completed successfully",
 			})
 		}
@@ -666,7 +662,7 @@ func (r *NodeReconciler) updateNodeStatusAfterJobFailure(ctx context.Context, no
 		}
 
 		// Clear progress and add failure condition
-		fresh.Status.Progress = ""
+		// fresh.Status.Progress = ""
 		fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,

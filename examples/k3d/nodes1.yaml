@@ -4,6 +4,7 @@ metadata:
   name: k3d-homelab-autoscaler-agent-0
   labels:
     group: group1
+  namespace: homelab-autoscaler-system
 spec:
   kubernetesNodeName: k3d-homelab-autoscaler-agent-0
   powerState: "on"

@@ -45,6 +45,11 @@ help: ## Display this help.
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
+.PHONY: helm-sync-crds
+helm-sync-crds: manifests ## Synchronize kubebuilder-generated CRDs to Helm chart templates.
+	@echo "Synchronizing CRDs from kubebuilder to Helm chart..."
+	./hack/sync-helm-crds.sh
+
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
@@ -61,111 +66,77 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= homelab-autoscaler-test-e2e
-VBOX_CLUSTER ?= homelab-autoscaler-vbox
-
-# Port forwarding process PID for cleanup
-GRPC_PORT_FORWARD_PID ?=
-
-# VM control server PID for cleanup
-VM_CONTROL_SERVER_PID ?=
-
-.PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)' with custom configuration..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) --config hack/kind-config.yaml ;; \
-	esac
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e tests with full deployment pipeline.
-	@echo "Loading Docker image into Kind cluster..."
-	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
+test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with full cleanup
+	@echo "Setting up development environment..."
+	./development/install-dev.sh
 	
-	@echo "Installing CRDs..."
-	$(MAKE) install
+	@echo "Starting VM control server..."
+	@cd examples/k3d && python3 vm_control_server.py & \
+	VM_CONTROL_PID=$$!; \
+	echo "export VM_CONTROL_PID=$$VM_CONTROL_PID" > /tmp/vm-control.pid
 	
-	@echo "Deploying operator..."
-	$(MAKE) deploy
-	
-	@echo "Waiting for deployment to be ready..."
-	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
-	
-	@echo "Creating test groups..."
-	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
-	
-	@echo "Creating test nodes..."
-	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
-	
-	@echo "Starting gRPC port forwarding for tests..."
-	$(MAKE) port-forward-grpc-e2e
-	@sleep 5  # Give port forwarding time to establish
+	@echo "Starting local server..."
+	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 & \
+	SERVER_PID=$$!; \
+	echo "export SERVER_PID=$$SERVER_PID" > /tmp/local-server.pid; \
+	sleep 5
 	
 	@echo "Running e2e tests..."
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	@KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration" || TEST_FAILED=true
 	
-	@echo "Cleaning up port forwarding..."
-	$(MAKE) kill-port-forward-grpc-e2e
+	@echo "Cleaning up local server..."
+	@if [ -f /tmp/local-server.pid ]; then \
+		source /tmp/local-server.pid; \
+		kill $$SERVER_PID 2>/dev/null || true; \
+		rm -f /tmp/local-server.pid; \
+	fi
 	
-	@echo "Cleaning up test resources..."
-	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
+	@echo "Cleaning up VM control server..."
+	@if [ -f /tmp/vm-control.pid ]; then \
+		source /tmp/vm-control.pid; \
+		kill $$VM_CONTROL_PID 2>/dev/null || true; \
+		rm -f /tmp/vm-control.pid; \
+	fi
 	
-	@echo "Cleaning up deployment and cluster..."
-	$(MAKE) undeploy ignore-not-found=true
-	$(MAKE) cleanup-test-e2e
+	@echo "Deleting cluster..."
+	./examples/k3d/delete-cluster.sh
+	
+	@if [ "$$TEST_FAILED" = "true" ]; then \
+		exit 1; \
+	fi
 
 .PHONY: run-e2e
-run-e2e: setup-test-e2e manifests generate fmt vet docker-build ## Run the e2e tests without cleanup afterwards.
-	@echo "Loading Docker image into Kind cluster..."
-	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
+run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without cleanup
+	@echo "Setting up development environment..."
+	./development/install-dev.sh
 	
-	@echo "Installing CRDs..."
-	$(MAKE) install
+	@echo "Starting VM control server..."
+	@cd examples/k3d && python3 vm_control_server.py & \
+	VM_CONTROL_PID=$$!; \
+	echo "export VM_CONTROL_PID=$$VM_CONTROL_PID" > /tmp/vm-control.pid; \
+	echo "VM control server started with PID: $$VM_CONTROL_PID"
 	
-	@echo "Deploying operator..."
-	$(MAKE) deploy
-	
-	@echo "Waiting for deployment to be ready..."
-	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
-	
-	@echo "Creating test groups..."
-	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
-	
-	@echo "Creating test nodes..."
-	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
-
-	@echo "Starting gRPC port forwarding for tests..."
-	$(MAKE) port-forward-grpc-e2e
-	@sleep 5  # Give port forwarding time to establish
+	@echo "Starting local server..."
+	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 & \
+	SERVER_PID=$$!; \
+	echo "export SERVER_PID=$$SERVER_PID" > /tmp/local-server.pid; \
+	echo "Local server started with PID: $$SERVER_PID"; \
+	sleep 5
 	
 	@echo "Running e2e tests..."
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 	
-	@echo "Cleaning up port forwarding..."
-	$(MAKE) kill-port-forward-grpc-e2e
-	
-	@echo "E2E tests completed! Resources are still deployed for inspection."
+	@echo "E2E tests completed! Environment is still running for inspection."
+	@echo "To clean up manually:"
+	@echo "  kill \$$(cat /tmp/local-server.pid | cut -d'=' -f2) 2>/dev/null || true"
+	@echo "  kill \$$(cat /tmp/vm-control.pid | cut -d'=' -f2) 2>/dev/null || true"
+	@echo "  ./examples/k3d/delete-cluster.sh"
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+cleanup-test-e2e: ## Tear down the k3d cluster used for e2e tests
+	./examples/k3d/delete-cluster.sh
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -182,7 +153,7 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
+build: helm-sync-crds generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: run
@@ -241,7 +212,6 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd test/virtualbox && ./deploy.sh $(IMG)
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 
@@ -258,7 +228,6 @@ $(LOCALBIN):
 
 ## Tool Binaries
 KUBECTL ?= kubectl
-KIND ?= kind
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
@@ -316,259 +285,3 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $$(realpath $(1)-$(3)) $(1)
 endef
-
-##@ gRPC Server Testing
-
-.PHONY: test-e2e-grpc
-test-e2e-grpc: setup-test-e2e manifests generate fmt vet docker-build ## Run the gRPC server e2e tests with full deployment pipeline.
-	@echo "Loading Docker image into Kind cluster..."
-	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
-	
-	@echo "Installing CRDs..."
-	$(MAKE) install
-	
-	@echo "Deploying operator with gRPC server enabled..."
-	$(MAKE) deploy
-	
-	@echo "Waiting for deployment to be ready..."
-	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
-	
-	@echo "Waiting for gRPC server to be ready..."
-	@for i in {1..30}; do \
-		if $(KUBECTL) get pods -n homelab-autoscaler-system -l control-plane=controller-manager -o jsonpath='{.items[0].status.phase}' | grep -q Running; then \
-			echo "Pod is running, checking gRPC server..."; \
-			if $(KUBECTL) logs -n homelab-autoscaler-system -l control-plane=controller-manager --tail=10 | grep -q "gRPC server started"; then \
-				echo "gRPC server is ready!"; \
-				break; \
-			fi; \
-		fi; \
-		echo "Waiting for gRPC server... ($$i/30)"; \
-		sleep 10; \
-	done
-	
-	@echo "Creating test groups..."
-	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
-	
-	@echo "Creating test nodes..."
-	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
-	
-	@echo "Waiting for groups to be processed..."
-	@for i in {1..30}; do \
-		healthy_count=$$($(KUBECTL) get groups -n homelab-autoscaler-system -o json | jq '[.items[] | select(.status.health == "healthy")] | length' 2>/dev/null || echo "0"); \
-		if [ "$$healthy_count" -ge "2" ]; then \
-			echo "Groups are ready! Found $$healthy_count healthy groups"; \
-			break; \
-		fi; \
-		echo "Waiting for groups to become healthy... ($$i/30) - Found $$healthy_count healthy groups"; \
-		sleep 10; \
-	done
-	
-	@echo "Running gRPC tests..."
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="gRPC Server"
-	
-	@echo "Cleaning up test resources..."
-	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	
-	@echo "Cleaning up deployment and cluster..."
-	$(MAKE) undeploy ignore-not-found=true
-	$(MAKE) cleanup-test-e2e
-
-.PHONY: test-grpc-server
-test-grpc-server: ## Test the gRPC server integration (requires running operator)
-	go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="gRPC Server" -timeout=5m
-
-.PHONY: port-forward-grpc
-port-forward-grpc: ## Port forward the gRPC server for manual testing
-	$(KUBECTL) port-forward deployment/homelab-autoscaler-controller-manager 50051:50051 -n homelab-autoscaler-system
-
-.PHONY: port-forward-grpc-e2e
-port-forward-grpc-e2e: ## Start port forwarding for gRPC server in background for e2e tests
-	@echo "Starting gRPC server port forwarding in background..."
-	@$(KUBECTL) port-forward deployment/homelab-autoscaler-controller-manager 50051:50051 -n homelab-autoscaler-system & \
-	GRPC_PORT_FORWARD_PID=$$!; \
-	echo "gRPC port forwarding started with PID: $$GRPC_PORT_FORWARD_PID"; \
-	echo "export GRPC_PORT_FORWARD_PID=$$GRPC_PORT_FORWARD_PID" > /tmp/grpc-port-forward.pid
-
-.PHONY: kill-port-forward-grpc-e2e
-kill-port-forward-grpc-e2e: ## Kill the background gRPC port forwarding process
-	@if [ -f /tmp/grpc-port-forward.pid ]; then \
-		source /tmp/grpc-port-forward.pid; \
-		if [ -n "$$GRPC_PORT_FORWARD_PID" ]; then \
-			echo "Killing gRPC port forwarding process with PID: $$GRPC_PORT_FORWARD_PID"; \
-			kill $$GRPC_PORT_FORWARD_PID 2>/dev/null || true; \
-			rm -f /tmp/grpc-port-forward.pid; \
-		fi; \
-	else \
-		echo "No gRPC port forwarding PID file found"; \
-	fi
-
-.PHONY: grpc-test-client
-grpc-test-client: ## Run a simple gRPC test client (requires port-forward-grpc)
-	@echo "Testing gRPC server endpoints..."
-	@echo "Available commands:"
-	@echo "  grpcurl -plaintext localhost:50051 list"
-	@echo "  grpcurl -plaintext localhost:50051 clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider/NodeGroups"
-	@echo "  grpcurl -plaintext localhost:50051 clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider/GPULabel"
-
-.PHONY: run-with-grpc
-run-with-grpc: manifests generate fmt vet ## Run the controller with gRPC server enabled
-	go run ./cmd/main.go --enable-grpc-server=true --grpc-server-address=:50051
-
-.PHONY: setup-grpc-dev
-setup-grpc-dev: setup-test-e2e docker-build ## Set up a development environment for gRPC testing
-	@echo "Setting up gRPC development environment..."
-	$(KIND) load docker-image ${IMG} --name $(KIND_CLUSTER)
-	$(MAKE) install
-	$(MAKE) deploy
-	@echo "Waiting for deployment to be ready..."
-	$(KUBECTL) wait --for=condition=available --timeout=300s deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
-	@echo "Creating test groups..."
-	$(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
-	
-	@echo "Creating test nodes..."
-	$(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
-	$(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
-	@echo "Setup complete! Use 'make port-forward-grpc' to access the gRPC server."
-	@echo "Then use 'make grpc-test-client' to see available testing commands."
-
-.PHONY: cleanup-grpc-dev
-cleanup-grpc-dev: ## Clean up the gRPC development environment
-	@echo "Cleaning up gRPC development environment..."
-	$(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	$(MAKE) undeploy ignore-not-found=true
-	$(MAKE) cleanup-test-e2e
-
-##@ VirtualBox E2E Testing
-
-.PHONY: setup-vbox-cluster
-setup-vbox-cluster: ## Set up VirtualBox cluster for e2e tests
-	@echo "Checking for existing VirtualBox cluster..."
-	@if vagrant status --machine-readable 2>/dev/null | grep -q "state,running"; then \
-		echo "VirtualBox cluster is already running. Skipping setup."; \
-	else \
-		echo "Setting up VirtualBox cluster..."; \
-		cd test/virtualbox && vagrant up; \
-	fi
-
-	cd test/virtualbox/ && furyctl apply --config ./furyctl.yaml --outdir "$PWD" --disable-analytics -D
-
-.PHONY: cleanup-vbox-cluster
-cleanup-vbox-cluster: ## Clean up VirtualBox cluster
-	@echo "Cleaning up VirtualBox cluster..."
-	@cd test/virtualbox && vagrant destroy -f || true
-
-.PHONY: start-vm-control-server
-start-vm-control-server: ## Start the VM control server with PID tracking
-	@echo "Starting VM control server..."
-	@cd test/virtualbox && python3 vm_control_server.py & \
-	VM_CONTROL_SERVER_PID=$$!; \
-	echo "VM control server started with PID: $$VM_CONTROL_SERVER_PID"; \
-	echo "export VM_CONTROL_SERVER_PID=$$VM_CONTROL_SERVER_PID" > /tmp/vm-control-server.pid
-
-.PHONY: stop-vm-control-server
-stop-vm-control-server: ## Stop the VM control server
-	@if [ -f /tmp/vm-control-server.pid ]; then \
-		source /tmp/vm-control-server.pid; \
-		if [ -n "$$VM_CONTROL_SERVER_PID" ]; then \
-			echo "Stopping VM control server with PID: $$VM_CONTROL_SERVER_PID"; \
-			kill $$VM_CONTROL_SERVER_PID 2>/dev/null || true; \
-			rm -f /tmp/vm-control-server.pid; \
-		fi; \
-	else \
-		echo "No VM control server PID file found"; \
-	fi
-
-.PHONY: test-e2e-vbox
-test-e2e-vbox: setup-vbox-cluster manifests generate fmt vet ## Run the VirtualBox e2e tests with full deployment pipeline and cleanup.
-
-	@echo "Installing CRDs to VirtualBox cluster..."
-	KUBECONFIG=test/virtualbox/kubeconfig $(MAKE) install
-	
-	@echo "Creating test groups..."
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/group1.yaml
-	
-	@echo "Creating test nodes..."
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml
-	
-	@echo "Starting VM control server..."
-	$(MAKE) start-vm-control-server
-	@sleep 3  # Give VM control server time to start
-	
-	@echo "Starting local controller with VirtualBox kubeconfig..."
-	@KUBECONFIG=test/virtualbox/kubeconfig go run ./cmd/main.go --enable-grpc-server=true --grpc-server-address=:50051 & \
-	CONTROLLER_PID=$$!; \
-	echo "Controller started with PID: $$CONTROLLER_PID"; \
-	echo "export CONTROLLER_PID=$$CONTROLLER_PID" > /tmp/vbox-controller.pid; \
-	sleep 10  # Give controller time to start and process resources
-	
-	@echo "Running VirtualBox e2e tests..."
-	@KUBECONFIG=test/virtualbox/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v || TEST_FAILED=true
-	
-	@echo "Cleaning up controller..."
-	@if [ -f /tmp/vbox-controller.pid ]; then \
-		source /tmp/vbox-controller.pid; \
-		if [ -n "$$CONTROLLER_PID" ]; then \
-			echo "Stopping controller with PID: $$CONTROLLER_PID"; \
-			kill $$CONTROLLER_PID 2>/dev/null || true; \
-			rm -f /tmp/vbox-controller.pid; \
-		fi; \
-	fi
-	
-	@echo "Cleaning up VM control server..."
-	$(MAKE) stop-vm-control-server
-	
-	@echo "Cleaning up test resources..."
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) delete -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system --ignore-not-found=true
-	
-	@echo "Cleaning up VirtualBox cluster..."
-	$(MAKE) cleanup-vbox-cluster
-	
-	@if [ "$$TEST_FAILED" = "true" ]; then \
-		echo "VirtualBox e2e tests failed!"; \
-		exit 1; \
-	fi
-
-.PHONY: run-e2e-vbox
-run-e2e-vbox: setup-vbox-cluster manifests generate fmt vet ## Run the VirtualBox e2e tests without cleanup afterwards.
-	@echo "Installing CRDs to VirtualBox cluster..."
-	KUBECONFIG=test/virtualbox/kubeconfig $(MAKE) install
-	
-	@echo "Creating test groups..."
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/group1.yaml -n homelab-autoscaler-system
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/group2.yaml -n homelab-autoscaler-system
-	
-	@echo "Creating test nodes..."
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/nodes1.yaml -n homelab-autoscaler-system
-	KUBECONFIG=test/virtualbox/kubeconfig $(KUBECTL) apply -f test/e2e/manifests/nodes2.yaml -n homelab-autoscaler-system
-	
-	@echo "Starting VM control server..."
-	$(MAKE) start-vm-control-server
-	@sleep 3  # Give VM control server time to start
-	
-	@echo "Starting local controller with VirtualBox kubeconfig..."
-	@KUBECONFIG=test/virtualbox/kubeconfig go run ./cmd/main.go --enable-grpc-server=true --grpc-server-address=:50051 & \
-	CONTROLLER_PID=$$!; \
-	echo "Controller started with PID: $$CONTROLLER_PID"; \
-	echo "export CONTROLLER_PID=$$CONTROLLER_PID" > /tmp/vbox-controller.pid; \
-	sleep 10  # Give controller time to start and process resources
-	
-	@echo "Running VirtualBox e2e tests..."
-	KUBECONFIG=test/virtualbox/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	
-	@echo "VirtualBox e2e tests completed! Resources are still deployed for inspection."
-	@echo "Use the following commands to clean up manually:"
-	@echo "  make stop-vm-control-server"
-	@echo "  kill \$$(cat /tmp/vbox-controller.pid | cut -d'=' -f2) 2>/dev/null || true"
-	@echo "  make cleanup-vbox-cluster"
