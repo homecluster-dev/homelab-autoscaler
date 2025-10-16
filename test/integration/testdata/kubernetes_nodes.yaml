@@ -1,0 +1,763 @@
+
+# Kubernetes core/v1 Node objects corresponding to Node CRs
+# These nodes have matching names and proper group labels for gRPC server queries
+
+---
+# Kubernetes node for test-node-1
+apiVersion: v1
+kind: Node
+metadata:
+  name: test-node-1
+  labels:
+    kubernetes.io/hostname: test-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: test-group
+    node.kubernetes.io/instance-type: standard
+    test-scenario: basic
+spec:
+  providerID: homelab://test-node-1
+status:
+  capacity:
+    cpu: "4"
+    memory: 8Gi
+    ephemeral-storage: 100Gi
+    pods: "110"
+  allocatable:
+    cpu: "3800m"
+    memory: 7516Mi
+    ephemeral-storage: 92Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: KubeletReady
+    message: kubelet is posting ready status
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:30:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:30:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:30:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:30:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.101
+  - type: Hostname
+    address: test-node-1
+  nodeInfo:
+    machineID: test-machine-id-1
+    systemUUID: test-system-uuid-1
+    bootID: test-boot-id-1
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for test-node-2
+apiVersion: v1
+kind: Node
+metadata:
+  name: test-node-2
+  labels:
+    kubernetes.io/hostname: test-node-2
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: test-group
+    node.kubernetes.io/instance-type: standard
+    test-scenario: basic
+spec:
+  providerID: homelab://test-node-2
+status:
+  capacity:
+    cpu: "4"
+    memory: 8Gi
+    ephemeral-storage: 100Gi
+    pods: "110"
+  allocatable:
+    cpu: "3800m"
+    memory: 7516Mi
+    ephemeral-storage: 92Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: KubeletReady
+    message: kubelet is posting ready status
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:35:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:35:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:35:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T09:35:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.102
+  - type: Hostname
+    address: test-node-2
+  nodeInfo:
+    machineID: test-machine-id-2
+    systemUUID: test-system-uuid-2
+    bootID: test-boot-id-2
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for gpu-node-1 (high-end GPU node)
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-1
+  labels:
+    kubernetes.io/hostname: gpu-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: gpu-group
+    node.kubernetes.io/instance-type: gpu
+    accelerator: nvidia-tesla-v100
+    test-scenario: gpu-workload
+    node-type: gpu
+spec:
+  providerID: homelab://gpu-node-1
+status:
+  capacity:
+    cpu: "16"
+    memory: 64Gi
+    ephemeral-storage: 500Gi
+    pods: "110"
+    nvidia.com/gpu: "2"
+  allocatable:
+    cpu: "15800m"
+    memory: 61440Mi
+    ephemeral-storage: 460Gi
+    pods: "110"
+    nvidia.com/gpu: "2"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: KubeletReady
+    message: kubelet is posting ready status
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:45:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:45:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:45:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:45:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.201
+  - type: Hostname
+    address: gpu-node-1
+  nodeInfo:
+    machineID: gpu-machine-id-1
+    systemUUID: gpu-system-uuid-1
+    bootID: gpu-boot-id-1
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for gpu-node-2 (powered off - NotReady)
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-2
+  labels:
+    kubernetes.io/hostname: gpu-node-2
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: gpu-group
+    node.kubernetes.io/instance-type: gpu
+    accelerator: nvidia-tesla-v100
+    test-scenario: scale-up-candidate
+    node-type: gpu
+spec:
+  providerID: homelab://gpu-node-2
+  unschedulable: true
+  taints:
+  - key: node.kubernetes.io/unreachable
+    effect: NoExecute
+    timeAdded: "2024-01-15T02:15:00Z"
+status:
+  capacity:
+    cpu: "16"
+    memory: 64Gi
+    ephemeral-storage: 500Gi
+    pods: "110"
+    nvidia.com/gpu: "2"
+  allocatable:
+    cpu: "15800m"
+    memory: 61440Mi
+    ephemeral-storage: 460Gi
+    pods: "110"
+    nvidia.com/gpu: "2"
+  conditions:
+  - type: Ready
+    status: "False"
+    reason: KubeletNotReady
+    message: kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T02:15:00Z"
+    lastTransitionTime: "2024-01-15T02:15:00Z"
+  - type: MemoryPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T02:15:00Z"
+    lastTransitionTime: "2024-01-15T02:15:00Z"
+  - type: DiskPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T02:15:00Z"
+    lastTransitionTime: "2024-01-15T02:15:00Z"
+  - type: PIDPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T02:15:00Z"
+    lastTransitionTime: "2024-01-15T02:15:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.202
+  - type: Hostname
+    address: gpu-node-2
+  nodeInfo:
+    machineID: gpu-machine-id-2
+    systemUUID: gpu-system-uuid-2
+    bootID: gpu-boot-id-2
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for cpu-node-1
+apiVersion: v1
+kind: Node
+metadata:
+  name: cpu-node-1
+  labels:
+    kubernetes.io/hostname: cpu-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: cpu-group
+    node.kubernetes.io/instance-type: compute
+    test-scenario: cpu-workload
+    node-type: cpu
+spec:
+  providerID: homelab://cpu-node-1
+status:
+  capacity:
+    cpu: "8"
+    memory: 16Gi
+    ephemeral-storage: 200Gi
+    pods: "110"
+  allocatable:
+    cpu: "7600m"
+    memory: 15360Mi
+    ephemeral-storage: 184Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: KubeletReady
+    message: kubelet is posting ready status
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T07:20:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T07:20:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T07:20:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T07:20:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.111
+  - type: Hostname
+    address: cpu-node-1
+  nodeInfo:
+    machineID: cpu-machine-id-1
+    systemUUID: cpu-system-uuid-1
+    bootID: cpu-boot-id-1
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for cpu-node-2 (shutting down - cordoned)
+apiVersion: v1
+kind: Node
+metadata:
+  name: cpu-node-2
+  labels:
+    kubernetes.io/hostname: cpu-node-2
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: cpu-group
+    node.kubernetes.io/instance-type: compute
+    test-scenario: shutting-down
+    node-type: cpu
+spec:
+  providerID: homelab://cpu-node-2
+  unschedulable: true
+  taints:
+  - key: node.kubernetes.io/unschedulable
+    effect: NoSchedule
+    timeAdded: "2024-01-15T10:15:00Z"
+status:
+  capacity:
+    cpu: "8"
+    memory: 16Gi
+    ephemeral-storage: 200Gi
+    pods: "110"
+  allocatable:
+    cpu: "7600m"
+    memory: 15360Mi
+    ephemeral-storage: 184Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: KubeletReady
+    message: kubelet is posting ready status but node is cordoned
+    lastHeartbeatTime: "2024-01-15T10:15:00Z"
+    lastTransitionTime: "2024-01-15T07:25:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:15:00Z"
+    lastTransitionTime: "2024-01-15T07:25:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:15:00Z"
+    lastTransitionTime: "2024-01-15T07:25:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:15:00Z"
+    lastTransitionTime: "2024-01-15T07:25:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.112
+  - type: Hostname
+    address: cpu-node-2
+  nodeInfo:
+    machineID: cpu-machine-id-2
+    systemUUID: cpu-system-uuid-2
+    bootID: cpu-boot-id-2
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for startup-node-1 (starting up - NotReady)
+apiVersion: v1
+kind: Node
+metadata:
+  name: startup-node-1
+  labels:
+    kubernetes.io/hostname: startup-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: unknown-group
+    node.kubernetes.io/instance-type: standard
+    test-scenario: starting-up
+spec:
+  providerID: homelab://startup-node-1
+status:
+  capacity:
+    cpu: "6"
+    memory: 12Gi
+    ephemeral-storage: 150Gi
+    pods: "110"
+  allocatable:
+    cpu: "5700m"
+    memory: 11520Mi
+    ephemeral-storage: 138Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "False"
+    reason: KubeletNotReady
+    message: container runtime network not ready
+    lastHeartbeatTime: "2024-01-15T10:10:00Z"
+    lastTransitionTime: "2024-01-15T10:10:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:10:00Z"
+    lastTransitionTime: "2024-01-15T10:10:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:10:00Z"
+    lastTransitionTime: "2024-01-15T10:10:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:10:00Z"
+    lastTransitionTime: "2024-01-15T10:10:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.121
+  - type: Hostname
+    address: startup-node-1
+  nodeInfo:
+    machineID: startup-machine-id-1
+    systemUUID: startup-system-uuid-1
+    bootID: startup-boot-id-1
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for offline-node-1 (unreachable)
+apiVersion: v1
+kind: Node
+metadata:
+  name: offline-node-1
+  labels:
+    kubernetes.io/hostname: offline-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: offline-group
+    node.kubernetes.io/instance-type: standard
+    test-scenario: offline-nodes
+spec:
+  providerID: homelab://offline-node-1
+  taints:
+  - key: node.kubernetes.io/unreachable
+    effect: NoExecute
+    timeAdded: "2024-01-15T09:00:00Z"
+  - key: node.kubernetes.io/not-ready
+    effect: NoExecute
+    timeAdded: "2024-01-15T09:00:00Z"
+status:
+  capacity:
+    cpu: "4"
+    memory: 8Gi
+    ephemeral-storage: 100Gi
+    pods: "110"
+  allocatable:
+    cpu: "3800m"
+    memory: 7516Mi
+    ephemeral-storage: 92Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T09:00:00Z"
+    lastTransitionTime: "2024-01-15T09:00:00Z"
+  - type: MemoryPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T09:00:00Z"
+    lastTransitionTime: "2024-01-15T09:00:00Z"
+  - type: DiskPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T09:00:00Z"
+    lastTransitionTime: "2024-01-15T09:00:00Z"
+  - type: PIDPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-15T09:00:00Z"
+    lastTransitionTime: "2024-01-15T09:00:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.131
+  - type: Hostname
+    address: offline-node-1
+  nodeInfo:
+    machineID: offline-machine-id-1
+    systemUUID: offline-system-uuid-1
+    bootID: offline-boot-id-1
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for fast-node-1 (high-performance)
+apiVersion: v1
+kind: Node
+metadata:
+  name: fast-node-1
+  labels:
+    kubernetes.io/hostname: fast-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: fast-scale-group
+    node.kubernetes.io/instance-type: high-performance
+    test-scenario: fast-scaling
+    performance: high
+spec:
+  providerID: homelab://fast-node-1
+status:
+  capacity:
+    cpu: "12"
+    memory: 32Gi
+    ephemeral-storage: 300Gi
+    pods: "110"
+  allocatable:
+    cpu: "11400m"
+    memory: 30720Mi
+    ephemeral-storage: 276Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: KubeletReady
+    message: kubelet is posting ready status
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:00:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:00:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:00:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T08:00:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.141
+  - type: Hostname
+    address: fast-node-1
+  nodeInfo:
+    machineID: fast-machine-id-1
+    systemUUID: fast-system-uuid-1
+    bootID: fast-boot-id-1
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for dev-node-1 (development environment)
+apiVersion: v1
+kind: Node
+metadata:
+  name: dev-node-1
+  labels:
+    kubernetes.io/hostname: dev-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    infra.homecluster.dev/group: dev-group
+    node.kubernetes.io/instance-type: development
+    test-scenario: development
+    environment: dev
+spec:
+  providerID: homelab://dev-node-1
+status:
+  capacity:
+    cpu: "2"
+    memory: 4Gi
+    ephemeral-storage: 50Gi
+    pods: "110"
+  allocatable:
+    cpu: "1900m"
+    memory: 3584Mi
+    ephemeral-storage: 46Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: KubeletReady
+    message: kubelet is posting ready status
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T06:00:00Z"
+  - type: MemoryPressure
+    status: "False"
+    reason: KubeletHasSufficientMemory
+    message: kubelet has sufficient memory available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T06:00:00Z"
+  - type: DiskPressure
+    status: "False"
+    reason: KubeletHasNoDiskPressure
+    message: kubelet has no disk pressure
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T06:00:00Z"
+  - type: PIDPressure
+    status: "False"
+    reason: KubeletHasSufficientPID
+    message: kubelet has sufficient PID available
+    lastHeartbeatTime: "2024-01-15T10:00:00Z"
+    lastTransitionTime: "2024-01-15T06:00:00Z"
+  addresses:
+  - type: InternalIP
+    address: 192.168.1.151
+  - type: Hostname
+    address: dev-node-1
+  nodeInfo:
+    machineID: dev-machine-id-1
+    systemUUID: dev-system-uuid-1
+    bootID: dev-boot-id-1
+    kernelVersion: 5.15.0-generic
+    osImage: Ubuntu 22.04.3 LTS
+    containerRuntimeVersion: containerd://1.6.12
+    kubeletVersion: v1.28.2
+    kubeProxyVersion: v1.28.2
+    operatingSystem: linux
+    architecture: amd64
+
+---
+# Kubernetes node for orphaned-node-1 (no group label)
+apiVersion: v1
+kind: Node
+metadata:
+  name: orphaned-node-1
+  labels:
+    kubernetes.io/hostname: orphaned-node-1
+    kubernetes.io/arch: amd64
+    kubernetes.io/os: linux
+    # Note: No infra.homecluster.dev/group label - this is intentional for testing
+    node.kubernetes.io/instance-type: standard
+    test-scenario: orphaned-node
+spec:
+  providerID: homelab://orphaned-node-1
+  unschedulable: true
+  taints:
+  - key: node.kubernetes.io/unreachable
+    effect: NoExecute
+    timeAdded: "2024-01-14T22:00:00Z"
+status:
+  capacity:
+    cpu: "4"
+    memory: 8Gi
+    ephemeral-storage: 100Gi
+    pods: "110"
+  allocatable:
+    cpu: "3800m"
+    memory: 7516Mi
+    ephemeral-storage: 92Gi
+    pods: "110"
+  conditions:
+  - type: Ready
+    status: "False"
+    reason: KubeletNotReady
+    message: kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-14T22:00:00Z"
+    lastTransitionTime: "2024-01-14T22:00:00Z"
+  - type: MemoryPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-14T22:00:00Z"
+    lastTransitionTime: "2024-01-14T22:00:00Z"
+  - type: DiskPressure
+    status: "Unknown"
+    reason: NodeStatusUnknown
+    message: Kubelet stopped posting node status
+    lastHeartbeatTime: "2024-01-14T22:00:00Z"
+    lastTransitionTime: "2024-01-14T22:00:00Z"

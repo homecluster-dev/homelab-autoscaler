@@ -149,10 +149,10 @@ func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.Node
 
 		// Create NodeGroup with: minSize=0, maxSize=GroupSpec.MaxSize, id=GroupSpec.Name
 		nodeGroup := &pb.NodeGroup{
-			Id:      group.Spec.Name,
+			Id:      group.Name,
 			MinSize: 0,
 			MaxSize: maxSize,
-			Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, maxSize),
+			Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Name, maxSize),
 		}
 
 		nodeGroups = append(nodeGroups, nodeGroup)
@@ -225,10 +225,10 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 		Id:      groupName,
 		MinSize: 0,
 		MaxSize: maxSize,
-		Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Spec.Name, len(nodes.Items)),
+		Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Name, len(nodes.Items)),
 	}
 
-	logger.Info("Found node group for node", "node", req.Node.Name, "group", group.Spec.Name)
+	logger.Info("Found node group for node", "node", req.Node.Name, "group", group.Name)
 	return &pb.NodeGroupForNodeResponse{
 		NodeGroup: nodeGroup,
 	}, nil
@@ -374,10 +374,12 @@ func (s *HomeClusterProviderServer) NodeGroupIncreaseSize(ctx context.Context, r
 	var nodeName string
 
 	for _, nodeCR := range nodes.Items {
+		desiredPowerState := nodeCR.Spec.DesiredPowerState
 		powerState := nodeCR.Status.PowerState
 		progress := nodeCR.Status.Progress
 
-		if powerState == infrav1alpha1.PowerStateOff && progress == infrav1alpha1.ProgressShutdown {
+		// Look for nodes that are desired to be off and are actually off and shutdown
+		if desiredPowerState == infrav1alpha1.PowerStateOff && powerState == infrav1alpha1.PowerStateOff && progress == infrav1alpha1.ProgressShutdown {
 			node = &nodeCR
 			nodeName = nodeCR.Name
 			break

@@ -9,7 +9,6 @@ metadata:
     {{- if .Values.crd.keep }}
     "helm.sh/resource-policy": keep
     {{- end }}
-    controller-gen.kubebuilder.io/version: v0.19.0
   name: nodes.infra.homecluster.dev
 spec:
   group: infra.homecluster.dev

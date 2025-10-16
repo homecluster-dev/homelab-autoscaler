@@ -2,11 +2,8 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Group
 metadata:
   name: group1
+  namespace: homelab-autoscaler-system
 spec:
-  name: group1
-  maxSize: 5
-  nodeSelector:
-    node.kubernetes.io/instance-type: "k3s"
   ignoreDaemonSetsUtilization: true
   maxNodeProvisionTime: 2m
   scaleDownGpuUtilizationThreshold: "30"

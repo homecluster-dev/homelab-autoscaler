@@ -1,0 +1,240 @@
+# Comprehensive Group CR test data for integration tests
+# This file contains various Group configurations to test different scenarios
+
+---
+# Basic test group - healthy state with standard configuration
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: test-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: basic
+spec:
+  name: test-group
+  scaleDownUtilizationThreshold: "0.5"
+  scaleDownGpuUtilizationThreshold: "0.5"
+  scaleDownUnneededTime: "10m"
+  scaleDownUnreadyTime: "20m"
+  maxNodeProvisionTime: "15m"
+  zeroOrMaxNodeScaling: false
+  ignoreDaemonSetsUtilization: true
+status:
+  health: healthy
+  conditions:
+  - type: Available
+    status: "True"
+    reason: GroupHealthy
+    message: All nodes in group are healthy
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+
+---
+# GPU-focused group with aggressive scaling settings
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: gpu-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: gpu-workload
+    node-type: gpu
+spec:
+  name: gpu-group
+  scaleDownUtilizationThreshold: "0.3"
+  scaleDownGpuUtilizationThreshold: "0.2"
+  scaleDownUnneededTime: "5m"
+  scaleDownUnreadyTime: "10m"
+  maxNodeProvisionTime: "20m"
+  zeroOrMaxNodeScaling: true
+  ignoreDaemonSetsUtilization: false
+status:
+  health: healthy
+  conditions:
+  - type: Available
+    status: "True"
+    reason: GroupHealthy
+    message: GPU group is operational
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+
+---
+# CPU-focused group with conservative scaling
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: cpu-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: cpu-workload
+    node-type: cpu
+spec:
+  name: cpu-group
+  scaleDownUtilizationThreshold: "0.7"
+  scaleDownGpuUtilizationThreshold: "0.8"
+  scaleDownUnneededTime: "30m"
+  scaleDownUnreadyTime: "45m"
+  maxNodeProvisionTime: "10m"
+  zeroOrMaxNodeScaling: false
+  ignoreDaemonSetsUtilization: true
+status:
+  health: healthy
+  conditions:
+  - type: Available
+    status: "True"
+    reason: GroupHealthy
+    message: CPU group is stable
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+
+---
+# Group with offline health status (some nodes are down)
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: offline-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: offline-nodes
+spec:
+  name: offline-group
+  scaleDownUtilizationThreshold: "0.5"
+  scaleDownGpuUtilizationThreshold: "0.5"
+  scaleDownUnneededTime: "15m"
+  scaleDownUnreadyTime: "25m"
+  maxNodeProvisionTime: "12m"
+  zeroOrMaxNodeScaling: false
+  ignoreDaemonSetsUtilization: true
+status:
+  health: offline
+  conditions:
+  - type: Available
+    status: "False"
+    reason: NodesOffline
+    message: Some nodes in group are offline
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+  - type: Degraded
+    status: "True"
+    reason: NodesOffline
+    message: Group performance is degraded due to offline nodes
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+
+---
+# Group with unknown health status (nodes in transition)
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: unknown-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: transitioning-nodes
+spec:
+  name: unknown-group
+  scaleDownUtilizationThreshold: "0.6"
+  scaleDownGpuUtilizationThreshold: "0.6"
+  scaleDownUnneededTime: "12m"
+  scaleDownUnreadyTime: "18m"
+  maxNodeProvisionTime: "18m"
+  zeroOrMaxNodeScaling: false
+  ignoreDaemonSetsUtilization: true
+status:
+  health: unknown
+  conditions:
+  - type: Available
+    status: "Unknown"
+    reason: NodesTransitioning
+    message: Nodes are in transitioning state
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+  - type: Progressing
+    status: "True"
+    reason: NodesStarting
+    message: Nodes are starting up
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+
+---
+# Empty group (no nodes assigned) - for scale-from-zero testing
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: empty-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: scale-from-zero
+spec:
+  name: empty-group
+  scaleDownUtilizationThreshold: "0.4"
+  scaleDownGpuUtilizationThreshold: "0.4"
+  scaleDownUnneededTime: "8m"
+  scaleDownUnreadyTime: "15m"
+  maxNodeProvisionTime: "25m"
+  zeroOrMaxNodeScaling: true
+  ignoreDaemonSetsUtilization: true
+status:
+  health: healthy
+  conditions:
+  - type: Available
+    status: "True"
+    reason: EmptyGroup
+    message: Group has no nodes but is ready for scaling
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+
+---
+# High-performance group with fast scaling
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: fast-scale-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: fast-scaling
+    performance: high
+spec:
+  name: fast-scale-group
+  scaleDownUtilizationThreshold: "0.8"
+  scaleDownGpuUtilizationThreshold: "0.9"
+  scaleDownUnneededTime: "2m"
+  scaleDownUnreadyTime: "5m"
+  maxNodeProvisionTime: "5m"
+  zeroOrMaxNodeScaling: true
+  ignoreDaemonSetsUtilization: false
+status:
+  health: healthy
+  conditions:
+  - type: Available
+    status: "True"
+    reason: GroupHealthy
+    message: High-performance group ready for fast scaling
+    lastTransitionTime: "2024-01-15T10:00:00Z"
+
+---
+# Development group with relaxed settings
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: dev-group
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: development
+    environment: dev
+spec:
+  name: dev-group
+  scaleDownUtilizationThreshold: "0.2"
+  scaleDownGpuUtilizationThreshold: "0.1"
+  scaleDownUnneededTime: "60m"
+  scaleDownUnreadyTime: "90m"
+  maxNodeProvisionTime: "30m"
+  zeroOrMaxNodeScaling: false
+  ignoreDaemonSetsUtilization: true
+status:
+  health: healthy
+  conditions:
+  - type: Available
+    status: "True"
+    reason: GroupHealthy
+    message: Development group with relaxed scaling policies
+    lastTransitionTime: "2024-01-15T10:00:00Z"

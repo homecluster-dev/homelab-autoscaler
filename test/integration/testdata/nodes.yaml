@@ -1,0 +1,513 @@
+# Comprehensive Node CR test data for integration tests
+# This file contains various Node configurations covering all power states, progress states, and pricing scenarios
+
+---
+# Basic test node - healthy and ready
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: test-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: test-group
+    test-scenario: basic
+spec:
+  powerState: on
+  kubernetesNodeName: test-node-1
+  startupPodSpec:
+    image: homelab/node-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    volumes:
+    - name: node-config
+      mountPath: /etc/node-config
+      configMapName: test-node-1-config
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/node-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.15"
+    podRate: "0.02"
+status:
+  health: healthy
+  powerState: on
+  progress: ready
+  lastStartupTime: "2024-01-15T09:30:00Z"
+  conditions:
+  - type: Available
+    status: "True"
+    reason: NodeReady
+    message: Node is healthy and ready
+    lastTransitionTime: "2024-01-15T09:30:00Z"
+
+---
+# Second test node - also healthy and ready
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: test-node-2
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: test-group
+    test-scenario: basic
+spec:
+  powerState: on
+  kubernetesNodeName: test-node-2
+  startupPodSpec:
+    image: homelab/node-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    volumes:
+    - name: node-config
+      mountPath: /etc/node-config
+      configMapName: test-node-2-config
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/node-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.15"
+    podRate: "0.02"
+status:
+  health: healthy
+  powerState: on
+  progress: ready
+  lastStartupTime: "2024-01-15T09:35:00Z"
+  conditions:
+  - type: Available
+    status: "True"
+    reason: NodeReady
+    message: Node is healthy and ready
+    lastTransitionTime: "2024-01-15T09:35:00Z"
+
+---
+# GPU node - high-performance with expensive pricing
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: gpu-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: gpu-group
+    test-scenario: gpu-workload
+    node-type: gpu
+spec:
+  powerState: on
+  kubernetesNodeName: gpu-node-1
+  startupPodSpec:
+    image: homelab/gpu-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP} && nvidia-smi"]
+    volumes:
+    - name: gpu-config
+      mountPath: /etc/gpu-config
+      configMapName: gpu-node-1-config
+    - name: nvidia-drivers
+      mountPath: /usr/local/nvidia
+      configMapName: nvidia-drivers
+    serviceAccount: gpu-node-controller
+  shutdownPodSpec:
+    image: homelab/gpu-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo nvidia-smi -pm 0 && sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: gpu-node-controller
+  pricing:
+    hourlyRate: "0.85"
+    podRate: "0.12"
+status:
+  health: healthy
+  powerState: on
+  progress: ready
+  lastStartupTime: "2024-01-15T08:45:00Z"
+  conditions:
+  - type: Available
+    status: "True"
+    reason: NodeReady
+    message: GPU node is ready for workloads
+    lastTransitionTime: "2024-01-15T08:45:00Z"
+
+---
+# GPU node that's powered off
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: gpu-node-2
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: gpu-group
+    test-scenario: scale-up-candidate
+    node-type: gpu
+spec:
+  powerState: off
+  kubernetesNodeName: gpu-node-2
+  startupPodSpec:
+    image: homelab/gpu-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP} && nvidia-smi"]
+    volumes:
+    - name: gpu-config
+      mountPath: /etc/gpu-config
+      configMapName: gpu-node-2-config
+    serviceAccount: gpu-node-controller
+  shutdownPodSpec:
+    image: homelab/gpu-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo nvidia-smi -pm 0 && sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: gpu-node-controller
+  pricing:
+    hourlyRate: "0.85"
+    podRate: "0.12"
+status:
+  health: offline
+  powerState: off
+  progress: shutdown
+  lastShutdownTime: "2024-01-15T02:15:00Z"
+  conditions:
+  - type: Available
+    status: "False"
+    reason: NodePoweredOff
+    message: Node is powered off
+    lastTransitionTime: "2024-01-15T02:15:00Z"
+
+---
+# CPU node - standard configuration
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: cpu-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: cpu-group
+    test-scenario: cpu-workload
+    node-type: cpu
+spec:
+  powerState: on
+  kubernetesNodeName: cpu-node-1
+  startupPodSpec:
+    image: homelab/node-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/node-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.25"
+    podRate: "0.03"
+status:
+  health: healthy
+  powerState: on
+  progress: ready
+  lastStartupTime: "2024-01-15T07:20:00Z"
+  conditions:
+  - type: Available
+    status: "True"
+    reason: NodeReady
+    message: CPU node is ready
+    lastTransitionTime: "2024-01-15T07:20:00Z"
+
+---
+# CPU node that's currently shutting down
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: cpu-node-2
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: cpu-group
+    test-scenario: shutting-down
+    node-type: cpu
+spec:
+  powerState: off
+  kubernetesNodeName: cpu-node-2
+  startupPodSpec:
+    image: homelab/node-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/node-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.25"
+    podRate: "0.03"
+status:
+  health: unknown
+  powerState: on
+  progress: shuttingdown
+  conditions:
+  - type: Available
+    status: "Unknown"
+    reason: NodeShuttingDown
+    message: Node is in the process of shutting down
+    lastTransitionTime: "2024-01-15T10:15:00Z"
+  - type: Progressing
+    status: "True"
+    reason: ShutdownInProgress
+    message: Shutdown process is running
+    lastTransitionTime: "2024-01-15T10:15:00Z"
+
+---
+# Node that's currently starting up
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: startup-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: unknown-group
+    test-scenario: starting-up
+spec:
+  powerState: on
+  kubernetesNodeName: startup-node-1
+  startupPodSpec:
+    image: homelab/node-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/node-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.20"
+    podRate: "0.025"
+status:
+  health: unknown
+  powerState: off
+  progress: startingup
+  lastStartupTime: "2024-01-15T10:10:00Z"
+  conditions:
+  - type: Available
+    status: "Unknown"
+    reason: NodeStartingUp
+    message: Node is in the process of starting up
+    lastTransitionTime: "2024-01-15T10:10:00Z"
+  - type: Progressing
+    status: "True"
+    reason: StartupInProgress
+    message: Startup process is running
+    lastTransitionTime: "2024-01-15T10:10:00Z"
+
+---
+# Offline node in offline-group
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: offline-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: offline-group
+    test-scenario: offline-nodes
+spec:
+  powerState: on
+  kubernetesNodeName: offline-node-1
+  startupPodSpec:
+    image: homelab/node-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/node-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.18"
+    podRate: "0.022"
+status:
+  health: offline
+  powerState: on
+  progress: ready
+  conditions:
+  - type: Available
+    status: "False"
+    reason: NodeUnreachable
+    message: Node is unreachable despite being powered on
+    lastTransitionTime: "2024-01-15T09:00:00Z"
+  - type: Degraded
+    status: "True"
+    reason: HealthCheckFailed
+    message: Health check is failing
+    lastTransitionTime: "2024-01-15T09:00:00Z"
+
+---
+# High-performance node for fast scaling
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: fast-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: fast-scale-group
+    test-scenario: fast-scaling
+    performance: high
+spec:
+  powerState: on
+  kubernetesNodeName: fast-node-1
+  startupPodSpec:
+    image: homelab/fast-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP} --timeout=30"]
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/fast-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.45"
+    podRate: "0.06"
+status:
+  health: healthy
+  powerState: on
+  progress: ready
+  lastStartupTime: "2024-01-15T08:00:00Z"
+  conditions:
+  - type: Available
+    status: "True"
+    reason: NodeReady
+    message: High-performance node ready
+    lastTransitionTime: "2024-01-15T08:00:00Z"
+
+---
+# Development node with budget pricing
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: dev-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: dev-group
+    test-scenario: development
+    environment: dev
+spec:
+  powerState: on
+  kubernetesNodeName: dev-node-1
+  startupPodSpec:
+    image: homelab/dev-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/dev-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.08"
+    podRate: "0.01"
+status:
+  health: healthy
+  powerState: on
+  progress: ready
+  lastStartupTime: "2024-01-15T06:00:00Z"
+  conditions:
+  - type: Available
+    status: "True"
+    reason: NodeReady
+    message: Development node ready
+    lastTransitionTime: "2024-01-15T06:00:00Z"
+
+---
+# Node without group assignment (orphaned node)
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: orphaned-node-1
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    test-scenario: orphaned-node
+spec:
+  powerState: off
+  kubernetesNodeName: orphaned-node-1
+  startupPodSpec:
+    image: homelab/node-startup:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "wake-on-lan ${NODE_MAC_ADDRESS} && wait-for-ssh ${NODE_IP}"]
+    serviceAccount: node-controller
+  shutdownPodSpec:
+    image: homelab/node-shutdown:v1.0.0
+    command: ["/bin/sh"]
+    args: ["-c", "ssh ${NODE_IP} 'sudo shutdown -h now'"]
+    volumes:
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      secretName: node-ssh-keys
+    serviceAccount: node-controller
+  pricing:
+    hourlyRate: "0.12"
+    podRate: "0.015"
+status:
+  health: offline
+  powerState: off
+  progress: shutdown
+  lastShutdownTime: "2024-01-14T22:00:00Z"
+  conditions:
+  - type: Available
+    status: "False"
+    reason: NodePoweredOff
+    message: Orphaned node is powered off
+    lastTransitionTime: "2024-01-14T22:00:00Z"
+
