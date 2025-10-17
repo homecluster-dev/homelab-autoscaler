@@ -17,6 +17,9 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"encoding/json"
+
+	"gopkg.in/yaml.v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -26,6 +29,52 @@ const (
 	PowerStateOn  PowerState = "on"
 	PowerStateOff PowerState = "off"
 )
+
+// UnmarshalJSON implements custom JSON unmarshaling for PowerState
+func (p *PowerState) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+
+	switch s {
+	case "on", "true":
+		*p = PowerStateOn
+	case "off", "false":
+		*p = PowerStateOff
+	default:
+		*p = PowerState(s) // fallback to original value
+	}
+	return nil
+}
+
+// MarshalJSON implements custom JSON marshaling for PowerState
+func (p PowerState) MarshalJSON() ([]byte, error) {
+	return json.Marshal(string(p))
+}
+
+// UnmarshalYAML implements custom YAML unmarshaling for PowerState
+func (p *PowerState) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return err
+	}
+
+	switch s {
+	case "on", "true":
+		*p = PowerStateOn
+	case "off", "false":
+		*p = PowerStateOff
+	default:
+		*p = PowerState(s) // fallback to original value
+	}
+	return nil
+}
+
+// MarshalYAML implements custom YAML marshaling for PowerState
+func (p PowerState) MarshalYAML() (interface{}, error) {
+	return string(p), nil
+}
 
 type Progress string
 
