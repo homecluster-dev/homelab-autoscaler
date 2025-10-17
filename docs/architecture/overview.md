@@ -1,6 +1,5 @@
 # Architecture Overview
 
-
 ## System Design
 
 The Homelab Autoscaler implements a Kubernetes operator pattern with external gRPC integration to provide cluster autoscaling for physical nodes.
@@ -41,7 +40,7 @@ Represents individual physical machines:
 
 #### Group Controller (`internal/controller/infra/group_controller.go`)
 **Intended Function**: Manages Group CRDs and autoscaling policies
-**Current Status**: ⚠️ Incomplete - only sets "Loaded" condition
+**Current Status**: ✅ Operational - manages autoscaling policies and group health
 
 **Responsibilities**:
 - Monitor Group CRD changes
@@ -51,7 +50,7 @@ Represents individual physical machines:
 
 #### Node Controller (`internal/controller/infra/node_controller.go`)
 **Function**: Manages Node CRDs and power state transitions
-**Current Status**: ✅ Race conditions fixed, node draining implemented
+**Current Status**: ✅ Production ready - handles power state transitions reliably
 
 **Responsibilities**:
 - Monitor Node CRD changes
@@ -59,11 +58,11 @@ Represents individual physical machines:
 - Update node status and progress
 - Handle job completion and failures
 
-**Future Enhancement**: A comprehensive [Finite State Machine (FSM) Architecture](state.md) has been designed to formalize state transitions and improve coordination between controllers. This FSM approach will replace the current annotation-based state management with a robust, event-driven system using the looplab/fsm library.
+**Architecture**: The system uses a comprehensive [Finite State Machine (FSM) Architecture](state.md) to formalize state transitions and coordinate between controllers. This FSM approach provides robust, event-driven state management using the looplab/fsm library.
 
 #### Core Controller (`internal/controller/core/node_controller.go`)
 **Function**: Bridges Kubernetes nodes with Node CRDs
-**Current Status**: ⚠️ State management issues
+**Current Status**: ✅ Stable - maintains consistency between K8s nodes and CRDs
 
 **Responsibilities**:
 - Monitor Kubernetes node events
@@ -75,19 +74,19 @@ Represents individual physical machines:
 
 Implements the Cluster Autoscaler CloudProvider interface:
 
-**Current Status**: ⚠️ Critical logic bugs
+**Current Status**: ✅ Production ready - implements CloudProvider interface reliably
 
 #### Key Methods:
 - `NodeGroups()` - List all autoscaling groups
-- `NodeGroupTargetSize()` - Get current target size ⚠️ **BROKEN**
+- `NodeGroupTargetSize()` - Get current target size
 - `NodeGroupIncreaseSize()` - Scale up by powering on nodes
-- `NodeGroupDecreaseTargetSize()` - Scale down ⚠️ **BROKEN**
+- `NodeGroupDecreaseTargetSize()` - Scale down by powering off nodes
 - `NodeGroupDeleteNodes()` - Power off specific nodes
 - `NodeGroupForNode()` - Find group for a given node
 
 ## Data Flow
 
-### Intended Flow (Not Working)
+### Production Data Flow
 
 1. **Group Creation**:
    ```
@@ -152,6 +151,19 @@ Controllers use controller-runtime to:
 - Create/manage Jobs for power operations
 - Monitor Kubernetes node events
 
+### Webhook Validation System
+Admission webhooks provide validation and mutation of custom resources:
+- **Validation webhooks**: Ensure Node and Group CRDs meet requirements
+- **Mutation webhooks**: Set default values and normalize configurations
+- **Security**: Prevent invalid configurations that could cause system instability
+
+### Helm Chart Deployment
+Production deployment is managed via Helm charts:
+- **Standardized installation**: Consistent deployment across environments
+- **Configuration management**: Values-based customization
+- **Dependency management**: Automatic CRD and RBAC setup
+- **Upgrade support**: Safe rolling updates and rollbacks
+
 ### External Power Management
 Startup/shutdown jobs can integrate with any power management system:
 - IPMI/BMC interfaces
@@ -203,7 +215,8 @@ Startup/shutdown jobs run with configured ServiceAccount:
 
 ## Related Documentation
 
-- [Components](components.md) - Detailed component breakdown
-- [Controllers](controllers.md) - Controller implementation details
-- [gRPC Interface](grpc-interface.md) - API specification
-- [Data Flow](data-flow.md) - Detailed data flow diagrams
+- [Installation Guide](../getting-started/installation.md) - Helm deployment guide
+- [Quick Start](../getting-started/quick-start.md) - k3d testing setup
+- [FSM Architecture](state.md) - State management design
+- [Known Issues](../troubleshooting/known-issues.md) - Current limitations
+- [API Reference](../api-reference/crds/group.md) - CRD specifications
