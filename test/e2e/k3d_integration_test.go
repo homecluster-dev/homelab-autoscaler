@@ -113,23 +113,31 @@ func applyTestManifests() {
 }
 
 func waitForNodeScaleDown() {
-	By("Waiting for node to be scaled down (checking for taint and SchedulingDisabled)")
+	By("Waiting for node to be scaled down in complete sequence: ToBeDeletedByClusterAutoscaler -> DeletionCandidateOfClusterAutoscaler -> SchedulingDisabled -> NotReady")
 
+	// Step 1: Wait for ToBeDeletedByClusterAutoscaler taint
 	Eventually(func() bool {
-		// Check if kubernetes node has the expected taint
 		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
 			return false
 		}
-
-		// Look for scale-down taint or unschedulable status
-		return strings.Contains(output, "ToBeDeletedByClusterAutoscaler") ||
-			strings.Contains(output, "DeletionCandidateOfClusterAutoscaler")
+		return strings.Contains(output, "ToBeDeletedByClusterAutoscaler")
 	}, defaultTimeout, defaultInterval).Should(BeTrue())
 
-	// Also check if node is marked as unschedulable
+	// Step 2: Wait for DeletionCandidateOfClusterAutoscaler taint
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(output, "DeletionCandidateOfClusterAutoscaler")
+	}, defaultTimeout, defaultInterval).Should(BeTrue())
+
+	// Step 3: Wait for SchedulingDisabled (spec.unschedulable = true)
 	Eventually(func() bool {
 		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.unschedulable}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
@@ -138,6 +146,18 @@ func waitForNodeScaleDown() {
 			return false
 		}
 		return strings.TrimSpace(output) == "true"
+	}, defaultTimeout, defaultInterval).Should(BeTrue())
+
+	// Step 4: Wait for node status to become NotReady
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+		status := strings.TrimSpace(output)
+		return status == "False" || status == "Unknown"
 	}, defaultTimeout, defaultInterval).Should(BeTrue())
 }
 

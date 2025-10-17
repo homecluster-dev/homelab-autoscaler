@@ -135,6 +135,8 @@ grpcurl -plaintext -d '{}' localhost:50051 externalgrpc.CloudProvider/NodeGroups
 #### Symptoms
 - Nodes stuck in transitional states
 - Power operations failing
+
+> **💡 Future Solution**: The [FSM Architecture](../architecture/state.md) provides a comprehensive solution for state management issues with formal state transitions, coordination lock integration, and automatic error recovery mechanisms.
 - Jobs not completing
 
 #### Debugging Steps

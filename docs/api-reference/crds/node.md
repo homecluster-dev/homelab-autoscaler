@@ -13,7 +13,7 @@ The Node Custom Resource Definition (CRD) represents individual physical machine
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `powerState` | `PowerState` | Yes | Desired power state: `on` or `off` |
+| `powerState` | `PowerState` | Yes | Desired power state: `on` or `off` (see [FSM Architecture](../../architecture/state.md) for formal state management) |
 | `startupPodSpec` | `MinimalPodSpec` | Yes | Pod specification for startup operations |
 | `shutdownPodSpec` | `MinimalPodSpec` | Yes | Pod specification for shutdown operations |
 | `kubernetesNodeName` | `string` | Yes | Name of the corresponding Kubernetes node |

@@ -232,6 +232,7 @@ kubectl get nodes.infra.homecluster.dev -w
 
 3. **Controller Race Conditions** (Priority: HIGH)
    - Multiple controllers accessing same resources without proper coordination
+   - **Solution**: [FSM Architecture](../architecture/state.md) provides formal state management with coordination lock integration
 
 ### Testing Limitations
 
