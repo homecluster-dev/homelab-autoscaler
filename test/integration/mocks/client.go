@@ -136,7 +136,7 @@ func (m *MockClient) List(ctx context.Context, list client.ObjectList, opts ...c
 	}
 
 	itemType := itemsField.Type().Elem()
-	var matchingObjects []runtime.Object
+	matchingObjects := make([]runtime.Object, 0, len(m.objects))
 
 	// Filter objects by type and namespace
 	for key, obj := range m.objects {
@@ -278,7 +278,8 @@ func (m *MockClient) Update(ctx context.Context, obj client.Object, opts ...clie
 }
 
 // Patch patches an existing object
-func (m *MockClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+func (m *MockClient) Patch(ctx context.Context, obj client.Object, patch client.Patch,
+	opts ...client.PatchOption) error {
 	// For simplicity, treat patch as update
 	return m.Update(ctx, obj, &client.UpdateOptions{})
 }
@@ -321,7 +322,7 @@ func (m *MockClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ..
 		objType = objType.Elem()
 	}
 
-	var keysToDelete []string
+	keysToDelete := make([]string, 0, len(m.objects))
 	for key, stored := range m.objects {
 		storedType := reflect.TypeOf(stored)
 		if storedType.Kind() == reflect.Ptr {
@@ -446,17 +447,20 @@ type mockStatusWriter struct {
 }
 
 // Update updates the status of an object
-func (w *mockStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+func (w *mockStatusWriter) Update(ctx context.Context, obj client.Object,
+	opts ...client.SubResourceUpdateOption) error {
 	return w.client.Update(ctx, obj)
 }
 
 // Patch patches the status of an object
-func (w *mockStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+func (w *mockStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch,
+	opts ...client.SubResourcePatchOption) error {
 	return w.client.Patch(ctx, obj, patch)
 }
 
 // Create creates the status of an object (not typically used)
-func (w *mockStatusWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+func (w *mockStatusWriter) Create(ctx context.Context, obj client.Object, subResource client.Object,
+	opts ...client.SubResourceCreateOption) error {
 	return w.client.Create(ctx, obj)
 }
 
@@ -479,26 +483,30 @@ type mockSubResourceClient struct {
 }
 
 // Get retrieves a subresource
-func (s *mockSubResourceClient) Get(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceGetOption) error {
+func (s *mockSubResourceClient) Get(ctx context.Context, obj client.Object, subResource client.Object,
+	opts ...client.SubResourceGetOption) error {
 	// For simplicity, delegate to main client Get
 	key := client.ObjectKeyFromObject(obj)
 	return s.client.Get(ctx, key, obj)
 }
 
 // Create creates a subresource
-func (s *mockSubResourceClient) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+func (s *mockSubResourceClient) Create(ctx context.Context, obj client.Object, subResource client.Object,
+	opts ...client.SubResourceCreateOption) error {
 	// For simplicity, delegate to main client Create
 	return s.client.Create(ctx, obj)
 }
 
 // Update updates a subresource
-func (s *mockSubResourceClient) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+func (s *mockSubResourceClient) Update(ctx context.Context, obj client.Object,
+	opts ...client.SubResourceUpdateOption) error {
 	// For simplicity, delegate to main client Update
 	return s.client.Update(ctx, obj)
 }
 
 // Patch patches a subresource
-func (s *mockSubResourceClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+func (s *mockSubResourceClient) Patch(ctx context.Context, obj client.Object, patch client.Patch,
+	opts ...client.SubResourcePatchOption) error {
 	// For simplicity, delegate to main client Patch
 	return s.client.Patch(ctx, obj, patch)
 }

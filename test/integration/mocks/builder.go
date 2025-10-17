@@ -76,7 +76,7 @@ func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockCli
 		opt(group)
 	}
 
-	b.client.AddObject(group)
+	_ = b.client.AddObject(group)
 	return b
 }
 
@@ -123,7 +123,7 @@ func (b *MockClientBuilder) WithNode(name string, opts ...NodeOption) *MockClien
 		opt(node)
 	}
 
-	b.client.AddObject(node)
+	_ = b.client.AddObject(node)
 	return b
 }
 
@@ -168,7 +168,7 @@ func (b *MockClientBuilder) WithKubernetesNode(name string, opts ...KubernetesNo
 		opt(node)
 	}
 
-	b.client.AddObject(node)
+	_ = b.client.AddObject(node)
 	return b
 }
 
@@ -190,10 +190,10 @@ func WithGroupHealth(health string) GroupOption {
 // WithGroupLabel adds a label to a Group
 func WithGroupLabel(key, value string) GroupOption {
 	return func(g *infrav1alpha1.Group) {
-		if g.ObjectMeta.Labels == nil {
-			g.ObjectMeta.Labels = make(map[string]string)
+		if g.Labels == nil {
+			g.Labels = make(map[string]string)
 		}
-		g.ObjectMeta.Labels[key] = value
+		g.Labels[key] = value
 	}
 }
 
@@ -210,10 +210,10 @@ type NodeOption func(*infrav1alpha1.Node)
 // WithNodeGroup assigns a Node to a Group
 func WithNodeGroup(groupName string) NodeOption {
 	return func(n *infrav1alpha1.Node) {
-		if n.ObjectMeta.Labels == nil {
-			n.ObjectMeta.Labels = make(map[string]string)
+		if n.Labels == nil {
+			n.Labels = make(map[string]string)
 		}
-		n.ObjectMeta.Labels["group"] = groupName
+		n.Labels["group"] = groupName
 	}
 }
 
@@ -250,10 +250,10 @@ func WithNodePricing(hourlyRate, podRate string) NodeOption {
 // WithNodeLabel adds a label to a Node
 func WithNodeLabel(key, value string) NodeOption {
 	return func(n *infrav1alpha1.Node) {
-		if n.ObjectMeta.Labels == nil {
-			n.ObjectMeta.Labels = make(map[string]string)
+		if n.Labels == nil {
+			n.Labels = make(map[string]string)
 		}
-		n.ObjectMeta.Labels[key] = value
+		n.Labels[key] = value
 	}
 }
 
@@ -271,25 +271,26 @@ type KubernetesNodeOption func(*corev1.Node)
 // WithKubernetesNodeLabel adds a label to a Kubernetes Node
 func WithKubernetesNodeLabel(key, value string) KubernetesNodeOption {
 	return func(n *corev1.Node) {
-		if n.ObjectMeta.Labels == nil {
-			n.ObjectMeta.Labels = make(map[string]string)
+		if n.Labels == nil {
+			n.Labels = make(map[string]string)
 		}
-		n.ObjectMeta.Labels[key] = value
+		n.Labels[key] = value
 	}
 }
 
 // WithKubernetesNodeGroupLabel adds the group label to a Kubernetes Node
 func WithKubernetesNodeGroupLabel(groupName string) KubernetesNodeOption {
 	return func(n *corev1.Node) {
-		if n.ObjectMeta.Labels == nil {
-			n.ObjectMeta.Labels = make(map[string]string)
+		if n.Labels == nil {
+			n.Labels = make(map[string]string)
 		}
-		n.ObjectMeta.Labels["infra.homecluster.dev/group"] = groupName
+		n.Labels["infra.homecluster.dev/group"] = groupName
 	}
 }
 
 // WithKubernetesNodeCondition sets a condition on a Kubernetes Node
-func WithKubernetesNodeCondition(conditionType corev1.NodeConditionType, status corev1.ConditionStatus, reason string) KubernetesNodeOption {
+func WithKubernetesNodeCondition(conditionType corev1.NodeConditionType, status corev1.ConditionStatus,
+	reason string) KubernetesNodeOption {
 	return func(n *corev1.Node) {
 		// Find existing condition or add new one
 		found := false
@@ -354,7 +355,7 @@ func WithKubernetesNodeUnschedulable(unschedulable bool) KubernetesNodeOption {
 // Validation helpers
 
 // ValidateNodeGroupConsistency validates that Node CRs have matching Kubernetes nodes
-func ValidateNodeGroupConsistency(client client.Client) error {
+func ValidateNodeGroupConsistency(c client.Client) error {
 	// This would be implemented to validate that:
 	// 1. Every Node CR has a corresponding Kubernetes Node
 	// 2. Group labels are consistent between Node CRs and Kubernetes Nodes
@@ -370,7 +371,8 @@ func NewBasicTestScenario(scheme *runtime.Scheme) client.Client {
 	return NewMockClientBuilder(scheme).
 		WithGroup("test-group").
 		WithNode("test-node-1", WithNodeGroup("test-group")).
-		WithNode("test-node-2", WithNodeGroup("test-group"), WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff)).
+		WithNode("test-node-2", WithNodeGroup("test-group"),
+			WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff)).
 		WithKubernetesNode("test-node-1", WithKubernetesNodeGroupLabel("test-group")).
 		WithKubernetesNode("test-node-2", WithKubernetesNodeGroupLabel("test-group")).
 		Build()
@@ -394,8 +396,11 @@ func NewMultiGroupScenario(scheme *runtime.Scheme) client.Client {
 func NewScaleUpScenario(scheme *runtime.Scheme) client.Client {
 	return NewMockClientBuilder(scheme).
 		WithGroup("scale-group").
-		WithNode("powered-on-node", WithNodeGroup("scale-group"), WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn)).
-		WithNode("powered-off-node", WithNodeGroup("scale-group"), WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff), WithNodeProgress(infrav1alpha1.ProgressShutdown)).
+		WithNode("powered-on-node", WithNodeGroup("scale-group"),
+			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn)).
+		WithNode("powered-off-node", WithNodeGroup("scale-group"),
+			WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff),
+			WithNodeProgress(infrav1alpha1.ProgressShutdown)).
 		WithKubernetesNode("powered-on-node", WithKubernetesNodeGroupLabel("scale-group")).
 		WithKubernetesNode("powered-off-node", WithKubernetesNodeGroupLabel("scale-group")).
 		Build()
@@ -405,9 +410,16 @@ func NewScaleUpScenario(scheme *runtime.Scheme) client.Client {
 func NewScaleDownScenario(scheme *runtime.Scheme) client.Client {
 	return NewMockClientBuilder(scheme).
 		WithGroup("scale-group").
-		WithNode("running-node-1", WithNodeGroup("scale-group"), WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn), WithNodeProgress(infrav1alpha1.ProgressReady)).
-		WithNode("running-node-2", WithNodeGroup("scale-group"), WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn), WithNodeProgress(infrav1alpha1.ProgressReady)).
-		WithNode("starting-node", WithNodeGroup("scale-group"), WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff), WithNodeProgress(infrav1alpha1.ProgressStartingUp), WithNodeLastStartupTime(time.Now().Add(-5*time.Minute))).
+		WithNode("running-node-1", WithNodeGroup("scale-group"),
+			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
+			WithNodeProgress(infrav1alpha1.ProgressReady)).
+		WithNode("running-node-2", WithNodeGroup("scale-group"),
+			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
+			WithNodeProgress(infrav1alpha1.ProgressReady)).
+		WithNode("starting-node", WithNodeGroup("scale-group"),
+			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff),
+			WithNodeProgress(infrav1alpha1.ProgressStartingUp),
+			WithNodeLastStartupTime(time.Now().Add(-5*time.Minute))).
 		WithKubernetesNode("running-node-1", WithKubernetesNodeGroupLabel("scale-group")).
 		WithKubernetesNode("running-node-2", WithKubernetesNodeGroupLabel("scale-group")).
 		WithKubernetesNode("starting-node", WithKubernetesNodeGroupLabel("scale-group")).
