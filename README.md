@@ -1,13 +1,8 @@
 # Homelab Autoscaler Documentation
 
-> ⚠️ **CRITICAL WARNING: NOT PRODUCTION READY** ⚠️
-> 
-> This system contains critical bugs and missing functionality. Do NOT use in production environments.
-> See [Known Issues](docs/troubleshooting/known-issues.md) for details.
-
 ## Overview
 
-The Homelab Autoscaler is a Kubernetes operator designed to provide cluster autoscaling capabilities for homelab environments with physical nodes. It manages the power state of physical machines based on workload demands, similar to how cloud providers scale virtual instances.
+The Homelab Autoscaler is a Kubernetes operator designed to provide cluster autoscaling capabilities for homelab environments with physical node s. It manages the power state of physical machines based on workload demands, similar to how cloud providers scale virtual instances, without actually provisioning/deprovissioning nodes for the cluster.
 
 ## Current Status
 
