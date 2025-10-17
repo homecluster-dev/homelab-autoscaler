@@ -107,11 +107,56 @@ jobs:
             console.log('Updated Docusaurus config and package.json with version v${{ env.CHART_VERSION }}');
           "
 
+      - name: Checkout gh-pages branch to preserve Helm repository
+        run: |
+          echo "Checking out gh-pages branch to preserve Helm repository files..."
+          git fetch origin gh-pages:gh-pages || echo "gh-pages branch doesn't exist yet, will be created"
+          
+          # Create a temporary directory to store Helm files
+          mkdir -p /tmp/helm-repo
+          
+          # If gh-pages branch exists, extract Helm repository files
+          if git show-ref --verify --quiet refs/heads/gh-pages; then
+            git checkout gh-pages
+            
+            # Copy Helm repository files if they exist
+            if [ -f "index.yaml" ]; then
+              echo "Found index.yaml, copying to temp directory"
+              cp index.yaml /tmp/helm-repo/
+            fi
+            
+            # Copy any .tgz chart files
+            if ls *.tgz 1> /dev/null 2>&1; then
+              echo "Found chart packages, copying to temp directory"
+              cp *.tgz /tmp/helm-repo/
+            fi
+            
+            # Switch back to main branch
+            git checkout main
+          else
+            echo "No gh-pages branch found, this will be the first deployment"
+          fi
+
       - name: Build Docusaurus site
         working-directory: website
         run: |
           echo "Building Docusaurus site with version v${{ env.CHART_VERSION }}"
           npm run build
+          
+          echo "Copying Helm repository files to Docusaurus build..."
+          # Copy Helm repository files to the build directory
+          if [ -f "/tmp/helm-repo/index.yaml" ]; then
+            cp /tmp/helm-repo/index.yaml build/
+            echo "✅ Copied index.yaml to build directory"
+          fi
+          
+          if ls /tmp/helm-repo/*.tgz 1> /dev/null 2>&1; then
+            cp /tmp/helm-repo/*.tgz build/
+            echo "✅ Copied chart packages to build directory"
+          fi
+          
+          echo "📦 Build directory contents:"
+          ls -la build/
         env:
           NODE_ENV: production
 
