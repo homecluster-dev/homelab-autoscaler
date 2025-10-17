@@ -59,14 +59,224 @@ jobs:
             echo "Warning: Version '$VERSION' does not follow semantic versioning format"
           fi
 
-  build:
+  generate-release-content:
     runs-on: ubuntu-latest
     needs: extract-version
+    env:
+      CHART_VERSION: ${{ needs.extract-version.outputs.version }}
+    outputs:
+      changelog-updated: ${{ steps.update-changelog.outputs.updated }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for git log
+
+      - name: Generate release content
+        id: generate-content
+        run: |
+          echo "Generating release content for version v${{ env.CHART_VERSION }}"
+          
+          # Get the current date
+          CURRENT_DATE=$(date -u '+%Y-%m-%d')
+          
+          # Try to find the previous version tag
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+' | head -2 | tail -1 || echo "")
+          
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found, using last 10 commits"
+            COMMIT_RANGE="HEAD~10..HEAD"
+          else
+            echo "Previous tag: $PREVIOUS_TAG"
+            COMMIT_RANGE="$PREVIOUS_TAG..HEAD"
+          fi
+          
+          echo "Commit range: $COMMIT_RANGE"
+          
+          # Generate changelog entries from commits
+          echo "## Changes in this release:" > /tmp/changelog_entries.txt
+          echo "" >> /tmp/changelog_entries.txt
+          
+          # Get commits with conventional commit format parsing
+          git log --format="%H %s" $COMMIT_RANGE | while IFS= read -r commit; do
+            if [ -n "$commit" ]; then
+              # Extract commit hash and message
+              HASH=$(echo "$commit" | cut -d' ' -f1)
+              MESSAGE=$(echo "$commit" | cut -d' ' -f2-)
+              SHORT_HASH=${HASH:0:7}
+              
+              # Parse conventional commit format
+              if [[ "$MESSAGE" =~ ^(feat|fix|docs|style|refactor|test|chore|perf|ci|build)(\(.+\))?: ]]; then
+                TYPE=$(echo "$MESSAGE" | sed -n 's/^\([^(:]*\).*/\1/p')
+                DESCRIPTION=$(echo "$MESSAGE" | sed -n 's/^[^:]*: \(.*\)/\1/p')
+                
+                case "$TYPE" in
+                  feat)
+                    EMOJI="✨"
+                    ;;
+                  fix)
+                    EMOJI="🐛"
+                    ;;
+                  docs)
+                    EMOJI="📚"
+                    ;;
+                  perf)
+                    EMOJI="⚡"
+                    ;;
+                  refactor)
+                    EMOJI="♻️"
+                    ;;
+                  test)
+                    EMOJI="✅"
+                    ;;
+                  ci|build)
+                    EMOJI="👷"
+                    ;;
+                  *)
+                    EMOJI="🔧"
+                    ;;
+                esac
+                
+                echo "- $EMOJI $DESCRIPTION ([${SHORT_HASH}](https://github.com/homecluster-dev/homelab-autoscaler/commit/$HASH))" >> /tmp/changelog_entries.txt
+              else
+                # Non-conventional commit
+                echo "- 🔧 $MESSAGE ([${SHORT_HASH}](https://github.com/homecluster-dev/homelab-autoscaler/commit/$HASH))" >> /tmp/changelog_entries.txt
+              fi
+            fi
+          done
+          
+          echo "" >> /tmp/changelog_entries.txt
+          echo "Generated changelog entries:"
+          cat /tmp/changelog_entries.txt
+
+      - name: Update changelog
+        id: update-changelog
+        run: |
+          CURRENT_DATE=$(date -u '+%Y-%m-%d')
+          CHANGELOG_FILE="docs/releases/changelog.md"
+          
+          # Read the generated changelog entries
+          CHANGELOG_ENTRIES=$(cat /tmp/changelog_entries.txt)
+          
+          # Create new version section
+          cat > /tmp/new_version_section.txt << EOF
+          ### [v${{ env.CHART_VERSION }}] - $CURRENT_DATE
+
+          **Current stable release**
+
+          #### Installation
+
+          \`\`\`bash
+          # Add the Helm repository
+          helm repo add homelab-autoscaler https://autoscaler.homecluster.dev
+          helm repo update
+
+          # Install the chart
+          helm install homelab-autoscaler homelab-autoscaler/homelab-autoscaler --version ${{ env.CHART_VERSION }}
+          \`\`\`
+
+          #### What's New
+          $CHANGELOG_ENTRIES
+
+          ---
+          EOF
+          
+          # Check if the version already exists in changelog
+          if grep -q "### \[v${{ env.CHART_VERSION }}\]" "$CHANGELOG_FILE"; then
+            echo "Version v${{ env.CHART_VERSION }} already exists in changelog, updating it"
+            
+            # Create a temporary file with updated content
+            awk '
+            BEGIN { in_version = 0; version_found = 0 }
+            /^### \[v'"${{ env.CHART_VERSION }}"'\]/ {
+              version_found = 1
+              in_version = 1
+              while ((getline new_line < "/tmp/new_version_section.txt") > 0) {
+                print new_line
+              }
+              close("/tmp/new_version_section.txt")
+              next
+            }
+            /^### \[v[0-9]+\.[0-9]+\.[0-9]+\]/ && in_version {
+              in_version = 0
+              print $0
+              next
+            }
+            /^---$/ && in_version {
+              in_version = 0
+              next
+            }
+            !in_version { print }
+            ' "$CHANGELOG_FILE" > /tmp/changelog_updated.md
+            
+            mv /tmp/changelog_updated.md "$CHANGELOG_FILE"
+          else
+            echo "Adding new version v${{ env.CHART_VERSION }} to changelog"
+            
+            # Insert the new version section after "## Current Version"
+            awk '
+            /^## Current Version$/ {
+              print $0
+              print ""
+              while ((getline new_line < "/tmp/new_version_section.txt") > 0) {
+                print new_line
+              }
+              close("/tmp/new_version_section.txt")
+              print ""
+              next
+            }
+            /^### \[v[0-9]+\.[0-9]+\.[0-9]+\]/ && !found_first {
+              print "## Release History"
+              print ""
+              found_first = 1
+            }
+            { print }
+            ' "$CHANGELOG_FILE" > /tmp/changelog_updated.md
+            
+            mv /tmp/changelog_updated.md "$CHANGELOG_FILE"
+          fi
+          
+          echo "updated=true" >> $GITHUB_OUTPUT
+          echo "✅ Changelog updated successfully"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [extract-version, generate-release-content]
     env:
       CHART_VERSION: ${{ needs.extract-version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Checkout gh-pages branch to preserve Helm repository
+        run: |
+          echo "Checking out gh-pages branch to preserve Helm repository files..."
+          git fetch origin gh-pages:gh-pages || echo "gh-pages branch doesn't exist yet, will be created"
+          
+          # Create a temporary directory to store Helm files
+          mkdir -p /tmp/helm-repo
+          
+          # If gh-pages branch exists, extract Helm repository files
+          if git show-ref --verify --quiet refs/heads/gh-pages; then
+            git checkout gh-pages
+            
+            # Copy Helm repository files if they exist
+            if [ -f "index.yaml" ]; then
+              echo "Found index.yaml, copying to temp directory"
+              cp index.yaml /tmp/helm-repo/
+            fi
+            
+            # Copy any .tgz chart files
+            if ls *.tgz 1> /dev/null 2>&1; then
+              echo "Found chart packages, copying to temp directory"
+              cp *.tgz /tmp/helm-repo/
+            fi
+            
+            # Switch back to main branch
+            git checkout main
+          else
+            echo "No gh-pages branch found, this will be the first deployment"
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -106,36 +316,6 @@ jobs:
             fs.writeFileSync(configPath, config);
             console.log('Updated Docusaurus config and package.json with version v${{ env.CHART_VERSION }}');
           "
-
-      - name: Checkout gh-pages branch to preserve Helm repository
-        run: |
-          echo "Checking out gh-pages branch to preserve Helm repository files..."
-          git fetch origin gh-pages:gh-pages || echo "gh-pages branch doesn't exist yet, will be created"
-          
-          # Create a temporary directory to store Helm files
-          mkdir -p /tmp/helm-repo
-          
-          # If gh-pages branch exists, extract Helm repository files
-          if git show-ref --verify --quiet refs/heads/gh-pages; then
-            git checkout gh-pages
-            
-            # Copy Helm repository files if they exist
-            if [ -f "index.yaml" ]; then
-              echo "Found index.yaml, copying to temp directory"
-              cp index.yaml /tmp/helm-repo/
-            fi
-            
-            # Copy any .tgz chart files
-            if ls *.tgz 1> /dev/null 2>&1; then
-              echo "Found chart packages, copying to temp directory"
-              cp *.tgz /tmp/helm-repo/
-            fi
-            
-            # Switch back to main branch
-            git checkout main
-          else
-            echo "No gh-pages branch found, this will be the first deployment"
-          fi
 
       - name: Build Docusaurus site
         working-directory: website
