@@ -29,8 +29,6 @@ The Homelab Autoscaler is a Kubernetes operator designed to provide cluster auto
 - [Examples](docs/api-reference/examples/) - Sample configurations
 
 ### Troubleshooting
-- [Known Issues](docs/troubleshooting/known-issues.md) - **READ THIS FIRST**
-- [Common Problems](docs/troubleshooting/common-problems.md) - Frequent issues and solutions
 - [Debugging Guide](docs/troubleshooting/debugging-guide.md) - How to debug the system
 
 ### Development
@@ -67,7 +65,6 @@ Implements the Cluster Autoscaler CloudProvider interface for external integrati
 | I want to... | Go to... |
 |--------------|----------|
 | Understand the system | [Architecture Overview](docs/architecture/overview.md) |
-| See what's broken | [Known Issues](docs/troubleshooting/known-issues.md) |
 | Try it out | [Quick Start](docs/getting-started/quick-start.md) |
 | Configure groups | [Group CRD](docs/api-reference/crds/group.md) |
 | Debug problems | [Debugging Guide](docs/troubleshooting/debugging-guide.md) |

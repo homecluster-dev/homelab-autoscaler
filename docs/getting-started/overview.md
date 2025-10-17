@@ -1,7 +1,5 @@
 # System Overview
 
-> ⚠️ **WARNING**: This system is not production-ready. See [Known Issues](../troubleshooting/known-issues.md).
-
 ## What is Homelab Autoscaler?
 
 The Homelab Autoscaler brings cloud-like autoscaling capabilities to physical homelab environments. Instead of creating/destroying virtual machines, it powers physical nodes on/off based on workload demands.
