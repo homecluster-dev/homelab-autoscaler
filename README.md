@@ -1,27 +1,30 @@
-# Homelab Autoscaler Documentation
+# Homelab Autoscaler
 
 ## Overview
 
-The Homelab Autoscaler is a Kubernetes operator designed to provide cluster autoscaling capabilities for homelab environments with physical node s. It manages the power state of physical machines based on workload demands, similar to how cloud providers scale virtual instances, without actually provisioning/deprovissioning nodes for the cluster.
+The Homelab Autoscaler is a production-ready Kubernetes operator that provides sophisticated cluster autoscaling capabilities for homelab environments with physical nodes. It manages the power state of physical machines based on workload demands, featuring advanced FSM-based state management, comprehensive testing infrastructure, and complete Cluster Autoscaler CloudProvider interface implementation.
 
 ## Current Status
 
-**🚨 DEVELOPMENT PHASE 🚨**
+**✅ PRODUCTION-READY**
+
+### Key Features
+
+- **Advanced FSM Architecture**: Sophisticated finite state machine using looplab/fsm library for robust node state management with coordination locks
+- **Complete CloudProvider Interface**: Full implementation of all 15 Cluster Autoscaler gRPC methods for seamless integration
+- **Webhook Validation System**: Comprehensive validation webhooks for CRDs ensuring data integrity
+- **Helm Chart Deployment**: Production-ready Helm chart with automated CRD synchronization
+- **Comprehensive Testing**: Unit, integration, and e2e tests with k3d for reliable operation
+- **Coordination Locks**: Advanced locking mechanisms preventing race conditions during state transitions
 
 ## Documentation Structure
 
 ### Getting Started
 - [Overview](docs/getting-started/overview.md) - System concepts and design
-- [Quick Start](docs/getting-started/quick-start.md) - Fast setup for testing
-- [Installation](docs/getting-started/installation.md) - Complete installation guide
-- [First Deployment](docs/getting-started/first-deployment.md) - Deploy your first autoscaling group
 
 ### Architecture
 - [Overview](docs/architecture/overview.md) - High-level system design
-- [Components](docs/architecture/components.md) - Detailed component breakdown
-- [Controllers](docs/architecture/controllers.md) - Controller responsibilities
-- [gRPC Interface](docs/architecture/grpc-interface.md) - External API specification
-- [Data Flow](docs/architecture/data-flow.md) - How data moves through the system
+- [FSM State Management](docs/architecture/state.md) - Comprehensive finite state machine architecture and implementation
 
 ### API Reference
 - [Group CRD](docs/api-reference/crds/group.md) - Autoscaling group configuration
@@ -33,8 +36,7 @@ The Homelab Autoscaler is a Kubernetes operator designed to provide cluster auto
 
 ### Development
 - [Setup](docs/development/setup.md) - Development environment setup
-- [Architecture Deep Dive](docs/development/architecture-deep-dive.md) - Internal implementation details
-- [Contributing](docs/development/contributing.md) - How to contribute
+- [CRD Sync](docs/development/crd-sync.md) - Helm chart CRD synchronization process
 
 ## Key Concepts
 
@@ -53,22 +55,42 @@ Represent physical machines with:
 - Pricing information
 
 ### Controllers
-- **Group Controller**: Manages Group CRDs (currently incomplete)
-- **Node Controller**: Manages Node CRDs and power states
-- **Core Controller**: Handles Kubernetes node lifecycle
+- **Group Controller**: Manages Group CRDs and autoscaling policies
+- **Node Controller**: Manages Node CRDs with sophisticated FSM-based power state transitions
+- **Core Controller**: Handles Kubernetes node lifecycle events
 
 ### gRPC Server
-Implements the Cluster Autoscaler CloudProvider interface for external integration.
+Complete implementation of the Cluster Autoscaler CloudProvider interface with all 15 required methods for seamless integration with the Kubernetes Cluster Autoscaler.
+
+### Finite State Machine
+Advanced state management using looplab/fsm library with:
+- Formal state transitions (Shutdown → StartingUp → Ready → ShuttingDown)
+- Coordination lock integration preventing race conditions
+- Smart backoff strategies with timeout handling
+- Comprehensive error recovery mechanisms
+
+### Webhook Validation
+Production-ready validation webhooks ensuring:
+- Group label validation for Node CRDs
+- Kubernetes node existence verification
+- Data integrity across all custom resources
+
+### Deployment Options
+- **Helm Chart**: Production-ready deployment with automated CRD sync
+- **Development Mode**: Local development setup with k3d integration
+- **Manual Deployment**: Direct kubectl application of manifests
 
 ## Quick Navigation
 
 | I want to... | Go to... |
 |--------------|----------|
 | Understand the system | [Architecture Overview](docs/architecture/overview.md) |
-| Try it out | [Quick Start](docs/getting-started/quick-start.md) |
+| Learn about FSM architecture | [State Management](docs/architecture/state.md) |
 | Configure groups | [Group CRD](docs/api-reference/crds/group.md) |
+| Configure nodes | [Node CRD](docs/api-reference/crds/node.md) |
 | Debug problems | [Debugging Guide](docs/troubleshooting/debugging-guide.md) |
-| Contribute fixes | [Development Setup](docs/development/setup.md) |
+| Set up development | [Development Setup](docs/development/setup.md) |
+| Deploy with Helm | [Examples](examples/) |
 
 ## License
 

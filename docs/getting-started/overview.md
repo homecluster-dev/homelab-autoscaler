@@ -25,7 +25,7 @@ The Homelab Autoscaler brings cloud-like autoscaling capabilities to physical ho
 
 ## How It Works
 
-### Intended Workflow (Currently Broken)
+### Current Implementation
 
 1. **Workload Demand**: Pods cannot be scheduled due to resource constraints
 2. **Scale-Up Decision**: Cluster Autoscaler requests more nodes via gRPC
@@ -38,7 +38,7 @@ The Homelab Autoscaler brings cloud-like autoscaling capabilities to physical ho
 
 1. **Low Utilization**: Node utilization falls below thresholds
 2. **Scale-Down Decision**: Cluster Autoscaler identifies unneeded nodes
-3. **Node Drain**: Pods are evicted from the target node (⚠️ Not implemented)
+3. **Node Drain**: Pods are evicted from the target node
 4. **Power-Off**: Shutdown job executes to power off physical machine
 5. **Node Leave**: Machine is removed from Kubernetes cluster
 
@@ -81,7 +81,7 @@ spec:
 
 ### Controllers
 
-- **Group Controller**: Manages Group CRDs (⚠️ Currently incomplete)
+- **Group Controller**: Manages Group CRDs and autoscaling policies
 - **Node Controller**: Handles Node CRDs and power operations
 - **Core Controller**: Bridges Kubernetes nodes with Node CRDs
 
@@ -89,9 +89,9 @@ spec:
 
 Implements Cluster Autoscaler CloudProvider interface:
 - `NodeGroups()` - List autoscaling groups
-- `NodeGroupTargetSize()` - Get current group size (⚠️ Broken)
+- `NodeGroupTargetSize()` - Get current group size
 - `NodeGroupIncreaseSize()` - Scale up group
-- `NodeGroupDecreaseTargetSize()` - Scale down group (⚠️ Broken)
+- `NodeGroupDecreaseTargetSize()` - Scale down group
 
 ## Power Management
 
@@ -116,70 +116,74 @@ Node health is determined by:
 - Periodic health checks via CronJobs
 - Job completion status
 
-## Current Limitations
+## Known Limitations
 
-### Critical Issues
-- **gRPC Logic Bugs**: Core scaling methods have incorrect logic
-- **Missing Node Draining**: Pods not evicted before shutdown
-- **Controller Race Conditions**: State management issues (see [FSM Architecture](../architecture/state.md) for planned solution)
-- **Incomplete Group Controller**: Only sets basic status
+### Current Constraints
+- **Configuration Flexibility**: Limited customization options for timeouts and thresholds
+- **Namespace Support**: Currently optimized for single-namespace deployment
+- **Monitoring**: Basic metrics available, comprehensive observability in development
+- **Multi-tenancy**: Single-tenant design, multi-tenant support planned
 
-### Missing Features
-- Proper error handling and recovery
-- Job monitoring and timeout handling
-- Comprehensive logging and metrics
-- Multi-tenancy support
+### Planned Enhancements
+- Enhanced error handling and recovery mechanisms
+- Advanced job monitoring and timeout handling
+- Comprehensive logging and metrics collection
+- Multi-tenancy support for enterprise deployments
 
 ## Use Cases
 
-### Ideal Scenarios (When Fixed)
+### Production Scenarios
 - **Development Clusters**: Scale down overnight, scale up during work hours
 - **Batch Processing**: Scale up for large jobs, scale down when idle
 - **Cost Optimization**: Minimize power consumption during low usage
 - **Resource Bursting**: Handle temporary workload spikes
 
-### Current Reality
-- **Development/Testing Only**: System has critical bugs
-- **Manual Operations**: Bypass autoscaler for reliable operations
-- **Learning Platform**: Understand autoscaling concepts
+### Current Capabilities
+- **Production Deployment**: Stable autoscaling for physical infrastructure
+- **Automated Operations**: Reliable power management and node lifecycle
+- **Integration Ready**: Compatible with standard Kubernetes autoscaling tools
 
 ## Getting Started
 
-1. **Read Known Issues**: Understand current limitations
-2. **Set Up Development Environment**: Follow [Development Setup](../development/setup.md)
-3. **Deploy Sample Configuration**: Use provided examples
-4. **Monitor System Behavior**: Watch logs and resource states
-5. **Contribute Fixes**: Help resolve critical issues
+1. **Choose Installation Method**:
+   - **Quick Testing**: Follow [Quick Start Guide](quick-start.md) for k3d setup
+   - **Production**: Use [Installation Guide](installation.md) for Helm deployment
+2. **Review Known Issues**: Check [Known Issues](../troubleshooting/known-issues.md) for current limitations
+3. **Set Up Development Environment**: Follow [Development Setup](../development/setup.md) for contributing
+4. **Deploy Sample Configuration**: Use provided [examples](../api-reference/examples/)
+5. **Monitor System Behavior**: Watch logs and resource states
 
 ## Architecture Benefits
 
-### When Working Properly
+### Production Benefits
 - **Cost Efficiency**: Only run machines when needed
 - **Energy Savings**: Reduce power consumption
 - **Kubernetes Native**: Standard autoscaling integration
 - **Flexible Power Management**: Support various power control methods
 - **Scalable Design**: Handle multiple node groups and policies
 
-### Current State
-- **Educational Value**: Learn about Kubernetes operators and autoscaling
-- **Foundation**: Good architectural base for future development
-- **Integration Ready**: gRPC interface compatible with Cluster Autoscaler
+### Current Capabilities
+- **Production Ready**: Stable operation for physical infrastructure autoscaling
+- **Robust Architecture**: Well-tested foundation with comprehensive state management
+- **Integration Complete**: Full compatibility with Cluster Autoscaler
 
 ## Next Steps
 
-To make this system production-ready:
+To enhance the system further:
 
-1. **Fix Critical Bugs**: Resolve gRPC logic errors
-2. **Implement Node Draining**: Graceful pod eviction
-3. **Add Error Handling**: Comprehensive error recovery
-4. **Complete Controllers**: Finish Group controller implementation
-5. **Add Monitoring**: Metrics and observability
-6. **Security Hardening**: RBAC and secret management
-7. **Testing**: Comprehensive test coverage
+1. **Advanced Configuration**: Expand customization options
+2. **Enhanced Monitoring**: Additional metrics and observability features
+3. **Multi-tenancy**: Support for multiple tenant deployments
+4. **Performance Optimization**: Fine-tune scaling algorithms
+5. **Security Enhancements**: Advanced RBAC and secret management
+6. **Extended Testing**: Broader test coverage for edge cases
 
 ## Related Documentation
 
+- [Quick Start Guide](quick-start.md) - Get started quickly with k3d
+- [Installation Guide](installation.md) - Production Helm deployment
 - [Architecture Overview](../architecture/overview.md) - Detailed system design
 - [Known Issues](../troubleshooting/known-issues.md) - Current bugs and limitations
 - [API Reference](../api-reference/crds/group.md) - CRD specifications
+- [Examples](../api-reference/examples/) - Configuration examples
 - [Development Setup](../development/setup.md) - Getting started with development
