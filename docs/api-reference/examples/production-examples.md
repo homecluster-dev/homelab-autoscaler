@@ -1,7 +1,12 @@
-# Production-ready examples for homelab-autoscaler
-# These examples demonstrate real-world configurations for physical nodes
+# Production Examples
 
----
+This page contains production-ready examples for homelab-autoscaler, demonstrating real-world configurations for physical nodes with various power management methods.
+
+## Production Group Configuration
+
+Conservative scaling settings suitable for production environments:
+
+```yaml
 # Production Group with conservative scaling settings
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Group
@@ -32,8 +37,13 @@ spec:
   
   # GPU utilization threshold (if using GPU nodes)
   scaleDownGpuUtilizationThreshold: "20"
+```
 
----
+## Wake-on-LAN Node
+
+Physical node with Wake-on-LAN startup and SSH shutdown:
+
+```yaml
 # Physical node with Wake-on-LAN startup
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -96,8 +106,13 @@ spec:
       secret:
         secretName: ssh-automation-keys
         defaultMode: 0600
+```
 
----
+## IPMI Node
+
+Physical node with IPMI power management:
+
+```yaml
 # Physical node with IPMI power management
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -165,8 +180,13 @@ spec:
       requests:
         cpu: 10m
         memory: 32Mi
+```
 
----
+## GPU Worker Node
+
+GPU worker node with smart PDU power control:
+
+```yaml
 # GPU worker node with specialized configuration
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -231,3 +251,21 @@ spec:
       requests:
         cpu: 10m
         memory: 32Mi
+```
+
+## Key Features
+
+### Production Group
+- **Conservative scaling**: 30% utilization threshold with long wait times
+- **Safety margins**: 30-minute delays before scaling down
+- **Moderate cluster size**: Up to 5 nodes for typical homelab setups
+
+### Power Management Methods
+- **Wake-on-LAN**: Network-based startup with SSH shutdown
+- **IPMI**: Industry-standard server management interface
+- **Smart PDU**: Intelligent power distribution unit control
+
+### Cost Management
+- **Realistic pricing**: Actual power consumption costs
+- **Per-pod costs**: Additional charges for resource usage
+- **GPU premium**: Higher costs for GPU-enabled nodes

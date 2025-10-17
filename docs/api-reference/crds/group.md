@@ -14,8 +14,6 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | `string` | Yes | Unique identifier for the group |
-| `maxSize` | `int` | Yes | Maximum number of nodes in the group |
-| `nodeSelector` | `map[string]string` | Yes | Labels to select nodes for this group |
 | `scaleDownUtilizationThreshold` | `float64` | Yes | CPU utilization threshold for scale-down (0.0-1.0) |
 | `scaleDownGpuUtilizationThreshold` | `float64` | Yes | GPU utilization threshold for scale-down (0.0-1.0) |
 | `scaleDownUnneededTime` | `*metav1.Duration` | Yes | Time a node must be unneeded before scale-down |
@@ -23,25 +21,6 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 | `maxNodeProvisionTime` | `*metav1.Duration` | Yes | Maximum time to wait for node provisioning |
 | `zeroOrMaxNodeScaling` | `bool` | Yes | Whether to scale to zero or max nodes only |
 | `ignoreDaemonSetsUtilization` | `bool` | Yes | Ignore DaemonSet pods in utilization calculations |
-
-### GroupStatus
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `health` | `string` | Overall health status: `healthy`, `offline`, `unknown` |
-| `conditions` | `[]metav1.Condition` | Standard Kubernetes conditions |
-
-#### Health Status Values
-
-- **`healthy`**: All nodes in the group are healthy
-- **`offline`**: At least one node in the group is offline
-- **`unknown`**: Health status cannot be determined
-
-#### Standard Conditions
-
-- **`Available`**: The group is fully functional
-- **`Progressing`**: The group is being created or updated
-- **`Degraded`**: The group failed to reach or maintain desired state
 
 ## Example
 
@@ -64,24 +43,15 @@ spec:
   maxNodeProvisionTime: "15m"
   zeroOrMaxNodeScaling: false
   ignoreDaemonSetsUtilization: true
-status:
-  health: healthy
-  conditions:
-  - type: Available
-    status: "True"
-    reason: GroupReady
-    message: "Group is ready and managing nodes"
-    lastTransitionTime: "2025-01-01T12:00:00Z"
 ```
 
 ## Usage
 
 ### Creating a Group
 
-1. **Define node selection criteria** using `nodeSelector`
-2. **Set scaling thresholds** for CPU and GPU utilization
-3. **Configure timing parameters** for scale-down behavior
-4. **Apply the Group resource** to your cluster
+1. **Set scaling thresholds** for CPU and GPU utilization
+2. **Configure timing parameters** for scale-down behavior
+3. **Apply the Group resource** to your cluster
 
 ```bash
 kubectl apply -f group.yaml
@@ -98,21 +68,6 @@ kubectl describe group worker-nodes -n homelab-autoscaler-system
 
 # Watch group status changes
 kubectl get groups -n homelab-autoscaler-system -w
-```
-
-### Node Selection
-
-Nodes are selected for a group based on the `nodeSelector` labels. Ensure your Node CRDs have matching labels:
-
-```yaml
-apiVersion: infra.homecluster.dev/v1alpha1
-kind: Node
-metadata:
-  name: worker-01
-  labels:
-    node-type: worker    # Matches group nodeSelector
-    zone: homelab        # Matches group nodeSelector
-    group: worker-nodes  # Required for group association
 ```
 
 ## Scaling Behavior
@@ -139,8 +94,6 @@ metadata:
 ## Best Practices
 
 ### Resource Planning
-- Set `maxSize` based on your physical infrastructure capacity
-- Consider power consumption and cooling when setting maximum sizes
 - Account for startup time in `maxNodeProvisionTime`
 
 ### Threshold Tuning
@@ -148,27 +101,16 @@ metadata:
 - Monitor actual utilization patterns before optimizing thresholds
 - Consider workload characteristics (CPU vs memory intensive)
 
-### Label Strategy
-- Use consistent labeling across nodes and groups
-- Include zone/rack information for placement awareness
-- Add node capability labels (GPU, storage type, etc.)
-
 ## Troubleshooting
 
 ### Common Issues
 
 1. **Nodes not joining group**
-   - Verify `nodeSelector` labels match Node CRD labels
    - Check that `group` label is set on Node CRDs
 
 2. **Scaling not working**
    - Verify gRPC server is running and accessible
    - Check controller logs for errors
-
-3. **Health status stuck**
-   - Group controller may not be functioning (see known issues)
-   - Check individual node health status
-   - Verify CronJob health checks are running
 
 ### Debugging Commands
 

@@ -164,7 +164,7 @@ startupPodSpec:
 
 ```yaml
 startupPodSpec:
-  image: homelab/ipmitool:latest
+  image: gemtest/ipmitool:latest
   command: ["ipmitool"]
   args: ["-I", "lanplus", "-H", "worker-01-ipmi", "-U", "admin", "-P", "password", "power", "on"]
   volumes:
@@ -173,7 +173,7 @@ startupPodSpec:
     secretName: ipmi-credentials
 
 shutdownPodSpec:
-  image: homelab/ipmitool:latest
+  image: gemtest/ipmitool:latest
   command: ["ipmitool"]
   args: ["-I", "lanplus", "-H", "worker-01-ipmi", "-U", "admin", "-P", "password", "power", "soft"]
   volumes:

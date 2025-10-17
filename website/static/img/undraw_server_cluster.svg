@@ -1,0 +1,10 @@
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <rect width="200" height="200" fill="#f0f0f0"/>
+  <rect x="20" y="40" width="160" height="30" rx="5" fill="#4285f4"/>
+  <rect x="20" y="80" width="160" height="30" rx="5" fill="#34a853"/>
+  <rect x="20" y="120" width="160" height="30" rx="5" fill="#fbbc04"/>
+  <circle cx="30" cy="55" r="5" fill="white"/>
+  <circle cx="30" cy="95" r="5" fill="white"/>
+  <circle cx="30" cy="135" r="5" fill="white"/>
+  <text x="100" y="170" text-anchor="middle" font-family="Arial" font-size="12" fill="#666">Server Cluster</text>
+</svg>
