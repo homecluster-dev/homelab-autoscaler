@@ -29,6 +29,8 @@ clusterAutoscaler:
     - --skip-nodes-with-local-storage=false
     - --max-node-provision-time=15m
     - --scale-down-delay-after-failure=3m
+    - --unremovable-node-recheck-timeout=1m0s  
+    - --scale-down-delay-after-add=1m0s
   
   # Resource limits and requests for cluster autoscaler pod
   resources:
