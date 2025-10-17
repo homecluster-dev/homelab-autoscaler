@@ -68,7 +68,8 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				// Verify response
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp).NotTo(BeNil())
-				Expect(resp.NodeGroups).To(HaveLen(8)) // Based on test data: test-group, gpu-group, cpu-group, offline-group, unknown-group, empty-group, fast-scale-group, dev-group
+				Expect(resp.NodeGroups).To(HaveLen(8)) // Based on test data: test-group, gpu-group, cpu-group,
+				// offline-group, unknown-group, empty-group, fast-scale-group, dev-group
 
 				// Verify specific groups
 				groupNames := make([]string, len(resp.NodeGroups))
@@ -77,7 +78,8 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 					Expect(group.MinSize).To(Equal(int32(0)))
 					Expect(group.MaxSize).To(BeNumerically(">=", 0))
 				}
-				Expect(groupNames).To(ContainElements("test-group", "gpu-group", "cpu-group", "offline-group", "unknown-group", "empty-group", "fast-scale-group", "dev-group"))
+				Expect(groupNames).To(ContainElements("test-group", "gpu-group", "cpu-group", "offline-group",
+					"unknown-group", "empty-group", "fast-scale-group", "dev-group"))
 			})
 		})
 
