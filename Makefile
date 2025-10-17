@@ -69,13 +69,15 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 
 .PHONY: test-e2e
 test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with full cleanup
+	@echo "Killing existing control server and controller"
+	lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+	lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+
 	@echo "Setting up development environment..."
 	./development/install-dev.sh
 	
 	@echo "Starting VM control server..."
 	@cd examples/k3d && python3 vm_control_server.py & \
-	VM_CONTROL_PID=$$!; \
-	echo "export VM_CONTROL_PID=$$VM_CONTROL_PID" > /tmp/vm-control.pid
 	
 	@echo "Starting local server..."
 	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 & \
@@ -102,6 +104,10 @@ test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with fu
 	
 	@echo "Deleting cluster..."
 	./examples/k3d/delete-cluster.sh
+	
+	@echo "Killing existing control server and controller"
+	lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+	lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
 	
 	@if [ "$$TEST_FAILED" = "true" ]; then \
 		exit 1; \
