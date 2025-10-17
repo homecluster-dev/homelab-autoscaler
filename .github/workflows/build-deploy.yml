@@ -64,6 +64,15 @@ jobs:
     needs:
       - build
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Extract appVersion from Chart.yaml
+        id: chart-version
+        run: |
+          APP_VERSION=$(grep '^appVersion:' dist/chart/Chart.yaml | sed 's/appVersion: *"\(.*\)"/\1/')
+          echo "app-version=$APP_VERSION" >> $GITHUB_OUTPUT
+      
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -86,6 +95,7 @@ jobs:
           docker buildx imagetools create \
             -t ${{ env.REGISTRY_IMAGE }}:latest \
             -t ${{ env.REGISTRY_IMAGE }}:${{ github.sha }} \
+            -t ${{ env.REGISTRY_IMAGE }}:${{ steps.chart-version.outputs.app-version }} \
             $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
       
       - name: Inspect image

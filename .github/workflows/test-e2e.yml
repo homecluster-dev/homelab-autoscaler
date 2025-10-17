@@ -1,10 +1,18 @@
 name: K3d Cluster Test
 
-on: [push]
+on:
+  workflow_run:
+    workflows: ["Test Chart", "Release Chart", "Build and Push Docker Image"]
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
       
