@@ -130,6 +130,57 @@ transform_crd() {
     print_success "Generated $target_file"
 }
 
+# Function to read version from Chart.yaml
+get_chart_version() {
+    local chart_file="dist/chart/Chart.yaml"
+    
+    if [ ! -f "$chart_file" ]; then
+        print_error "Chart.yaml not found at $chart_file"
+        return 1
+    fi
+    
+    # Extract version using grep and sed
+    local version=$(grep "^version:" "$chart_file" | sed 's/version:[[:space:]]*//')
+    
+    if [ -z "$version" ]; then
+        print_error "Could not extract version from $chart_file"
+        return 1
+    fi
+    
+    echo "$version"
+}
+
+# Function to update image tag in values.yaml
+update_image_tag() {
+    local values_file="dist/chart/values.yaml"
+    local new_tag="$1"
+    
+    if [ ! -f "$values_file" ]; then
+        print_error "values.yaml not found at $values_file"
+        return 1
+    fi
+    
+    print_status "Updating image tag from 'latest' to '$new_tag' in $values_file..."
+    
+    # Use sed to replace the tag on line 8 (controllerManager.container.image.tag)
+    sed -i.bak "s/tag: latest/tag: $new_tag/" "$values_file"
+    
+    # Verify the change was made
+    if grep -q "tag: $new_tag" "$values_file"; then
+        print_success "Successfully updated image tag to '$new_tag'"
+        # Remove backup file
+        rm -f "${values_file}.bak"
+        return 0
+    else
+        print_error "Failed to update image tag"
+        # Restore from backup if update failed
+        if [ -f "${values_file}.bak" ]; then
+            mv "${values_file}.bak" "$values_file"
+        fi
+        return 1
+    fi
+}
+
 # Main execution
 main() {
     print_status "Starting CRD synchronization from kubebuilder to Helm chart..."
@@ -175,6 +226,22 @@ main() {
     print_success "CRD synchronization completed successfully!"
     print_status "Synchronized CRDs:"
     ls -la "$TARGET_DIR"/*.yaml 2>/dev/null || print_warning "No CRD files found in target directory"
+    
+    # Update image tag in values.yaml
+    print_status "Updating image tag in values.yaml..."
+    chart_version=$(get_chart_version)
+    if [ $? -eq 0 ] && [ -n "$chart_version" ]; then
+        update_image_tag "$chart_version"
+        if [ $? -eq 0 ]; then
+            print_success "Image tag update completed successfully!"
+        else
+            print_error "Failed to update image tag"
+            exit 1
+        fi
+    else
+        print_error "Failed to get chart version"
+        exit 1
+    fi
 }
 
 # Run main function
