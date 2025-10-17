@@ -73,6 +73,14 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Releases',
+      items: [
+        'releases/changelog',
+      ],
+      collapsed: false,
+    },
+    {
+      type: 'category',
       label: 'Troubleshooting',
       items: [
         'troubleshooting/debugging-guide',
