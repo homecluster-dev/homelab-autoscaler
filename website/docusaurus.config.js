@@ -99,6 +99,9 @@ const config = {
           },
         ],
       },
+      metadata: [
+        {name: 'algolia-site-verification', content: 'F26C39078E44141A' }
+      ],
       footer: {
         style: 'dark',
         links: [
