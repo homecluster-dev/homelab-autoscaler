@@ -172,12 +172,12 @@ homelab-autoscaler/
 
 | File | Purpose |
 |------|---------|
-| [`cmd/main.go`](../../cmd/main.go) | Application entry point |
-| [`api/infra/v1alpha1/group_types.go`](../../api/infra/v1alpha1/group_types.go) | Group CRD definition |
-| [`api/infra/v1alpha1/node_types.go`](../../api/infra/v1alpha1/node_types.go) | Node CRD definition |
-| [`internal/grpcserver/server.go`](../../internal/grpcserver/server.go) | gRPC server implementation |
-| [`Makefile`](../../Makefile) | Build automation |
-| [`PROJECT`](../../PROJECT) | Kubebuilder project file |
+| `cmd/main.go` | Application entry point |
+| `api/infra/v1alpha1/group_types.go` | Group CRD definition |
+| `api/infra/v1alpha1/node_types.go` | Node CRD definition |
+| `internal/grpcserver/server.go` | gRPC server implementation |
+| `Makefile` | Build automation |
+| `PROJECT` | Kubebuilder project file |
 
 ## Development Tips
 
@@ -223,11 +223,11 @@ kubectl get nodes.infra.homecluster.dev -w
 ### Critical Bugs to Fix First
 
 1. **gRPC Logic Bugs** (Priority: CRITICAL)
-   - File: [`internal/grpcserver/server.go:306-311`](../../internal/grpcserver/server.go:306)
-   - File: [`internal/grpcserver/server.go:461-473`](../../internal/grpcserver/server.go:461)
+   - File: `internal/grpcserver/server.go:306-311`
+   - File: `internal/grpcserver/server.go:461-473`
 
 2. **GroupStore Not Used** (Priority: HIGH)
-   - File: [`cmd/main.go:186`](../../cmd/main.go:186)
+   - File: `cmd/main.go:186`
    - GroupStore created but never passed to gRPC server
 
 3. **Controller Race Conditions** (Priority: HIGH)
@@ -236,9 +236,7 @@ kubectl get nodes.infra.homecluster.dev -w
 
 ### Testing Limitations
 
-- E2E tests require VirtualBox setup (see [`test/virtualbox/`](../../test/virtualbox/))
 - Some tests hardcode namespace `homelab-autoscaler-system`
-- gRPC tests may fail due to logic bugs
 
 ### Debugging Commands
 

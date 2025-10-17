@@ -9,7 +9,7 @@ This document outlines the current known issues and limitations in the homelab-a
 ### 1. Configuration Constraints
 
 #### Advanced gRPC Configuration
-- **Location**: [`internal/grpcserver/server.go`](../internal/grpcserver/server.go)
+- **Location**: `internal/grpcserver/server.go`
 - **Description**: Limited customization options for gRPC server behavior
 - **Impact**: May require code changes for specific deployment needs
 - **Status**: ✅ **STABLE** - Works reliably with default configuration
@@ -25,14 +25,14 @@ This document outlines the current known issues and limitations in the homelab-a
 ### 2. Operational Considerations
 
 #### State Management
-- **Location**: [`internal/controller/infra/node_controller.go`](../internal/controller/infra/node_controller.go)
+- **Location**: `internal/controller/infra/node_controller.go`
 - **Description**: Robust state management with FSM architecture
 - **Impact**: Reliable power state transitions
 - **Status**: ✅ **PRODUCTION READY** - Comprehensive state coordination
 - **Architecture**: [FSM Architecture](../architecture/state.md) provides robust solution
 
 #### Group Controller Features
-- **Location**: [`internal/controller/infra/group_controller.go`](../internal/controller/infra/group_controller.go)
+- **Location**: `internal/controller/infra/group_controller.go`
 - **Description**: Full autoscaling policy management and health monitoring
 - **Impact**: Complete autoscaling functionality
 - **Status**: ✅ **OPERATIONAL** - Manages groups and policies effectively

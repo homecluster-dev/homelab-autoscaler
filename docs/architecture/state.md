@@ -46,7 +46,7 @@ const (
 
 ### Current Progress States
 
-The system defines four progress states in [`api/infra/v1alpha1/node_types.go`](api/infra/v1alpha1/node_types.go:79-86):
+The system defines four progress states in `api/infra/v1alpha1/node_types.go`:
 
 ```go
 type Progress string
@@ -68,14 +68,14 @@ The coordination system uses two operation types:
 ### Async Architecture
 
 State transitions are handled asynchronously using:
-- [`startNodeAsync()`](internal/controller/infra/node_controller.go:545) goroutines
-- [`shutdownNodeAsync()`](internal/controller/infra/node_controller.go:579) goroutines
+- `startNodeAsync()` goroutines
+- `shutdownNodeAsync()` goroutines
 - Kubernetes Jobs for actual power operations
 - 5-minute timeout for job completion
 
 ### Smart Backoff Strategy
 
-The current system implements a 4-tier backoff strategy in [`validateStateTransition()`](internal/controller/infra/node_controller.go:686):
+The current system implements a 4-tier backoff strategy in `validateStateTransition()`:
 
 1. **Early Phase (0-2 min)**: 30-second backoff
 2. **Normal Phase (2-10 min)**: 2-minute backoff  
@@ -827,10 +827,10 @@ func (nm *NodeStateMachine) updateNodeProgress(progress infrav1alpha1.Progress) 
 
 ## References
 
-- **Existing Implementation**: [`docs/todo/state_management.md`](docs/todo/state_management.md) - Comprehensive 2,904-line implementation guide for current coordination annotation system
-- **Node Controller**: [`internal/controller/infra/node_controller.go`](internal/controller/infra/node_controller.go) - Current state management implementation
-- **gRPC Server**: [`internal/grpcserver/server.go`](internal/grpcserver/server.go) - Cluster autoscaler integration
-- **Node Types**: [`api/infra/v1alpha1/node_types.go`](api/infra/v1alpha1/node_types.go) - Progress enum definitions
+- **Existing Implementation**: [State Management Documentation](state.md) - Comprehensive implementation guide for current coordination annotation system
+- **Node Controller**: `internal/controller/infra/node_controller.go` - Current state management implementation
+- **gRPC Server**: `internal/grpcserver/server.go` - Cluster autoscaler integration
+- **Node Types**: `api/infra/v1alpha1/node_types.go` - Progress enum definitions
 - **looplab/fsm**: [GitHub Repository](https://github.com/looplab/fsm) - FSM library documentation
 
 ---

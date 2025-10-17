@@ -150,7 +150,7 @@ Node health is determined by:
    - **Production**: Use [Installation Guide](installation.md) for Helm deployment
 2. **Review Known Issues**: Check [Known Issues](../troubleshooting/known-issues.md) for current limitations
 3. **Set Up Development Environment**: Follow [Development Setup](../development/setup.md) for contributing
-4. **Deploy Sample Configuration**: Use provided [examples](../api-reference/examples/)
+4. **Deploy Sample Configuration**: Use provided [examples](../api-reference/examples/k3d-group.md)
 5. **Monitor System Behavior**: Watch logs and resource states
 
 ## Architecture Benefits

@@ -214,7 +214,5 @@ If validation reports schema differences:
 
 Potential improvements to consider:
 
-- **CI/CD integration**: Validate CRD sync in GitHub Actions
 - **Pre-commit hooks**: Ensure CRDs are synced before commits
 - **Schema versioning**: Track CRD schema changes over time
-- **Automated testing**: Unit tests for sync script functionality
