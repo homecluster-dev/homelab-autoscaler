@@ -162,7 +162,6 @@ metadata:
    - Check that `group` label is set on Node CRDs
 
 2. **Scaling not working**
-   - See [Known Issues](../../troubleshooting/known-issues.md) for critical bugs
    - Verify gRPC server is running and accessible
    - Check controller logs for errors
 
@@ -191,4 +190,3 @@ kubectl port-forward -n homelab-autoscaler-system service/homelab-autoscaler-grp
 
 - [Node CRD](node.md) - Individual node management
 - [Architecture Overview](../../architecture/overview.md) - System design
-- [Known Issues](../../troubleshooting/known-issues.md) - Current limitations

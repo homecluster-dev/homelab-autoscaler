@@ -1,6 +1,5 @@
 # Architecture Overview
 
-> ⚠️ **WARNING**: This describes the intended architecture. See [Known Issues](../troubleshooting/known-issues.md) for current implementation problems.
 
 ## System Design
 

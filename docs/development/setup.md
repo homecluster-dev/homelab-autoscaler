@@ -2,7 +2,6 @@
 
 This guide helps you set up a development environment for the homelab-autoscaler project.
 
-> ⚠️ **WARNING**: This system has critical bugs. See [Known Issues](../troubleshooting/known-issues.md) before starting development.
 
 ## Prerequisites
 
@@ -292,5 +291,4 @@ kubectl port-forward -n homelab-autoscaler-system pod/<pod-name> 50051:50051
 ## Related Documentation
 
 - [Architecture Overview](../architecture/overview.md) - System design
-- [Known Issues](../troubleshooting/known-issues.md) - Current bugs and limitations
 - [API Reference](../api-reference/crds/group.md) - CRD specifications

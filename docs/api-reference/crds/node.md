@@ -291,4 +291,3 @@ kubectl describe node.infra.homecluster.dev <node-name> -n homelab-autoscaler-sy
 
 - [Group CRD](group.md) - Autoscaling group configuration
 - [Architecture Overview](../../architecture/overview.md) - System design
-- [Known Issues](../../troubleshooting/known-issues.md) - Current limitations
