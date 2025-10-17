@@ -121,7 +121,7 @@ Node health is determined by:
 ### Critical Issues
 - **gRPC Logic Bugs**: Core scaling methods have incorrect logic
 - **Missing Node Draining**: Pods not evicted before shutdown
-- **Controller Race Conditions**: State management issues
+- **Controller Race Conditions**: State management issues (see [FSM Architecture](../architecture/state.md) for planned solution)
 - **Incomplete Group Controller**: Only sets basic status
 
 ### Missing Features

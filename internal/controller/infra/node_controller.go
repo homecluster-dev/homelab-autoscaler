@@ -22,10 +22,8 @@ import (
 	"strconv"
 	"time"
 
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -34,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 )
 
 // Coordination annotation keys for preventing race conditions with cluster autoscaler
@@ -130,53 +129,64 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return result, nil
 	}
 
-	// Handle power state transitions with proper logic
+	// Handle power state transitions using FSM
+	return r.handleStateTransitionsWithFSM(ctx, node)
+}
+
+// handleStateTransitionsWithFSM uses the FSM for state management
+func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node *infrav1alpha1.Node) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// Create coordination manager
+	coordMgr := fsm.NewCoordinationManager(r.Client, fsm.NodeControllerOwner)
+
+	// Create FSM instance
+	stateMachine := fsm.NewNodeStateMachine(node, r.Client, r.Scheme, coordMgr)
+
+	logger.Info("Using FSM for state management",
+		"node", node.Name,
+		"currentState", stateMachine.GetCurrentState(),
+		"desiredPowerState", node.Spec.DesiredPowerState)
+
+	// Handle desired state transitions
 	if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
 		(node.Status.PowerState == infrav1alpha1.PowerStateOff || node.Status.PowerState == "") &&
-		node.Status.Progress != infrav1alpha1.ProgressStartingUp {
+		stateMachine.CanTransition(fsm.EventStartNode) {
 
-		err := r.startNode(ctx, node)
-		if err != nil {
-			logger.Error(err, "Failed to start Node", "node", node.Name)
-			// Check if this is a coordination lock error - use longer backoff to avoid conflicts
-			if fmt.Sprintf("%v", err) != "" && (fmt.Sprintf("%v", err) == "coordination lock" ||
-				fmt.Sprintf("%v", err) == "lock already exists") {
-				logger.Info("Coordination lock conflict during node start, backing off",
-					"node", node.Name,
-					"backoff", "2 minutes")
-				return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
-			}
-			return ctrl.Result{RequeueAfter: time.Minute}, err
+		if err := stateMachine.StartNode(); err != nil {
+			logger.Error(err, "FSM failed to start node", "node", node.Name)
+			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, err
 		}
 
 	} else if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOff &&
 		node.Status.PowerState == infrav1alpha1.PowerStateOn &&
-		node.Status.Progress != infrav1alpha1.ProgressShuttingDown {
+		stateMachine.CanTransition(fsm.EventShutdownNode) {
 
-		err := r.shutdownNode(ctx, node)
-		if err != nil {
-			logger.Error(err, "Failed to shutdown Node", "node", node.Name)
-			// Check if this is a coordination lock error - use longer backoff to avoid conflicts
-			if fmt.Sprintf("%v", err) != "" && (fmt.Sprintf("%v", err) == "coordination lock" ||
-				fmt.Sprintf("%v", err) == "lock already exists") {
-				logger.Info("Coordination lock conflict during node shutdown, backing off",
-					"node", node.Name,
-					"backoff", "2 minutes")
-				return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
-			}
-			return ctrl.Result{RequeueAfter: time.Minute}, err
+		if err := stateMachine.ShutdownNode(); err != nil {
+			logger.Error(err, "FSM failed to shutdown node", "node", node.Name)
+			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, err
 		}
+
 	} else {
+		// Check for stuck transitions
+		stateMachine.CheckStuckState()
+
 		// Node is already in desired state or transitioning
 		logger.Info("Node is in desired state or transitioning",
 			"node", node.Name,
 			"desiredState", node.Spec.DesiredPowerState,
 			"currentState", node.Status.PowerState,
-			"progress", node.Status.Progress)
-		return ctrl.Result{RequeueAfter: time.Minute * 5}, nil // Check again later
+			"progress", node.Status.Progress,
+			"fsmState", stateMachine.GetCurrentState())
+
+		// Use FSM backoff if in transitional state, otherwise standard requeue
+		if fsm.IsTransitionalState(stateMachine.GetCurrentState()) {
+			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, nil
+		}
+		return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
 	}
 
-	logger.Info("Successfully reconciled Node", "node", node.Name)
+	logger.Info("Successfully processed FSM state transition", "node", node.Name)
 	return ctrl.Result{}, nil
 }
 
@@ -234,451 +244,6 @@ func (r *NodeReconciler) addLabelToKubernetesNodeWithPatch(ctx context.Context, 
 
 	logger.Info("Successfully patched Kubernetes node with label", "node", nodeName, "label", labelKey, "value", labelValue)
 	return nil
-}
-
-func (r *NodeReconciler) shutdownNode(ctx context.Context, nodeCR *infrav1alpha1.Node) error {
-	logger := log.FromContext(ctx)
-
-	// Acquire operation lock for scale-down operation
-	if err := r.acquireOperationLock(ctx, nodeCR, "scale-down", DefaultLockTimeout); err != nil {
-		logger.Info("Failed to acquire coordination lock for scale-down operation",
-			"node", nodeCR.Name,
-			"error", err)
-		return fmt.Errorf("cannot shutdown node due to coordination lock: %w", err)
-	}
-
-	logger.Info("Acquired coordination lock for scale-down operation", "node", nodeCR.Name)
-
-	// Mark the Kubernetes node as not schedulable before starting shutdown
-	k8sNode := &corev1.Node{}
-	if err := r.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
-		logger.Error(err, "failed to get Kubernetes node", "nodeName", nodeCR.Spec.KubernetesNodeName)
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	// Mark the node as unschedulable
-	k8sNode.Spec.Unschedulable = true
-	if err := r.Update(ctx, k8sNode); err != nil {
-		logger.Error(err, "failed to mark Kubernetes node as unschedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	logger.Info("Successfully marked Kubernetes node as unschedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
-
-	// // Drain the node by evicting all pods
-	// if err := r.drainNode(ctx, nodeCR.Spec.KubernetesNodeName); err != nil {
-	// 	logger.Error(err, "failed to drain node", "nodeName", nodeCR.Spec.KubernetesNodeName)
-	// 	// Release lock on error
-	// 	if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-	// 		logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-	// 	}
-	// 	return err
-	// }
-
-	// logger.Info("Successfully drained node", "nodeName", nodeCR.Spec.KubernetesNodeName)
-
-	// Create a Job to shutdown the node
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-shutdown-%s", nodeCR.Name, fmt.Sprintf("%d", metav1.Now().Unix())),
-			Namespace: nodeCR.Namespace,
-			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"group": nodeCR.Labels["group"],
-				"node":  nodeCR.Spec.KubernetesNodeName,
-				"type":  "shutdown",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"group": nodeCR.Labels["group"],
-						"node":  nodeCR.Spec.KubernetesNodeName,
-						"type":  "shutdown",
-					},
-				},
-				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
-					Containers: []corev1.Container{
-						{
-							Name:    "shutdown",
-							Image:   nodeCR.Spec.ShutdownPodSpec.Image,
-							Command: nodeCR.Spec.ShutdownPodSpec.Command,
-							Args:    nodeCR.Spec.ShutdownPodSpec.Args,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// Set owner reference to the Node CR
-	if err := ctrl.SetControllerReference(nodeCR, job, r.Scheme); err != nil {
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	// Create the Job
-	if err := r.Create(ctx, job); err != nil {
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	logger.Info("Successfully created shutdown job", "job", job.Name, "node", nodeCR.Spec.KubernetesNodeName)
-
-	// Update the Node status condition to "progressing" immediately for UI feedback
-	nodeCR.Status.Conditions = append(nodeCR.Status.Conditions, metav1.Condition{
-		Type:               "progressing",
-		Status:             metav1.ConditionTrue,
-		LastTransitionTime: metav1.Now(),
-		Reason:             "NodeGroupDecreasingSize",
-		Message:            fmt.Sprintf("Shutting down node via job %s", job.Name),
-	})
-	nodeCR.Status.LastShutdownTime = &metav1.Time{Time: time.Now().UTC()}
-	nodeCR.Status.Progress = infrav1alpha1.ProgressShuttingDown
-
-	// Update the Node with the new status info
-	if err := r.Update(ctx, nodeCR); err != nil {
-		logger.Error(err, "Failed to update Node with status condition", "node", nodeCR.Name)
-		// Don't return error here as job is already created, let async function handle it
-	}
-
-	// Launch async goroutine to wait for job completion and release lock
-	go r.shutdownNodeAsync(ctx, nodeCR, job.Name)
-
-	return nil
-}
-
-func (r *NodeReconciler) startNode(ctx context.Context, nodeCR *infrav1alpha1.Node) error {
-	logger := log.FromContext(ctx)
-
-	// Acquire operation lock for scale-up operation
-	if err := r.acquireOperationLock(ctx, nodeCR, "scale-up", DefaultLockTimeout); err != nil {
-		logger.Info("Failed to acquire coordination lock for scale-up operation",
-			"node", nodeCR.Name,
-			"error", err)
-		return fmt.Errorf("cannot start node due to coordination lock: %w", err)
-	}
-
-	logger.Info("Acquired coordination lock for scale-up operation", "node", nodeCR.Name)
-
-	// Get the Kubernetes node object and set it as schedulable
-	k8sNode := &corev1.Node{}
-	if err := r.Get(ctx, client.ObjectKey{Name: nodeCR.Spec.KubernetesNodeName}, k8sNode); err != nil {
-		logger.Error(err, "failed to get Kubernetes node", "nodeName", nodeCR.Spec.KubernetesNodeName)
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	// Set the node as schedulable
-	k8sNode.Spec.Unschedulable = false
-
-	// Remove cluster autoscaler taints by key
-	var filteredTaints []corev1.Taint
-	for _, taint := range k8sNode.Spec.Taints {
-		if taint.Key != "ToBeDeletedByClusterAutoscaler" && taint.Key != "DeletionCandidateOfClusterAutoscaler" {
-			filteredTaints = append(filteredTaints, taint)
-		}
-	}
-	k8sNode.Spec.Taints = filteredTaints
-
-	if err := r.Update(ctx, k8sNode); err != nil {
-		logger.Error(err, "failed to mark Kubernetes node as schedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	logger.Info("Successfully marked Kubernetes node as schedulable", "nodeName", nodeCR.Spec.KubernetesNodeName)
-
-	// Create a Job to start the unhealthy node
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-startup-%s", nodeCR.Name, fmt.Sprintf("%d", metav1.Now().Unix())),
-			Namespace: nodeCR.Namespace,
-			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"group": nodeCR.Labels["group"],
-				"node":  nodeCR.Spec.KubernetesNodeName,
-				"type":  "startup",
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"group": nodeCR.Labels["group"],
-						"node":  nodeCR.Spec.KubernetesNodeName,
-						"type":  "startup",
-					},
-				},
-				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
-					Containers: []corev1.Container{
-						{
-							Name:    "startup",
-							Image:   nodeCR.Spec.StartupPodSpec.Image,
-							Command: nodeCR.Spec.StartupPodSpec.Command,
-							Args:    nodeCR.Spec.StartupPodSpec.Args,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// Set owner reference to the Node CR
-	if err := ctrl.SetControllerReference(nodeCR, job, r.Scheme); err != nil {
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	// Create the Job
-	if err := r.Create(ctx, job); err != nil {
-		// Release lock on error
-		if releaseErr := r.releaseOperationLock(ctx, nodeCR); releaseErr != nil {
-			logger.Error(releaseErr, "Failed to release coordination lock after error", "node", nodeCR.Name)
-		}
-		return err
-	}
-
-	logger.Info("Successfully created startup job", "job", job.Name, "node", nodeCR.Name)
-
-	// Update the Node status condition to "progressing" immediately for UI feedback
-	nodeCR.Status.Conditions = append(nodeCR.Status.Conditions, metav1.Condition{
-		Type:               "progressing",
-		Status:             metav1.ConditionTrue,
-		LastTransitionTime: metav1.Now(),
-		Reason:             "NodeGroupIncreaseSize",
-		Message:            fmt.Sprintf("Starting node via job %s", job.Name),
-	})
-	nodeCR.Status.LastStartupTime = &metav1.Time{Time: time.Now().UTC()}
-	nodeCR.Status.Progress = infrav1alpha1.ProgressStartingUp
-
-	// Update the Node with the new status info
-	if err := r.Update(ctx, nodeCR); err != nil {
-		logger.Error(err, "Failed to update Node with status condition", "node", nodeCR.Name)
-		// Don't return error here as job is already created, let async function handle it
-	}
-
-	// Launch async goroutine to wait for job completion and release lock
-	go r.startNodeAsync(ctx, nodeCR, job.Name)
-
-	return nil
-}
-
-// waitForJobCompletion waits for a job to complete with polling and timeout
-func (r *NodeReconciler) waitForJobCompletion(ctx context.Context, jobName, namespace string, timeout time.Duration) error {
-	logger := log.FromContext(ctx)
-
-	// Create context with timeout
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Poll every 30 seconds
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	logger.Info("Waiting for job completion", "job", jobName, "timeout", timeout)
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			logger.Error(timeoutCtx.Err(), "Timeout waiting for job completion", "job", jobName)
-			return fmt.Errorf("timeout waiting for job %s to complete: %w", jobName, timeoutCtx.Err())
-		case <-ticker.C:
-			// Check job status
-			job := &batchv1.Job{}
-			if err := r.Get(timeoutCtx, types.NamespacedName{Name: jobName, Namespace: namespace}, job); err != nil {
-				if errors.IsNotFound(err) {
-					logger.Info("Job not found, may have been cleaned up", "job", jobName)
-					return nil
-				}
-				logger.Error(err, "Failed to get job status", "job", jobName)
-				continue
-			}
-
-			// Check if job completed successfully
-			if job.Status.Succeeded > 0 {
-				logger.Info("Job completed successfully", "job", jobName)
-				return nil
-			}
-
-			// Check if job failed
-			if job.Status.Failed > 0 {
-				logger.Error(nil, "Job failed", "job", jobName, "failedPods", job.Status.Failed)
-				return fmt.Errorf("job %s failed with %d failed pods", jobName, job.Status.Failed)
-			}
-
-			// Job is still running
-			logger.Info("Job still running", "job", jobName, "active", job.Status.Active)
-		}
-	}
-}
-
-// startNodeAsync runs the node startup process asynchronously and waits for job completion before releasing the lock
-func (r *NodeReconciler) startNodeAsync(ctx context.Context, nodeCR *infrav1alpha1.Node, jobName string) {
-	logger := log.FromContext(ctx)
-
-	// Ensure lock is always released
-	defer func() {
-		if err := r.releaseOperationLock(ctx, nodeCR); err != nil {
-			logger.Error(err, "Failed to release coordination lock after startNodeAsync operation",
-				"node", nodeCR.Name)
-		} else {
-			logger.Info("Successfully released coordination lock after startNodeAsync operation",
-				"node", nodeCR.Name)
-		}
-	}()
-
-	// Wait for job completion with 5-minute timeout
-	if err := r.waitForJobCompletion(ctx, jobName, nodeCR.Namespace, 5*time.Minute); err != nil {
-		logger.Error(err, "Startup job did not complete successfully", "node", nodeCR.Name, "job", jobName)
-
-		// Update node status to reflect failure
-		if updateErr := r.updateNodeStatusAfterJobFailure(ctx, nodeCR, "startup", err); updateErr != nil {
-			logger.Error(updateErr, "Failed to update node status after job failure", "node", nodeCR.Name)
-		}
-		return
-	}
-
-	// Update node status to reflect successful completion
-	if err := r.updateNodeStatusAfterJobSuccess(ctx, nodeCR, "startup"); err != nil {
-		logger.Error(err, "Failed to update node status after job success", "node", nodeCR.Name)
-	}
-
-	logger.Info("Node startup completed successfully", "node", nodeCR.Name, "job", jobName)
-}
-
-// shutdownNodeAsync runs the node shutdown process asynchronously and waits for job completion before releasing the lock
-func (r *NodeReconciler) shutdownNodeAsync(ctx context.Context, nodeCR *infrav1alpha1.Node, jobName string) {
-	logger := log.FromContext(ctx)
-
-	// Ensure lock is always released
-	defer func() {
-		if err := r.releaseOperationLock(ctx, nodeCR); err != nil {
-			logger.Error(err, "Failed to release coordination lock after shutdownNodeAsync operation",
-				"node", nodeCR.Name)
-		} else {
-			logger.Info("Successfully released coordination lock after shutdownNodeAsync operation",
-				"node", nodeCR.Name)
-		}
-	}()
-
-	// Wait for job completion with 5-minute timeout
-	if err := r.waitForJobCompletion(ctx, jobName, nodeCR.Namespace, 5*time.Minute); err != nil {
-		logger.Error(err, "Shutdown job did not complete successfully", "node", nodeCR.Name, "job", jobName)
-
-		// Update node status to reflect failure
-		if updateErr := r.updateNodeStatusAfterJobFailure(ctx, nodeCR, "shutdown", err); updateErr != nil {
-			logger.Error(updateErr, "Failed to update node status after job failure", "node", nodeCR.Name)
-		}
-		return
-	}
-
-	// Update node status to reflect successful completion
-	if err := r.updateNodeStatusAfterJobSuccess(ctx, nodeCR, "shutdown"); err != nil {
-		logger.Error(err, "Failed to update node status after job success", "node", nodeCR.Name)
-	}
-
-	logger.Info("Node shutdown completed successfully", "node", nodeCR.Name, "job", jobName)
-}
-
-// updateNodeStatusAfterJobSuccess updates the node status after a job completes successfully
-func (r *NodeReconciler) updateNodeStatusAfterJobSuccess(ctx context.Context, nodeCR *infrav1alpha1.Node, operation string) error {
-	logger := log.FromContext(ctx)
-
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(nodeCR), fresh); err != nil {
-			return fmt.Errorf("failed to get fresh node: %w", err)
-		}
-
-		// Update status based on operation
-		switch operation {
-		case "startup":
-			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
-				Type:               "StartupJobCompleted",
-				Status:             metav1.ConditionTrue,
-				LastTransitionTime: metav1.Now(),
-				Reason:             "NodeStartupJobCompleted",
-				Message:            "Node startup job completed successfully",
-			})
-		case "shutdown":
-			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
-				Type:               "ShutdownJobCompleted",
-				Status:             metav1.ConditionFalse,
-				LastTransitionTime: metav1.Now(),
-				Reason:             "NodeShutdownJobCompleted",
-				Message:            "Node shutdown job completed successfully",
-			})
-		}
-
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-
-		logger.Info("Successfully updated node status after job success",
-			"node", fresh.Name, "operation", operation, "powerState", fresh.Status.PowerState)
-		return nil
-	})
-}
-
-// updateNodeStatusAfterJobFailure updates the node status after a job fails
-func (r *NodeReconciler) updateNodeStatusAfterJobFailure(ctx context.Context, nodeCR *infrav1alpha1.Node, operation string, jobErr error) error {
-	logger := log.FromContext(ctx)
-
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(nodeCR), fresh); err != nil {
-			return fmt.Errorf("failed to get fresh node: %w", err)
-		}
-
-		// Clear progress and add failure condition
-		// fresh.Status.Progress = ""
-		fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			LastTransitionTime: metav1.Now(),
-			Reason:             fmt.Sprintf("Node%sJobFailed", operation),
-			Message:            fmt.Sprintf("Node %s job failed: %v", operation, jobErr),
-		})
-
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-
-		logger.Info("Successfully updated node status after job failure",
-			"node", fresh.Name, "operation", operation, "error", jobErr)
-		return nil
-	})
 }
 
 // validateStateTransition validates that a state transition is valid and implements smart backoff strategy
@@ -818,70 +383,6 @@ func (r *NodeReconciler) SetControllerReference(ctx context.Context, node *infra
 	return nil
 }
 
-// acquireOperationLock attempts to acquire an operation lock on a node using atomic operations
-// with optimistic locking (resource version conflicts). Returns error if lock cannot be acquired.
-func (r *NodeReconciler) acquireOperationLock(ctx context.Context, node *infrav1alpha1.Node, operation string, timeout time.Duration) error {
-	logger := log.FromContext(ctx)
-
-	if timeout == 0 {
-		timeout = DefaultLockTimeout
-	}
-
-	// Check if lock already exists and is not expired
-	if existingLock, exists := r.checkOperationLock(ctx, node); exists {
-		if !r.isLockExpired(existingLock) {
-			return fmt.Errorf("coordination lock already exists: operation=%s, owner=%s, age=%v",
-				existingLock.Operation, existingLock.Owner, time.Since(existingLock.Timestamp))
-		}
-		logger.Info("Existing lock expired, proceeding with acquisition",
-			"node", node.Name,
-			"expiredOperation", existingLock.Operation,
-			"expiredOwner", existingLock.Owner,
-			"age", time.Since(existingLock.Timestamp))
-	}
-
-	// Use optimistic locking with retry to acquire the lock
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
-			return fmt.Errorf("failed to get fresh node: %w", err)
-		}
-
-		// Double-check lock doesn't exist on fresh copy
-		if existingLock, exists := r.checkOperationLock(ctx, fresh); exists {
-			if !r.isLockExpired(existingLock) {
-				return fmt.Errorf("coordination lock acquired by another process: operation=%s, owner=%s",
-					existingLock.Operation, existingLock.Owner)
-			}
-		}
-
-		// Initialize annotations if needed
-		if fresh.Annotations == nil {
-			fresh.Annotations = make(map[string]string)
-		}
-
-		// Set lock annotations
-		fresh.Annotations[OperationLockAnnotation] = operation
-		fresh.Annotations[LockOwnerAnnotation] = NodeControllerOwner
-		fresh.Annotations[LockTimestampAnnotation] = time.Now().Format(time.RFC3339)
-		fresh.Annotations[LockTimeoutAnnotation] = strconv.FormatFloat(timeout.Seconds(), 'f', 0, 64)
-
-		// Attempt to update with optimistic locking
-		if err := r.Update(ctx, fresh); err != nil {
-			return err
-		}
-
-		logger.Info("Successfully acquired coordination lock",
-			"node", node.Name,
-			"operation", operation,
-			"owner", NodeControllerOwner,
-			"timeout", timeout)
-
-		return nil
-	})
-}
-
 // checkOperationLock checks if a node has an active operation lock and returns the lock details.
 // Returns (lock, true) if an active lock exists, (nil, false) otherwise.
 func (r *NodeReconciler) checkOperationLock(ctx context.Context, node *infrav1alpha1.Node) (*OperationLock, bool) {
@@ -932,56 +433,6 @@ func (r *NodeReconciler) checkOperationLock(ctx context.Context, node *infrav1al
 	}
 
 	return lock, true
-}
-
-// releaseOperationLock releases an operation lock from a node. Only releases locks owned by this controller.
-// Uses optimistic locking to prevent race conditions during release.
-func (r *NodeReconciler) releaseOperationLock(ctx context.Context, node *infrav1alpha1.Node) error {
-	logger := log.FromContext(ctx)
-
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
-			return fmt.Errorf("failed to get fresh node: %w", err)
-		}
-
-		if fresh.Annotations == nil {
-			logger.V(1).Info("No annotations to clean up", "node", node.Name)
-			return nil
-		}
-
-		// Check if we own the lock before releasing
-		currentOwner := fresh.Annotations[LockOwnerAnnotation]
-		if currentOwner != NodeControllerOwner {
-			if currentOwner == "" {
-				logger.V(1).Info("No lock to release", "node", node.Name)
-				return nil
-			}
-			logger.Info("Cannot release lock owned by different component",
-				"node", node.Name,
-				"currentOwner", currentOwner,
-				"expectedOwner", NodeControllerOwner)
-			return fmt.Errorf("cannot release lock owned by %s", currentOwner)
-		}
-
-		// Remove coordination annotations
-		delete(fresh.Annotations, OperationLockAnnotation)
-		delete(fresh.Annotations, LockOwnerAnnotation)
-		delete(fresh.Annotations, LockTimestampAnnotation)
-		delete(fresh.Annotations, LockTimeoutAnnotation)
-
-		// Update the node
-		if err := r.Update(ctx, fresh); err != nil {
-			return err
-		}
-
-		logger.Info("Successfully released coordination lock",
-			"node", node.Name,
-			"owner", NodeControllerOwner)
-
-		return nil
-	})
 }
 
 // isLockExpired checks if an existing lock has expired based on timestamp and timeout.

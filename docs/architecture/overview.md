@@ -59,6 +59,8 @@ Represents individual physical machines:
 - Update node status and progress
 - Handle job completion and failures
 
+**Future Enhancement**: A comprehensive [Finite State Machine (FSM) Architecture](state.md) has been designed to formalize state transitions and improve coordination between controllers. This FSM approach will replace the current annotation-based state management with a robust, event-driven system using the looplab/fsm library.
+
 #### Core Controller (`internal/controller/core/node_controller.go`)
 **Function**: Bridges Kubernetes nodes with Node CRDs
 **Current Status**: ⚠️ State management issues
