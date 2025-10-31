@@ -50,7 +50,7 @@ Represents individual physical machines:
 
 #### Node Controller (`internal/controller/infra/node_controller.go`)
 **Function**: Manages Node CRDs and power state transitions
-**Current Status**: ✅ Production ready - handles power state transitions reliably
+**Current Status**: in development
 
 **Responsibilities**:
 - Monitor Node CRD changes
@@ -74,7 +74,7 @@ Represents individual physical machines:
 
 Implements the Cluster Autoscaler CloudProvider interface:
 
-**Current Status**: ✅ Production ready - implements CloudProvider interface reliably
+**Current Status**: in Development
 
 #### Key Methods:
 - `NodeGroups()` - List all autoscaling groups

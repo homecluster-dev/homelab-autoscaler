@@ -4,12 +4,11 @@ import styles from './styles.module.css';
 
 const FeatureList = [
   {
-    title: 'Production Ready',
+    title: 'In development',
     Svg: require('@site/static/img/undraw_server_cluster.svg').default,
     description: (
       <>
-        Advanced FSM-based state management with comprehensive testing infrastructure.
-        Complete CloudProvider interface implementation for seamless Cluster Autoscaler integration.
+        Still work-in-progress
       </>
     ),
   },

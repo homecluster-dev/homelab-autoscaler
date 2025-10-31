@@ -1,0 +1,12 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    additionalArguments:
+      - "--entryPoints.web.transport.respondingTimeouts.readTimeout=0s"
+      - "--entryPoints.web.transport.respondingTimeouts.writeTimeout=0s"
+      - "--entryPoints.websecure.transport.respondingTimeouts.readTimeout=0s"
+      - "--entryPoints.websecure.transport.respondingTimeouts.writeTimeout=0s"

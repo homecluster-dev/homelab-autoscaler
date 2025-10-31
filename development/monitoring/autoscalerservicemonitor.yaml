@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: homelab-autoscaler-metrics
+  namespace: homelab-autoscaler-system
+  labels:
+    app.kubernetes.io/name: cluster-autoscaler
+    app.kubernetes.io/component: autoscaler
+spec:
+  selector:
+    app.kubernetes.io/component: cluster-autoscaler  # Adjust to match your pod labels
+  ports:
+    - name: metrics
+      port: 8085
+      targetPort: 8085
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: homelab-autoscaler
+  namespace: homelab-autoscaler-system
+  labels:
+    app: cluster-autoscaler
+    release: monitoring  # Must match kube-prometheus-stack release name
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cluster-autoscaler  # Adjust to match your service labels
+  endpoints:
+    - port: metrics  # If your service has a named port
+      interval: 30s
+      path: /metrics
+      scheme: http
+    # Fallback if port is not named:
+    # - targetPort: 8085
+    #   interval: 30s
+    #   path: /metrics
+    #   scheme: http
+  namespaceSelector:
+    matchNames:
+      - homelab-autoscaler-system

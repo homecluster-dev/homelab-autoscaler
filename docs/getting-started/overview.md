@@ -163,7 +163,7 @@ Node health is determined by:
 - **Scalable Design**: Handle multiple node groups and policies
 
 ### Current Capabilities
-- **Production Ready**: Stable operation for physical infrastructure autoscaling
+- **Status:**: in development
 - **Robust Architecture**: Well-tested foundation with comprehensive state management
 - **Integration Complete**: Full compatibility with Cluster Autoscaler
 

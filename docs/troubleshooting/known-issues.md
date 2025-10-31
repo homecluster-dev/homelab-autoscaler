@@ -28,7 +28,7 @@ This document outlines the current known issues and limitations in the homelab-a
 - **Location**: `internal/controller/infra/node_controller.go`
 - **Description**: Robust state management with FSM architecture
 - **Impact**: Reliable power state transitions
-- **Status**: ✅ **PRODUCTION READY** - Comprehensive state coordination
+- **Status**: in development
 - **Architecture**: [FSM Architecture](../architecture/state.md) provides robust solution
 
 #### Group Controller Features
