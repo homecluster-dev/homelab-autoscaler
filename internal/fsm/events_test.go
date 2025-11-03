@@ -19,9 +19,10 @@ package fsm
 import (
 	"testing"
 
+	"k8s.io/apimachinery/pkg/runtime"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/runtime"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )

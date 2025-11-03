@@ -76,10 +76,16 @@ transform_crd() {
                     # Add Helm labels and annotations first
                     echo "  labels:"
                     echo "    {{- include \"chart.labels\" . | nindent 4 }}"
+                    {{- if .Values.crd.labels }}
+                    echo "    {{- toYaml .Values.crd.labels | nindent 4 }}"
+                    {{- end }}
                     echo "  annotations:"
                     echo "    {{- if .Values.crd.keep }}"
                     echo "    \"helm.sh/resource-policy\": keep"
                     echo "    {{- end }}"
+                    {{- if .Values.crd.annotations }}
+                    echo "    {{- toYaml .Values.crd.annotations | nindent 4 }}"
+                    {{- end }}
                     metadata_labels_added=true
                     
                     # Skip the original annotations/labels section
@@ -104,10 +110,16 @@ transform_crd() {
                     if [[ "$metadata_labels_added" == false ]]; then
                         echo "  labels:"
                         echo "    {{- include \"chart.labels\" . | nindent 4 }}"
+                        {{- if .Values.crd.labels }}
+                        echo "    {{- toYaml .Values.crd.labels | nindent 4 }}"
+                        {{- end }}
                         echo "  annotations:"
                         echo "    {{- if .Values.crd.keep }}"
                         echo "    \"helm.sh/resource-policy\": keep"
                         echo "    {{- end }}"
+                        {{- if .Values.crd.annotations }}
+                        echo "    {{- toYaml .Values.crd.annotations | nindent 4 }}"
+                        {{- end }}
                         metadata_labels_added=true
                     fi
                     echo "$line"
@@ -150,8 +162,8 @@ get_chart_version() {
     echo "$version"
 }
 
-# Function to update image tag in values.yaml
-update_image_tag() {
+# Function to update image configuration in values.yaml
+update_image_config() {
     local values_file="dist/chart/values.yaml"
     local new_tag="$1"
     
@@ -160,23 +172,44 @@ update_image_tag() {
         return 1
     fi
     
-    print_status "Updating image tag from 'latest' to '$new_tag' in $values_file..."
+    print_status "Updating image configuration in $values_file..."
     
-    # Use sed to replace the tag on line 8 (controllerManager.container.image.tag)
-    sed -i.bak "s/tag: latest/tag: $new_tag/" "$values_file"
+    # Update repository if specified in values.yaml
+    if [[ -n "$(yq eval '.controllerManager.container.image.repository' "$values_file")" ]]; then
+        sed -i.bak "s|repository:.*|repository: {{ .Values.controllerManager.container.image.repository }}|" "$values_file"
+    fi
     
-    # Verify the change was made
-    if grep -q "tag: $new_tag" "$values_file"; then
-        print_success "Successfully updated image tag to '$new_tag'"
+    # Update tag
+    sed -i.bak "s|tag:.*|tag: {{ .Values.controllerManager.container.image.tag }}|" "$values_file"
+    
+    # Verify the changes were made
+    if grep -q "repository: {{ .Values.controllerManager.container.image.repository }}" "$values_file" && \
+       grep -q "tag: {{ .Values.controllerManager.container.image.tag }}" "$values_file"; then
+        print_success "Successfully updated image configuration"
         # Remove backup file
         rm -f "${values_file}.bak"
         return 0
     else
-        print_error "Failed to update image tag"
+        print_error "Failed to update image configuration"
         # Restore from backup if update failed
         if [ -f "${values_file}.bak" ]; then
             mv "${values_file}.bak" "$values_file"
         fi
+        return 1
+    fi
+}
+
+# Function to validate Helm templates
+validate_helm_templates() {
+    print_status "Validating Helm templates..."
+    
+    cd "$PROJECT_ROOT/dist/chart"
+    
+    if helm template . --dry-run > /dev/null; then
+        print_success "Helm templates are valid"
+        return 0
+    else
+        print_error "Helm template validation failed"
         return 1
     fi
 }
@@ -227,19 +260,25 @@ main() {
     print_status "Synchronized CRDs:"
     ls -la "$TARGET_DIR"/*.yaml 2>/dev/null || print_warning "No CRD files found in target directory"
     
-    # Update image tag in values.yaml
-    print_status "Updating image tag in values.yaml..."
+    # Update image configuration in values.yaml
+    print_status "Updating image configuration in values.yaml..."
     chart_version=$(get_chart_version)
     if [ $? -eq 0 ] && [ -n "$chart_version" ]; then
-        update_image_tag "$chart_version"
+        update_image_config "$chart_version"
         if [ $? -eq 0 ]; then
-            print_success "Image tag update completed successfully!"
+            print_success "Image configuration update completed successfully!"
         else
-            print_error "Failed to update image tag"
+            print_error "Failed to update image configuration"
             exit 1
         fi
     else
         print_error "Failed to get chart version"
+        exit 1
+    fi
+    
+    # Validate Helm templates
+    validate_helm_templates
+    if [ $? -ne 0 ]; then
         exit 1
     fi
 }

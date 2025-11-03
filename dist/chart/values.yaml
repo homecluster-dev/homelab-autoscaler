@@ -5,7 +5,7 @@ controllerManager:
   container:
     image:
       repository: homeclusterdev/autoscaler
-      tag: 0.1.10
+      tag: 0.1.11
     imagePullPolicy: IfNotPresent
     args:
       - "--leader-elect"

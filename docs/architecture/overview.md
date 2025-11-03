@@ -99,7 +99,7 @@ Implements the Cluster Autoscaler CloudProvider interface:
 
 3. **Autoscaling Decision**:
    ```
-   Cluster Autoscaler → gRPC call → GroupStore lookup → Scaling action
+   Cluster Autoscaler → gRPC call → kubernetes API CRs → Scaling action
    ```
 
 4. **Scale Up**:
@@ -202,14 +202,8 @@ Startup/shutdown jobs run with configured ServiceAccount:
 
 ## Scalability
 
-### Current Limitations
-- Single controller instance (no leader election for some controllers)
-- In-memory GroupStore (not persistent)
-- No horizontal scaling of gRPC server
-
 ### Design Considerations
 - Controller-runtime provides leader election
-- GroupStore could be replaced with persistent storage
 - gRPC server is stateless (can be horizontally scaled)
 
 ## Related Documentation

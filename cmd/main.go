@@ -82,7 +82,7 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.BoolVar(&enableGRPCServer, "enable-grpc-server", true,
-		"Enable the mock gRPC CloudProvider server")
+		"Enable the gRPC CloudProvider server")
 	flag.StringVar(&grpcServerAddr, "grpc-server-address", ":50051", "The address the gRPC server binds to")
 	opts := zap.Options{
 		Development: true,

@@ -226,11 +226,7 @@ kubectl get nodes.infra.homecluster.dev -w
    - File: `internal/grpcserver/server.go:306-311`
    - File: `internal/grpcserver/server.go:461-473`
 
-2. **GroupStore Not Used** (Priority: HIGH)
-   - File: `cmd/main.go:186`
-   - GroupStore created but never passed to gRPC server
-
-3. **Controller Race Conditions** (Priority: HIGH)
+2. **Controller Race Conditions** (Priority: HIGH)
    - Multiple controllers accessing same resources without proper coordination
    - **Solution**: [FSM Architecture](../architecture/state.md) provides formal state management with coordination lock integration
 

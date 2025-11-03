@@ -69,11 +69,11 @@ func (sm *ServerManager) Start(ctx context.Context) error {
 	// Register the reflection service to enable grpcurl and other tools
 	reflection.Register(sm.server)
 
-	// Register the mock cloud provider service
-	mockServer := NewHomeClusterProviderServer(sm.client, sm.scheme)
-	pb.RegisterCloudProviderServer(sm.server, mockServer)
+	// Register the cloud provider service
+	server := NewHomeClusterProviderServer(sm.client, sm.scheme)
+	pb.RegisterCloudProviderServer(sm.server, server)
 
-	log.Printf("Starting Mock CloudProvider gRPC server on %s", sm.address)
+	log.Printf("Starting CloudProvider gRPC server on %s", sm.address)
 
 	// Start server in a goroutine
 	sm.wg.Add(1)
@@ -96,7 +96,7 @@ func (sm *ServerManager) Stop() error {
 		return fmt.Errorf("server is not running")
 	}
 
-	log.Printf("Stopping Mock CloudProvider gRPC server")
+	log.Printf("Stopping CloudProvider gRPC server")
 
 	// Graceful stop
 	sm.server.GracefulStop()
@@ -107,7 +107,7 @@ func (sm *ServerManager) Stop() error {
 	sm.server = nil
 	sm.listener = nil
 
-	log.Printf("Mock CloudProvider gRPC server stopped")
+	log.Printf("CloudProvider gRPC server stopped")
 	return nil
 }
 

@@ -44,28 +44,15 @@ type HomeClusterProviderServer struct {
 	Client client.Client
 	Scheme *runtime.Scheme
 
-	// Mock data storage (kept for compatibility with other methods)
-	nodeGroups      map[string]*pb.NodeGroup
-	nodeGroupSizes  map[string]int32
-	nodes           map[string]*pb.ExternalGrpcNode
-	nodeToNodeGroup map[string]string
-	instances       map[string][]*pb.Instance
-	gpuTypes        map[string]*anypb.Any
-	pricingData     map[string]float64
+	gpuTypes map[string]*anypb.Any
 }
 
-// NewHomeClusterProviderServer creates a new mock server with GroupStore integration
+// NewHomeClusterProviderServer creates a new server
 func NewHomeClusterProviderServer(k8sClient client.Client, scheme *runtime.Scheme) *HomeClusterProviderServer {
 	server := &HomeClusterProviderServer{
-		Client:          k8sClient,
-		Scheme:          scheme,
-		nodeGroups:      make(map[string]*pb.NodeGroup),
-		nodeGroupSizes:  make(map[string]int32),
-		nodes:           make(map[string]*pb.ExternalGrpcNode),
-		nodeToNodeGroup: make(map[string]string),
-		instances:       make(map[string][]*pb.Instance),
-		gpuTypes:        make(map[string]*anypb.Any),
-		pricingData:     make(map[string]float64),
+		Client:   k8sClient,
+		Scheme:   scheme,
+		gpuTypes: make(map[string]*anypb.Any),
 	}
 
 	// Initialize with some default mock data to ensure basic functionality
@@ -83,41 +70,10 @@ func (s *HomeClusterProviderServer) initializeMockData() {
 	s.gpuTypes["nvidia-tesla-v100"] = &anypb.Any{}
 	s.gpuTypes["nvidia-tesla-t4"] = &anypb.Any{}
 
-	// Initialize a default node group for testing
-	defaultNodeGroup := &pb.NodeGroup{
-		Id:      "ng-1",
-		MinSize: 0,
-		MaxSize: 5,
-		Debug:   "Default test node group",
-	}
-	s.nodeGroups["ng-1"] = defaultNodeGroup
-	s.nodeGroupSizes["ng-1"] = 2
-
-	// Initialize some mock nodes and instances
-	mockNode := &pb.ExternalGrpcNode{
-		Name: "node-1",
-	}
-	s.nodes["node-1"] = mockNode
-	s.nodeToNodeGroup["node-1"] = "ng-1"
-
-	// Initialize some mock instances
-	s.instances["ng-1"] = []*pb.Instance{
-		{
-			Id: "instance-1",
-			Status: &pb.InstanceStatus{
-				InstanceState: pb.InstanceStatus_instanceRunning,
-				ErrorInfo: &pb.InstanceErrorInfo{
-					ErrorCode:    "",
-					ErrorMessage: "",
-				},
-			},
-		},
-	}
-
-	logger.Info("Mock data initialization completed", "nodeGroups", len(s.nodeGroups), "gpuTypes", len(s.gpuTypes))
+	logger.Info("Data initialization completed", "gpuTypes", len(s.gpuTypes))
 }
 
-// NodeGroups returns all node groups from the GroupStore
+// NodeGroups returns all node groups
 func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.NodeGroupsRequest) (*pb.NodeGroupsResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 
@@ -128,7 +84,7 @@ func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.Node
 		return nil, status.Errorf(codes.Internal, "failed to list groups: %v", err)
 	}
 
-	logger.Info("Retrieved groups from GroupStore", "count", len(groups.Items))
+	logger.Info("Retrieved groups", "count", len(groups.Items))
 
 	// Create NodeGroup messages for all groups
 	nodeGroups := make([]*pb.NodeGroup, 0, len(groups.Items))
@@ -421,7 +377,7 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 			return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded while processing nodes: %v", ctx.Err())
 		}
 
-		// Get the Node CR from the GroupStore
+		// Get the Node CR
 		nodeCR := &infrav1alpha1.Node{}
 		err := s.Client.Get(ctx, client.ObjectKey{Name: node.Name, Namespace: "homelab-autoscaler-system"}, nodeCR)
 		if err != nil {
