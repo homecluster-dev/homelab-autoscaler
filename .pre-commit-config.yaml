@@ -1,0 +1,38 @@
+# Pre-commit configuration for Homelab Autoscaler
+# This file defines automatic checks that run before each commit
+
+default_language_version:
+  python: python3
+
+repos:
+  # Local hooks that run Makefile targets
+  - repo: local
+    hooks:
+      # Code generation phase
+      - id: generate-code
+        name: Generate CRDs and DeepCopy methods
+        entry: make pre-commit-generate
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+
+      # Code formatting and validation
+      - id: format-code
+        name: Format and validate code
+        entry: make pre-commit-validate
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+
+      # Add generated files to staging
+      - id: stage-generated
+        name: Stage generated files
+        entry: make stage-generated-files
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+
+# Default configuration
+fail_fast: false
+default_stages: [pre-commit]
+minimum_pre_commit_version: "2.9.2"

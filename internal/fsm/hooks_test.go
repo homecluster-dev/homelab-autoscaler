@@ -158,12 +158,16 @@ func TestAfterJobCompleted(t *testing.T) {
 		nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
 		ctx := context.TODO()
 
-		// Create a mock FSM event
+		// Create a test job and add it to the fake client
+		job := CreateTestJob("test-job", "default", "startup")
+
+		// Create a mock FSM event with job argument
 		event := &fsm.Event{
 			FSM:   nm.fsm,
 			Event: EventJobCompleted,
 			Src:   StateStartingUp,
 			Dst:   StateReady,
+			Args:  []interface{}{job},
 		}
 
 		// Call the after hook
@@ -190,12 +194,16 @@ func TestAfterJobCompleted(t *testing.T) {
 		nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
 		ctx := context.TODO()
 
-		// Create a mock FSM event
+		// Create a test job and add it to the fake client
+		job := CreateTestJob("test-job", "default", "shutdown")
+
+		// Create a mock FSM event with job argument
 		event := &fsm.Event{
 			FSM:   nm.fsm,
 			Event: EventJobCompleted,
 			Src:   StateShuttingDown,
 			Dst:   StateShutdown,
+			Args:  []interface{}{job},
 		}
 
 		// Call the after hook - should not panic or fail

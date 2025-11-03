@@ -5,9 +5,15 @@ kind: CustomResourceDefinition
 metadata:
   labels:
     {{- include "chart.labels" . | nindent 4 }}
+    {{- if .Values.crd.labels }}
+    {{- toYaml .Values.crd.labels | nindent 4 }}
+    {{- end }}
   annotations:
     {{- if .Values.crd.keep }}
     "helm.sh/resource-policy": keep
+    {{- end }}
+    {{- if .Values.crd.annotations }}
+    {{- toYaml .Values.crd.annotations | nindent 4 }}
     {{- end }}
   name: nodes.infra.homecluster.dev
 spec:

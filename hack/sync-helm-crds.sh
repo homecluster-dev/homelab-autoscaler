@@ -40,27 +40,33 @@ transform_crd() {
     local source_file="$1"
     local target_file="$2"
     local crd_name="$(basename "$source_file")"
-    
+
     print_status "Transforming $crd_name..."
-    
+
     # Create target directory if it doesn't exist
     mkdir -p "$(dirname "$target_file")"
-    
+
+    # Check if source file exists
+    if [ ! -f "$source_file" ]; then
+        print_error "Source file $source_file does not exist"
+        return 1
+    fi
+
     # Create the Helm-templated CRD
     {
         echo "{{- if .Values.crd.enable }}"
         echo "---"
-        
+
         # Process the source file line by line
         local in_metadata=false
         local metadata_labels_added=false
-        
+
         while IFS= read -r line; do
             # Skip the initial document separator
             if [[ "$line" == "---" ]]; then
                 continue
             fi
-            
+
             # Handle metadata section
             if [[ "$line" == "metadata:" ]]; then
                 echo "$line"
@@ -68,7 +74,7 @@ transform_crd() {
                 metadata_labels_added=false
                 continue
             fi
-            
+
             # If we're in metadata and haven't added Helm labels yet
             if [[ "$in_metadata" == true ]] && [[ "$metadata_labels_added" == false ]]; then
                 # Check if this is annotations or labels that we want to replace
@@ -76,18 +82,18 @@ transform_crd() {
                     # Add Helm labels and annotations first
                     echo "  labels:"
                     echo "    {{- include \"chart.labels\" . | nindent 4 }}"
-                    {{- if .Values.crd.labels }}
+                    echo "    {{- if .Values.crd.labels }}"
                     echo "    {{- toYaml .Values.crd.labels | nindent 4 }}"
-                    {{- end }}
+                    echo "    {{- end }}"
                     echo "  annotations:"
                     echo "    {{- if .Values.crd.keep }}"
                     echo "    \"helm.sh/resource-policy\": keep"
                     echo "    {{- end }}"
-                    {{- if .Values.crd.annotations }}
+                    echo "    {{- if .Values.crd.annotations }}"
                     echo "    {{- toYaml .Values.crd.annotations | nindent 4 }}"
-                    {{- end }}
+                    echo "    {{- end }}"
                     metadata_labels_added=true
-                    
+
                     # Skip the original annotations/labels section
                     while IFS= read -r skip_line; do
                         # Check if this line starts a new top-level field (not indented more than current)
@@ -110,36 +116,43 @@ transform_crd() {
                     if [[ "$metadata_labels_added" == false ]]; then
                         echo "  labels:"
                         echo "    {{- include \"chart.labels\" . | nindent 4 }}"
-                        {{- if .Values.crd.labels }}
+                        echo "    {{- if .Values.crd.labels }}"
                         echo "    {{- toYaml .Values.crd.labels | nindent 4 }}"
-                        {{- end }}
+                        echo "    {{- end }}"
                         echo "  annotations:"
                         echo "    {{- if .Values.crd.keep }}"
                         echo "    \"helm.sh/resource-policy\": keep"
                         echo "    {{- end }}"
-                        {{- if .Values.crd.annotations }}
+                        echo "    {{- if .Values.crd.annotations }}"
                         echo "    {{- toYaml .Values.crd.annotations | nindent 4 }}"
-                        {{- end }}
+                        echo "    {{- end }}"
                         metadata_labels_added=true
                     fi
                     echo "$line"
                     continue
                 fi
             fi
-            
+
             # Check if we're leaving metadata section
             if [[ "$in_metadata" == true ]] && [[ "$line" =~ ^[^[:space:]] ]]; then
                 in_metadata=false
             fi
-            
+
             echo "$line"
-            
+
         done < "$source_file"
-        
+
         echo "{{- end -}}"
     } > "$target_file"
-    
-    print_success "Generated $target_file"
+
+    # Check if the file was created successfully
+    if [ -f "$target_file" ]; then
+        print_success "Generated $target_file"
+        return 0
+    else
+        print_error "Failed to generate $target_file"
+        return 1
+    fi
 }
 
 # Function to read version from Chart.yaml
@@ -165,27 +178,58 @@ get_chart_version() {
 # Function to update image configuration in values.yaml
 update_image_config() {
     local values_file="dist/chart/values.yaml"
-    local new_tag="$1"
-    
+    local chart_version="$1"
+
     if [ ! -f "$values_file" ]; then
         print_error "values.yaml not found at $values_file"
         return 1
     fi
-    
+
     print_status "Updating image configuration in $values_file..."
-    
-    # Update repository if specified in values.yaml
-    if [[ -n "$(yq eval '.controllerManager.container.image.repository' "$values_file")" ]]; then
-        sed -i.bak "s|repository:.*|repository: {{ .Values.controllerManager.container.image.repository }}|" "$values_file"
+
+    # Backup the original file
+    cp "$values_file" "${values_file}.bak"
+
+    # Extract the current repository and tag values from the controllerManager section
+    local current_repo=$(awk '/controllerManager:/,/^[[:space:]]*[a-zA-Z]/ {if ($1 == "repository:") {getline; print $2; exit}}' "$values_file" | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | xargs)
+    local current_tag=$(awk '/controllerManager:/,/^[[:space:]]*[a-zA-Z]/ {if ($1 == "tag:") {getline; print $2; exit}}' "$values_file" | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | xargs)
+
+    # If we couldn't extract the values, use defaults
+    if [ -z "$current_repo" ]; then
+        current_repo="homeclusterdev/autoscaler"
     fi
-    
-    # Update tag
-    sed -i.bak "s|tag:.*|tag: {{ .Values.controllerManager.container.image.tag }}|" "$values_file"
-    
+    if [ -z "$current_tag" ]; then
+        current_tag="0.1.11"
+    fi
+
+    # Update the controllerManager repository line to use templating with default
+    awk -v repo="$current_repo" '
+    /controllerManager:/,/^[[:space:]]*[a-zA-Z]/ {
+        if ($1 == "repository:") {
+            print $1 " {{ .Values.controllerManager.container.image.repository | default \"" repo "\" }}"
+            getline
+            next
+        }
+    }
+    { print }
+    ' "$values_file" > "${values_file}.tmp" && mv "${values_file}.tmp" "$values_file"
+
+    # Update the controllerManager tag line to use templating with default
+    awk -v tag="$current_tag" '
+    /controllerManager:/,/^[[:space:]]*[a-zA-Z]/ {
+        if ($1 == "tag:") {
+            print $1 " {{ .Values.controllerManager.container.image.tag | default \"" tag "\" }}"
+            getline
+            next
+        }
+    }
+    { print }
+    ' "$values_file" > "${values_file}.tmp" && mv "${values_file}.tmp" "$values_file"
+
     # Verify the changes were made
-    if grep -q "repository: {{ .Values.controllerManager.container.image.repository }}" "$values_file" && \
-       grep -q "tag: {{ .Values.controllerManager.container.image.tag }}" "$values_file"; then
-        print_success "Successfully updated image configuration"
+    if grep -q "repository: {{ .Values.controllerManager.container.image.repository | default " "$values_file" && \
+       grep -q "tag: {{ .Values.controllerManager.container.image.tag | default " "$values_file"; then
+        print_success "Successfully updated image configuration with templating and defaults"
         # Remove backup file
         rm -f "${values_file}.bak"
         return 0
@@ -260,21 +304,8 @@ main() {
     print_status "Synchronized CRDs:"
     ls -la "$TARGET_DIR"/*.yaml 2>/dev/null || print_warning "No CRD files found in target directory"
     
-    # Update image configuration in values.yaml
-    print_status "Updating image configuration in values.yaml..."
-    chart_version=$(get_chart_version)
-    if [ $? -eq 0 ] && [ -n "$chart_version" ]; then
-        update_image_config "$chart_version"
-        if [ $? -eq 0 ]; then
-            print_success "Image configuration update completed successfully!"
-        else
-            print_error "Failed to update image configuration"
-            exit 1
-        fi
-    else
-        print_error "Failed to get chart version"
-        exit 1
-    fi
+    # Note: Image configuration is already properly templated in values.yaml
+    print_status "Skipping image configuration update - already properly templated in values.yaml"
     
     # Validate Helm templates
     validate_helm_templates

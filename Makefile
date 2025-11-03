@@ -41,6 +41,45 @@ help: ## Display this help.
 
 ##@ Development
 
+.PHONY: check-tools
+check-tools: ## Check if all required tools for pre-commit are available
+	@echo "Checking required tools..."
+	@test -f "$(CONTROLLER_GEN)" || (echo "Error: controller-gen not found. Run 'make controller-gen'" && exit 1)
+	@test -f "$(GOLANGCI_LINT)" || (echo "Error: golangci-lint not found. Run 'make golangci-lint'" && exit 1)
+	@which helm >/dev/null 2>&1 || (echo "Error: helm not found. Please install Helm" && exit 1)
+	@echo "All required tools are available ✓"
+
+.PHONY: pre-commit-generate
+pre-commit-generate: check-tools ## Generate code for pre-commit (manifests + generate + helm-sync)
+	@echo "Generating code for pre-commit..."
+	$(MAKE) manifests
+	$(MAKE) generate
+	$(MAKE) helm-sync-crds
+
+.PHONY: pre-commit-validate
+pre-commit-validate: ## Run validation for pre-commit (fmt + vet + lint)
+	@echo "Running code validation..."
+	$(MAKE) fmt
+	$(MAKE) vet
+	$(MAKE) lint
+
+.PHONY: pre-commit-test
+pre-commit-test: setup-envtest ## Run tests for pre-commit (unit tests only). Set SKIP_TESTS=1 to skip.
+	@if [ "$$SKIP_TESTS" = "1" ]; then \
+		echo "Skipping tests due to SKIP_TESTS=1"; \
+	else \
+		echo "Running unit tests..."; \
+		KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out; \
+	fi
+
+.PHONY: stage-generated-files
+stage-generated-files: ## Stage generated files for git commit
+	@echo "Staging generated files..."
+	git add config/crd/bases/*.yaml 2>/dev/null || true
+	git add dist/chart/templates/crd/*.yaml 2>/dev/null || true
+	git add api/infra/v1alpha1/zz_generated.deepcopy.go 2>/dev/null || true
+	@echo "Generated files staged ✓"
+
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
@@ -63,7 +102,7 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest ## Run tests.
+test: helm-sync-crds generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 
@@ -163,7 +202,7 @@ build: helm-sync-crds generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: run
-run: manifests generate fmt vet ## Run a controller from your host.
+run: helm-sync-crds generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
@@ -195,7 +234,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	rm Dockerfile.cross
 
 .PHONY: build-installer
-build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+build-installer: helm-sync-crds generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default > dist/install.yaml
@@ -207,23 +246,31 @@ ifndef ignore-not-found
 endif
 
 .PHONY: install
-install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+install: helm-sync-crds kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) apply -f -; else echo "No CRDs to install; skipping."; fi
 
 .PHONY: uninstall
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+uninstall: helm-sync-crds kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: helm-sync-crds kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+
+.PHONY: helm-template
+helm-template: helm-sync-crds ## Validate Helm templates
+	helm template dist/chart --debug
+
+.PHONY: helm-lint
+helm-lint: helm-sync-crds ## Lint Helm chart
+	helm lint dist/chart
 
 ##@ Dependencies
 
@@ -275,6 +322,23 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+##@ Pre-commit
+
+.PHONY: pre-commit
+pre-commit: pre-commit-generate pre-commit-validate pre-commit-test stage-generated-files ## Run full pre-commit validation pipeline
+	@echo "✅ Pre-commit validation completed successfully!"
+
+.PHONY: install-pre-commit
+install-pre-commit: ## Install pre-commit framework and hooks
+	@echo "Installing pre-commit framework..."
+	@if ! command -v pre-commit >/dev/null 2>&1; then \
+		echo "Installing pre-commit via pip..."; \
+		pip install pre-commit || (echo "Failed to install pre-commit. Please install it manually: pip install pre-commit" && exit 1); \
+	fi
+	@pre-commit install
+	@echo "Pre-commit hooks installed successfully ✓"
+	@echo "Run 'pre-commit run --all-files' to test all hooks"
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

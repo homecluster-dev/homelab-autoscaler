@@ -91,20 +91,17 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 	// Update node status to reflect new state
 	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
 
-	job := e.Args[0]
-	if job != nil {
-		job, ok := job.(*batchv1.Job)
-		if !ok {
-			// handle mismatch
-			return
-		}
-		deletePolicy := metav1.DeletePropagationForeground
-		deleteOpts := &client.DeleteOptions{
-			PropagationPolicy: &deletePolicy,
-		}
+	// Check if we have job arguments and handle job cleanup if provided
+	if len(e.Args) > 0 && e.Args[0] != nil {
+		if job, ok := e.Args[0].(*batchv1.Job); ok && job != nil {
+			deletePolicy := metav1.DeletePropagationForeground
+			deleteOpts := &client.DeleteOptions{
+				PropagationPolicy: &deletePolicy,
+			}
 
-		if err := nm.client.Delete(ctx, job, deleteOpts); err != nil {
-			logger.Error(err, "Failed to delete completed job", "job", job.Name)
+			if err := nm.client.Delete(ctx, job, deleteOpts); err != nil {
+				logger.Error(err, "Failed to delete completed job", "job", job.Name)
+			}
 		}
 	}
 }

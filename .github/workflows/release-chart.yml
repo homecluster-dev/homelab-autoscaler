@@ -6,10 +6,19 @@ on:
       - main
     paths:
       - 'dist/chart/**'
+      - 'config/crd/bases/**'
+      - 'hack/sync-helm-crds.sh'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'dist/chart/**'
+      - 'config/crd/bases/**'
+      - 'hack/sync-helm-crds.sh'
   workflow_dispatch:
 
 jobs:
-  release:
+  sync-and-release:
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -29,7 +38,44 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Check if source CRDs exist
+        id: check_crds
+        run: |
+          if [ -d "config/crd/bases" ] && [ "$(ls -A config/crd/bases/*.yaml 2>/dev/null | wc -l)" -gt 0 ]; then
+            echo "crds_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "crds_exist=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync CRDs to Helm chart
+        if: steps.check_crds.outputs.crds_exist == 'true'
+        run: |
+          echo "Syncing CRDs to Helm chart..."
+          ./hack/sync-helm-crds.sh
+
+      - name: Check for changes in dist/chart
+        id: git_check
+        run: |
+          git add -A
+          if git diff --cached --quiet dist/chart; then
+            echo "chart_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "chart_changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push chart changes
+        if: steps.git_check.outputs.chart_changed == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          git add dist/chart
+          git commit -m "chore(chart): sync CRDs to Helm chart [skip ci]"
+          git push
+
       - name: Run chart-releaser
+        if: steps.git_check.outputs.chart_changed == 'true' && github.ref == 'refs/heads/main'
         uses: helm/chart-releaser-action@v1.6.0
         with:
           charts_dir: dist

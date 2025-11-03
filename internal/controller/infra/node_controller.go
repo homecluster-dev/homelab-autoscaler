@@ -85,7 +85,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	if node.Labels["group"] != "" || node.Labels["infra.homecluster.dev/group"] != node.Labels["group"] {
+	if node.Labels["group"] != "" && node.Labels["infra.homecluster.dev/group"] != node.Labels["group"] {
 		if err := r.addLabelToKubernetesNodeWithPatch(ctx, node.Spec.KubernetesNodeName, "infra.homecluster.dev/group", node.Labels["group"]); err != nil {
 			logger.Error(err, "Failed to add group label to Kubernetes node", "node", node.Spec.KubernetesNodeName)
 		}
