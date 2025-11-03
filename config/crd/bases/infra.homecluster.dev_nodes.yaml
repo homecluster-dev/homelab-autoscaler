@@ -15,13 +15,13 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - description: Health status
-      jsonPath: .status.health
-      name: Health
+    - description: Current power state
+      jsonPath: .status.powerState
+      name: Powerstate
       type: string
-    - description: First condition type
-      jsonPath: .status.conditions[0].type
-      name: Condition
+    - description: Current power progress
+      jsonPath: .status.progress
+      name: Progress
       type: string
     name: v1alpha1
     schema:

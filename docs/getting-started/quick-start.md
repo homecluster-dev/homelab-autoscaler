@@ -2,7 +2,7 @@
 
 Get up and running with homelab-autoscaler in 5 minutes using k3d for local testing.
 
-> ℹ️ **NOTE**: This guide uses k3d for quick local testing and development. For production deployment, see the [Installation Guide](installation.md).
+> ℹ️ **NOTE**: This guide uses k3d for quick local testing and development. For deployment, see the [Installation Guide](installation.md).
 
 ## Prerequisites
 
@@ -314,12 +314,12 @@ k3d cluster delete homelab-autoscaler
 2. **Setup Development** - Follow [Development Setup](../development/setup.md)
 3. **Fix Known Issues** - Contribute to resolving [Known Issues](../troubleshooting/known-issues.md)
 
-### For Production
+### For normal use
 
 1. **Install via Helm** - Use the [Installation Guide](installation.md)
 2. **Configure Security** - Set up proper RBAC and network policies
 3. **Monitor System** - Implement monitoring and alerting
-4. **Review Production Guide** - Follow production-specific configuration recommendations
+4. **Review Guide** - Follow configuration recommendations
 
 ## Troubleshooting
 
@@ -366,7 +366,7 @@ kubectl port-forward service/homelab-autoscaler-grpc 50051:50051 \
 
 ## Related Documentation
 
-- [Installation Guide](installation.md) - Production Helm installation
+- [Installation Guide](installation.md) - Helm installation
 - [Architecture Overview](../architecture/overview.md) - System design
 - [Known Issues](../troubleshooting/known-issues.md) - Current limitations
 - [API Reference](../api-reference/crds/group.md) - CRD specifications

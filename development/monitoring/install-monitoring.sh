@@ -183,6 +183,7 @@ loki:
     replication_factor: 1
   storage:
     type: 'filesystem'
+    bucketNames: {}
   schemaConfig:
     configs:
       - from: 2024-01-01
@@ -294,6 +295,7 @@ helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
 # Install Loki
 echo "🔧 Installing Loki..."
 helm upgrade --install loki grafana/loki \
+  --version 6.33.0 \
   --namespace monitoring \
   --values /tmp/loki-values.yaml \
   --wait \

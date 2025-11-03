@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/looplab/fsm"
@@ -66,7 +68,6 @@ func (nm *NodeStateMachine) beforeShutdownNode(ctx context.Context, e *fsm.Event
 }
 
 // After hooks - executed after state transitions for lock release and status updates
-
 func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
 
@@ -89,6 +90,23 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 
 	// Update node status to reflect new state
 	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
+
+	job := e.Args[0]
+	if job != nil {
+		job, ok := job.(*batchv1.Job)
+		if !ok {
+			// handle mismatch
+			return
+		}
+		deletePolicy := metav1.DeletePropagationForeground
+		deleteOpts := &client.DeleteOptions{
+			PropagationPolicy: &deletePolicy,
+		}
+
+		if err := nm.client.Delete(ctx, job, deleteOpts); err != nil {
+			logger.Error(err, "Failed to delete completed job", "job", job.Name)
+		}
+	}
 }
 
 func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {

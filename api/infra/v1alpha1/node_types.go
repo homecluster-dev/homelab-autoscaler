@@ -157,8 +157,8 @@ type NodeStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Health",type=string,JSONPath=".status.health",description="Health status"
-// +kubebuilder:printcolumn:name="Condition",type=string,JSONPath=".status.conditions[0].type",description="First condition type"
+// +kubebuilder:printcolumn:name="Powerstate",type=string,JSONPath=".status.powerState",description="Current power state"
+// +kubebuilder:printcolumn:name="Progress",type=string,JSONPath=".status.progress",description="Current power progress"
 
 // Node is the Schema for the nodes API
 type Node struct {

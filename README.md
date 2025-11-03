@@ -2,18 +2,18 @@
 
 ## Overview
 
-The Homelab Autoscaler is a production-ready Kubernetes operator that provides sophisticated cluster autoscaling capabilities for homelab environments with physical nodes. It manages the power state of physical machines based on workload demands, featuring advanced FSM-based state management, comprehensive testing infrastructure, and complete Cluster Autoscaler CloudProvider interface implementation.
+The Homelab Autoscaler is a Kubernetes operator that provides sophisticated cluster autoscaling capabilities for homelab environments with physical nodes. It manages the power state of physical machines based on workload demands, featuring advanced FSM-based state management, comprehensive testing infrastructure, and complete Cluster Autoscaler CloudProvider interface implementation.
 
 ## Current Status
 
-**✅ PRODUCTION-READY**
+**under active development**
 
 ### Key Features
 
 - **Advanced FSM Architecture**: Sophisticated finite state machine using looplab/fsm library for robust node state management with coordination locks
 - **Complete CloudProvider Interface**: Full implementation of all 15 Cluster Autoscaler gRPC methods for seamless integration
 - **Webhook Validation System**: Comprehensive validation webhooks for CRDs ensuring data integrity
-- **Helm Chart Deployment**: Production-ready Helm chart with automated CRD synchronization
+- **Helm Chart Deployment**: Helm chart with automated CRD synchronization
 - **Comprehensive Testing**: Unit, integration, and e2e tests with k3d for reliable operation
 - **Coordination Locks**: Advanced locking mechanisms preventing race conditions during state transitions
 
@@ -70,13 +70,13 @@ Advanced state management using looplab/fsm library with:
 - Comprehensive error recovery mechanisms
 
 ### Webhook Validation
-Production-ready validation webhooks ensuring:
+Validation webhooks ensuring:
 - Group label validation for Node CRDs
 - Kubernetes node existence verification
 - Data integrity across all custom resources
 
 ### Deployment Options
-- **Helm Chart**: Production-ready deployment with automated CRD sync
+- **Helm Chart**: deployment with automated CRD sync
 - **Development Mode**: Local development setup with k3d integration
 - **Manual Deployment**: Direct kubectl application of manifests
 

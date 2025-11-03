@@ -132,14 +132,14 @@ Node health is determined by:
 
 ## Use Cases
 
-### Production Scenarios
+### Scenarios
 - **Development Clusters**: Scale down overnight, scale up during work hours
 - **Batch Processing**: Scale up for large jobs, scale down when idle
 - **Cost Optimization**: Minimize power consumption during low usage
 - **Resource Bursting**: Handle temporary workload spikes
 
 ### Current Capabilities
-- **Production Deployment**: Stable autoscaling for physical infrastructure
+- **Deployment**: Stable autoscaling for physical infrastructure
 - **Automated Operations**: Reliable power management and node lifecycle
 - **Integration Ready**: Compatible with standard Kubernetes autoscaling tools
 
@@ -155,7 +155,7 @@ Node health is determined by:
 
 ## Architecture Benefits
 
-### Production Benefits
+### Benefits
 - **Cost Efficiency**: Only run machines when needed
 - **Energy Savings**: Reduce power consumption
 - **Kubernetes Native**: Standard autoscaling integration
@@ -181,7 +181,7 @@ To enhance the system further:
 ## Related Documentation
 
 - [Quick Start Guide](quick-start.md) - Get started quickly with k3d
-- [Installation Guide](installation.md) - Production Helm deployment
+- [Installation Guide](installation.md) - Helm deployment
 - [Architecture Overview](../architecture/overview.md) - Detailed system design
 - [Known Issues](../troubleshooting/known-issues.md) - Current bugs and limitations
 - [API Reference](../api-reference/crds/group.md) - CRD specifications

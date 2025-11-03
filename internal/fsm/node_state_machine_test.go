@@ -21,13 +21,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
@@ -399,7 +400,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
 
-		err := fsm.JobCompleted()
+		err := fsm.JobCompleted(nil)
 		assert.NoError(t, err)
 
 		// Verify FSM state changed to Ready
@@ -424,7 +425,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
 
-		err := fsm.JobCompleted()
+		err := fsm.JobCompleted(nil)
 		assert.NoError(t, err)
 
 		// Verify FSM state changed to Shutdown
@@ -447,7 +448,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 			name:         "job completed from starting up",
 			initialState: infrav1alpha1.ProgressStartingUp,
 			event: func(fsm *NodeStateMachine) error {
-				return fsm.JobCompleted()
+				return fsm.JobCompleted(nil)
 			},
 			expectedState: StateReady,
 		},
@@ -455,7 +456,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 			name:         "job completed from shutting down",
 			initialState: infrav1alpha1.ProgressShuttingDown,
 			event: func(fsm *NodeStateMachine) error {
-				return fsm.JobCompleted()
+				return fsm.JobCompleted(nil)
 			},
 			expectedState: StateShutdown,
 		},

@@ -86,7 +86,6 @@ Implements the Cluster Autoscaler CloudProvider interface:
 
 ## Data Flow
 
-### Production Data Flow
 
 1. **Group Creation**:
    ```
@@ -158,7 +157,7 @@ Admission webhooks provide validation and mutation of custom resources:
 - **Security**: Prevent invalid configurations that could cause system instability
 
 ### Helm Chart Deployment
-Production deployment is managed via Helm charts:
+Deployment is managed via Helm charts:
 - **Standardized installation**: Consistent deployment across environments
 - **Configuration management**: Values-based customization
 - **Dependency management**: Automatic CRD and RBAC setup

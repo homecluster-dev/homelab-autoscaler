@@ -1,8 +1,8 @@
-# Production-ready examples for homelab-autoscaler
+# Examples for homelab-autoscaler
 # These examples demonstrate real-world configurations for physical nodes
 
 ---
-# Production Group with conservative scaling settings
+# Group with conservative scaling settings
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Group
 metadata:

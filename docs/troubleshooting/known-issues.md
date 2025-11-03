@@ -2,7 +2,7 @@
 
 This document outlines the current known issues and limitations in the homelab-autoscaler system.
 
-> ℹ️ **NOTE**: The homelab-autoscaler is production-ready with a solid architecture. This document tracks current limitations and provides workarounds for known constraints.
+> ℹ️ **NOTE**: This document tracks current limitations and provides workarounds for known constraints.
 
 ## Current Limitations
 

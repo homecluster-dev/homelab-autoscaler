@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/looplab/fsm"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +29,8 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/looplab/fsm"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
@@ -177,9 +178,9 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 }
 
 // JobCompleted triggers the JobCompleted event
-func (nm *NodeStateMachine) JobCompleted() error {
+func (nm *NodeStateMachine) JobCompleted(job *batchv1.Job) error {
 	ctx := context.TODO()
-	return nm.fsm.Event(ctx, EventJobCompleted)
+	return nm.fsm.Event(ctx, EventJobCompleted, job)
 }
 
 // JobFailed triggers the JobFailed event
@@ -278,7 +279,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 	if err == nil {
 		if job.Status.Succeeded > 0 {
 			logger.Info("Job completed successfully", "node", nm.node.Name, "job", jobName)
-			if err := nm.JobCompleted(); err != nil {
+			if err := nm.JobCompleted(job); err != nil {
 				logger.Error(err, "Failed to trigger JobCompleted event", "node", nm.node.Name)
 			}
 			return
@@ -312,7 +313,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 
 			if job.Status.Succeeded > 0 {
 				logger.Info("Job completed successfully", "node", nm.node.Name, "job", jobName)
-				if err := nm.JobCompleted(); err != nil {
+				if err := nm.JobCompleted(job); err != nil {
 					logger.Error(err, "Failed to trigger JobCompleted event", "node", nm.node.Name)
 				}
 				return

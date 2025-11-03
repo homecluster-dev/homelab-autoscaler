@@ -21,13 +21,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looplab/fsm"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/looplab/fsm"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
@@ -513,7 +514,7 @@ func TestHooksIntegration(t *testing.T) {
 		assert.NotNil(t, nm.backoff)
 
 		// Complete the job - should trigger after hook
-		err = nm.JobCompleted()
+		err = nm.JobCompleted(nil)
 		assert.NoError(t, err)
 
 		// Verify we're in ready state
@@ -547,7 +548,7 @@ func TestHooksIntegration(t *testing.T) {
 		assert.NotNil(t, nm.backoff)
 
 		// Complete the job - should trigger after hook
-		err = nm.JobCompleted()
+		err = nm.JobCompleted(nil)
 		assert.NoError(t, err)
 
 		// Verify we're in shutdown state

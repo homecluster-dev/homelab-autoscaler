@@ -1,8 +1,8 @@
 # Installation Guide
 
-This guide covers installing the homelab-autoscaler using Helm, the recommended production deployment method.
+This guide covers installing the homelab-autoscaler using Helm, the recommended deployment method.
 
-> ℹ️ **NOTE**: Review [Known Issues](../troubleshooting/known-issues.md) for current limitations and configuration recommendations before production deployment.
+> ℹ️ **NOTE**: Review [Known Issues](../troubleshooting/known-issues.md) for current limitations and configuration recommendations before deployment.
 
 ## Prerequisites
 
@@ -174,7 +174,6 @@ grpcServer:
 clusterAutoscaler:
   enabled: true
   config:
-    # Production-ready settings
     scaleDownDelayAfterAdd: "30m"
     scaleDownUnneededTime: "30m"
     scaleDownUtilizationThreshold: 0.3

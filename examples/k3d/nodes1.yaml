@@ -25,3 +25,31 @@ spec:
     args:
       - -c
       - curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-0
+---
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Node
+metadata:
+  name: k3d-homelab-autoscaler-agent-1
+  labels:
+    group: group1
+  namespace: homelab-autoscaler-system
+spec:
+  kubernetesNodeName: k3d-homelab-autoscaler-agent-1
+  powerState: "on"
+  pricing:
+    hourlyRate: "1.5"
+    podRate: "0.0"
+  startupPodSpec:
+    image: curlimages/curl:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-1
+  shutdownPodSpec:
+    image: curlimages/curl:latest
+    command:
+      - /bin/sh
+    args:
+      - -c
+      - curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-1

@@ -6,6 +6,7 @@ echo "Creating k3d cluster: ${CLUSTER_NAME}"
 k3d cluster create ${CLUSTER_NAME} \
   --servers 3 \
   --agents 2 \
+  -p "80:80@loadbalancer" -p "443:443@loadbalancer" \
   --wait
 
 echo "Exporting kubeconfig..."
