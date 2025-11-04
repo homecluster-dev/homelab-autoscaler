@@ -6,4 +6,14 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: node-sample
 spec:
-  # TODO(user): Add fields here
+  kubernetesNodeName: "example-node"
+  powerState: "on"
+  pricing:
+    hourlyRate: "1.0"
+    podRate: "0.1"
+  startupPodSpec:
+    image: busybox:latest
+    command: ["echo", "Node startup simulation"]
+  shutdownPodSpec:
+    image: busybox:latest
+    command: ["echo", "Node shutdown simulation"]

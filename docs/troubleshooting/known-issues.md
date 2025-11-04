@@ -1,8 +1,8 @@
 # Known Issues
 
-This document outlines the current known issues and limitations in the homelab-autoscaler system.
+This document outlines current known issues, limitations, and workarounds for the homelab-autoscaler system.
 
-> ℹ️ **NOTE**: This document tracks current limitations and provides workarounds for known constraints.
+> 📋 **NOTE**: For comprehensive implementation status, see [Implementation Status](../IMPLEMENTATION-STATUS.md)
 
 ## Current Limitations
 
@@ -26,10 +26,10 @@ This document outlines the current known issues and limitations in the homelab-a
 
 #### State Management
 - **Location**: `internal/controller/infra/node_controller.go`
-- **Description**: Robust state management with FSM architecture
-- **Impact**: Reliable power state transitions
-- **Status**: in development
-- **Architecture**: [FSM Architecture](../architecture/state.md) provides robust solution
+- **Description**: Core FSM implemented, power operations in development
+- **Impact**: Basic state transitions work, power operations require completion
+- **Status**: 🚧 **PARTIAL** - FSM architecture ready, power operations in development
+- **Architecture**: [FSM Architecture](../architecture/state.md) provides robust foundation
 
 #### Group Controller Features
 - **Location**: `internal/controller/infra/group_controller.go`

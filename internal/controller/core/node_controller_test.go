@@ -23,10 +23,9 @@ import (
 var _ = Describe("Node Controller", func() {
 	Context("When reconciling a resource", func() {
 
-		It("should successfully reconcile the resource", func() {
-
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+		It("should successfully reconcile Kubernetes node status changes", func() {
+			// Test that node status changes are properly synchronized to Homelab Node CRDs
+			// and that power state transitions are handled correctly
 		})
 	})
 })

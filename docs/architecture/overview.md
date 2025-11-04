@@ -50,15 +50,17 @@ Represents individual physical machines:
 
 #### Node Controller (`internal/controller/infra/node_controller.go`)
 **Function**: Manages Node CRDs and power state transitions
-**Current Status**: in development
+**Current Status**: Core FSM implemented, power operations in development
 
-**Responsibilities**:
-- Monitor Node CRD changes
-- Execute startup/shutdown jobs when power state changes
-- Update node status and progress
-- Handle job completion and failures
+**Implemented Features**:
+- Finite State Machine architecture using looplab/fsm library
+- Coordination locking to prevent race conditions
+- Basic reconciliation and status updates
 
-**Architecture**: The system uses a comprehensive [Finite State Machine (FSM) Architecture](state.md) to formalize state transitions and coordinate between controllers. This FSM approach provides robust, event-driven state management using the looplab/fsm library.
+**In Development**:
+- Complete startup/shutdown job execution
+- Comprehensive error handling and recovery
+- Full power operation integration
 
 #### Core Controller (`internal/controller/core/node_controller.go`)
 **Function**: Bridges Kubernetes nodes with Node CRDs
@@ -74,15 +76,19 @@ Represents individual physical machines:
 
 Implements the Cluster Autoscaler CloudProvider interface:
 
-**Current Status**: in Development
+**Current Status**: Basic methods implemented, full integration in development
 
-#### Key Methods:
-- `NodeGroups()` - List all autoscaling groups
-- `NodeGroupTargetSize()` - Get current target size
+#### Implemented Methods:
+- `NodeGroups()` - ✅ Lists all autoscaling groups
+- `NodeGroupTargetSize()` - ✅ Gets current target size
+- `NodeGroupNodes()` - ✅ Lists nodes in a group
+- `NodeGroupForNode()` - ✅ Finds group for a given node
+
+#### In Development:
 - `NodeGroupIncreaseSize()` - Scale up by powering on nodes
-- `NodeGroupDecreaseTargetSize()` - Scale down by powering off nodes
-- `NodeGroupDeleteNodes()` - Power off specific nodes
-- `NodeGroupForNode()` - Find group for a given node
+- `NodeGroupDeleteNodes()` - Scale down by powering off nodes
+- `NodeGroupDecreaseTargetSize()` - Target size reduction
+- Complete Cluster Autoscaler integration
 
 ## Data Flow
 
