@@ -2,8 +2,6 @@
 
 This document outlines current known issues, limitations, and workarounds for the homelab-autoscaler system.
 
-> 📋 **NOTE**: For comprehensive implementation status, see [Implementation Status](../IMPLEMENTATION-STATUS.md)
-
 ## Current Limitations
 
 ### 1. Configuration Constraints

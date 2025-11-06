@@ -17,7 +17,6 @@ A Kubernetes operator that manages physical node power states for energy-efficie
 - Complete Cluster Autoscaler integration
 - Advanced error recovery and monitoring
 
-📋 **See [Implementation Status](docs/IMPLEMENTATION-STATUS.md) for detailed status**
 
 ## 🚀 Quick Start
 
@@ -114,7 +113,6 @@ make test-e2e
 
 ## 📚 Documentation
 
-- **[Implementation Status](docs/IMPLEMENTATION-STATUS.md)** - Authoritative feature status
 - **[Quick Start](docs/getting-started/quick-start.md)** - k3d testing setup
 - **[Architecture](docs/architecture/overview.md)** - System design and components
 - **[API Reference](docs/api-reference/crds/group.md)** - CRD specifications
