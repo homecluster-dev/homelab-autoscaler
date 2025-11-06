@@ -4,21 +4,12 @@ import styles from './styles.module.css';
 
 const FeatureList = [
   {
-    title: 'In development',
-    Svg: require('@site/static/img/undraw_server_cluster.svg').default,
-    description: (
-      <>
-        Still work-in-progress
-      </>
-    ),
-  },
-  {
     title: 'Physical Infrastructure',
     Svg: require('@site/static/img/undraw_server_status.svg').default,
     description: (
       <>
-        Manage power states of physical machines based on workload demands.
-        Support for Wake-on-LAN, IPMI, BMC interfaces, and smart PDUs.
+        Manage physical machine power states based on workload demands.
+        Supports wake-on-LAN, IPMI, BMC interfaces, and smart PDUs.
       </>
     ),
   },
@@ -27,8 +18,18 @@ const FeatureList = [
     Svg: require('@site/static/img/undraw_kubernetes.svg').default,
     description: (
       <>
-        Built with Custom Resource Definitions and controllers.
-        Webhook validation system ensuring data integrity across all resources.
+        Uses Custom Resource Definitions and controllers for native integration.
+        Webhook validation ensures data integrity across all resources.
+      </>
+    ),
+  },
+  {
+    title: 'State Management',
+    Svg: require('@site/static/img/undraw_server_cluster.svg').default,
+    description: (
+      <>
+        Advanced finite state machine manages node power transitions.
+        Coordination locks prevent race conditions during state changes.
       </>
     ),
   },

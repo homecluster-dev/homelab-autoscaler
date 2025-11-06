@@ -1,8 +1,6 @@
-# Architecture Overview
+# Architecture
 
-## System Design
-
-The Homelab Autoscaler implements a Kubernetes operator pattern with external gRPC integration to provide cluster autoscaling for physical nodes.
+Homelab Autoscaler is a Kubernetes operator with gRPC integration for physical node autoscaling.
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
@@ -20,202 +18,139 @@ The Homelab Autoscaler implements a Kubernetes operator pattern with external gR
 
 ## Core Components
 
-### 1. Custom Resource Definitions (CRDs)
+### Custom Resources
 
-#### Group CRD
-Defines autoscaling policies for a collection of physical nodes:
-- **Scaling thresholds** (CPU, GPU utilization)
-- **Timing parameters** (scale-down delays, provision timeouts)
-- **Node selection** (labels, maximum size)
-- **Health status** (healthy, offline, unknown)
+**Group CRD** - Defines autoscaling policies:
+- Scaling thresholds
+- Timing parameters
+- Node selection
+- Health status
 
-#### Node CRD
-Represents individual physical machines:
-- **Power state management** (desired vs actual)
-- **Startup/shutdown jobs** (container specs for power operations)
-- **Health monitoring** (progress tracking)
-- **Pricing information** (hourly rates, pod costs)
+**Node CRD** - Physical machine representation:
+- Power state management
+- Startup/shutdown jobs
+- Health monitoring
+- Pricing information
 
-### 2. Controllers
+### Controllers
 
-#### Group Controller (`internal/controller/infra/group_controller.go`)
-**Intended Function**: Manages Group CRDs and autoscaling policies
-**Current Status**: ✅ Operational - manages autoscaling policies and group health
+**Group Controller** (`internal/controller/infra/group_controller.go`)
+- Manages Group CRDs and autoscaling policies
+- Updates group health status
+- Enforces scaling policies
 
-**Responsibilities**:
-- Monitor Group CRD changes
-- Update group health status based on node states
-- Enforce autoscaling policies
-- Manage group-level conditions
+**Node Controller** (`internal/controller/infra/node_controller.go`)
+- Manages Node CRDs and power state transitions
+- Finite State Machine architecture
+- Coordination locking for race prevention
+- Power operation integration (in development)
 
-#### Node Controller (`internal/controller/infra/node_controller.go`)
-**Function**: Manages Node CRDs and power state transitions
-**Current Status**: Core FSM implemented, power operations in development
+**Core Controller** (`internal/controller/core/node_controller.go`)
+- Bridges Kubernetes nodes with Node CRDs
+- Syncs node health status
+- Handles node registration/deregistration
 
-**Implemented Features**:
-- Finite State Machine architecture using looplab/fsm library
-- Coordination locking to prevent race conditions
-- Basic reconciliation and status updates
+### gRPC Server (`internal/grpcserver/server.go`)
+
+Implements Cluster Autoscaler CloudProvider interface:
+
+**Implemented**:
+- `NodeGroups()` - Lists autoscaling groups
+- `NodeGroupTargetSize()` - Gets current target size
+- `NodeGroupNodes()` - Lists nodes in group
+- `NodeGroupForNode()` - Finds group for node
 
 **In Development**:
-- Complete startup/shutdown job execution
-- Comprehensive error handling and recovery
-- Full power operation integration
-
-#### Core Controller (`internal/controller/core/node_controller.go`)
-**Function**: Bridges Kubernetes nodes with Node CRDs
-**Current Status**: ✅ Stable - maintains consistency between K8s nodes and CRDs
-
-**Responsibilities**:
-- Monitor Kubernetes node events
-- Sync node health status with Node CRDs
-- Handle node registration/deregistration
-- Maintain consistency between K8s nodes and CRDs
-
-### 3. gRPC Server (`internal/grpcserver/server.go`)
-
-Implements the Cluster Autoscaler CloudProvider interface:
-
-**Current Status**: Basic methods implemented, full integration in development
-
-#### Implemented Methods:
-- `NodeGroups()` - ✅ Lists all autoscaling groups
-- `NodeGroupTargetSize()` - ✅ Gets current target size
-- `NodeGroupNodes()` - ✅ Lists nodes in a group
-- `NodeGroupForNode()` - ✅ Finds group for a given node
-
-#### In Development:
-- `NodeGroupIncreaseSize()` - Scale up by powering on nodes
-- `NodeGroupDeleteNodes()` - Scale down by powering off nodes
+- `NodeGroupIncreaseSize()` - Scale up nodes
+- `NodeGroupDeleteNodes()` - Scale down nodes
 - `NodeGroupDecreaseTargetSize()` - Target size reduction
-- Complete Cluster Autoscaler integration
 
 ## Data Flow
 
+1. **Group Creation**: User creates Group CRD → Group Controller → Updates status
+2. **Node Management**: Node CRD created → Node Controller → Startup job → K8s node joins
+3. **Autoscaling**: Cluster Autoscaler → gRPC call → Kubernetes API → Scaling action
+4. **Scale Up**: gRPC IncreaseSize → Find powered-off node → Set DesiredPowerState=on → Startup job
+5. **Scale Down**: gRPC DeleteNodes → Set DesiredPowerState=off → Drain node → Shutdown job
 
-1. **Group Creation**:
-   ```
-   User creates Group CRD → Group Controller processes → Updates status
-   ```
-
-2. **Node Management**:
-   ```
-   Node CRD created → Node Controller → Startup job → K8s node joins
-   ```
-
-3. **Autoscaling Decision**:
-   ```
-   Cluster Autoscaler → gRPC call → kubernetes API CRs → Scaling action
-   ```
-
-4. **Scale Up**:
-   ```
-   gRPC IncreaseSize → Find powered-off node → Set DesiredPowerState=on
-   → Node Controller → Startup job → Node joins cluster
-   ```
-
-5. **Scale Down**:
-   ```
-   gRPC DeleteNodes → Set DesiredPowerState=off → Node Controller
-   → Drain node → Shutdown job → Node leaves cluster
-   ```
-
-
-## Key Design Patterns
+## Design Patterns
 
 ### Controller Pattern
-Each CRD has a dedicated controller following the Kubernetes operator pattern:
-- Watch for resource changes
+Each CRD has dedicated controller:
+- Watch resource changes
 - Reconcile desired vs actual state
 - Update status fields
 - Handle errors and retries
 
 ### Job-Based Power Management
-Physical power operations are executed via Kubernetes Jobs:
-- **Startup jobs**: Execute scripts/commands to power on machines
-- **Shutdown jobs**: Gracefully power off machines
-- **Isolation**: Power operations isolated in containers
-- **Monitoring**: Job status indicates operation success/failure
+Power operations via Kubernetes Jobs:
+- **Startup jobs**: Execute power-on commands
+- **Shutdown jobs**: Graceful power-off
+- **Isolation**: Operations in containers
+- **Monitoring**: Job status indicates success/failure
 
 ### Health Monitoring
-Node health determined by multiple factors:
-- **Power state**: Physical machine on/off status
-- **Kubernetes node**: Node registered and ready in cluster
-- **Progress tracking**: Startup/shutdown operation status
-- **CronJob health checks**: Periodic health verification
+Node health determined by:
+- Power state (on/off)
+- Kubernetes node readiness
+- Progress tracking
+- Periodic health checks
 
 ## Integration Points
 
-### Cluster Autoscaler Integration
-The gRPC server implements the CloudProvider interface, allowing standard Cluster Autoscaler to manage physical nodes as if they were cloud instances.
+### Cluster Autoscaler
+Standard gRPC CloudProvider interface for integration.
 
-### Kubernetes API Integration
-Controllers use controller-runtime to:
-- Watch CRD changes
-- Update resource status
-- Create/manage Jobs for power operations
-- Monitor Kubernetes node events
+### Kubernetes API
+Controllers use controller-runtime for:
+- Watching CRD changes
+- Updating resource status
+- Creating/managing Jobs
+- Monitoring node events
 
-### Webhook Validation System
-Admission webhooks provide validation and mutation of custom resources:
-- **Validation webhooks**: Ensure Node and Group CRDs meet requirements
-- **Mutation webhooks**: Set default values and normalize configurations
-- **Security**: Prevent invalid configurations that could cause system instability
-
-### Helm Chart Deployment
-Deployment is managed via Helm charts:
-- **Standardized installation**: Consistent deployment across environments
-- **Configuration management**: Values-based customization
-- **Dependency management**: Automatic CRD and RBAC setup
-- **Upgrade support**: Safe rolling updates and rollbacks
-
-### External Power Management
-Startup/shutdown jobs can integrate with any power management system:
-- IPMI/BMC interfaces
-- Wake-on-LAN
-- Smart PDUs
-- Custom scripts
+### Webhook Validation
+Admission webhooks provide:
+- Validation - Ensure CRD requirements
+- Mutation - Set default values
+- Security - Prevent invalid configurations
 
 ## Configuration
 
 ### Namespace
-**Current**: Hardcoded to `homelab-autoscaler-system`
-**Issue**: No configuration option for custom namespaces
+- Hardcoded to `homelab-autoscaler-system`
+- No custom namespace option yet
 
 ### gRPC Server
-- **Default**: Enabled on port 50051
-- **Configurable**: Via command-line flags
-- **TLS**: Not currently implemented
+- Enabled on port 50051 by default
+- Configurable via command-line flags
+- TLS not implemented
 
-### Health Check Frequency
-- **Default**: Every 10 seconds
-- **Configurable**: Via CronJob schedule format
+### Health Checks
+- Default: Every 10 seconds
+- Configurable via CronJob schedule
 
-## Security Considerations
+## Security
 
 ### RBAC
-Controllers require permissions for:
-- Reading/writing Group and Node CRDs
-- Creating/monitoring Jobs
-- Reading Kubernetes nodes
-- Creating CronJobs for health checks
+Controllers need permissions for:
+- Group/Node CRD operations
+- Job creation/monitoring
+- Kubernetes node reading
+- CronJob creation
 
 ### Job Security
-Startup/shutdown jobs run with configured ServiceAccount:
-- Should have minimal required permissions
+Startup/shutdown jobs:
+- Minimal required permissions
 - Secrets/ConfigMaps for credentials
-- Network policies for isolation
+- Network policy isolation
 
 ## Scalability
-
-### Design Considerations
-- Controller-runtime provides leader election
-- gRPC server is stateless (can be horizontally scaled)
+- Controller-runtime leader election
+- gRPC server is stateless (horizontal scaling)
 
 ## Related Documentation
-
-- [Installation Guide](../getting-started/installation.md) - Helm deployment guide
-- [Quick Start](../getting-started/quick-start.md) - k3d testing setup
-- [FSM Architecture](state.md) - State management design
+- [Installation](../getting-started/installation.md) - Helm deployment
+- [Quick Start](../getting-started/quick-start.md) - k3d testing
+- [FSM Architecture](state.md) - State management
 - [Known Issues](../troubleshooting/known-issues.md) - Current limitations
-- [API Reference](../api-reference/crds/group.md) - CRD specifications
+- [API Reference](../api-reference/crds/group.md) - CRD specs

@@ -1,16 +1,14 @@
-# Installation Guide
+# Installation
 
-This guide covers installing the homelab-autoscaler using Helm, the recommended deployment method.
+Install homelab-autoscaler using Helm, the recommended deployment method.
 
-> ℹ️ **NOTE**: Review [Known Issues](../troubleshooting/known-issues.md) for current limitations and configuration recommendations before deployment.
+> **Note**: Check [Known Issues](../troubleshooting/known-issues.md) for current limitations and configuration recommendations.
 
 ## Prerequisites
 
-### Required Tools
-
-- **Kubernetes cluster** (v1.19+)
-- **Helm** (v3.0+)
-- **kubectl** configured for your cluster
+- Kubernetes cluster (v1.19+)
+- Helm (v3.0+)
+- kubectl configured for your cluster
 
 ### Cluster Requirements
 
