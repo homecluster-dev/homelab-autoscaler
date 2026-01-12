@@ -27,6 +27,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -72,7 +73,7 @@ func TestNewNodeStateMachine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, tt.nodeProgress)
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, tt.nodeProgress)
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
@@ -203,7 +204,7 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, tt.currentState)
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, tt.currentState)
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
@@ -220,7 +221,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("successful node start", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -246,7 +247,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 
 		job := jobs.Items[0]
 		assert.Contains(t, job.Name, "test-node-startup-")
-		assert.Equal(t, "default", job.Namespace)
+		assert.Equal(t, "homelab-autoscaler-system", job.Namespace)
 		assert.Equal(t, "startup", job.Labels["type"])
 		assert.Equal(t, "test/startup:latest", job.Spec.Template.Spec.Containers[0].Image)
 
@@ -256,7 +257,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 	})
 
 	t.Run("coordination lock failure", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -278,7 +279,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 	})
 
 	t.Run("invalid state transition", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -302,7 +303,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("successful node shutdown with kubernetes node cordoning", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", false) // Initially schedulable
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
@@ -335,7 +336,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 
 		job := jobs.Items[0]
 		assert.Contains(t, job.Name, "test-node-shutdown-")
-		assert.Equal(t, "default", job.Namespace)
+		assert.Equal(t, "homelab-autoscaler-system", job.Namespace)
 		assert.Equal(t, "shutdown", job.Labels["type"])
 		assert.Equal(t, "test/shutdown:latest", job.Spec.Template.Spec.Containers[0].Image)
 
@@ -345,7 +346,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 	})
 
 	t.Run("successful node shutdown without kubernetes node", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node) // No Kubernetes node
 
@@ -365,7 +366,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 	})
 
 	t.Run("coordination lock failure", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -393,7 +394,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("startup job completed uncordons kubernetes node", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", true) // Initially unschedulable
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
@@ -418,7 +419,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 	})
 
 	t.Run("shutdown job completed does not uncordon kubernetes node", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", true) // Initially unschedulable
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
@@ -512,7 +513,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, tt.initialState)
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, tt.initialState)
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
@@ -530,7 +531,7 @@ func TestNodeStateMachine_CalculateBackoff(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -592,7 +593,7 @@ func TestNodeStateMachine_IsTransitionStuck(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -629,12 +630,12 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("job completes successfully", func(t *testing.T) {
-		node := CreateTestNode("test-node-monitor-1", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node-monitor-1", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
 		// Create a job that will be marked as successful
-		job := CreateTestJob("test-job-1", "default", "startup")
+		job := CreateTestJob("test-job-1", config.NewNamespaceConfig().Get(), "startup")
 		job.Status.Succeeded = 1
 		err := fakeClient.Create(context.TODO(), job)
 		require.NoError(t, err)
@@ -665,12 +666,12 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 	})
 
 	t.Run("job fails", func(t *testing.T) {
-		node := CreateTestNode("test-node-monitor-2", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node-monitor-2", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
 		// Create a job that will be marked as failed
-		job := CreateTestJob("test-job-2", "default", "startup")
+		job := CreateTestJob("test-job-2", config.NewNamespaceConfig().Get(), "startup")
 		job.Status.Failed = 1
 		err := fakeClient.Create(context.TODO(), job)
 		require.NoError(t, err)
@@ -701,12 +702,12 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 	})
 
 	t.Run("job times out", func(t *testing.T) {
-		node := CreateTestNode("test-node-monitor-3", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node-monitor-3", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
 		// Create a job that remains running
-		job := CreateTestJob("test-job-3", "default", "startup")
+		job := CreateTestJob("test-job-3", config.NewNamespaceConfig().Get(), "startup")
 		job.Status.Active = 1
 		err := fakeClient.Create(context.TODO(), job)
 		require.NoError(t, err)
@@ -743,19 +744,19 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("cleanup multiple pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create multiple pending jobs for the same node
-		pendingStartupJob := CreateTestJobWithNodeLabel("test-node-startup-old", "default", "startup", "test-node-k8s")
-		pendingShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", "default", "shutdown", "test-node-k8s")
+		pendingStartupJob := CreateTestJobWithNodeLabel("test-node-startup-old", config.NewNamespaceConfig().Get(), "startup", "test-node-k8s")
+		pendingShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", config.NewNamespaceConfig().Get(), "shutdown", "test-node-k8s")
 
 		// Create a completed job that should not be deleted
-		completedJob := CreateTestJobWithNodeLabel("test-node-startup-completed", "default", "startup", "test-node-k8s")
+		completedJob := CreateTestJobWithNodeLabel("test-node-startup-completed", config.NewNamespaceConfig().Get(), "startup", "test-node-k8s")
 		completedJob.Status.Succeeded = 1
 
 		// Create a job for a different node that should not be deleted
-		otherNodeJob := CreateTestJobWithNodeLabel("other-node-startup", "default", "startup", "other-node-k8s")
+		otherNodeJob := CreateTestJobWithNodeLabel("other-node-startup", config.NewNamespaceConfig().Get(), "startup", "other-node-k8s")
 
 		fakeClient := CreateFakeClient(scheme, node, pendingStartupJob, pendingShutdownJob, completedJob, otherNodeJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
@@ -784,7 +785,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	})
 
 	t.Run("cleanup with no pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -802,7 +803,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	})
 
 	t.Run("cleanup with empty kubernetes node name", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		node.Spec.KubernetesNodeName = "" // Empty node name
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
@@ -815,15 +816,15 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	})
 
 	t.Run("cleanup only affects startup and shutdown jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create jobs with different types
-		startupJob := CreateTestJobWithNodeLabel("test-node-startup", "default", "startup", "test-node-k8s")
-		shutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown", "default", "shutdown", "test-node-k8s")
+		startupJob := CreateTestJobWithNodeLabel("test-node-startup", config.NewNamespaceConfig().Get(), "startup", "test-node-k8s")
+		shutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown", config.NewNamespaceConfig().Get(), "shutdown", "test-node-k8s")
 
 		// Create a job with different type that should not be deleted
-		otherTypeJob := CreateTestJobWithNodeLabel("test-node-other", "default", "maintenance", "test-node-k8s")
+		otherTypeJob := CreateTestJobWithNodeLabel("test-node-other", config.NewNamespaceConfig().Get(), "maintenance", "test-node-k8s")
 
 		fakeClient := CreateFakeClient(scheme, node, startupJob, shutdownJob, otherTypeJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
@@ -849,12 +850,12 @@ func TestNodeStateMachine_StartNodeWithCleanup(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("startup cleans up existing pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create existing pending jobs
-		oldStartupJob := CreateTestJobWithNodeLabel("test-node-startup-old", "default", "startup", "test-node-k8s")
-		oldShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", "default", "shutdown", "test-node-k8s")
+		oldStartupJob := CreateTestJobWithNodeLabel("test-node-startup-old", config.NewNamespaceConfig().Get(), "startup", "test-node-k8s")
+		oldShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", config.NewNamespaceConfig().Get(), "shutdown", "test-node-k8s")
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
@@ -884,12 +885,12 @@ func TestNodeStateMachine_ShutdownNodeWithCleanup(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("shutdown cleans up existing pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create existing pending jobs
-		oldStartupJob := CreateTestJobWithNodeLabel("test-node-startup-old", "default", "startup", "test-node-k8s")
-		oldShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", "default", "shutdown", "test-node-k8s")
+		oldStartupJob := CreateTestJobWithNodeLabel("test-node-startup-old", config.NewNamespaceConfig().Get(), "startup", "test-node-k8s")
+		oldShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", config.NewNamespaceConfig().Get(), "shutdown", "test-node-k8s")
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)

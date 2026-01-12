@@ -5,7 +5,7 @@ metadata:
     app.kubernetes.io/name: homelab-autoscaler
     app.kubernetes.io/managed-by: kustomize
   name: webhook-service
-  namespace: system
+  namespace: ${HOMELAB_AUTOSCALER_NAMESPACE:-homelab-autoscaler-system}
 spec:
   ports:
     - port: 443

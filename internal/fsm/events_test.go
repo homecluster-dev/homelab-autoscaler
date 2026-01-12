@@ -21,6 +21,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -564,7 +565,7 @@ func TestGetOperationForEvent(t *testing.T) {
 
 func TestGetFSMCallbacks(t *testing.T) {
 	// Create a minimal NodeStateMachine for testing
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 	mockCoord := NewMockCoordinationManager()
 
 	// Set up proper scheme

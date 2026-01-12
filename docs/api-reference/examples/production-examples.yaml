@@ -7,7 +7,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Group
 metadata:
   name: worker-nodes
-  namespace: homelab-autoscaler-system
+  namespace: ${NAMESPACE:-homelab-autoscaler-system}
 spec:
   # Conservative maximum size for production
   maxSize: 5
@@ -39,7 +39,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: worker-01
-  namespace: homelab-autoscaler-system
+  namespace: ${NAMESPACE:-homelab-autoscaler-system}
   labels:
     group: worker-nodes
     node-type: worker
@@ -103,7 +103,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: worker-02
-  namespace: homelab-autoscaler-system
+  namespace: ${NAMESPACE:-homelab-autoscaler-system}
   labels:
     group: worker-nodes
     node-type: worker
@@ -172,7 +172,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: gpu-worker-01
-  namespace: homelab-autoscaler-system
+  namespace: ${NAMESPACE:-homelab-autoscaler-system}
   labels:
     group: gpu-workers
     node-type: gpu-worker

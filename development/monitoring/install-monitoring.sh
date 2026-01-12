@@ -363,7 +363,7 @@ rm -f /tmp/prometheus-values.yaml /tmp/loki-values.yaml /tmp/tempo-values.yaml
 
 
 echo "Installing Cluster autoscaler service monitor"
-kubectl apply -f ./development/monitoring/autoscalerservicemonitor.yaml
+NAMESPACE="${NAMESPACE:-homelab-autoscaler-system}" kubectl apply -f ./development/monitoring/autoscalerservicemonitor.yaml
 
 echo "✅ Monitoring stack installed successfully!"
 echo ""

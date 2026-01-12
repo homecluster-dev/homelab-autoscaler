@@ -105,6 +105,7 @@ spec:
     spec:
       nodeSelector:
         infra.homecluster.dev/group: group1
+        infra.homecluster.dev/namespace: ${NAMESPACE:-homelab-autoscaler-system}
       tolerations:
       - key: "autoscaler"
         operator: "Equal"

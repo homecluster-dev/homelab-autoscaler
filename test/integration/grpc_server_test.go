@@ -30,6 +30,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 	"github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
@@ -42,11 +43,13 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 		testCancel context.CancelFunc
 		server     *grpcserver.HomeClusterProviderServer
 		loader     *testdata.TestDataLoader
+		namespace  *config.NamespaceConfig
 	)
 
 	BeforeEach(func() {
 		testCtx, testCancel = context.WithTimeout(ctx, 30*time.Second)
 		loader = testdata.NewTestDataLoader(scheme.Scheme)
+		namespace = config.NewNamespaceConfig()
 	})
 
 	AfterEach(func() {
@@ -216,7 +219,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 		Context("when powered off nodes are available", func() {
 			It("should power on nodes to increase size", func() {
 				// Setup test data with gpu-group that has a powered off node
-				mockClient, err := loader.CreateMockClientWithGroup("gpu-group")
+				mockClient, err := loader.CreateMockClientWithAllData()
 				Expect(err).NotTo(HaveOccurred())
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
 
@@ -233,7 +236,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				// Verify node was updated to desired power state on
 				node := &infrav1alpha1.Node{}
-				err = mockClient.Get(testCtx, client.ObjectKey{Name: "gpu-node-2", Namespace: "homelab-autoscaler-system"}, node)
+				err = mockClient.Get(testCtx, client.ObjectKey{Name: "gpu-node-2", Namespace: namespace.Get()}, node)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(node.Spec.DesiredPowerState).To(Equal(infrav1alpha1.PowerStateOn))
 			})
@@ -307,7 +310,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				// Verify node was updated to desired power state off
 				node := &infrav1alpha1.Node{}
-				err = mockClient.Get(testCtx, client.ObjectKey{Name: "test-node-1", Namespace: "homelab-autoscaler-system"}, node)
+				err = mockClient.Get(testCtx, client.ObjectKey{Name: "test-node-1", Namespace: namespace.Get()}, node)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(node.Spec.DesiredPowerState).To(Equal(infrav1alpha1.PowerStateOff))
 			})
@@ -458,6 +461,34 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 			})
 		})
 
+		Context("when node defines custom taints to remove", func() {
+			It("filters those taints from the template node", func() {
+				// Build a mock client with a group and a node that defines custom taints to remove
+				customTaint := corev1.Taint{Key: "custom/taint", Effect: corev1.TaintEffectNoSchedule}
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode(
+						"test-node-1",
+						mocks.WithNodeGroup("test-group"),
+						mocks.WithNodeTaintsToRemove([]corev1.Taint{customTaint}),
+					).
+					Build()
+
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				// Call the endpoint
+				req := &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"}
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, req)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp).NotTo(BeNil())
+				Expect(resp.NodeInfo).NotTo(BeNil())
+				// Ensure the custom taint is not present in the template node's taints
+				for _, t := range resp.NodeInfo.Spec.Taints {
+					Expect(t.Key).NotTo(Equal("custom/taint"))
+				}
+			})
+		})
 		Context("when group has no nodes", func() {
 			It("should return unimplemented error for scale from zero", func() {
 				// Setup test data with empty group

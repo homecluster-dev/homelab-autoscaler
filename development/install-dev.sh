@@ -10,7 +10,7 @@ set -e
 
 # Configuration
 CLUSTER_NAME="homelab-autoscaler"
-NAMESPACE="homelab-autoscaler-system"
+NAMESPACE="${NAMESPACE:-homelab-autoscaler-system}"
 RELEASE_NAME="homelab-autoscaler-dev"
 CHART_PATH="dist/chart"
 VALUES_FILE="development/development-values.yaml"
@@ -273,7 +273,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  -n, --namespace NAMESPACE    Kubernetes namespace (default: homelab-autoscaler-system)"
+            echo "  -n, --namespace NAMESPACE    Kubernetes namespace (default: \$NAMESPACE or homelab-autoscaler-system)"
             echo "  -r, --release RELEASE        Helm release name (default: homelab-autoscaler-dev)"
             echo "  -c, --cluster CLUSTER        K3d cluster name (default: homelab-autoscaler)"
             echo "  -h, --help                   Show this help message"

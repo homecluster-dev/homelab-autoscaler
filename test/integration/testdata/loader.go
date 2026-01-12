@@ -17,17 +17,18 @@ limitations under the License.
 package testdata
 
 import (
-	"embed"
-	"fmt"
-	"strings"
+    "embed"
+    "fmt"
+    "strings"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/yaml"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+    corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/runtime"
+    "k8s.io/apimachinery/pkg/util/yaml"
+    "sigs.k8s.io/controller-runtime/pkg/client"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
-	"github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
+    infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+    "github.com/homecluster-dev/homelab-autoscaler/internal/config"
+    "github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
 )
 
 //go:embed *.yaml
@@ -47,10 +48,13 @@ func NewTestDataLoader(scheme *runtime.Scheme) *TestDataLoader {
 
 // LoadGroups loads all Group CRs from groups.yaml
 func (l *TestDataLoader) LoadGroups() ([]*infrav1alpha1.Group, error) {
-	data, err := testDataFiles.ReadFile("groups.yaml")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read groups.yaml: %w", err)
-	}
+    data, err := testDataFiles.ReadFile("groups.yaml")
+    if err != nil {
+        return nil, fmt.Errorf("failed to read groups.yaml: %w", err)
+    }
+    // Replace template placeholder with actual namespace used by the server.
+    ns := config.NewNamespaceConfig().Get()
+    data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
 	var groups []*infrav1alpha1.Group
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
@@ -77,10 +81,12 @@ func (l *TestDataLoader) LoadGroups() ([]*infrav1alpha1.Group, error) {
 
 // LoadNodes loads all Node CRs from nodes.yaml
 func (l *TestDataLoader) LoadNodes() ([]*infrav1alpha1.Node, error) {
-	data, err := testDataFiles.ReadFile("nodes.yaml")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read nodes.yaml: %w", err)
-	}
+    data, err := testDataFiles.ReadFile("nodes.yaml")
+    if err != nil {
+        return nil, fmt.Errorf("failed to read nodes.yaml: %w", err)
+    }
+    ns := config.NewNamespaceConfig().Get()
+    data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
 	var nodes []*infrav1alpha1.Node
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
@@ -107,10 +113,12 @@ func (l *TestDataLoader) LoadNodes() ([]*infrav1alpha1.Node, error) {
 
 // LoadKubernetesNodes loads all Kubernetes Node objects from kubernetes_nodes.yaml
 func (l *TestDataLoader) LoadKubernetesNodes() ([]*corev1.Node, error) {
-	data, err := testDataFiles.ReadFile("kubernetes_nodes.yaml")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read kubernetes_nodes.yaml: %w", err)
-	}
+    data, err := testDataFiles.ReadFile("kubernetes_nodes.yaml")
+    if err != nil {
+        return nil, fmt.Errorf("failed to read kubernetes_nodes.yaml: %w", err)
+    }
+    ns := config.NewNamespaceConfig().Get()
+    data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
 	var nodes []*corev1.Node
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)

@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/name: homelab-autoscaler
     app.kubernetes.io/managed-by: kustomize
   name: metrics-certs  # this name should match the one appeared in kustomizeconfig.yaml
-  namespace: system
+  namespace: ${HOMELAB_AUTOSCALER_NAMESPACE:-homelab-autoscaler-system}
 spec:
   dnsNames:
   # SERVICE_NAME and SERVICE_NAMESPACE will be substituted by kustomize

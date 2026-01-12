@@ -26,6 +26,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/looplab/fsm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,7 +40,7 @@ func TestBeforeStartNode(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock acquisition", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -69,7 +70,7 @@ func TestBeforeStartNode(t *testing.T) {
 	})
 
 	t.Run("lock acquisition failure cancels event", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -95,7 +96,7 @@ func TestBeforeShutdownNode(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock acquisition", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -125,7 +126,7 @@ func TestBeforeShutdownNode(t *testing.T) {
 	})
 
 	t.Run("lock acquisition failure cancels event", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -151,7 +152,7 @@ func TestAfterJobCompleted(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock release and status update", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -159,7 +160,7 @@ func TestAfterJobCompleted(t *testing.T) {
 		ctx := context.TODO()
 
 		// Create a test job and add it to the fake client
-		job := CreateTestJob("test-job", "default", "startup")
+		job := CreateTestJob("test-job", config.NewNamespaceConfig().Get(), "startup")
 
 		// Create a mock FSM event with job argument
 		event := &fsm.Event{
@@ -186,7 +187,7 @@ func TestAfterJobCompleted(t *testing.T) {
 	})
 
 	t.Run("lock release failure is logged but doesn't fail", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetReleaseError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -195,7 +196,7 @@ func TestAfterJobCompleted(t *testing.T) {
 		ctx := context.TODO()
 
 		// Create a test job and add it to the fake client
-		job := CreateTestJob("test-job", "default", "shutdown")
+		job := CreateTestJob("test-job", config.NewNamespaceConfig().Get(), "shutdown")
 
 		// Create a mock FSM event with job argument
 		event := &fsm.Event{
@@ -227,7 +228,7 @@ func TestAfterJobFailed(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock release and failure condition added", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -272,7 +273,7 @@ func TestAfterForceCleanup(t *testing.T) {
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
 	t.Run("successful force lock release and cleanup condition added", func(t *testing.T) {
-		node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -316,7 +317,7 @@ func TestEnterStartingUp(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -360,7 +361,7 @@ func TestEnterShuttingDown(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -404,7 +405,7 @@ func TestEnterReady(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -451,7 +452,7 @@ func TestEnterShutdown(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -499,7 +500,7 @@ func TestHooksIntegration(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -575,7 +576,7 @@ func TestHooksIntegration(t *testing.T) {
 		mockCoord.Reset()
 
 		// Create a new node with a different name to avoid job conflicts
-		freshNode := CreateTestNode("test-node-2", "default", infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		freshNode := CreateTestNode("test-node-2", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
 		fakeClient2 := CreateFakeClient(scheme, freshNode)
 		nm2 := NewNodeStateMachine(freshNode, fakeClient2, scheme, mockCoord)
 

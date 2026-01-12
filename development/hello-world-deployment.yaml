@@ -17,6 +17,7 @@ spec:
     spec:
       nodeSelector:
         infra.homecluster.dev/group: group1
+        infra.homecluster.dev/namespace: ${NAMESPACE:-homelab-autoscaler-system}
       containers:
       - name: hello-world
         image: busybox:latest

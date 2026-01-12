@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 
 	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -93,6 +94,10 @@ type NodeSpec struct {
 	ShutdownPodSpec    MinimalPodSpec `json:"shutdownPodSpec"`
 	KubernetesNodeName string         `json:"kubernetesNodeName"`
 	Pricing            PricingSpec    `json:"pricing"`
+	// TaintsToRemove is a list of taints that should be stripped from the node when generating a template.
+	// It allows users to declare custom taints that the autoscaler must ignore.
+	// +optional
+	TaintsToRemove []corev1.Taint `json:"taintsToRemove,omitempty"`
 }
 
 type PricingSpec struct {

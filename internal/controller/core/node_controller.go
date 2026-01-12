@@ -27,7 +27,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
+
+// Namespace configuration instance
+var namespaceConfig = config.NewNamespaceConfig()
 
 // NodeReconciler reconciles a Node object
 type KubernetesNodeReconciler struct {
@@ -62,7 +66,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Get the corresponding Node CR
 	nodeCR := &infrav1alpha1.Node{}
-	if err := r.Get(ctx, client.ObjectKey{Name: nodeLabel, Namespace: "homelab-autoscaler-system"}, nodeCR); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeLabel, Namespace: namespaceConfig.Get()}, nodeCR); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			logger.Info("Node CR not found for Kubernetes node", "nodeName", node.Name, "nodeCR", nodeLabel)
 			return ctrl.Result{}, nil

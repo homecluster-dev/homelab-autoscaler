@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
 // MockClientBuilder provides a fluent interface for building mock clients with predefined data
@@ -53,7 +54,7 @@ func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockCli
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: "homelab-autoscaler-system",
+			Namespace: config.NewNamespaceConfig().Get(),
 			UID:       types.UID(fmt.Sprintf("group-%s-uid", name)),
 			Labels:    make(map[string]string),
 		},
@@ -89,7 +90,7 @@ func (b *MockClientBuilder) WithNode(name string, opts ...NodeOption) *MockClien
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: "homelab-autoscaler-system",
+			Namespace: config.NewNamespaceConfig().Get(),
 			UID:       types.UID(fmt.Sprintf("node-%s-uid", name)),
 			Labels:    make(map[string]string),
 		},
@@ -254,6 +255,13 @@ func WithNodeLabel(key, value string) NodeOption {
 			n.Labels = make(map[string]string)
 		}
 		n.Labels[key] = value
+	}
+}
+
+// WithNodeTaintsToRemove adds a list of taints that should be stripped when generating a template node.
+func WithNodeTaintsToRemove(taints []corev1.Taint) NodeOption {
+	return func(n *infrav1alpha1.Node) {
+		n.Spec.TaintsToRemove = taints
 	}
 }
 

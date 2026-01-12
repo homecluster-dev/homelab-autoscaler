@@ -29,6 +29,9 @@ import (
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
 
+// NOTE: Namespace configuration is not needed in the coordination manager.
+// The original variable caused an "unused" lint warning and has been removed.
+
 // Coordination annotation keys for preventing race conditions with cluster autoscaler
 const (
 	OperationLockAnnotation = "homelab-autoscaler.dev/operation-lock"

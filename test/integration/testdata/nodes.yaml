@@ -7,7 +7,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: test-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: test-group
@@ -54,7 +54,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: test-node-2
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: test-group
@@ -101,7 +101,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: gpu-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: gpu-group
@@ -152,7 +152,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: gpu-node-2
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: gpu-group
@@ -200,7 +200,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: cpu-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: cpu-group
@@ -244,7 +244,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: cpu-node-2
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: cpu-group
@@ -292,7 +292,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: startup-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: unknown-group
@@ -340,7 +340,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: offline-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: offline-group
@@ -387,7 +387,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: fast-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: fast-scale-group
@@ -431,7 +431,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: dev-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     group: dev-group
@@ -475,7 +475,7 @@ apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
 metadata:
   name: orphaned-node-1
-  namespace: homelab-autoscaler-system
+  namespace: "{{ .Namespace }}"
   labels:
     app.kubernetes.io/name: homelab-autoscaler
     test-scenario: orphaned-node

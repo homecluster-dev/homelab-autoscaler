@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	infrahomeclusterdevv1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
 	// +kubebuilder:scaffold:imports
 )
@@ -91,10 +92,10 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
 
-	By("creating the homelab-autoscaler-system namespace")
+	By("creating the namespace")
 	namespace := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "homelab-autoscaler-system",
+			Name: config.NewNamespaceConfig().Get(),
 		},
 	}
 	err = k8sClient.Create(ctx, namespace)

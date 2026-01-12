@@ -53,7 +53,7 @@ func NewServerManager(address string, k8sClient client.Client, scheme *runtime.S
 // Start starts the gRPC server in a goroutine
 func (sm *ServerManager) Start(ctx context.Context) error {
 	if sm.server != nil {
-		return fmt.Errorf("server is already running")
+		return fmt.Errorf("server is already running in namespace %s", namespaceConfig.Get())
 	}
 
 	// Create TCP listener
