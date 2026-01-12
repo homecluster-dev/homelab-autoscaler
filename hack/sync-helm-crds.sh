@@ -199,7 +199,7 @@ update_image_config() {
         current_repo="homeclusterdev/autoscaler"
     fi
     if [ -z "$current_tag" ]; then
-        current_tag="0.1.11"
+        current_tag="0.1.12"
     fi
 
     # Update the controllerManager repository line to use templating with default
