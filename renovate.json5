@@ -3,11 +3,13 @@
   extends: [
     "config:recommended",
     "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
   ],
   postUpdateOptions: ["gomodTidy"],
   schedule: ["before 9am on Monday"],
   prConcurrentLimit: 5,
   packageRules: [
+    // --- Go modules ---
     {
       groupName: "Kubernetes ecosystem",
       matchManagers: ["gomod"],
@@ -37,15 +39,47 @@
       ],
       automerge: false,
     },
+    // --- GitHub Actions ---
+    {
+      groupName: "GitHub Actions",
+      matchManagers: ["github-actions"],
+      automerge: true,
+    },
+    // --- Docker ---
     {
       groupName: "Dockerfile base images",
       matchManagers: ["dockerfile"],
       automerge: false,
     },
+    // --- Helm and Kustomize ---
     {
       groupName: "Helm chart dependencies",
-      matchManagers: ["helmv3"],
+      matchManagers: ["helmv3", "helm-values"],
       automerge: false,
+    },
+    {
+      groupName: "Kustomize dependencies",
+      matchManagers: ["kustomize"],
+      automerge: false,
+    },
+    // --- Website (npm) ---
+    {
+      groupName: "Website npm dependencies",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      automerge: true,
+    },
+    {
+      groupName: "Website npm major updates",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["major"],
+      automerge: false,
+    },
+    // --- Devcontainer ---
+    {
+      groupName: "Devcontainer dependencies",
+      matchManagers: ["devcontainer"],
+      automerge: true,
     },
   ],
 }
