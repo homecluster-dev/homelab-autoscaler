@@ -1,0 +1,51 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    "docker:pinDigests",
+  ],
+  postUpdateOptions: ["gomodTidy"],
+  schedule: ["before 9am on Monday"],
+  prConcurrentLimit: 5,
+  packageRules: [
+    {
+      groupName: "Kubernetes ecosystem",
+      matchManagers: ["gomod"],
+      matchPackagePatterns: [
+        "^k8s\\.io/",
+        "^sigs\\.k8s\\.io/",
+      ],
+      automerge: false,
+    },
+    {
+      groupName: "Go module minor and patch updates",
+      matchManagers: ["gomod"],
+      matchUpdateTypes: ["minor", "patch"],
+      excludePackagePatterns: [
+        "^k8s\\.io/",
+        "^sigs\\.k8s\\.io/",
+      ],
+      automerge: true,
+    },
+    {
+      groupName: "Go module major updates",
+      matchManagers: ["gomod"],
+      matchUpdateTypes: ["major"],
+      excludePackagePatterns: [
+        "^k8s\\.io/",
+        "^sigs\\.k8s\\.io/",
+      ],
+      automerge: false,
+    },
+    {
+      groupName: "Dockerfile base images",
+      matchManagers: ["dockerfile"],
+      automerge: false,
+    },
+    {
+      groupName: "Helm chart dependencies",
+      matchManagers: ["helmv3"],
+      automerge: false,
+    },
+  ],
+}
