@@ -22,13 +22,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
@@ -40,7 +38,7 @@ var nodelog = logf.Log.WithName("node-resource")
 
 // SetupNodeWebhookWithManager registers the webhook for Node in the manager.
 func SetupNodeWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).For(&infrav1alpha1.Node{}).
+	return ctrl.NewWebhookManagedBy(mgr, &infrav1alpha1.Node{}).
 		WithValidator(&NodeCustomValidator{
 			Client: mgr.GetClient(),
 		}).
@@ -58,14 +56,8 @@ type NodeCustomValidator struct {
 	Client client.Client
 }
 
-var _ webhook.CustomValidator = &NodeCustomValidator{}
-
 // ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type Node.
-func (v *NodeCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	node, ok := obj.(*infrav1alpha1.Node)
-	if !ok {
-		return nil, fmt.Errorf("expected a Node object but got %T", obj)
-	}
+func (v *NodeCustomValidator) ValidateCreate(ctx context.Context, node *infrav1alpha1.Node) (admission.Warnings, error) {
 	nodelog.Info("Validation for Node upon creation", "name", node.GetName())
 
 	if err := v.validateGroupLabel(ctx, node); err != nil {
@@ -75,25 +67,17 @@ func (v *NodeCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Ob
 }
 
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type Node.
-func (v *NodeCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	node, ok := newObj.(*infrav1alpha1.Node)
-	if !ok {
-		return nil, fmt.Errorf("expected a Node object for the newObj but got %T", newObj)
-	}
-	nodelog.Info("Validation for Node upon update", "name", node.GetName())
+func (v *NodeCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *infrav1alpha1.Node) (admission.Warnings, error) {
+	nodelog.Info("Validation for Node upon update", "name", newObj.GetName())
 
-	if err := v.validateGroupLabel(ctx, node); err != nil {
+	if err := v.validateGroupLabel(ctx, newObj); err != nil {
 		return nil, err
 	}
-	return nil, v.validateKubernetesNode(ctx, node)
+	return nil, v.validateKubernetesNode(ctx, newObj)
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type Node.
-func (v *NodeCustomValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	node, ok := obj.(*infrav1alpha1.Node)
-	if !ok {
-		return nil, fmt.Errorf("expected a Node object but got %T", obj)
-	}
+func (v *NodeCustomValidator) ValidateDelete(ctx context.Context, node *infrav1alpha1.Node) (admission.Warnings, error) {
 	nodelog.Info("Validation for Node upon deletion", "name", node.GetName())
 
 	return nil, nil
