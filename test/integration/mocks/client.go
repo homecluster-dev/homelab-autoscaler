@@ -452,6 +452,12 @@ func (w *mockStatusWriter) Update(ctx context.Context, obj client.Object,
 	return w.client.Update(ctx, obj)
 }
 
+// Apply applies the status of an object
+func (w *mockStatusWriter) Apply(ctx context.Context, obj runtime.ApplyConfiguration,
+	opts ...client.SubResourceApplyOption) error {
+	return fmt.Errorf("Apply method not fully implemented in mock client")
+}
+
 // Patch patches the status of an object
 func (w *mockStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch,
 	opts ...client.SubResourcePatchOption) error {
@@ -509,4 +515,11 @@ func (s *mockSubResourceClient) Patch(ctx context.Context, obj client.Object, pa
 	opts ...client.SubResourcePatchOption) error {
 	// For simplicity, delegate to main client Patch
 	return s.client.Patch(ctx, obj, patch)
+}
+
+// Apply applies a subresource
+func (s *mockSubResourceClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration,
+	opts ...client.SubResourceApplyOption) error {
+	// For simplicity in mocking, we don't fully implement server-side apply
+	return fmt.Errorf("Apply method not fully implemented in mock client")
 }
