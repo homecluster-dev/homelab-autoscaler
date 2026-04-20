@@ -75,7 +75,7 @@ jobs:
           git push
 
       - name: Run chart-releaser
-        if: steps.git_check.outputs.chart_changed == 'true' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main'
         uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
         with:
           charts_dir: dist
