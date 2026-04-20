@@ -17,14 +17,14 @@ spec:
       - /bin/sh
     args:
       - -c
-      - curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-0
+      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-0
   shutdownPodSpec:
     image: curlimages/curl:latest
     command:
       - /bin/sh
     args:
       - -c
-      - curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-0
+      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-0
 ---
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -45,11 +45,11 @@ spec:
       - /bin/sh
     args:
       - -c
-      - curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-1
+      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-1
   shutdownPodSpec:
     image: curlimages/curl:latest
     command:
       - /bin/sh
     args:
       - -c
-      - curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-1
+      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-1

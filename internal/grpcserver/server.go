@@ -26,11 +26,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -221,7 +223,7 @@ func (s *HomeClusterProviderServer) PricingNodePrice(ctx context.Context, req *p
 // PricingPodPrice returns a theoretical minimum price of running a pod
 func (s *HomeClusterProviderServer) PricingPodPrice(ctx context.Context, req *pb.PricingPodPriceRequest) (*pb.PricingPodPriceResponse, error) {
 	logger := log.Log.WithName("grpc-server")
-	logger.Info("PricingPodPrice called", "pod", req.Pod.Name)
+	logger.Info("PricingPodPrice called", "podBytes", len(req.PodBytes))
 
 	// This is an optional method - return Unimplemented
 	return nil, status.Errorf(codes.Unimplemented, "PricingPodPrice not implemented")
@@ -658,8 +660,16 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	// Ensure node is schedulable
 	templateNode.Spec.Unschedulable = false
 
+	// Serialize the node to bytes using the scheme's encoder
+	// Create a legacy codec for the corev1 API group
+	encoder := serializer.NewCodecFactory(s.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
+	nodeBytes, err := runtime.Encode(encoder, templateNode)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to encode node: %v", err)
+	}
+
 	return &pb.NodeGroupTemplateNodeInfoResponse{
-		NodeInfo: templateNode,
+		NodeBytes: nodeBytes,
 	}, nil
 }
 
@@ -671,10 +681,10 @@ func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req
 	group := &infrav1alpha1.Group{}
 	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Id, Namespace: namespaceConfig.Get()}, group)
 	if err != nil {
-		// Node not found in any group, return empty string
-		logger.Info("Group not found", "group", req.Id)
-		return &pb.NodeGroupAutoscalingOptionsResponse{}, nil
-
+		logger.Info("Group not found, returning nil to use CA defaults", "group", req.Id)
+		return &pb.NodeGroupAutoscalingOptionsResponse{
+			NodeGroupAutoscalingOptions: nil,
+		}, nil
 	}
 
 	scaleDownUtilizationThreshold, err := strconv.ParseFloat(group.Spec.ScaleDownUtilizationThreshold, 64)
@@ -689,13 +699,21 @@ func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req
 		scaleDownGpuUtilizationThreshold = 0
 	}
 
+	// Convert *metav1.Duration to *durationpb.Duration
+	toDurationPB := func(d *metav1.Duration) *durationpb.Duration {
+		if d == nil || d.Duration == 0 {
+			return nil
+		}
+		return durationpb.New(d.Duration)
+	}
+
 	return &pb.NodeGroupAutoscalingOptionsResponse{
 		NodeGroupAutoscalingOptions: &pb.NodeGroupAutoscalingOptions{
 			ScaleDownUtilizationThreshold:    scaleDownUtilizationThreshold,
 			ScaleDownGpuUtilizationThreshold: scaleDownGpuUtilizationThreshold,
-			ScaleDownUnneededTime:            group.Spec.ScaleDownUnneededTime,
-			ScaleDownUnreadyTime:             group.Spec.ScaleDownUnreadyTime,
-			MaxNodeProvisionTime:             group.Spec.MaxNodeProvisionTime,
+			ScaleDownUnneededDuration:        toDurationPB(group.Spec.ScaleDownUnneededTime),
+			ScaleDownUnreadyDuration:         toDurationPB(group.Spec.ScaleDownUnreadyTime),
+			MaxNodeProvisionDuration:         toDurationPB(group.Spec.MaxNodeProvisionTime),
 			ZeroOrMaxNodeScaling:             group.Spec.ZeroOrMaxNodeScaling,
 			IgnoreDaemonSetsUtilization:      group.Spec.IgnoreDaemonSetsUtilization,
 		},

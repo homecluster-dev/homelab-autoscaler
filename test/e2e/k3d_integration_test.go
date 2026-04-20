@@ -20,6 +20,7 @@ limitations under the License.
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -32,7 +33,7 @@ import (
 )
 
 const (
-	clusterName     = "homelab-autoscaler-k3d-e2e"
+	clusterName     = "homelab-autoscaler"
 	grpcServerPort  = "50052"
 	kubeconfigPath  = "./kubeconfig"
 	serverPidFile   = "/tmp/homelab-autoscaler-server.pid"
@@ -40,6 +41,8 @@ const (
 	namespace       = "homelab-autoscaler-system"
 	defaultTimeout  = 600 * time.Second
 	defaultInterval = 5 * time.Second
+	caTimeout       = 120 * time.Second
+	caInterval      = 5 * time.Second
 )
 
 var _ = Describe("K3d Integration", func() {
@@ -55,8 +58,20 @@ var _ = Describe("K3d Integration", func() {
 	Context("Full workflow test", func() {
 		It("should complete the full scaling workflow", func() {
 
-			By("Applying group and node CRs")
-			applyTestManifests()
+			By("Setting up gRPC service forwarder")
+			setupServiceForwarder()
+
+			By("Setting up host-internal service")
+			setupHostInternalService()
+
+			By("Waiting for cluster autoscaler to be ready")
+			waitForClusterAutoscaler()
+
+			By("Applying group with aggressive scale-down settings")
+			applyTestGroupWithAggressiveScaleDown()
+
+			By("Applying node CRs")
+			applyTestNodeManifests()
 
 			By("Waiting for node to be scaled down")
 			waitForNodeScaleDown()
@@ -81,29 +96,190 @@ var _ = Describe("K3d Integration", func() {
 	})
 })
 
-func applyTestManifests() {
-	By("Applying group and node CRs from example manifests")
-
-	manifestFiles := []string{
-		"./examples/k3d/group1.yaml",
-		"./examples/k3d/nodes1.yaml",
+func getK3dGatewayIP() string {
+	cmd := exec.Command("docker", "network", "inspect", "k3d-"+clusterName, "-f", "{{(index .IPAM.Config 0).Gateway}}")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		By(fmt.Sprintf("Warning: docker network inspect failed: %v", err))
+		return ""
 	}
+	gatewayIP := strings.TrimSpace(output)
+	By(fmt.Sprintf("Found k3d gateway IP: %s", gatewayIP))
+	return gatewayIP
+}
 
-	for _, manifestFile := range manifestFiles {
-		cmd := exec.Command("kubectl", "apply", "-f", manifestFile)
+func setupServiceForwarder() {
+	By("Setting up gRPC service forwarder to localhost:50052")
+
+	gatewayIP := getK3dGatewayIP()
+	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP. "+
+		"Ensure k3d cluster '%s' is running: k3d cluster create '%s'", clusterName, clusterName)
+	By(fmt.Sprintf("Using k3d gateway IP: %s", gatewayIP))
+
+	fwdYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: homelab-autoscaler-grpc-local
+  namespace: %s
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    app.kubernetes.io/component: grpc-forwarder
+spec:
+  ports:
+  - port: 50052
+    targetPort: 50052
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: homelab-autoscaler-grpc-local
+  namespace: %s
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    app.kubernetes.io/component: grpc-forwarder
+subsets:
+- addresses:
+  - ip: %s
+  ports:
+  - port: 50052
+    protocol: TCP
+`, namespace, namespace, gatewayIP)
+
+	tmpFile, err := os.CreateTemp("", "fwd-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(fwdYAML)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply service forwarder: %s", output)
+
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "service", "homelab-autoscaler-grpc-local",
+			"-n", namespace, "-o", "name")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-	}
+		return err == nil
+	}, caTimeout, caInterval).Should(BeTrue(), "Service forwarder should be created")
+}
 
-	// Wait for resources to be created
-	Eventually(func() error {
-		cmd := exec.Command("kubectl", "get", "groups.infra.homecluster.dev", "group1", "-o", "name", "-n", "homelab-autoscaler-system")
+func setupHostInternalService() {
+	By("Setting up host-internal service for startup/shutdown pods")
+
+	gatewayIP := getK3dGatewayIP()
+	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP")
+
+	hostSvcYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: host-internal
+  namespace: %s
+spec:
+  clusterIP: None
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: host-internal
+  namespace: %s
+subsets:
+- addresses:
+  - ip: %s
+  ports:
+  - port: 8080
+    protocol: TCP
+`, namespace, namespace, gatewayIP)
+
+	tmpFile, err := os.CreateTemp("", "host-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(hostSvcYAML)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply host-internal service: %s", output)
+}
+
+func applyTestGroupWithAggressiveScaleDown() {
+	By("Applying test group with aggressive scale-down settings")
+
+	groupYAML := `
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: group1
+  namespace: homelab-autoscaler-system
+spec:
+  ignoreDaemonSetsUtilization: true
+  maxNodeProvisionTime: 2m
+  scaleDownGpuUtilizationThreshold: "30"
+  scaleDownUnneededTime: 30s
+  scaleDownUnreadyTime: 30s
+  scaleDownUtilizationThreshold: "0.1"
+  zeroOrMaxNodeScaling: false
+`
+
+	tmpFile, err := os.CreateTemp("", "group-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(groupYAML)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply group: %s", output)
+}
+
+func waitForClusterAutoscaler() {
+	By("Waiting for cluster autoscaler pod to be Ready")
+	Eventually(func() string {
+		cmd := exec.Command("kubectl", "get", "pods",
+			"-l", "app.kubernetes.io/component=cluster-autoscaler",
+			"-n", namespace,
+			"-o", `jsonpath={.items[*].status.conditions[?(@.type=="Ready")].status}`)
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		return err
-	}, defaultTimeout, defaultInterval).Should(Succeed())
+		output, _ := utils.Run(cmd)
+		return strings.TrimSpace(output)
+	}, caTimeout, caInterval).Should(Equal("True"), "Cluster autoscaler pod should be Ready")
 
+	By("Waiting for cluster autoscaler to acquire leader lease")
+	Eventually(func() string {
+		cmd := exec.Command("kubectl", "get", "lease", "cluster-autoscaler",
+			"-n", "kube-system",
+			"-o", "jsonpath={.spec.holderIdentity}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, _ := utils.Run(cmd)
+		return strings.TrimSpace(output)
+	}, caTimeout, caInterval).ShouldNot(BeEmpty(), "Cluster autoscaler should hold leader lease")
+}
+
+func applyTestNodeManifests() {
+	By("Applying node CRs from example manifests")
+
+	cmd := exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+
+	// Wait for node CR to be created
 	Eventually(func() error {
 		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName, "-o", "name", "-n", "homelab-autoscaler-system")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
@@ -124,7 +300,7 @@ func waitForNodeScaleDown() {
 			return false
 		}
 		return strings.Contains(output, "ToBeDeletedByClusterAutoscaler")
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should get ToBeDeletedByClusterAutoscaler taint")
 
 	// Step 2: Wait for DeletionCandidateOfClusterAutoscaler taint
 	Eventually(func() bool {
@@ -135,7 +311,7 @@ func waitForNodeScaleDown() {
 			return false
 		}
 		return strings.Contains(output, "DeletionCandidateOfClusterAutoscaler")
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should get DeletionCandidateOfClusterAutoscaler taint")
 
 	// Step 3: Wait for SchedulingDisabled (spec.unschedulable = true)
 	Eventually(func() bool {
@@ -146,7 +322,7 @@ func waitForNodeScaleDown() {
 			return false
 		}
 		return strings.TrimSpace(output) == "true"
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should be marked unschedulable")
 
 	// Step 4: Wait for node status to become NotReady
 	Eventually(func() bool {
@@ -158,7 +334,7 @@ func waitForNodeScaleDown() {
 		}
 		status := strings.TrimSpace(output)
 		return status == "False" || status == "Unknown"
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should be marked NotReady")
 }
 
 func applyHelloWorldDeployment() {
