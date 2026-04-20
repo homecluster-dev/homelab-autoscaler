@@ -681,10 +681,10 @@ func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req
 	group := &infrav1alpha1.Group{}
 	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Id, Namespace: namespaceConfig.Get()}, group)
 	if err != nil {
-		// Node not found in any group, return empty string
-		logger.Info("Group not found", "group", req.Id)
-		return &pb.NodeGroupAutoscalingOptionsResponse{}, nil
-
+		logger.Info("Group not found, returning default options", "group", req.Id)
+		return &pb.NodeGroupAutoscalingOptionsResponse{
+			NodeGroupAutoscalingOptions: &pb.NodeGroupAutoscalingOptions{},
+		}, nil
 	}
 
 	scaleDownUtilizationThreshold, err := strconv.ParseFloat(group.Spec.ScaleDownUtilizationThreshold, 64)
