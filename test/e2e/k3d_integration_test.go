@@ -63,8 +63,11 @@ var _ = Describe("K3d Integration", func() {
 			By("Waiting for cluster autoscaler to be ready")
 			waitForClusterAutoscaler()
 
-			By("Applying group and node CRs")
-			applyTestManifests()
+			By("Applying group with aggressive scale-down settings")
+			applyTestGroupWithAggressiveScaleDown()
+
+			By("Applying node CRs")
+			applyTestNodeManifests()
 
 			By("Waiting for node to be scaled down")
 			waitForNodeScaleDown()
@@ -147,6 +150,39 @@ subsets:
 	}, caTimeout, caInterval).Should(BeTrue(), "Service forwarder should be created")
 }
 
+func applyTestGroupWithAggressiveScaleDown() {
+	By("Applying test group with aggressive scale-down settings")
+
+	groupYAML := `
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: group1
+  namespace: homelab-autoscaler-system
+spec:
+  ignoreDaemonSetsUtilization: true
+  maxNodeProvisionTime: 2m
+  scaleDownGpuUtilizationThreshold: "30"
+  scaleDownUnneededTime: 30s
+  scaleDownUnreadyTime: 30s
+  scaleDownUtilizationThreshold: "0.1"
+  zeroOrMaxNodeScaling: false
+`
+
+	tmpFile, err := os.CreateTemp("", "group-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(groupYAML)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply group: %s", output)
+}
+
 func waitForClusterAutoscaler() {
 	By("Waiting for cluster autoscaler to be ready")
 
@@ -170,29 +206,15 @@ func waitForClusterAutoscaler() {
 	}, caTimeout, caInterval).Should(BeTrue(), "Cluster autoscaler should be initialized")
 }
 
-func applyTestManifests() {
-	By("Applying group and node CRs from example manifests")
+func applyTestNodeManifests() {
+	By("Applying node CRs from example manifests")
 
-	manifestFiles := []string{
-		"./examples/k3d/group1.yaml",
-		"./examples/k3d/nodes1.yaml",
-	}
+	cmd := exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
 
-	for _, manifestFile := range manifestFiles {
-		cmd := exec.Command("kubectl", "apply", "-f", manifestFile)
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-	}
-
-	// Wait for resources to be created
-	Eventually(func() error {
-		cmd := exec.Command("kubectl", "get", "groups.infra.homecluster.dev", "group1", "-o", "name", "-n", "homelab-autoscaler-system")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		return err
-	}, defaultTimeout, defaultInterval).Should(Succeed())
-
+	// Wait for node CR to be created
 	Eventually(func() error {
 		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName, "-o", "name", "-n", "homelab-autoscaler-system")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
