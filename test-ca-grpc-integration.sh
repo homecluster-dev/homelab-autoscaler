@@ -77,8 +77,6 @@ create_cluster() {
     k3d cluster create "$CLUSTER_NAME" \
         --servers 3 \
         --agents 2 \
-        -p "80:80@loadbalancer" \
-        -p "443:443@loadbalancer" \
         --wait
     
     # Export kubeconfig

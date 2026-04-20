@@ -30,7 +30,9 @@ CLUSTER_NAME="ca-grpc-test"
 
 echo "1. Creating k3d cluster..."
 k3d cluster delete "$CLUSTER_NAME" 2>/dev/null || true
-k3d cluster create "$CLUSTER_NAME" --servers 2 --agents 2 --wait
+k3d cluster create "$CLUSTER_NAME" --servers 2 --agents 2 \
+    --k3s-arg "--tls-sans=127.0.0.1@server:*" \
+    --wait
 k3d kubeconfig get "$CLUSTER_NAME" > ./kubeconfig
 export KUBECONFIG=./kubeconfig
 
