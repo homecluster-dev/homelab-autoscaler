@@ -681,9 +681,9 @@ func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req
 	group := &infrav1alpha1.Group{}
 	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Id, Namespace: namespaceConfig.Get()}, group)
 	if err != nil {
-		logger.Info("Group not found, returning default options", "group", req.Id)
+		logger.Info("Group not found, returning nil to use CA defaults", "group", req.Id)
 		return &pb.NodeGroupAutoscalingOptionsResponse{
-			NodeGroupAutoscalingOptions: &pb.NodeGroupAutoscalingOptions{},
+			NodeGroupAutoscalingOptions: nil,
 		}, nil
 	}
 
