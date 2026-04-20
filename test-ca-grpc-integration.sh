@@ -91,11 +91,9 @@ create_cluster() {
 deploy_controller() {
     log_info "Deploying controller with Helm chart..."
     
-    cd "$PROJECT_ROOT"
-    
-    # Deploy using Helm chart
+    # Deploy using Helm chart (chart is in parent directory)
     log_info "Installing/upgrading Helm chart..."
-    helm upgrade --install homelab-autoscaler ./dist/chart \
+    helm upgrade --install homelab-autoscaler "$PROJECT_ROOT/dist/chart" \
         --namespace homelab-autoscaler-system \
         --create-namespace \
         --set controllerManager.container.image.tag=latest \
