@@ -40,6 +40,8 @@ const (
 	namespace       = "homelab-autoscaler-system"
 	defaultTimeout  = 600 * time.Second
 	defaultInterval = 5 * time.Second
+	caTimeout       = 120 * time.Second
+	caInterval      = 5 * time.Second
 )
 
 var _ = Describe("K3d Integration", func() {
@@ -54,6 +56,12 @@ var _ = Describe("K3d Integration", func() {
 
 	Context("Full workflow test", func() {
 		It("should complete the full scaling workflow", func() {
+
+			By("Setting up gRPC service forwarder")
+			setupServiceForwarder()
+
+			By("Waiting for cluster autoscaler to be ready")
+			waitForClusterAutoscaler()
 
 			By("Applying group and node CRs")
 			applyTestManifests()
@@ -80,6 +88,87 @@ var _ = Describe("K3d Integration", func() {
 		})
 	})
 })
+
+func setupServiceForwarder() {
+	By("Setting up gRPC service forwarder to localhost:50052")
+
+	hostIP := "host.k3d.internal"
+
+	fwdYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: homelab-autoscaler-grpc-local
+  namespace: %s
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    app.kubernetes.io/component: grpc-forwarder
+spec:
+  ports:
+  - port: 50051
+    targetPort: 50052
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: homelab-autoscaler-grpc-local
+  namespace: %s
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    app.kubernetes.io/component: grpc-forwarder
+subsets:
+- addresses:
+  - ip: %s
+  ports:
+  - port: 50052
+    protocol: TCP
+`, namespace, namespace, hostIP)
+
+	tmpFile, err := os.CreateTemp("", "fwd-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(fwdYAML)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply service forwarder: %s", output)
+
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "service", "homelab-autoscaler-grpc-local",
+			"-n", namespace, "-o", "name")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		_, err := utils.Run(cmd)
+		return err == nil
+	}, caTimeout, caInterval).Should(BeTrue(), "Service forwarder should be created")
+}
+
+func waitForClusterAutoscaler() {
+	By("Waiting for cluster autoscaler to be ready")
+
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "pods", "-l", "app.kubernetes.io/component=cluster-autoscaler",
+			"-o", "jsonpath={.items[*].status.phase}", "-n", namespace)
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(output, "Running")
+	}, caTimeout, caInterval).Should(BeTrue(), "Cluster autoscaler pod should be running")
+
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "logs", "-l", "app.kubernetes.io/component=cluster-autoscaler",
+			"-n", namespace, "--tail=100")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		return err == nil && strings.Contains(output, "Cluster Autoscaler")
+	}, caTimeout, caInterval).Should(BeTrue(), "Cluster autoscaler should be initialized")
+}
 
 func applyTestManifests() {
 	By("Applying group and node CRs from example manifests")
@@ -124,7 +213,7 @@ func waitForNodeScaleDown() {
 			return false
 		}
 		return strings.Contains(output, "ToBeDeletedByClusterAutoscaler")
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should get ToBeDeletedByClusterAutoscaler taint")
 
 	// Step 2: Wait for DeletionCandidateOfClusterAutoscaler taint
 	Eventually(func() bool {
@@ -135,7 +224,7 @@ func waitForNodeScaleDown() {
 			return false
 		}
 		return strings.Contains(output, "DeletionCandidateOfClusterAutoscaler")
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should get DeletionCandidateOfClusterAutoscaler taint")
 
 	// Step 3: Wait for SchedulingDisabled (spec.unschedulable = true)
 	Eventually(func() bool {
@@ -146,7 +235,7 @@ func waitForNodeScaleDown() {
 			return false
 		}
 		return strings.TrimSpace(output) == "true"
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should be marked unschedulable")
 
 	// Step 4: Wait for node status to become NotReady
 	Eventually(func() bool {
@@ -158,7 +247,7 @@ func waitForNodeScaleDown() {
 		}
 		status := strings.TrimSpace(output)
 		return status == "False" || status == "Unknown"
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should be marked NotReady")
 }
 
 func applyHelloWorldDeployment() {
