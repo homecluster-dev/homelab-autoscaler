@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	clusterName     = "homelab-autoscaler-k3d-e2e"
+	clusterName     = "homelab-autoscaler"
 	grpcServerPort  = "50052"
 	kubeconfigPath  = "./kubeconfig"
 	serverPidFile   = "/tmp/homelab-autoscaler-server.pid"
