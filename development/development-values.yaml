@@ -9,7 +9,7 @@ clusterAutoscaler:
   # Cluster autoscaler image configuration
   image:
     repository: registry.k8s.io/autoscaling/cluster-autoscaler
-    tag: v1.28.2
+    tag: v1.35.0@sha256:2fc9433dd3b47baef0e68d6b1110b770a3c93db10c7bead4c5bc6cb21c72b875
     pullPolicy: IfNotPresent
   
   # gRPC provider configuration (points to local service forwarder)
