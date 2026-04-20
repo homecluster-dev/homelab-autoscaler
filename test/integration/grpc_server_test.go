@@ -23,6 +23,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -449,13 +451,19 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				// Verify response
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp).NotTo(BeNil())
-				Expect(resp.NodeInfo).NotTo(BeNil())
-				Expect(resp.NodeInfo.Name).To(ContainSubstring("test-group-template"))
-				Expect(resp.NodeInfo.Spec.Unschedulable).To(BeFalse())
+				Expect(resp.NodeBytes).NotTo(BeEmpty())
+
+				// Unmarshal the node bytes to verify contents
+				templateNode := &corev1.Node{}
+				decoder := serializer.NewCodecFactory(scheme.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
+				_, _, err = decoder.Decode(resp.NodeBytes, nil, templateNode)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(templateNode.Name).To(ContainSubstring("test-group-template"))
+				Expect(templateNode.Spec.Unschedulable).To(BeFalse())
 
 				// Verify template node has proper conditions
-				Expect(resp.NodeInfo.Status.Conditions).To(HaveLen(5))
-				readyCondition := resp.NodeInfo.Status.Conditions[0]
+				Expect(templateNode.Status.Conditions).To(HaveLen(5))
+				readyCondition := templateNode.Status.Conditions[0]
 				Expect(readyCondition.Type).To(Equal(corev1.NodeReady))
 				Expect(readyCondition.Status).To(Equal(corev1.ConditionTrue))
 			})
@@ -482,9 +490,16 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp).NotTo(BeNil())
-				Expect(resp.NodeInfo).NotTo(BeNil())
+				Expect(resp.NodeBytes).NotTo(BeEmpty())
+
+				// Unmarshal the node bytes to verify contents
+				templateNode := &corev1.Node{}
+				decoder := serializer.NewCodecFactory(scheme.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
+				_, _, err = decoder.Decode(resp.NodeBytes, nil, templateNode)
+				Expect(err).NotTo(HaveOccurred())
+
 				// Ensure the custom taint is not present in the template node's taints
-				for _, t := range resp.NodeInfo.Spec.Taints {
+				for _, t := range templateNode.Spec.Taints {
 					Expect(t.Key).NotTo(Equal("custom/taint"))
 				}
 			})
