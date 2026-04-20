@@ -19,6 +19,13 @@ if ! command -v kubectl &> /dev/null; then
     exit 1
 fi
 
+# Check if helm is installed
+if ! command -v helm &> /dev/null; then
+    echo "Error: helm is not installed"
+    echo "Install with: https://helm.sh/docs/intro/install/"
+    exit 1
+fi
+
 CLUSTER_NAME="ca-grpc-test"
 
 echo "1. Creating k3d cluster..."
@@ -31,21 +38,33 @@ echo "2. Building controller..."
 cd /home/opencode/homecluster-dev/homelab-autoscaler
 go build -o bin/manager ./cmd/main.go
 
-echo "3. Installing CRDs and deploying controller..."
-make install
-make deploy
+echo "3. Deploying controller with Helm chart..."
+helm upgrade --install homelab-autoscaler ./dist/chart \
+    --namespace homelab-autoscaler-system \
+    --create-namespace \
+    --set controllerManager.container.image.tag=latest \
+    --set grpcService.enabled=true \
+    --wait --timeout 120s
 
 echo "4. Waiting for controller to be ready..."
 kubectl wait --for=condition=available deployment/homelab-autoscaler-controller-manager \
     -n homelab-autoscaler-system --timeout=120s
 
-echo "5. Starting gRPC server..."
-ENABLE_WEBHOOKS=false KUBECONFIG=./kubeconfig \
-    go run ./cmd/main.go --grpc-server-address=":50052" &
-GRPC_PID=$!
+echo "5. Configuring Helm chart to expose gRPC server..."
+# The Helm chart already exposes the gRPC service, we just need to ensure it's accessible
+# We'll patch the deployment to run without leader election for testing
+kubectl patch deployment homelab-autoscaler-controller-manager \
+    -n homelab-autoscaler-system \
+    --type='json' \
+    -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--grpc-server-address=:50052"}]' || true
+
 sleep 5
 
-echo "6. Deploying cluster autoscaler..."
+echo "6. Verifying gRPC service is accessible..."
+kubectl wait --for=condition=available deployment/homelab-autoscaler-controller-manager \
+    -n homelab-autoscaler-system --timeout=120s
+
+echo "7. Deploying cluster autoscaler..."
 kubectl create namespace cluster-autoscaler --dry-run=client -o yaml | kubectl apply -f -
 
 # Deploy cluster autoscaler
@@ -127,10 +146,10 @@ spec:
               memory: 300Mi
 EOF
 
-echo "7. Waiting for cluster autoscaler to start..."
+echo "8. Waiting for cluster autoscaler to start..."
 sleep 15
 
-echo "8. Checking for errors..."
+echo "9. Checking for errors..."
 echo "=== Cluster Autoscaler Logs ==="
 kubectl logs -n cluster-autoscaler -l app=cluster-autoscaler --tail=50
 

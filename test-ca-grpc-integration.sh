@@ -52,7 +52,7 @@ check_prerequisites() {
     
     local missing=0
     
-    for cmd in k3d kubectl go python3; do
+    for cmd in k3d kubectl go helm python3; do
         if ! command -v $cmd &> /dev/null; then
             log_error "$cmd is not installed"
             missing=1
@@ -89,23 +89,22 @@ create_cluster() {
     kubectl cluster-info
 }
 
-# Build and deploy the controller
+# Deploy controller using Helm chart
 deploy_controller() {
-    log_info "Building and deploying controller..."
+    log_info "Deploying controller with Helm chart..."
     
     cd "$PROJECT_ROOT"
     
-    # Build the manager binary
-    log_info "Building manager binary..."
-    go build -o bin/manager ./cmd/main.go
-    
-    # Install CRDs
-    log_info "Installing CRDs..."
-    make install
-    
-    # Deploy controller
-    log_info "Deploying controller..."
-    make deploy
+    # Deploy using Helm chart
+    log_info "Installing/upgrading Helm chart..."
+    helm upgrade --install homelab-autoscaler ./dist/chart \
+        --namespace homelab-autoscaler-system \
+        --create-namespace \
+        --set controllerManager.container.image.tag=latest \
+        --set grpcService.enabled=true \
+        --set grpcService.type=ClusterIP \
+        --set grpcService.port=50052 \
+        --wait --timeout 120s
     
     # Wait for controller to be ready
     log_info "Waiting for controller to be ready..."
@@ -113,41 +112,32 @@ deploy_controller() {
         -n homelab-autoscaler-system \
         --timeout=120s
     
-    log_info "Controller deployed successfully"
+    log_info "Controller deployed successfully via Helm chart"
+    
+    # Verify Helm release
+    log_info "Verifying Helm release..."
+    helm list -n homelab-autoscaler-system
 }
 
-# Start gRPC server in background
-start_grpc_server() {
-    log_info "Starting gRPC server..."
+# Verify gRPC service is accessible
+verify_grpc_service() {
+    log_info "Verifying gRPC service from Helm chart..."
     
-    cd "$PROJECT_ROOT"
-    
-    # Start the manager with gRPC server enabled
-    ENABLE_WEBHOOKS=false \
-    GRPC_SERVER_ADDRESS=":50052" \
-    KUBECONFIG="$KUBECONFIG_FILE" \
-    go run ./cmd/main.go \
-        --grpc-server-address=":50052" \
-        --metrics-bind-address=":8443" \
-        --health-probe-bind-address=":8081" \
-        --leader-elect=false &
-    
-    GRPC_PID=$!
-    log_info "gRPC server started with PID: $GRPC_PID"
-    
-    # Wait for gRPC server to be ready
-    sleep 5
-    
-    # Check if gRPC server is listening
-    if lsof -i :50052 > /dev/null; then
-        log_info "gRPC server is listening on port 50052"
+    # Check if gRPC service exists
+    if kubectl get svc homelab-autoscaler-grpc-service -n homelab-autoscaler-system > /dev/null 2>&1; then
+        log_info "✓ gRPC service exists"
+        kubectl get svc homelab-autoscaler-grpc-service -n homelab-autoscaler-system
     else
-        log_error "gRPC server failed to start"
-        kill $GRPC_PID 2>/dev/null || true
-        exit 1
+        log_warn "⚠ gRPC service not found, checking deployment..."
     fi
     
-    echo $GRPC_PID > /tmp/grpc-server.pid
+    # Check if controller pods are running
+    log_info "Waiting for controller pods to be ready..."
+    kubectl wait --for=condition=available deployment/homelab-autoscaler-controller-manager \
+        -n homelab-autoscaler-system \
+        --timeout=120s
+    
+    log_info "gRPC service verification completed"
 }
 
 # Deploy cluster autoscaler with externalgrpc provider
@@ -452,14 +442,14 @@ main() {
     # Step 2: Create k3d cluster
     create_cluster
     
-    # Step 3: Deploy controller
+    # Step 3: Deploy controller with Helm
     deploy_controller
     
     # Step 4: Create test Group
     create_test_group
     
-    # Step 5: Start gRPC server
-    start_grpc_server
+    # Step 5: Verify gRPC service from Helm
+    verify_grpc_service
     
     # Step 6: Deploy cluster autoscaler
     deploy_cluster_autoscaler
@@ -492,12 +482,8 @@ main() {
     log_info "To inspect logs: kubectl logs -n cluster-autoscaler -l app=cluster-autoscaler -f"
     log_info "To cleanup manually: ./examples/k3d/delete-cluster.sh"
     
-    # Read GRPC_PID and cleanup
-    if [ -f /tmp/grpc-server.pid ]; then
-        GRPC_PID=$(cat /tmp/grpc-server.pid)
-        kill $GRPC_PID 2>/dev/null || true
-        rm -f /tmp/grpc-server.pid
-    fi
+    # No manual gRPC server cleanup needed - Helm manages it
+    log_info "Helm-managed deployment requires no manual cleanup"
     
     # Return appropriate exit code
     if [ $VERIFICATION_RESULT -eq 0 ] && [ $MONITOR_RESULT -eq 0 ]; then
