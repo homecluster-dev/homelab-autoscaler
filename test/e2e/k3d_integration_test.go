@@ -93,21 +93,8 @@ var _ = Describe("K3d Integration", func() {
 	})
 })
 
-func getK3dGatewayIP() string {
-	cmd := exec.Command("docker", "network", "inspect", "k3d-"+clusterName, "-f", "{{(index .IPAM.Config 0).Gateway}}")
-	output, err := utils.Run(cmd)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(output)
-}
-
 func setupServiceForwarder() {
-	By("Setting up gRPC service forwarder to localhost:50052")
-
-	gatewayIP := getK3dGatewayIP()
-	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP")
-	By(fmt.Sprintf("Using k3d gateway IP: %s", gatewayIP))
+	By("Setting up gRPC service forwarder using ExternalName to host.k3d.internal:50052")
 
 	fwdYAML := fmt.Sprintf(`
 apiVersion: v1
@@ -119,26 +106,12 @@ metadata:
     app.kubernetes.io/name: homelab-autoscaler
     app.kubernetes.io/component: grpc-forwarder
 spec:
-  ports:
-  - port: 50051
-    targetPort: 50052
-    protocol: TCP
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: homelab-autoscaler-grpc-local
-  namespace: %s
-  labels:
-    app.kubernetes.io/name: homelab-autoscaler
-    app.kubernetes.io/component: grpc-forwarder
-subsets:
-- addresses:
-  - ip: %s
+  type: ExternalName
+  externalName: host.k3d.internal
   ports:
   - port: 50052
     protocol: TCP
-`, namespace, namespace, gatewayIP)
+`, namespace)
 
 	tmpFile, err := os.CreateTemp("", "fwd-*.yaml")
 	Expect(err).NotTo(HaveOccurred())

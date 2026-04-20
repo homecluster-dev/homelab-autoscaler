@@ -14,7 +14,7 @@ clusterAutoscaler:
   
   # gRPC provider configuration (points to local service forwarder)
   grpcProvider:
-    endpoint: "homelab-autoscaler-grpc-local:50051"
+    endpoint: "homelab-autoscaler-grpc-local:50052"
   
   # Scaling policies - same as production
   scaleDownDelay: "10m"
