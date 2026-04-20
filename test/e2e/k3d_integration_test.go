@@ -97,16 +97,20 @@ func getK3dGatewayIP() string {
 	cmd := exec.Command("docker", "network", "inspect", "k3d-"+clusterName, "-f", "{{(index .IPAM.Config 0).Gateway}}")
 	output, err := utils.Run(cmd)
 	if err != nil {
+		By(fmt.Sprintf("Warning: docker network inspect failed: %v", err))
 		return ""
 	}
-	return strings.TrimSpace(output)
+	gatewayIP := strings.TrimSpace(output)
+	By(fmt.Sprintf("Found k3d gateway IP: %s", gatewayIP))
+	return gatewayIP
 }
 
 func setupServiceForwarder() {
 	By("Setting up gRPC service forwarder to localhost:50052")
 
 	gatewayIP := getK3dGatewayIP()
-	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP")
+	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP. "+
+		"Ensure k3d cluster '%s' is running: k3d cluster create '%s'", clusterName, clusterName)
 	By(fmt.Sprintf("Using k3d gateway IP: %s", gatewayIP))
 
 	fwdYAML := fmt.Sprintf(`
