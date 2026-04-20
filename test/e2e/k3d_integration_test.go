@@ -61,6 +61,9 @@ var _ = Describe("K3d Integration", func() {
 			By("Setting up gRPC service forwarder")
 			setupServiceForwarder()
 
+			By("Setting up host-internal service")
+			setupHostInternalService()
+
 			By("Waiting for cluster autoscaler to be ready")
 			waitForClusterAutoscaler()
 
@@ -164,6 +167,52 @@ subsets:
 		_, err := utils.Run(cmd)
 		return err == nil
 	}, caTimeout, caInterval).Should(BeTrue(), "Service forwarder should be created")
+}
+
+func setupHostInternalService() {
+	By("Setting up host-internal service for startup/shutdown pods")
+
+	gatewayIP := getK3dGatewayIP()
+	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP")
+
+	hostSvcYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: host-internal
+  namespace: %s
+spec:
+  clusterIP: None
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: host-internal
+  namespace: %s
+subsets:
+- addresses:
+  - ip: %s
+  ports:
+  - port: 8080
+    protocol: TCP
+`, namespace, namespace, gatewayIP)
+
+	tmpFile, err := os.CreateTemp("", "host-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(hostSvcYAML)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply host-internal service: %s", output)
 }
 
 func applyTestGroupWithAggressiveScaleDown() {
