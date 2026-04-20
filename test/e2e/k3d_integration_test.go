@@ -249,26 +249,26 @@ spec:
 }
 
 func waitForClusterAutoscaler() {
-	By("Waiting for cluster autoscaler to be ready")
-
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "pods", "-l", "app.kubernetes.io/component=cluster-autoscaler",
-			"-o", "jsonpath={.items[*].status.phase}", "-n", namespace)
+	By("Waiting for cluster autoscaler pod to be Ready")
+	Eventually(func() string {
+		cmd := exec.Command("kubectl", "get", "pods",
+			"-l", "app.kubernetes.io/component=cluster-autoscaler",
+			"-n", namespace,
+			"-o", `jsonpath={.items[*].status.conditions[?(@.type=="Ready")].status}`)
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			return false
-		}
-		return strings.Contains(output, "Running")
-	}, caTimeout, caInterval).Should(BeTrue(), "Cluster autoscaler pod should be running")
+		output, _ := utils.Run(cmd)
+		return strings.TrimSpace(output)
+	}, caTimeout, caInterval).Should(Equal("True"), "Cluster autoscaler pod should be Ready")
 
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "logs", "-l", "app.kubernetes.io/component=cluster-autoscaler",
-			"-n", namespace, "--tail=100")
+	By("Waiting for cluster autoscaler to acquire leader lease")
+	Eventually(func() string {
+		cmd := exec.Command("kubectl", "get", "lease", "cluster-autoscaler",
+			"-n", "kube-system",
+			"-o", "jsonpath={.spec.holderIdentity}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		return err == nil && strings.Contains(output, "Cluster Autoscaler")
-	}, caTimeout, caInterval).Should(BeTrue(), "Cluster autoscaler should be initialized")
+		output, _ := utils.Run(cmd)
+		return strings.TrimSpace(output)
+	}, caTimeout, caInterval).ShouldNot(BeEmpty(), "Cluster autoscaler should hold leader lease")
 }
 
 func applyTestNodeManifests() {
