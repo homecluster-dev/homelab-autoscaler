@@ -39,6 +39,9 @@ spec:
       - name: config
         configMapName: shutdown-config
         mountPath: /config
+      - name: auth
+        secretName: auth-secrets
+        mountPath: /auth
 ---
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -81,6 +84,9 @@ spec:
       - name: config
         configMapName: shutdown-config
         mountPath: /config
+      - name: auth
+        secretName: auth-secrets
+        mountPath: /auth
 ---
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
