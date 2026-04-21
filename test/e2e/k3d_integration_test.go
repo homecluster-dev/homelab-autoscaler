@@ -55,6 +55,35 @@ var _ = Describe("K3d Integration", func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
+	Context("Volumes and ServiceAccount support", func() {
+		It("should verify jobs have ServiceAccount, ConfigMap and Secret volumes", func() {
+
+			By("Setting up test ConfigMaps and Secrets")
+			setupTestConfigMapsAndSecrets()
+
+			By("Applying test node manifests with volumes and ServiceAccount")
+			applyTestNodeManifestsWithVolumes()
+
+			By("Starting the node to trigger startup job creation")
+			startTestNode()
+
+			By("Verifying startup job has correct ServiceAccount")
+			verifyStartupJobServiceAccount()
+
+			By("Verifying startup job has ConfigMap volume")
+			verifyStartupJobConfigMapVolume()
+
+			By("Waiting for startup job to complete")
+			waitForStartupJobCompletion()
+
+			By("Verifying shutdown job has Secret volume")
+			verifyShutdownJobSecretVolume()
+
+			By("Cleaning up test resources")
+			cleanupTestResources()
+		})
+	})
+
 	Context("Full workflow test", func() {
 		It("should complete the full scaling workflow", func() {
 
@@ -409,4 +438,217 @@ func waitForNodeShutdown() {
 		// Node should be powered off or in process of shutting down
 		return powerState == "off" || powerState == "shutting-down"
 	}, 600*time.Second, 10*time.Second).Should(BeTrue())
+}
+
+func setupTestConfigMapsAndSecrets() {
+	// Create test ConfigMap for startup config
+	startupConfigCM := `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: startup-config
+  namespace: homelab-autoscaler-system
+data:
+  startup-config.sh: |
+    echo "Starting node..."
+`
+	tmpFile, err := os.CreateTemp("", "startup-cm-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(startupConfigCM)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply startup ConfigMap: %s", output)
+
+	// Create test ConfigMap for shutdown config
+	shutdownConfigCM := `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shutdown-config
+  namespace: homelab-autoscaler-system
+data:
+  shutdown-config.sh: |
+    echo "Shutting down node..."
+`
+	tmpFile, err = os.CreateTemp("", "shutdown-cm-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(shutdownConfigCM)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd = exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply shutdown ConfigMap: %s", output)
+
+	// Create test Secret for authentication
+	authSecret := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: auth-secrets
+  namespace: homelab-autoscaler-system
+type: Opaque
+stringData:
+  token: test-token-12345
+`
+	tmpFile, err = os.CreateTemp("", "auth-secret-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(authSecret)
+	Expect(err).NotTo(HaveOccurred())
+	tmpFile.Close()
+
+	cmd = exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	output, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply auth Secret: %s", output)
+}
+
+func applyTestNodeManifestsWithVolumes() {
+	By("Applying node CR with volumes and ServiceAccount from nodes1.yaml")
+
+	cmd := exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+
+	// Wait for node CR to be created
+	Eventually(func() error {
+		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName, "-o", "name", "-n", "homelab-autoscaler-system")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		_, err := utils.Run(cmd)
+		return err
+	}, defaultTimeout, defaultInterval).Should(Succeed())
+}
+
+func startTestNode() {
+	By("Patching node to trigger startup")
+
+	// Patch the node to powerState: on if it's not already
+	patch := `{"spec":{"powerState":"on"}}`
+	cmd := exec.Command("kubectl", "patch", "nodes.infra.homecluster.dev", nodeName,
+		"-n", "homelab-autoscaler-system", "--type=merge", "-p", patch)
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+func verifyStartupJobServiceAccount() {
+	By("Verifying startup job has correct ServiceAccount")
+
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "jobs",
+			"-l", "type=startup",
+			"-n", "homelab-autoscaler-system",
+			"-o", "jsonpath={.items[*].spec.template.spec.serviceAccountName}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(output, "homelab-autoscaler")
+	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
+		"Startup job should have ServiceAccount 'homelab-autoscaler'")
+}
+
+func verifyStartupJobConfigMapVolume() {
+	By("Verifying startup job has ConfigMap volume mounted")
+
+	Eventually(func() bool {
+		// Check for ConfigMap volume
+		cmd := exec.Command("kubectl", "get", "jobs",
+			"-l", "type=startup",
+			"-n", "homelab-autoscaler-system",
+			"-o", "jsonpath={.items[*].spec.template.spec.volumes}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+
+		// Check for volume mount
+		cmd = exec.Command("kubectl", "get", "jobs",
+			"-l", "type=startup",
+			"-n", "homelab-autoscaler-system",
+			"-o", "jsonpath={.items[*].spec.template.spec.containers[*].volumeMounts}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		volumeMountOutput, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+
+		return strings.Contains(output, "configMap") && strings.Contains(volumeMountOutput, "config")
+	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
+		"Startup job should have ConfigMap volume mounted")
+}
+
+func waitForStartupJobCompletion() {
+	By("Waiting for startup job to complete")
+
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "jobs",
+			"-l", "type=startup",
+			"-n", "homelab-autoscaler-system",
+			"-o", "jsonpath={.items[*].status.succeeded}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(output, "1")
+	}, 120*time.Second, 5*time.Second).Should(BeTrue(),
+		"Startup job should complete successfully")
+}
+
+func verifyShutdownJobSecretVolume() {
+	By("Verifying shutdown job has Secret volume mounted")
+
+	// Trigger shutdown first
+	patch := `{"spec":{"powerState":"off"}}`
+	cmd := exec.Command("kubectl", "patch", "nodes.infra.homecluster.dev", nodeName,
+		"-n", "homelab-autoscaler-system", "--type=merge", "-p", patch)
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+
+	// Wait for shutdown job and verify Secret volume
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "jobs",
+			"-l", "type=shutdown",
+			"-n", "homelab-autoscaler-system",
+			"-o", "jsonpath={.items[*].spec.template.spec.volumes}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			return false
+		}
+
+		// Check for Secret volume source
+		return strings.Contains(output, "secret") && strings.Contains(output, "auth-secrets")
+	}, 120*time.Second, 5*time.Second).Should(BeTrue(),
+		"Shutdown job should have Secret volume 'auth-secrets' mounted")
+}
+
+func cleanupTestResources() {
+	By("Cleaning up test ConfigMaps and Secrets")
+
+	cmd := exec.Command("kubectl", "delete", "configmap", "startup-config", "shutdown-config",
+		"-n", "homelab-autoscaler-system", "--ignore-not-found")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, _ = utils.Run(cmd)
+
+	cmd = exec.Command("kubectl", "delete", "secret", "auth-secrets",
+		"-n", "homelab-autoscaler-system", "--ignore-not-found")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, _ = utils.Run(cmd)
 }

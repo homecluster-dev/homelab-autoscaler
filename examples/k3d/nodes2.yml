@@ -18,12 +18,26 @@ spec:
       - /bin/sh
     args:
       - -c
-      - curl http://host.k3d.internal:8080/start?vm=k3d-worker-2-0
+      - |
+        export TOKEN=$(cat /secrets/token)
+        curl -H "Authorization: Bearer $TOKEN" http://host.k3d.internal:8080/start?vm=k3d-worker-2-0
+    serviceAccount: homelab-autoscaler
+    volumes:
+      - name: secrets
+        secretName: auth-secrets
+        mountPath: /secrets
   shutdownPodSpec:
     image: curlimages/curl:latest
     command:
       - /bin/sh
     args:
       - -c
-      - curl http://host.k3d.internal:8080/stop?vm=k3d-worker-2-0
+      - |
+        export TOKEN=$(cat /secrets/token)
+        curl -H "Authorization: Bearer $TOKEN" http://host.k3d.internal:8080/stop?vm=k3d-worker-2-0
+    serviceAccount: homelab-autoscaler
+    volumes:
+      - name: secrets
+        secretName: auth-secrets
+        mountPath: /secrets
 ---
