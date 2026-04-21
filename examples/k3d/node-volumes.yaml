@@ -1,0 +1,45 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: startup-config
+  namespace: homelab-autoscaler-system
+  labels:
+    app: homelab-autoscaler
+    description: "Startup script for node initialization"
+data:
+  startup-config.sh: |
+    #!/bin/sh
+    echo "Starting node..."
+    # Add any custom startup commands here
+    echo "Node startup complete"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shutdown-config
+  namespace: homelab-autoscaler-system
+  labels:
+    app: homelab-autoscaler
+    description: "Shutdown script for node cleanup"
+data:
+  shutdown-config.sh: |
+    #!/bin/sh
+    echo "Shutting down node..."
+    # Add any custom shutdown commands here
+    echo "Node shutdown complete"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: auth-secrets
+  namespace: homelab-autoscaler-system
+  labels:
+    app: homelab-autoscaler
+    description: "Authentication secrets for node operations"
+type: Opaque
+stringData:
+  token: "your-auth-token-here"
+  # Add other secrets as needed
+  # username: "your-username"
+  # password: "your-password"
