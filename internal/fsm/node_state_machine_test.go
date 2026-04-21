@@ -913,3 +913,341 @@ func TestNodeStateMachine_ShutdownNodeWithCleanup(t *testing.T) {
 		assert.NotEqual(t, "test-node-shutdown-old", newJob.Name) // Should be a new job
 	})
 }
+
+func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	t.Run("startup job uses default ServiceAccount when not specified", func(t *testing.T) {
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.StartNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+		assert.Equal(t, "default", job.Spec.Template.Spec.ServiceAccountName)
+	})
+
+	t.Run("startup job uses specified ServiceAccount", func(t *testing.T) {
+		serviceAccountName := "custom-service-account"
+		node := CreateTestNode("test-node-sa", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node.Spec.StartupPodSpec.ServiceAccount = &serviceAccountName
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.StartNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+		assert.Equal(t, "custom-service-account", job.Spec.Template.Spec.ServiceAccountName)
+	})
+
+	t.Run("startup job mounts Secret volume", func(t *testing.T) {
+		node := CreateTestNode("test-node-secret", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node.Spec.StartupPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+			{
+				Name:       "credentials",
+				MountPath:  "/etc/credentials",
+				SecretName: "my-secret",
+			},
+		}
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.StartNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+
+		// Verify volume is created
+		assert.Len(t, job.Spec.Template.Spec.Volumes, 1)
+		assert.Equal(t, "credentials", job.Spec.Template.Spec.Volumes[0].Name)
+		assert.NotNil(t, job.Spec.Template.Spec.Volumes[0].Secret)
+		assert.Equal(t, "my-secret", job.Spec.Template.Spec.Volumes[0].Secret.SecretName)
+
+		// Verify volume mount is created
+		assert.Len(t, job.Spec.Template.Spec.Containers[0].VolumeMounts, 1)
+		assert.Equal(t, "credentials", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name)
+		assert.Equal(t, "/etc/credentials", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath)
+		assert.True(t, job.Spec.Template.Spec.Containers[0].VolumeMounts[0].ReadOnly)
+	})
+
+	t.Run("startup job mounts ConfigMap volume", func(t *testing.T) {
+		node := CreateTestNode("test-node-configmap", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node.Spec.StartupPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+			{
+				Name:          "config",
+				MountPath:     "/etc/config",
+				ConfigMapName: "my-configmap",
+			},
+		}
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.StartNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+
+		// Verify volume is created
+		assert.Len(t, job.Spec.Template.Spec.Volumes, 1)
+		assert.Equal(t, "config", job.Spec.Template.Spec.Volumes[0].Name)
+		assert.NotNil(t, job.Spec.Template.Spec.Volumes[0].ConfigMap)
+		assert.Equal(t, "my-configmap", job.Spec.Template.Spec.Volumes[0].ConfigMap.Name)
+
+		// Verify volume mount is created
+		assert.Len(t, job.Spec.Template.Spec.Containers[0].VolumeMounts, 1)
+		assert.Equal(t, "config", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name)
+		assert.Equal(t, "/etc/config", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath)
+		assert.True(t, job.Spec.Template.Spec.Containers[0].VolumeMounts[0].ReadOnly)
+	})
+
+	t.Run("startup job mounts multiple volumes", func(t *testing.T) {
+		node := CreateTestNode("test-node-multi", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node.Spec.StartupPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+			{
+				Name:       "credentials",
+				MountPath:  "/credentials",
+				SecretName: "hetzner-credentials",
+			},
+			{
+				Name:          "scripts",
+				MountPath:     "/scripts",
+				ConfigMapName: "hcloud-scripts",
+			},
+		}
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.StartNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+
+		// Verify both volumes are created
+		assert.Len(t, job.Spec.Template.Spec.Volumes, 2)
+
+		volumeNames := make(map[string]bool)
+		for _, vol := range job.Spec.Template.Spec.Volumes {
+			volumeNames[vol.Name] = true
+		}
+		assert.True(t, volumeNames["credentials"])
+		assert.True(t, volumeNames["scripts"])
+
+		// Verify both volume mounts are created
+		assert.Len(t, job.Spec.Template.Spec.Containers[0].VolumeMounts, 2)
+
+		mountPaths := make(map[string]bool)
+		for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
+			mountPaths[mount.MountPath] = true
+		}
+		assert.True(t, mountPaths["/credentials"])
+		assert.True(t, mountPaths["/scripts"])
+	})
+
+	t.Run("shutdown job uses default ServiceAccount when not specified", func(t *testing.T) {
+		node := CreateTestNode("test-node-shutdown-sa", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.ShutdownNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+		assert.Equal(t, "default", job.Spec.Template.Spec.ServiceAccountName)
+	})
+
+	t.Run("shutdown job uses specified ServiceAccount", func(t *testing.T) {
+		serviceAccountName := "shutdown-service-account"
+		node := CreateTestNode("test-node-shutdown-sa2", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node.Spec.ShutdownPodSpec.ServiceAccount = &serviceAccountName
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.ShutdownNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+		assert.Equal(t, "shutdown-service-account", job.Spec.Template.Spec.ServiceAccountName)
+	})
+
+	t.Run("shutdown job mounts Secret volume", func(t *testing.T) {
+		node := CreateTestNode("test-node-shutdown-secret", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node.Spec.ShutdownPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+			{
+				Name:       "credentials",
+				MountPath:  "/etc/credentials",
+				SecretName: "shutdown-secret",
+			},
+		}
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.ShutdownNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+
+		// Verify volume is created
+		assert.Len(t, job.Spec.Template.Spec.Volumes, 1)
+		assert.Equal(t, "credentials", job.Spec.Template.Spec.Volumes[0].Name)
+		assert.NotNil(t, job.Spec.Template.Spec.Volumes[0].Secret)
+		assert.Equal(t, "shutdown-secret", job.Spec.Template.Spec.Volumes[0].Secret.SecretName)
+
+		// Verify volume mount is created
+		assert.Len(t, job.Spec.Template.Spec.Containers[0].VolumeMounts, 1)
+		assert.Equal(t, "credentials", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name)
+		assert.Equal(t, "/etc/credentials", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath)
+		assert.True(t, job.Spec.Template.Spec.Containers[0].VolumeMounts[0].ReadOnly)
+	})
+
+	t.Run("shutdown job mounts ConfigMap volume", func(t *testing.T) {
+		node := CreateTestNode("test-node-shutdown-configmap", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node.Spec.ShutdownPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+			{
+				Name:          "config",
+				MountPath:     "/etc/config",
+				ConfigMapName: "shutdown-configmap",
+			},
+		}
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.ShutdownNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+
+		// Verify volume is created
+		assert.Len(t, job.Spec.Template.Spec.Volumes, 1)
+		assert.Equal(t, "config", job.Spec.Template.Spec.Volumes[0].Name)
+		assert.NotNil(t, job.Spec.Template.Spec.Volumes[0].ConfigMap)
+		assert.Equal(t, "shutdown-configmap", job.Spec.Template.Spec.Volumes[0].ConfigMap.Name)
+
+		// Verify volume mount is created
+		assert.Len(t, job.Spec.Template.Spec.Containers[0].VolumeMounts, 1)
+		assert.Equal(t, "config", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name)
+		assert.Equal(t, "/etc/config", job.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath)
+		assert.True(t, job.Spec.Template.Spec.Containers[0].VolumeMounts[0].ReadOnly)
+	})
+
+	t.Run("shutdown job uses volumes and ServiceAccount together", func(t *testing.T) {
+		serviceAccountName := "shutdown-sa"
+		node := CreateTestNode("test-node-shutdown-combined", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node.Spec.ShutdownPodSpec.ServiceAccount = &serviceAccountName
+		node.Spec.ShutdownPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+			{
+				Name:       "credentials",
+				MountPath:  "/credentials",
+				SecretName: "shutdown-creds",
+			},
+			{
+				Name:          "scripts",
+				MountPath:     "/scripts",
+				ConfigMapName: "shutdown-scripts",
+			},
+		}
+
+		mockCoord := NewMockCoordinationManager()
+		fakeClient := CreateFakeClient(scheme, node)
+
+		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+
+		err := fsm.ShutdownNode()
+		assert.NoError(t, err)
+
+		jobs := &batchv1.JobList{}
+		err = fakeClient.List(context.TODO(), jobs)
+		assert.NoError(t, err)
+		assert.Len(t, jobs.Items, 1)
+
+		job := jobs.Items[0]
+
+		// Verify ServiceAccount is set
+		assert.Equal(t, "shutdown-sa", job.Spec.Template.Spec.ServiceAccountName)
+
+		// Verify volumes are created
+		assert.Len(t, job.Spec.Template.Spec.Volumes, 2)
+
+		// Verify volume mounts are created
+		assert.Len(t, job.Spec.Template.Spec.Containers[0].VolumeMounts, 2)
+
+		// Verify all volume mounts are read-only
+		for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
+			assert.True(t, mount.ReadOnly)
+		}
+	})
+}
