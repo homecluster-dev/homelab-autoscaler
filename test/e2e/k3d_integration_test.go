@@ -152,22 +152,22 @@ metadata:
   name: homelab-autoscaler-grpc-local
   namespace: %s
   labels:
-    app.kubernetes.io/name: homelab-autoscaler
-    app.kubernetes.io/component: grpc-forwarder
+    app: homelab-autoscaler
+    type: grpc-service-forwarder
 spec:
   ports:
-  - port: 50052
+  - port: 50051
     targetPort: 50052
     protocol: TCP
+    name: grpc
+  selector:
+    app: cluster-autoscaler
 ---
 apiVersion: v1
 kind: Endpoints
 metadata:
   name: homelab-autoscaler-grpc-local
   namespace: %s
-  labels:
-    app.kubernetes.io/name: homelab-autoscaler
-    app.kubernetes.io/component: grpc-forwarder
 subsets:
 - addresses:
   - ip: %s
@@ -176,7 +176,7 @@ subsets:
     protocol: TCP
 `, namespace, namespace, gatewayIP)
 
-	tmpFile, err := os.CreateTemp("", "fwd-*.yaml")
+	tmpFile, err := os.CreateTemp("", "grpc-fwd-*.yaml")
 	Expect(err).NotTo(HaveOccurred())
 	defer os.Remove(tmpFile.Name())
 
@@ -187,15 +187,7 @@ subsets:
 	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 	output, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred(), "Failed to apply service forwarder: %s", output)
-
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "service", "homelab-autoscaler-grpc-local",
-			"-n", namespace, "-o", "name")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		return err == nil
-	}, caTimeout, caInterval).Should(BeTrue(), "Service forwarder should be created")
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply gRPC service forwarder: %s", output)
 }
 
 func setupHostInternalService() {
@@ -318,52 +310,58 @@ func applyTestNodeManifests() {
 }
 
 func waitForNodeScaleDown() {
-	By("Waiting for node to be scaled down in complete sequence: ToBeDeletedByClusterAutoscaler -> DeletionCandidateOfClusterAutoscaler -> SchedulingDisabled -> NotReady")
+	By("Waiting for node to be scaled down")
 
-	// Step 1: Wait for ToBeDeletedByClusterAutoscaler taint
+	// Wait for ToBeDeletedByClusterAutoscaler taint
 	Eventually(func() bool {
 		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get node taints: %v", err))
 			return false
 		}
-		return strings.Contains(output, "ToBeDeletedByClusterAutoscaler")
-	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should get ToBeDeletedByClusterAutoscaler taint")
+		hasTaint := strings.Contains(output, "ToBeDeletedByClusterAutoscaler")
+		if hasTaint {
+			By("Node has ToBeDeletedByClusterAutoscaler taint")
+		}
+		return hasTaint
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(),
+		"Node should get ToBeDeletedByClusterAutoscaler taint")
 
-	// Step 2: Wait for DeletionCandidateOfClusterAutoscaler taint
+	// Wait for DeletionCandidateOfClusterAutoscaler taint
 	Eventually(func() bool {
 		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get node taints: %v", err))
 			return false
 		}
-		return strings.Contains(output, "DeletionCandidateOfClusterAutoscaler")
-	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should get DeletionCandidateOfClusterAutoscaler taint")
+		hasTaint := strings.Contains(output, "DeletionCandidateOfClusterAutoscaler")
+		if hasTaint {
+			By("Node has DeletionCandidateOfClusterAutoscaler taint")
+		}
+		return hasTaint
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(),
+		"Node should get DeletionCandidateOfClusterAutoscaler taint")
 
-	// Step 3: Wait for SchedulingDisabled (spec.unschedulable = true)
+	// Wait for SchedulingDisabled (spec.unschedulable = true)
 	Eventually(func() bool {
 		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.unschedulable}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get node unschedulable status: %v", err))
 			return false
 		}
-		return strings.TrimSpace(output) == "true"
-	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should be marked unschedulable")
-
-	// Step 4: Wait for node status to become NotReady
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			return false
+		isUnschedulable := strings.TrimSpace(output) == "true"
+		if isUnschedulable {
+			By("Node is marked unschedulable (cordoned)")
 		}
-		status := strings.TrimSpace(output)
-		return status == "False" || status == "Unknown"
-	}, 300*time.Second, 5*time.Second).Should(BeTrue(), "Node should be marked NotReady")
+		return isUnschedulable
+	}, 300*time.Second, 5*time.Second).Should(BeTrue(),
+		"Node should be marked unschedulable (cordoned)")
 }
 
 func applyHelloWorldDeployment() {
@@ -384,6 +382,7 @@ func verifyDeploymentRunning() {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get deployment status: %v", err))
 			return false
 		}
 		readyReplicas := strings.TrimSpace(output)
@@ -396,6 +395,7 @@ func verifyDeploymentRunning() {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get pod status: %v", err))
 			return false
 		}
 		return strings.TrimSpace(output) == "Running"
@@ -420,24 +420,119 @@ func deleteHelloWorldDeployment() {
 }
 
 func waitForNodeShutdown() {
-	By("Waiting for node shutdown after cleanup period")
+	By("Waiting for node shutdown sequence")
 
-	// Wait for the node to be removed or marked for deletion
-	// This might take some time based on the scaleDownUnneededTime setting (30s in our config)
-	Eventually(func() bool {
-		// Check if node CR still exists and has appropriate status
-		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName, "-o", "jsonpath={.status.powerState}")
+	// Step 1: Wait for Node CR progress to become shuttingdown
+	By("Waiting for Node CR progress to become shuttingdown")
+	Eventually(func() string {
+		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName,
+			"-n", namespace, "-o", "jsonpath={.status.progress}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
-			// Node might be deleted, which is also a valid end state
-			return true
+			By(fmt.Sprintf("Warning: failed to get Node CR progress: %v", err))
+			return ""
 		}
+		progress := strings.TrimSpace(output)
+		By(fmt.Sprintf("Node CR progress: %s", progress))
+		return progress
+	}, 120*time.Second, 5*time.Second).Should(Equal("shuttingdown"),
+		"Node CR should have progress='shuttingdown'")
 
-		powerState := strings.TrimSpace(output)
-		// Node should be powered off or in process of shutting down
-		return powerState == "off" || powerState == "shutting-down"
-	}, 600*time.Second, 10*time.Second).Should(BeTrue())
+	// Step 2: Verify Kubernetes node is cordoned
+	By("Verifying Kubernetes node is cordoned")
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.unschedulable}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get node unschedulable: %v", err))
+			return false
+		}
+		isCordoned := strings.TrimSpace(output) == "true"
+		if isCordoned {
+			By("Kubernetes node is confirmed cordoned (unschedulable=true)")
+		}
+		return isCordoned
+	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
+		"Kubernetes node should be cordoned")
+
+	// Step 3: Verify shutdown job is created
+	By("Verifying shutdown job is created")
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "jobs",
+			"-l", "type=shutdown",
+			"-n", namespace,
+			"-o", "jsonpath={.items[*].metadata.name}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get shutdown jobs: %v", err))
+			return false
+		}
+		hasJob := len(strings.TrimSpace(output)) > 0
+		if hasJob {
+			By(fmt.Sprintf("Shutdown job created: %s", output))
+		}
+		return hasJob
+	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
+		"Shutdown job should be created")
+
+	// Step 4: Wait for shutdown job to complete
+	By("Waiting for shutdown job to complete")
+	Eventually(func() bool {
+		cmd := exec.Command("kubectl", "get", "jobs",
+			"-l", "type=shutdown",
+			"-n", namespace,
+			"-o", "jsonpath={.items[*].status.succeeded}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get shutdown job status: %v", err))
+			return false
+		}
+		completed := strings.Contains(output, "1")
+		if completed {
+			By("Shutdown job completed successfully")
+		}
+		return completed
+	}, 180*time.Second, 5*time.Second).Should(BeTrue(),
+		"Shutdown job should complete successfully")
+
+	// Step 5: Wait for Node CR progress to become shutdown
+	By("Waiting for Node CR progress to become shutdown")
+	Eventually(func() string {
+		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName,
+			"-n", namespace, "-o", "jsonpath={.status.progress}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get Node CR progress: %v", err))
+			return ""
+		}
+		progress := strings.TrimSpace(output)
+		By(fmt.Sprintf("Node CR progress: %s", progress))
+		return progress
+	}, 120*time.Second, 5*time.Second).Should(Equal("shutdown"),
+		"Node CR should have progress='shutdown'")
+
+	// Step 6: Verify Kubernetes node is NotReady (VM is powered off)
+	By("Verifying Kubernetes node is NotReady (VM powered off)")
+	Eventually(func() string {
+		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+		output, err := utils.Run(cmd)
+		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get node Ready status: %v", err))
+			return ""
+		}
+		status := strings.TrimSpace(output)
+		By(fmt.Sprintf("Kubernetes node Ready status: %s", status))
+		return status
+	}, 120*time.Second, 5*time.Second).Should(SatisfyAny(
+		Equal("False"),
+		Equal("Unknown")),
+		"Kubernetes node should be NotReady or Unknown (VM is powered off)")
 }
 
 func setupTestConfigMapsAndSecrets() {
@@ -554,9 +649,14 @@ func verifyStartupJobServiceAccount() {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get startup job ServiceAccount: %v", err))
 			return false
 		}
-		return strings.Contains(output, "homelab-autoscaler")
+		hasServiceAccount := strings.Contains(output, "homelab-autoscaler")
+		if hasServiceAccount {
+			By(fmt.Sprintf("Startup job has ServiceAccount: %s", output))
+		}
+		return hasServiceAccount
 	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
 		"Startup job should have ServiceAccount 'homelab-autoscaler'")
 }
@@ -573,6 +673,7 @@ func verifyStartupJobConfigMapVolume() {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get startup job volumes: %v", err))
 			return false
 		}
 
@@ -584,10 +685,15 @@ func verifyStartupJobConfigMapVolume() {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		volumeMountOutput, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get startup job volume mounts: %v", err))
 			return false
 		}
 
-		return strings.Contains(output, "configMap") && strings.Contains(volumeMountOutput, "config")
+		hasConfigMap := strings.Contains(output, "configMap") && strings.Contains(volumeMountOutput, "config")
+		if hasConfigMap {
+			By("Startup job has ConfigMap volume and mount")
+		}
+		return hasConfigMap
 	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
 		"Startup job should have ConfigMap volume mounted")
 }
@@ -603,9 +709,14 @@ func waitForStartupJobCompletion() {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get startup job status: %v", err))
 			return false
 		}
-		return strings.Contains(output, "1")
+		completed := strings.Contains(output, "1")
+		if completed {
+			By("Startup job completed successfully")
+		}
+		return completed
 	}, 120*time.Second, 5*time.Second).Should(BeTrue(),
 		"Startup job should complete successfully")
 }
@@ -630,11 +741,15 @@ func verifyShutdownJobSecretVolume() {
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 		output, err := utils.Run(cmd)
 		if err != nil {
+			By(fmt.Sprintf("Warning: failed to get shutdown job volumes: %v", err))
 			return false
 		}
 
-		// Check for Secret volume source
-		return strings.Contains(output, "secret") && strings.Contains(output, "auth-secrets")
+		hasSecret := strings.Contains(output, "secret") && strings.Contains(output, "auth-secrets")
+		if hasSecret {
+			By("Shutdown job has Secret volume 'auth-secrets'")
+		}
+		return hasSecret
 	}, 120*time.Second, 5*time.Second).Should(BeTrue(),
 		"Shutdown job should have Secret volume 'auth-secrets' mounted")
 }
