@@ -53,7 +53,7 @@ const (
 	vmShutdownTimeout    = 60 * time.Second
 	vmStartupTimeout     = 60 * time.Second
 	jobCompletionTimeout = 120 * time.Second
-	podScheduleTimeout   = 60 * time.Second
+	podScheduleTimeout   = 5 * time.Minute
 	nodeStateTimeout     = 120 * time.Second
 
 	// Check intervals
