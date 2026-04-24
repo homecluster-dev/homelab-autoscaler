@@ -17,6 +17,7 @@ limitations under the License.
 package grpcserver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -32,7 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -660,13 +661,17 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	// Ensure node is schedulable
 	templateNode.Spec.Unschedulable = false
 
-	// Serialize the node to bytes using the scheme's encoder
-	// Create a legacy codec for the corev1 API group
-	encoder := serializer.NewCodecFactory(s.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
-	nodeBytes, err := runtime.Encode(encoder, templateNode)
+	// Serialize the node to bytes using protobuf encoding
+	// Cluster Autoscaler expects protobuf marshaled v1.Node objects
+	protoSerializer := protobuf.NewSerializer(s.Scheme, s.Scheme)
+	
+	// Use a buffer to capture the encoded bytes
+	var buf bytes.Buffer
+	err = protoSerializer.Encode(templateNode, &buf)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to encode node: %v", err)
 	}
+	nodeBytes := buf.Bytes()
 
 	return &pb.NodeGroupTemplateNodeInfoResponse{
 		NodeBytes: nodeBytes,
