@@ -191,7 +191,7 @@ func VerifyVMControlServer(host string, port int) bool {
 	if err != nil {
 		return false
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 
 	// Server might return 404 for root path but that's okay - it's responding
 	return resp.StatusCode < 500
@@ -263,13 +263,13 @@ func GetHomeClusterAutoscalerLogs(namespace string, tailLines int) (string, erro
 	if err != nil {
 		return "", err
 	}
-	
+
 	lines := strings.Split(string(data), "\n")
 	start := 0
 	if len(lines) > tailLines {
 		start = len(lines) - tailLines
 	}
-	
+
 	return strings.Join(lines[start:], "\n"), nil
 }
 
@@ -501,7 +501,7 @@ func WaitForDeploymentRunning(namespace string, deploymentName string, readyRepl
 				return ready == "" || ready == "0"
 			}
 			readyInt := 0
-			fmt.Sscanf(ready, "%d", &readyInt)
+			fmt.Sscanf(ready, "%d", &readyInt) // nolint:errcheck
 			if readyInt >= readyReplicas {
 				return true
 			}
@@ -551,7 +551,7 @@ func WriteToLogFile(logFile, message string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer f.Close() // nolint:errcheck
 
 	_, err = f.WriteString(message + "\n")
 	return err
