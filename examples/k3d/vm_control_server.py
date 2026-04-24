@@ -7,8 +7,24 @@ Default port: 8080
 
 import subprocess
 import sys
+import os
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
+
+# Log file for e2e test verification
+LOG_FILE = os.environ.get('VM_CONTROL_LOG_FILE', '/tmp/vm-control-requests.log')
+
+
+def log_request(endpoint, vm_name):
+    """Log request to file for e2e test verification"""
+    try:
+        timestamp = datetime.now().isoformat()
+        log_line = f"[{timestamp}] {endpoint} vm={vm_name}\n"
+        with open(LOG_FILE, 'a') as f:
+            f.write(log_line)
+    except Exception as e:
+        print(f"Warning: Failed to log request: {e}", file=sys.stderr)
 
 
 class VMControlHandler(BaseHTTPRequestHandler):
@@ -25,6 +41,9 @@ class VMControlHandler(BaseHTTPRequestHandler):
         if not vm_name:
             self.send_error_response(400, "Missing 'vm' parameter")
             return
+        
+        # Log the request for e2e test verification
+        log_request(parsed_path.path, vm_name)
         
         # Route to appropriate handler
         if parsed_path.path == '/start':
