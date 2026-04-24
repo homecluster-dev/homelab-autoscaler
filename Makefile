@@ -121,7 +121,7 @@ test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with fu
 	@cd examples/k3d && python3 vm_control_server.py & \
 	
 	@echo "Starting local server..."
-	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 & \
+	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 > /tmp/homelab-autoscaler.log 2>&1 & \
 	SERVER_PID=$$!; \
 	echo "export SERVER_PID=$$SERVER_PID" > /tmp/local-server.pid; \
 	sleep 5
@@ -166,7 +166,7 @@ run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without 
 	echo "VM control server started with PID: $$VM_CONTROL_PID"
 	
 	@echo "Starting local server..."
-	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 & \
+	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 > /tmp/homelab-autoscaler.log 2>&1 & \
 	SERVER_PID=$$!; \
 	echo "export SERVER_PID=$$SERVER_PID" > /tmp/local-server.pid; \
 	echo "Local server started with PID: $$SERVER_PID"; \

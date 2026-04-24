@@ -218,10 +218,10 @@ spec:
 
 			By("Verifying gRPC NodeGroupDeleteNodes call was made")
 			Eventually(func() bool {
-				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
-				return strings.Contains(logs, "DeleteNodes")
+				logs, _ := utils.GetHomeClusterAutoscalerLogs(namespace, 1000)
+				return strings.Contains(logs, "NodeGroupDeleteNodes")
 			}, caDetectionTimeout, checkInterval).Should(BeTrue(),
-				"CA should call NodeGroupDeleteNodes")
+				"homelab-autoscaler should receive NodeGroupDeleteNodes call")
 
 			By("Verifying Node CR desiredPowerState is set to Off")
 			Eventually(func() string {

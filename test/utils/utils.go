@@ -256,12 +256,29 @@ func GetClusterAutoscalerLogs(namespace string, tailLines int) (string, error) {
 	return string(output), nil
 }
 
-// VerifyGRPCCall checks if a specific gRPC method was called by searching CA logs
+// GetHomeClusterAutoscalerLogs retrieves logs from the homelab-autoscaler gRPC server log file
+func GetHomeClusterAutoscalerLogs(namespace string, tailLines int) (string, error) {
+	logFile := "/tmp/homelab-autoscaler.log"
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		return "", err
+	}
+	
+	lines := strings.Split(string(data), "\n")
+	start := 0
+	if len(lines) > tailLines {
+		start = len(lines) - tailLines
+	}
+	
+	return strings.Join(lines[start:], "\n"), nil
+}
+
+// VerifyGRPCCall checks if a specific gRPC method was called by searching homelab-autoscaler logs
 func VerifyGRPCCall(namespace, method string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		logs, err := GetClusterAutoscalerLogs(namespace, 500)
+		logs, err := GetHomeClusterAutoscalerLogs(namespace, 500)
 		if err == nil && strings.Contains(logs, method) {
 			return true
 		}
