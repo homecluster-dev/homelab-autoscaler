@@ -220,7 +220,7 @@ spec:
 			Eventually(func() bool {
 				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
 				return strings.Contains(logs, "DeleteNodes")
-			}, 30*time.Second, checkInterval).Should(BeTrue(),
+			}, caDetectionTimeout, checkInterval).Should(BeTrue(),
 				"CA should call NodeGroupDeleteNodes")
 
 			By("Verifying Node CR desiredPowerState is set to Off")

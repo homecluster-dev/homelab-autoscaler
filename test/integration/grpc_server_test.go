@@ -23,7 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -454,8 +454,8 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				// Unmarshal the node bytes to verify contents
 				templateNode := &corev1.Node{}
-				protoSerializer := protobuf.NewSerializer(scheme.Scheme, scheme.Scheme)
-				_, _, err = protoSerializer.Decode(resp.NodeBytes, nil, templateNode)
+				decoder := serializer.NewCodecFactory(scheme.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
+				_, _, err = decoder.Decode(resp.NodeBytes, nil, templateNode)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(templateNode.Name).To(ContainSubstring("test-group-template"))
 				Expect(templateNode.Spec.Unschedulable).To(BeFalse())
@@ -493,8 +493,8 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				// Unmarshal the node bytes to verify contents
 				templateNode := &corev1.Node{}
-				protoSerializer := protobuf.NewSerializer(scheme.Scheme, scheme.Scheme)
-				_, _, err = protoSerializer.Decode(resp.NodeBytes, nil, templateNode)
+				decoder := serializer.NewCodecFactory(scheme.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
+				_, _, err = decoder.Decode(resp.NodeBytes, nil, templateNode)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Ensure the custom taint is not present in the template node's taints
