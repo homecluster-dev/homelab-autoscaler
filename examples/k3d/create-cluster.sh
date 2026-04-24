@@ -12,6 +12,7 @@ k3d cluster create ${CLUSTER_NAME} \
   --image "${K3S_IMAGE}" \
   --servers 3 \
   --agents 2 \
+  --port "8080:8080@loadbalancer" \
   --wait
 
 echo "Exporting kubeconfig..."
