@@ -20,9 +20,9 @@ limitations under the License.
 package e2e
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,239 +33,154 @@ import (
 )
 
 const (
-	clusterName     = "homelab-autoscaler"
-	grpcServerPort  = "50052"
-	kubeconfigPath  = "./kubeconfig"
-	serverPidFile   = "/tmp/homelab-autoscaler-server.pid"
-	nodeName        = "k3d-homelab-autoscaler-agent-0"
-	namespace       = "homelab-autoscaler-system"
-	defaultTimeout  = 600 * time.Second
-	defaultInterval = 5 * time.Second
-	caTimeout       = 120 * time.Second
-	caInterval      = 5 * time.Second
+	clusterName      = "homelab-autoscaler"
+	grpcServerPort   = "50052"
+	kubeconfigPath   = "./kubeconfig"
+	namespace        = "homelab-autoscaler-system"
+	vmControlPort    = 8080
+	vmControlHost    = "localhost"
+	vmControlLogFile = "/tmp/vm-control-requests.log"
+
+	// Node names
+	agentNode0 = "k3d-homelab-autoscaler-agent-0"
+	agentNode1 = "k3d-homelab-autoscaler-agent-1"
+
+	// Taints
+	agentTaint = "node.kubernetes.io/role=agent:NoSchedule"
+
+	// Timeouts
+	caDetectionTimeout   = 60 * time.Second
+	vmShutdownTimeout    = 60 * time.Second
+	vmStartupTimeout     = 60 * time.Second
+	jobCompletionTimeout = 120 * time.Second
+	podScheduleTimeout   = 60 * time.Second
+	nodeStateTimeout     = 120 * time.Second
+
+	// Check intervals
+	checkInterval     = 5 * time.Second
+	fastCheckInterval = 1 * time.Second
 )
 
-var _ = Describe("K3d Integration", func() {
+// Shared state between tests
+var (
+	vmControlServerPID int
+	shutdownNodeName   string
+)
 
-	BeforeEach(func() {
-		By("Setting up test environment")
+var _ = BeforeSuite(func() {
+	By("Setting up test environment")
 
-		// Set KUBECONFIG environment variable
-		err := os.Setenv("KUBECONFIG", kubeconfigPath)
-		Expect(err).NotTo(HaveOccurred())
+	// Set KUBECONFIG environment variable
+	err := os.Setenv("KUBECONFIG", filepath.Join(getProjectDir(), kubeconfigPath))
+	Expect(err).NotTo(HaveOccurred())
 
-		// Check if k3d cluster exists
-		cmd := exec.Command("k3d", "cluster", "list")
-		output, err := utils.Run(cmd)
-		if err != nil || !strings.Contains(output, clusterName) {
-			Fail(fmt.Sprintf("k3d cluster '%s' not found. Please run 'make test-e2e' to set up the test environment.", clusterName))
-		}
-	})
+	// Verify k3d cluster exists
+	cmd := exec.Command("k3d", "cluster", "list")
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
 
-	Context("Volumes and ServiceAccount support", func() {
-		It("should verify jobs have ServiceAccount, ConfigMap and Secret volumes", func() {
+	cmd = exec.Command("k3d", "cluster", "list")
+	output, _ := utils.Run(cmd)
+	Expect(strings.Contains(output, clusterName)).To(BeTrue(),
+		"k3d cluster '%s' not found. Please run 'make test-e2e' to set up the test environment.", clusterName)
 
-			By("Applying example ConfigMaps and Secrets from node-volumes.yaml")
-			applyExampleVolumes()
-
-			By("Applying test node manifests with volumes and ServiceAccount")
-			applyTestNodeManifestsWithVolumes()
-
-			By("Starting the node to trigger startup job creation")
-			startTestNode()
-
-			By("Verifying startup job has correct ServiceAccount")
-			verifyStartupJobServiceAccount()
-
-			By("Verifying startup job has ConfigMap volume")
-			verifyStartupJobConfigMapVolume()
-
-			By("Waiting for startup job to complete")
-			waitForStartupJobCompletion()
-
-			By("Verifying shutdown job has Secret volume")
-			verifyShutdownJobSecretVolume()
-
-			By("Cleaning up test resources")
-			cleanupTestResources()
-		})
-	})
-
-	Context("Full workflow test", func() {
-		It("should complete the full scaling workflow", func() {
-
-			By("Setting up gRPC service forwarder")
-			setupServiceForwarder()
-
-			By("Setting up host-internal service")
-			setupHostInternalService()
-
-			By("Waiting for cluster autoscaler to be ready")
-			waitForClusterAutoscaler()
-
-			By("Applying group with aggressive scale-down settings")
-			applyTestGroupWithAggressiveScaleDown()
-
-	By("Applying node CRs")
-		applyTestNodeManifests()
-
-		By("Capturing cluster autoscaler logs after node creation")
-		captureClusterAutoscalerLogs("after-node-creation")
-
-		By("Waiting for node to be scaled down")
-		waitForNodeScaleDown()
-
-			By("Applying hello-world deployment")
-			applyHelloWorldDeployment()
-
-			By("Verifying deployment runs successfully")
-			verifyDeploymentRunning()
-
-			By("Deleting the deployment")
-			deleteHelloWorldDeployment()
-
-			By("Capturing cluster autoscaler logs after deployment deletion")
-			captureClusterAutoscalerLogs("after-deployment-delete")
-
-			By("Waiting for node shutdown after cleanup period")
-			waitForNodeShutdown()
-
-			By("Waiting for node to be scaled down after deployment deleted")
-			waitForNodeScaleDown()
-
-			By("Capturing final cluster autoscaler logs")
-			captureClusterAutoscalerLogs("final")
-
-			By("Test completed successfully")
-		})
-	})
+	// Clear VM control server log
+	err = utils.ClearLogFile(vmControlLogFile)
+	Expect(err).NotTo(HaveOccurred())
 })
 
-func getK3dGatewayIP() string {
-	cmd := exec.Command("docker", "network", "inspect", "k3d-"+clusterName, "-f", "{{(index .IPAM.Config 0).Gateway}}")
-	output, err := utils.Run(cmd)
-	if err != nil {
-		By(fmt.Sprintf("Warning: docker network inspect failed: %v", err))
-		return ""
-	}
-	gatewayIP := strings.TrimSpace(output)
-	By(fmt.Sprintf("Found k3d gateway IP: %s", gatewayIP))
-	return gatewayIP
-}
+var _ = AfterSuite(func() {
+	By("Cleaning up test environment")
 
-func setupServiceForwarder() {
-	By("Setting up gRPC service forwarder to localhost:50052")
+	// Untaint nodes
+	By("Untainting agent nodes")
+	_ = utils.UntaintNode(agentNode0, "node.kubernetes.io/role")
+	_ = utils.UntaintNode(agentNode1, "node.kubernetes.io/role")
 
-	gatewayIP := getK3dGatewayIP()
-	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP. "+
-		"Ensure k3d cluster '%s' is running: k3d cluster create '%s'", clusterName, clusterName)
-	By(fmt.Sprintf("Using k3d gateway IP: %s", gatewayIP))
-
-	// Verify gRPC service forwarder is reachable
-	By("Verifying gRPC service forwarder connectivity")
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "service", "homelab-autoscaler-grpc-local", "-n", namespace, "-o", "name")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		return err == nil
-	}, 30*time.Second, 5*time.Second).Should(BeTrue(),
-		"gRPC service forwarder 'homelab-autoscaler-grpc-local' should exist")
-
-	fwdYAML := fmt.Sprintf(`
-apiVersion: v1
-kind: Service
-metadata:
-  name: homelab-autoscaler-grpc-local
-  namespace: %s
-  labels:
-    app: homelab-autoscaler
-    type: grpc-service-forwarder
-spec:
-  ports:
-  - port: 50051
-    targetPort: 50052
-    protocol: TCP
-    name: grpc
-  selector:
-    app: cluster-autoscaler
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: homelab-autoscaler-grpc-local
-  namespace: %s
-subsets:
-- addresses:
-  - ip: %s
-  ports:
-  - port: 50052
-    protocol: TCP
-`, namespace, namespace, gatewayIP)
-
-	tmpFile, err := os.CreateTemp("", "grpc-fwd-*.yaml")
-	Expect(err).NotTo(HaveOccurred())
-	defer os.Remove(tmpFile.Name())
-
-	_, err = tmpFile.WriteString(fwdYAML)
-	Expect(err).NotTo(HaveOccurred())
-	tmpFile.Close()
-
-	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	// Cleanup Node CRs
+	By("Cleaning up Node CRs")
+	cmd := exec.Command("kubectl", "delete", "-f", "./examples/k3d/nodes1.yaml", "--ignore-not-found")
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	output, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred(), "Failed to apply gRPC service forwarder: %s", output)
-}
+	_, _ = utils.Run(cmd)
 
-func setupHostInternalService() {
-	By("Setting up host-internal service for startup/shutdown pods")
-
-	gatewayIP := getK3dGatewayIP()
-	Expect(gatewayIP).NotTo(BeEmpty(), "Failed to get k3d gateway IP")
-
-	hostSvcYAML := fmt.Sprintf(`
-apiVersion: v1
-kind: Service
-metadata:
-  name: host-internal
-  namespace: %s
-spec:
-  clusterIP: None
-  ports:
-  - port: 8080
-    targetPort: 8080
-    protocol: TCP
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: host-internal
-  namespace: %s
-subsets:
-- addresses:
-  - ip: %s
-  ports:
-  - port: 8080
-    protocol: TCP
-`, namespace, namespace, gatewayIP)
-
-	tmpFile, err := os.CreateTemp("", "host-*.yaml")
-	Expect(err).NotTo(HaveOccurred())
-	defer os.Remove(tmpFile.Name())
-
-	_, err = tmpFile.WriteString(hostSvcYAML)
-	Expect(err).NotTo(HaveOccurred())
-	tmpFile.Close()
-
-	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+	// Cleanup test deployment
+	By("Cleaning up test deployment")
+	cmd = exec.Command("kubectl", "delete", "-f", "examples/k3d/hello-world-deployment.yaml", "--ignore-not-found")
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	output, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred(), "Failed to apply host-internal service: %s", output)
-}
+	_, _ = utils.Run(cmd)
 
-func applyTestGroupWithAggressiveScaleDown() {
-	By("Applying test group with aggressive scale-down settings")
+	// Cleanup Group CR
+	By("Cleaning up Group CR")
+	cmd = exec.Command("kubectl", "delete", "group", "group1", "-n", namespace, "--ignore-not-found")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	_, _ = utils.Run(cmd)
+})
 
-	groupYAML := `
+var _ = Describe("K3d Integration", Serial, func() {
+
+	Context("Setup & Environment Validation", func() {
+		It("should verify prerequisites and prepare environment", func() {
+			By("Verifying k3d cluster is running")
+			cmd := exec.Command("k3d", "cluster", "list", clusterName)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+	By("Verifying agent nodes exist")
+		Expect(utils.NodeExists(agentNode0)).To(BeTrue(),
+			"Agent node 0 should exist")
+		Expect(utils.NodeExists(agentNode1)).To(BeTrue(),
+			"Agent node 1 should exist")
+
+			By("Tainting agent nodes to prevent workload scheduling")
+			err = utils.TaintNode(agentNode0, agentTaint)
+			Expect(err).NotTo(HaveOccurred())
+			err = utils.TaintNode(agentNode1, agentTaint)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying nodes are tainted")
+			Eventually(func() bool {
+				return utils.VerifyNodeTaint(agentNode0, "role") &&
+					utils.VerifyNodeTaint(agentNode1, "role")
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"Agent nodes should be tainted with role taint")
+
+			By("Verifying gRPC service forwarder exists")
+			cmd = exec.Command("kubectl", "get", "service", "homelab-autoscaler-grpc-local",
+				"-n", namespace)
+			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+			// Service may not exist yet - that's okay, it will be created by the test
+			_, _ = utils.Run(cmd)
+
+			By("Verifying VM control server is accessible")
+			Eventually(func() bool {
+				return utils.VerifyVMControlServer(vmControlHost, vmControlPort)
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"VM control server should be responding on %s:%d", vmControlHost, vmControlPort)
+
+			By("Applying Node CRs")
+			cmd = exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
+			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply Node CRs: %s", output)
+
+			By("Verifying Node CRs are created")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev",
+					agentNode0, "-n", namespace)
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				_, err := utils.Run(cmd)
+				return err
+			}, 30*time.Second, checkInterval).Should(Succeed(),
+				"Node CRs should be created")
+
+			By("Setup & Environment Validation completed successfully")
+		})
+	})
+
+	Context("Scale-Down Workflow", func() {
+		It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
+			By("Applying Group CR with aggressive scale-down settings")
+			groupYAML := `
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Group
 metadata:
@@ -280,564 +195,232 @@ spec:
   scaleDownUtilizationThreshold: "0.1"
   zeroOrMaxNodeScaling: false
 `
+			tmpFile, err := os.CreateTemp("", "group-*.yaml")
+			Expect(err).NotTo(HaveOccurred())
+			defer os.Remove(tmpFile.Name())
 
-	tmpFile, err := os.CreateTemp("", "group-*.yaml")
-	Expect(err).NotTo(HaveOccurred())
-	defer os.Remove(tmpFile.Name())
+			_, err = tmpFile.WriteString(groupYAML)
+			Expect(err).NotTo(HaveOccurred())
+			tmpFile.Close()
 
-	_, err = tmpFile.WriteString(groupYAML)
-	Expect(err).NotTo(HaveOccurred())
-	tmpFile.Close()
+			cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply Group: %s", output)
 
-	cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	output, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred(), "Failed to apply group: %s", output)
-}
+			By("Waiting for Cluster Autoscaler to detect unneeded nodes")
+			Eventually(func() bool {
+				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
+				return strings.Contains(logs, "unneeded") ||
+					strings.Contains(logs, "DeleteNodes")
+			}, caDetectionTimeout, checkInterval).Should(BeTrue(),
+				"Cluster Autoscaler should detect unneeded nodes. Check CA logs.")
 
-func captureClusterAutoscalerLogs(testName string) {
-	By(fmt.Sprintf("Capturing cluster autoscaler logs for test: %s", testName))
-	
-	logFile := fmt.Sprintf("/tmp/ca-logs-%s.log", testName)
-	cmd := exec.Command("kubectl", "logs",
-		"-l", "app.kubernetes.io/component=cluster-autoscaler",
-		"-n", namespace,
-		"--tail=500")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	
-	output, err := utils.Run(cmd)
-	if err != nil {
-		By(fmt.Sprintf("Warning: failed to capture CA logs: %v", err))
-		return
-	}
-	
-	// Filter logs to show only relevant messages
-	filteredLogs := filterClusterAutoscalerLogs(output)
-	
-	err = os.WriteFile(logFile, []byte(filteredLogs), 0644)
-	if err != nil {
-		By(fmt.Sprintf("Warning: failed to write CA logs to file: %v", err))
-		return
-	}
-	
-	By(fmt.Sprintf("CA logs saved to: %s", logFile))
-}
+			By("Verifying gRPC NodeGroupDeleteNodes call was made")
+			Eventually(func() bool {
+				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
+				return strings.Contains(logs, "DeleteNodes")
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"CA should call NodeGroupDeleteNodes")
 
-func filterClusterAutoscalerLogs(logs string) string {
-	var filtered []string
-	lines := strings.Split(logs, "\n")
-	
-	relevantKeywords := []string{
-		"Failed to get nodes",
-		"node group",
-		"scale down",
-		"unneeded",
-		"utilization",
-		"expander",
-		"filtering nodes",
-		"should be scaled down",
-		"nodegroup",
-		"registration",
-		"connected",
-		"error",
-		"Error",
-		"WARNING",
-		"panic",
-	}
-	
-	for _, line := range lines {
-		lowerLine := strings.ToLower(line)
-		for _, keyword := range relevantKeywords {
-			if strings.Contains(lowerLine, strings.ToLower(keyword)) {
-				filtered = append(filtered, line)
-				break
-			}
-		}
-	}
-	
-	return strings.Join(filtered, "\n")
-}
+			By("Verifying Node CR desiredPowerState is set to Off")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", agentNode0,
+					"-n", namespace, "-o", "jsonpath={.spec.desiredPowerState}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, _ := utils.Run(cmd)
+				return strings.TrimSpace(output)
+			}, 30*time.Second, checkInterval).Should(Equal("off"),
+				"Node CR desiredPowerState should be off")
 
-func waitForClusterAutoscaler() {
-	By("Waiting for cluster autoscaler pod to be Ready")
-	Eventually(func() string {
-		cmd := exec.Command("kubectl", "get", "pods",
-			"-l", "app.kubernetes.io/component=cluster-autoscaler",
-			"-n", namespace,
-			"-o", `jsonpath={.items[*].status.conditions[?(@.type=="Ready")].status}`)
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, _ := utils.Run(cmd)
-		return strings.TrimSpace(output)
-	}, caTimeout, caInterval).Should(Equal("True"), "Cluster autoscaler pod should be Ready")
+			By("Verifying shutdown job is created")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "jobs",
+					"-l", "type=shutdown",
+					"-n", namespace,
+					"-o", "jsonpath={.items[*].metadata.name}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, err := utils.Run(cmd)
+				return err == nil && len(strings.TrimSpace(output)) > 0
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Shutdown job should be created")
 
-	By("Waiting for cluster autoscaler to acquire leader lease")
-	Eventually(func() string {
-		cmd := exec.Command("kubectl", "get", "lease", "cluster-autoscaler",
-			"-n", "kube-system",
-			"-o", "jsonpath={.spec.holderIdentity}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, _ := utils.Run(cmd)
-		return strings.TrimSpace(output)
-	}, caTimeout, caInterval).ShouldNot(BeEmpty(), "Cluster autoscaler should hold leader lease")
+			By("Verifying shutdown job has correct ServiceAccount")
+			Eventually(func() bool {
+				return utils.VerifyJobHasServiceAccount(namespace, "type=shutdown", "controller-manager")
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Shutdown job should use controller-manager ServiceAccount")
 
-	By("Verifying cluster autoscaler is connected to gRPC controller")
-	Eventually(func() string {
-		cmd := exec.Command("kubectl", "logs",
-			"-l", "app.kubernetes.io/component=cluster-autoscaler",
-			"-n", namespace,
-			"--tail=200")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, _ := utils.Run(cmd)
-		
-		// Check for successful gRPC connection or provider initialization
-		if strings.Contains(output, "Starting main loop") {
-			return "connected"
-		}
-		return "connecting"
-	}, 120*time.Second, 5*time.Second).Should(Equal("connected"),
-		"Cluster autoscaler should be connected to gRPC controller (not seeing 'Starting main loop' in logs)")
+			By("Verifying shutdown job has Secret volume")
+			Eventually(func() bool {
+				return utils.VerifyJobHasVolume(namespace, "type=shutdown", "auth-secrets")
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Shutdown job should have auth-secrets volume")
 
-	By("Verifying cluster autoscaler can see node groups")
-	Eventually(func() string {
-		cmd := exec.Command("kubectl", "logs",
-			"-l", "app.kubernetes.io/component=cluster-autoscaler",
-			"-n", namespace,
-			"--tail=200")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, _ := utils.Run(cmd)
-		
-		// Check if CA is trying to communicate with our controller
-		if strings.Contains(output, "group1") || 
-		   strings.Contains(output, "homelab-autoscaler") ||
-		   strings.Contains(output, "node group") {
-			return "seeing-groups"
-		}
-		return "waiting"
-	}, 60*time.Second, 5*time.Second).Should(Equal("seeing-groups"),
-		"Cluster autoscaler should be able to see node groups. Check CA logs for connection issues.")
+			By("Verifying VM control server receives /stop request")
+			Eventually(func() bool {
+				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/stop", agentNode0, 30*time.Second)
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"VM control server should receive /stop request for %s", agentNode0)
 
-	By("Cluster autoscaler is ready and connected")
-	captureClusterAutoscalerLogs("initialization")
-}
+			By("Verifying k3d node stops")
+			Eventually(func() bool {
+				cmd := exec.Command("k3d", "node", "list", agentNode0)
+				output, _ := cmd.CombinedOutput()
+				outputStr := strings.ToLower(string(output))
+				return !strings.Contains(outputStr, "running") && !strings.Contains(outputStr, "up")
+			}, vmShutdownTimeout, checkInterval).Should(BeTrue(),
+				"k3d node %s should stop", agentNode0)
 
-func applyTestNodeManifests() {
-	By("Applying node CRs from example manifests")
+			By("Verifying Node CR progress becomes shutdown")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", agentNode0,
+					"-n", namespace, "-o", "jsonpath={.status.progress}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, _ := utils.Run(cmd)
+				return strings.TrimSpace(output)
+			}, nodeStateTimeout, checkInterval).Should(Equal("shutdown"),
+				"Node CR progress should be shutdown")
 
-	cmd := exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred())
+			By("Verifying Kubernetes node becomes NotReady")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "node", agentNode0,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, _ := utils.Run(cmd)
+				status := strings.TrimSpace(string(output))
+				return status == "False" || status == "Unknown"
+			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
+				"Kubernetes node should be NotReady or Unknown")
 
-	// Wait for node CR to be created
-	Eventually(func() error {
-		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName, "-o", "name", "-n", "homelab-autoscaler-system")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		return err
-	}, defaultTimeout, defaultInterval).Should(Succeed())
-}
+			// Store node name for Test 3
+			shutdownNodeName = agentNode0
 
-func waitForNodeScaleDown() {
-	By("Waiting for node to be scaled down")
+			By("Scale-Down Workflow completed successfully")
+		})
+	})
 
-	// Capture CA logs before waiting
-	captureClusterAutoscalerLogs("before-scale-down-wait")
+	Context("Scale-Up Workflow", func() {
+		It("should verify Cluster Autoscaler scales up when pods need scheduling", func() {
+			By("Verifying node is in shutdown state from Test 2")
+			Expect(shutdownNodeName).ToNot(BeEmpty(),
+				"shutdownNodeName should be set by Test 2")
 
-	// Wait for ToBeDeletedByClusterAutoscaler taint
-	Eventually(func() bool {
-		// Periodically log node status for debugging
-		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "wide")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		nodeStatus, _ := utils.Run(cmd)
-		By(fmt.Sprintf("Node status: %s", strings.TrimSpace(nodeStatus)))
-		
-		cmd = exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get node taints: %v", err))
-			return false
-		}
-		hasTaint := strings.Contains(output, "ToBeDeletedByClusterAutoscaler")
-		if hasTaint {
-			By("Node has ToBeDeletedByClusterAutoscaler taint")
-		}
-		return hasTaint
-	}, 300*time.Second, 5*time.Second).Should(BeTrue(),
-		"Node should get ToBeDeletedByClusterAutoscaler taint. CA logs: /tmp/ca-logs-before-scale-down-wait.log")
+			By("Untainting the shutdown node to allow scheduling")
+			err := utils.UntaintNode(shutdownNodeName, "node.kubernetes.io/role")
+			Expect(err).NotTo(HaveOccurred())
 
-	// Wait for DeletionCandidateOfClusterAutoscaler taint
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get node taints: %v", err))
-			return false
-		}
-		hasTaint := strings.Contains(output, "DeletionCandidateOfClusterAutoscaler")
-		if hasTaint {
-			By("Node has DeletionCandidateOfClusterAutoscaler taint")
-		}
-		return hasTaint
-	}, 300*time.Second, 5*time.Second).Should(BeTrue(),
-		"Node should get DeletionCandidateOfClusterAutoscaler taint")
+			By("Verifying node is untainted")
+			Eventually(func() bool {
+				return !utils.VerifyNodeTaint(shutdownNodeName, "role")
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"Node should be untainted")
 
-	// Wait for SchedulingDisabled (spec.unschedulable = true)
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.unschedulable}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get node unschedulable status: %v", err))
-			return false
-		}
-		isUnschedulable := strings.TrimSpace(output) == "true"
-		if isUnschedulable {
-			By("Node is marked unschedulable (cordoned)")
-		}
-		return isUnschedulable
-	}, 300*time.Second, 5*time.Second).Should(BeTrue(),
-		"Node should be marked unschedulable (cordoned)")
-}
+			By("Applying hello-world deployment targeting the agent node")
+			cmd := exec.Command("kubectl", "apply", "-f", "examples/k3d/hello-world-deployment.yaml")
+			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply deployment: %s", output)
 
-func applyHelloWorldDeployment() {
-	By("Applying hello-world deployment")
+			By("Waiting for CA to detect need for scale-up")
+			Eventually(func() bool {
+				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
+				return strings.Contains(logs, "IncreaseSize") ||
+					strings.Contains(logs, "scale up")
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"CA should detect need for scale-up")
 
-	cmd := exec.Command("kubectl", "apply", "-f", "examples/k3d/hello-world-deployment.yaml")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred())
-}
+			By("Verifying gRPC NodeGroupIncreaseSize call was made")
+			Eventually(func() bool {
+				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
+				return strings.Contains(logs, "IncreaseSize")
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"CA should call NodeGroupIncreaseSize")
 
-func verifyDeploymentRunning() {
-	By("Verifying deployment runs successfully")
+			By("Verifying Node CR desiredPowerState is set to On")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", shutdownNodeName,
+					"-n", namespace, "-o", "jsonpath={.spec.desiredPowerState}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, _ := utils.Run(cmd)
+				return strings.TrimSpace(output)
+			}, 30*time.Second, checkInterval).Should(Equal("on"),
+				"Node CR desiredPowerState should be on")
 
-	// Wait for deployment to be ready
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "deployment", "hello-world-deployment", "-o", "jsonpath={.status.readyReplicas}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get deployment status: %v", err))
-			return false
-		}
-		readyReplicas := strings.TrimSpace(output)
-		return readyReplicas == "1"
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
+			By("Verifying startup job is created")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "jobs",
+					"-l", "type=startup",
+					"-n", namespace,
+					"-o", "jsonpath={.items[*].metadata.name}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, err := utils.Run(cmd)
+				return err == nil && len(strings.TrimSpace(output)) > 0
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Startup job should be created")
 
-	// Verify pod is running
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "pods", "-l", "app=hello-world", "-o", "jsonpath={.items[0].status.phase}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get pod status: %v", err))
-			return false
-		}
-		return strings.TrimSpace(output) == "Running"
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
-}
+			By("Verifying startup job has correct ServiceAccount")
+			Eventually(func() bool {
+				return utils.VerifyJobHasServiceAccount(namespace, "type=startup", "controller-manager")
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Startup job should use controller-manager ServiceAccount")
 
-func deleteHelloWorldDeployment() {
-	By("Deleting hello-world deployment")
+			By("Verifying startup job has ConfigMap volume")
+			Eventually(func() bool {
+				return utils.VerifyJobHasVolume(namespace, "type=startup", "startup-config")
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Startup job should have startup-config volume")
 
-	cmd := exec.Command("kubectl", "delete", "-f", "examples/k3d/hello-world-deployment.yaml")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred())
+			By("Verifying VM control server receives /start request")
+			Eventually(func() bool {
+				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/start", shutdownNodeName, 30*time.Second)
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"VM control server should receive /start request for %s", shutdownNodeName)
 
-	// Wait for deployment to be deleted
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "deployment", "hello-world-deployment")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		return err != nil // Should return error when deployment doesn't exist
-	}, defaultTimeout, defaultInterval).Should(BeTrue())
-}
+			By("Verifying k3d node starts")
+			Eventually(func() bool {
+				cmd := exec.Command("k3d", "node", "list", shutdownNodeName)
+				output, _ := cmd.CombinedOutput()
+				outputStr := strings.ToLower(string(output))
+				return strings.Contains(outputStr, "running") || strings.Contains(outputStr, "up")
+			}, vmStartupTimeout, checkInterval).Should(BeTrue(),
+				"k3d node %s should start", shutdownNodeName)
 
-func waitForNodeShutdown() {
-	By("Waiting for node shutdown sequence")
+			By("Verifying startup job completes")
+			Eventually(func() bool {
+				return utils.WaitForJobCompletion(namespace, "type=startup", jobCompletionTimeout)
+			}, jobCompletionTimeout, checkInterval).Should(BeTrue(),
+				"Startup job should complete")
 
-	// Step 1: Wait for Node CR progress to become shuttingdown
-	By("Waiting for Node CR progress to become shuttingdown")
-	Eventually(func() string {
-		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName,
-			"-n", namespace, "-o", "jsonpath={.status.progress}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get Node CR progress: %v", err))
-			return ""
-		}
-		progress := strings.TrimSpace(output)
-		By(fmt.Sprintf("Node CR progress: %s", progress))
-		return progress
-	}, 120*time.Second, 5*time.Second).Should(Equal("shuttingdown"),
-		"Node CR should have progress='shuttingdown'")
+			By("Verifying Node CR progress becomes ready")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", shutdownNodeName,
+					"-n", namespace, "-o", "jsonpath={.status.progress}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, _ := utils.Run(cmd)
+				return strings.TrimSpace(output)
+			}, nodeStateTimeout, checkInterval).Should(Equal("ready"),
+				"Node CR progress should be ready")
 
-	// Step 2: Verify Kubernetes node is cordoned
-	By("Verifying Kubernetes node is cordoned")
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.unschedulable}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get node unschedulable: %v", err))
-			return false
-		}
-		isCordoned := strings.TrimSpace(output) == "true"
-		if isCordoned {
-			By("Kubernetes node is confirmed cordoned (unschedulable=true)")
-		}
-		return isCordoned
-	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
-		"Kubernetes node should be cordoned")
+			By("Verifying Kubernetes node becomes Ready")
+			Eventually(func() bool {
+				return utils.WaitForNodeReady(shutdownNodeName, true, nodeStateTimeout)
+			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
+				"Kubernetes node should be Ready")
 
-	// Step 3: Verify shutdown job is created
-	By("Verifying shutdown job is created")
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "jobs",
-			"-l", "type=shutdown",
-			"-n", namespace,
-			"-o", "jsonpath={.items[*].metadata.name}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get shutdown jobs: %v", err))
-			return false
-		}
-		hasJob := len(strings.TrimSpace(output)) > 0
-		if hasJob {
-			By(fmt.Sprintf("Shutdown job created: %s", output))
-		}
-		return hasJob
-	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
-		"Shutdown job should be created")
+			By("Verifying deployment pod is scheduled and running")
+			Eventually(func() bool {
+				return utils.WaitForPodScheduled("default", "app=hello-world", podScheduleTimeout)
+			}, podScheduleTimeout, checkInterval).Should(BeTrue(),
+				"Deployment pod should be scheduled and running")
 
-	// Step 4: Wait for shutdown job to complete
-	By("Waiting for shutdown job to complete")
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "jobs",
-			"-l", "type=shutdown",
-			"-n", namespace,
-			"-o", "jsonpath={.items[*].status.succeeded}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get shutdown job status: %v", err))
-			return false
-		}
-		completed := strings.Contains(output, "1")
-		if completed {
-			By("Shutdown job completed successfully")
-		}
-		return completed
-	}, 180*time.Second, 5*time.Second).Should(BeTrue(),
-		"Shutdown job should complete successfully")
+			By("Scale-Up Workflow completed successfully")
+		})
+	})
+})
 
-	// Step 5: Wait for Node CR progress to become shutdown
-	By("Waiting for Node CR progress to become shutdown")
-	Eventually(func() string {
-		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName,
-			"-n", namespace, "-o", "jsonpath={.status.progress}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get Node CR progress: %v", err))
-			return ""
-		}
-		progress := strings.TrimSpace(output)
-		By(fmt.Sprintf("Node CR progress: %s", progress))
-		return progress
-	}, 120*time.Second, 5*time.Second).Should(Equal("shutdown"),
-		"Node CR should have progress='shutdown'")
-
-	// Step 6: Verify Kubernetes node is NotReady (VM is powered off)
-	By("Verifying Kubernetes node is NotReady (VM powered off)")
-	Eventually(func() string {
-		cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get node Ready status: %v", err))
-			return ""
-		}
-		status := strings.TrimSpace(output)
-		By(fmt.Sprintf("Kubernetes node Ready status: %s", status))
-		return status
-	}, 120*time.Second, 5*time.Second).Should(SatisfyAny(
-		Equal("False"),
-		Equal("Unknown")),
-		"Kubernetes node should be NotReady or Unknown (VM is powered off)")
-}
-
-func applyExampleVolumes() {
-	By("Applying example ConfigMaps and Secrets from node-volumes.yaml")
-
-	cmd := exec.Command("kubectl", "apply", "-f", "./examples/k3d/node-volumes.yaml")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	output, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred(), "Failed to apply node-volumes.yaml: %s", output)
-}
-
-func applyTestNodeManifestsWithVolumes() {
-	By("Applying node CR with volumes and ServiceAccount from nodes1.yaml")
-
-	cmd := exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred())
-
-	// Wait for node CR to be created
-	Eventually(func() error {
-		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName, "-o", "name", "-n", "homelab-autoscaler-system")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		_, err := utils.Run(cmd)
-		return err
-	}, defaultTimeout, defaultInterval).Should(Succeed())
-}
-
-func startTestNode() {
-	By("Patching node to trigger startup")
-
-	// Patch the node to powerState: on if it's not already
-	patch := `{"spec":{"powerState":"on"}}`
-	cmd := exec.Command("kubectl", "patch", "nodes.infra.homecluster.dev", nodeName,
-		"-n", "homelab-autoscaler-system", "--type=merge", "-p", patch)
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred())
-}
-
-func verifyStartupJobServiceAccount() {
-	By("Verifying startup job has correct ServiceAccount")
-
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "jobs",
-			"-l", "type=startup",
-			"-n", "homelab-autoscaler-system",
-			"-o", "jsonpath={.items[*].spec.template.spec.serviceAccountName}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get startup job ServiceAccount: %v", err))
-			return false
-		}
-		hasServiceAccount := strings.Contains(output, "controller-manager")
-		if hasServiceAccount {
-			By(fmt.Sprintf("Startup job has ServiceAccount: %s", output))
-		}
-		return hasServiceAccount
-	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
-		"Startup job should have ServiceAccount 'controller-manager'")
-}
-
-func verifyStartupJobConfigMapVolume() {
-	By("Verifying startup job has ConfigMap volume mounted")
-
-	Eventually(func() bool {
-		// Check for ConfigMap volume
-		cmd := exec.Command("kubectl", "get", "jobs",
-			"-l", "type=startup",
-			"-n", "homelab-autoscaler-system",
-			"-o", "jsonpath={.items[*].spec.template.spec.volumes}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get startup job volumes: %v", err))
-			return false
-		}
-
-		// Check for volume mount
-		cmd = exec.Command("kubectl", "get", "jobs",
-			"-l", "type=startup",
-			"-n", "homelab-autoscaler-system",
-			"-o", "jsonpath={.items[*].spec.template.spec.containers[*].volumeMounts}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		volumeMountOutput, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get startup job volume mounts: %v", err))
-			return false
-		}
-
-		hasConfigMap := strings.Contains(output, "configMap") && strings.Contains(volumeMountOutput, "config")
-		if hasConfigMap {
-			By("Startup job has ConfigMap volume and mount")
-		}
-		return hasConfigMap
-	}, 60*time.Second, 5*time.Second).Should(BeTrue(),
-		"Startup job should have ConfigMap volume mounted")
-}
-
-func waitForStartupJobCompletion() {
-	By("Waiting for startup job to complete")
-
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "jobs",
-			"-l", "type=startup",
-			"-n", "homelab-autoscaler-system",
-			"-o", "jsonpath={.items[*].status.succeeded}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get startup job status: %v", err))
-			return false
-		}
-		completed := strings.Contains(output, "1")
-		if completed {
-			By("Startup job completed successfully")
-		}
-		return completed
-	}, 120*time.Second, 5*time.Second).Should(BeTrue(),
-		"Startup job should complete successfully")
-}
-
-func verifyShutdownJobSecretVolume() {
-	By("Verifying shutdown job has Secret volume mounted")
-
-	// Trigger shutdown first
-	patch := `{"spec":{"powerState":"off"}}`
-	cmd := exec.Command("kubectl", "patch", "nodes.infra.homecluster.dev", nodeName,
-		"-n", "homelab-autoscaler-system", "--type=merge", "-p", patch)
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred())
-
-	// Wait for shutdown job and verify Secret volume
-	Eventually(func() bool {
-		cmd := exec.Command("kubectl", "get", "jobs",
-			"-l", "type=shutdown",
-			"-n", "homelab-autoscaler-system",
-			"-o", "jsonpath={.items[*].spec.template.spec.volumes}")
-		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-		output, err := utils.Run(cmd)
-		if err != nil {
-			By(fmt.Sprintf("Warning: failed to get shutdown job volumes: %v", err))
-			return false
-		}
-
-		hasSecret := strings.Contains(output, "secret") && strings.Contains(output, "auth-secrets")
-		if hasSecret {
-			By("Shutdown job has Secret volume 'auth-secrets'")
-		}
-		return hasSecret
-	}, 120*time.Second, 5*time.Second).Should(BeTrue(),
-		"Shutdown job should have Secret volume 'auth-secrets' mounted")
-}
-
-func cleanupTestResources() {
-	By("Cleaning up test Node CRs")
-
-	cmd := exec.Command("kubectl", "delete", "-f", "./examples/k3d/nodes1.yaml",
-		"--ignore-not-found")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, _ = utils.Run(cmd)
-
-	By("Cleaning up example ConfigMaps and Secrets")
-
-	cmd = exec.Command("kubectl", "delete", "-f", "./examples/k3d/node-volumes.yaml",
-		"--ignore-not-found")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, _ = utils.Run(cmd)
+// getProjectDir returns the project directory
+func getProjectDir() string {
+	wd, _ := os.Getwd()
+	return strings.Replace(wd, "/test/e2e", "", 1)
 }

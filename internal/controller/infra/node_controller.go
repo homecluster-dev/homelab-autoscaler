@@ -104,8 +104,8 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	group := &infrav1alpha1.Group{}
 	if err := r.Get(ctx, types.NamespacedName{Name: groupName, Namespace: node.Namespace}, group); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("Group referenced by node label not found", "group", groupName, "node", node.Name)
-			return ctrl.Result{}, nil
+			logger.Info("Group referenced by node label not found, requeuing", "group", groupName, "node", node.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		logger.Error(err, "Failed to get Group", "group", groupName)
 		return ctrl.Result{}, err

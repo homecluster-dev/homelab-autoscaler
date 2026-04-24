@@ -6,6 +6,7 @@ metadata:
   namespace: homelab-autoscaler-system
   labels:
     app: homelab-autoscaler
+  annotations:
     description: "Startup script for node initialization"
 data:
   startup-config.sh: |
@@ -21,6 +22,7 @@ metadata:
   namespace: homelab-autoscaler-system
   labels:
     app: homelab-autoscaler
+  annotations:
     description: "Shutdown script for node cleanup"
 data:
   shutdown-config.sh: |
@@ -36,6 +38,7 @@ metadata:
   namespace: homelab-autoscaler-system
   labels:
     app: homelab-autoscaler
+  annotations:
     description: "Authentication secrets for node operations"
 type: Opaque
 stringData:
