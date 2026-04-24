@@ -191,7 +191,7 @@ func VerifyVMControlServer(host string, port int) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() // nolint:errcheck
 
 	// Server might return 404 for root path but that's okay - it's responding
 	return resp.StatusCode < 500
