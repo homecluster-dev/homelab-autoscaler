@@ -229,15 +229,15 @@ spec:
 			}, caDetectionTimeout, checkInterval).Should(BeTrue(),
 				"homelab-autoscaler should receive NodeGroupDeleteNodes call")
 
-			By("Verifying Node CR desiredPowerState is set to Off")
+			By("Verifying Node CR powerState is set to Off")
 			Eventually(func() string {
 				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", agentNode0,
-					"-n", namespace, "-o", "jsonpath={.spec.desiredPowerState}")
+					"-n", namespace, "-o", "jsonpath={.spec.powerState }")
 				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 				output, _ := utils.Run(cmd)
 				return strings.TrimSpace(output)
 			}, 30*time.Second, checkInterval).Should(Equal("off"),
-				"Node CR desiredPowerState should be off")
+				"Node CR powerState should be off")
 
 			By("Verifying shutdown job is created")
 			Eventually(func() bool {
