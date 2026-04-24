@@ -157,10 +157,16 @@ var _ = Describe("K3d Integration", Serial, func() {
 			}, 30*time.Second, checkInterval).Should(BeTrue(),
 				"VM control server should be responding on %s:%d", vmControlHost, vmControlPort)
 
+			By("Setting up VM control host service")
+			cmd = exec.Command("bash", "./examples/k3d/setup-vm-control-service.sh")
+			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to setup VM control service: %s", output)
+
 			By("Applying secrets and configmaps")
 			cmd = exec.Command("kubectl", "apply", "-f", "./examples/k3d/secrets.yaml")
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-			output, err := utils.Run(cmd)
+			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply secrets/configmaps: %s", output)
 
 			By("Applying Node CRs")
