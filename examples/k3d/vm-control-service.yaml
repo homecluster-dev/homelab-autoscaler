@@ -1,0 +1,15 @@
+---
+# ExternalName service to reach host machine from within the cluster
+# This allows pods to access the VM control server running on the host
+apiVersion: v1
+kind: Service
+metadata:
+  name: vm-control-host
+  namespace: homelab-autoscaler-system
+spec:
+  type: ExternalName
+  # Docker gateway IP - accessible from k3d containers
+  externalName: host.k3d.internal
+  ports:
+  - port: 8080
+    targetPort: 8080

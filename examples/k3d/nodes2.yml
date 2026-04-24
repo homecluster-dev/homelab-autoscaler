@@ -20,7 +20,7 @@ spec:
       - -c
       - |
         export TOKEN=$(cat /secrets/token)
-        curl -H "Authorization: Bearer $TOKEN" http://host.k3d.internal:8080/start?vm=k3d-worker-2-0
+        curl -H "Authorization: Bearer $TOKEN" http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-worker-2-0
     serviceAccount: controller-manager
     volumes:
       - name: secrets
@@ -34,7 +34,7 @@ spec:
       - -c
       - |
         export TOKEN=$(cat /secrets/token)
-        curl -H "Authorization: Bearer $TOKEN" http://host.k3d.internal:8080/stop?vm=k3d-worker-2-0
+        curl -H "Authorization: Bearer $TOKEN" http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-worker-2-0
     serviceAccount: controller-manager
     volumes:
       - name: secrets

@@ -19,7 +19,7 @@ spec:
       - -c
       - |
         source /config/startup-config.sh
-        curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-0
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-0
     serviceAccount: controller-manager
     volumes:
       - name: config
@@ -33,7 +33,7 @@ spec:
       - -c
       - |
         source /config/shutdown-config.sh
-        curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-0
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-0
     serviceAccount: controller-manager
     volumes:
       - name: config
@@ -64,7 +64,7 @@ spec:
       - -c
       - |
         source /config/startup-config.sh
-        curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-1
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-1
     serviceAccount: controller-manager
     volumes:
       - name: config
@@ -78,7 +78,7 @@ spec:
       - -c
       - |
         source /config/shutdown-config.sh
-        curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-1
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-1
     serviceAccount: controller-manager
     volumes:
       - name: config
