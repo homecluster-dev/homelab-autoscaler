@@ -163,12 +163,6 @@ var _ = Describe("K3d Integration", Serial, func() {
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply secrets/configmaps: %s", output)
 
-			By("Applying VM control host service")
-			cmd = exec.Command("kubectl", "apply", "-f", "./examples/k3d/vm-control-service.yaml")
-			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-			output, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to apply VM control service: %s", output)
-
 			By("Applying Node CRs")
 			cmd = exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)

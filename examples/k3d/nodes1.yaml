@@ -19,12 +19,16 @@ spec:
       - -c
       - |
         source /config/startup-config.sh
-        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-0
+        curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-0
     serviceAccount: controller-manager
     volumes:
       - name: config
         configMapName: startup-config
         mountPath: /config
+    hostAliases:
+      - ip: "172.17.0.1"
+        hostnames:
+          - "host.k3d.internal"
   shutdownPodSpec:
     image: curlimages/curl:latest
     command:
@@ -33,7 +37,7 @@ spec:
       - -c
       - |
         source /config/shutdown-config.sh
-        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-0
+        curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-0
     serviceAccount: controller-manager
     volumes:
       - name: config
@@ -42,6 +46,10 @@ spec:
       - name: auth
         secretName: auth-secrets
         mountPath: /auth
+    hostAliases:
+      - ip: "172.17.0.1"
+        hostnames:
+          - "host.k3d.internal"
 ---
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -64,12 +72,16 @@ spec:
       - -c
       - |
         source /config/startup-config.sh
-        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-1
+        curl http://host.k3d.internal:8080/start?vm=k3d-homelab-autoscaler-agent-1
     serviceAccount: controller-manager
     volumes:
       - name: config
         configMapName: startup-config
         mountPath: /config
+    hostAliases:
+      - ip: "172.17.0.1"
+        hostnames:
+          - "host.k3d.internal"
   shutdownPodSpec:
     image: curlimages/curl:latest
     command:
@@ -78,7 +90,7 @@ spec:
       - -c
       - |
         source /config/shutdown-config.sh
-        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-1
+        curl http://host.k3d.internal:8080/stop?vm=k3d-homelab-autoscaler-agent-1
     serviceAccount: controller-manager
     volumes:
       - name: config
@@ -87,4 +99,8 @@ spec:
       - name: auth
         secretName: auth-secrets
         mountPath: /auth
+    hostAliases:
+      - ip: "172.17.0.1"
+        hostnames:
+          - "host.k3d.internal"
 
