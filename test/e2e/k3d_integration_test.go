@@ -275,6 +275,11 @@ spec:
 			}, 60*time.Second, checkInterval).Should(BeTrue(),
 				"VM control server should receive /stop request for %s", agentNode0)
 
+			By("Verifying shutdown job completes")
+			success, jobLogs, jobEvents := utils.WaitForJobCompletionWithError(namespace, "type=shutdown", jobCompletionTimeout)
+			Expect(success).To(BeTrue(),
+				"Shutdown job should complete successfully. Job Logs: %s. Job Events: %s", jobLogs, jobEvents)
+
 			By("Verifying k3d node stops")
 			Eventually(func() bool {
 				cmd := exec.Command("k3d", "node", "list", agentNode0)
@@ -344,20 +349,20 @@ spec:
 
 			By("Verifying gRPC NodeGroupIncreaseSize call was made")
 			Eventually(func() bool {
-				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
-				return strings.Contains(logs, "IncreaseSize")
+				logs, _ := utils.GetHomeClusterAutoscalerLogs(namespace, 1000)
+				return strings.Contains(logs, "NodeGroupIncreaseSize")
 			}, 30*time.Second, checkInterval).Should(BeTrue(),
-				"CA should call NodeGroupIncreaseSize")
+				"homelab-autoscaler should receive NodeGroupIncreaseSize call")
 
-			By("Verifying Node CR desiredPowerState is set to On")
+			By("Verifying Node CR powerState is set to On")
 			Eventually(func() string {
 				cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", shutdownNodeName,
-					"-n", namespace, "-o", "jsonpath={.spec.desiredPowerState}")
+					"-n", namespace, "-o", "jsonpath={.spec.powerState}")
 				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 				output, _ := utils.Run(cmd)
 				return strings.TrimSpace(output)
 			}, 30*time.Second, checkInterval).Should(Equal("on"),
-				"Node CR desiredPowerState should be on")
+				"Node CR powerState should be on")
 
 			By("Verifying startup job is created")
 			Eventually(func() bool {
@@ -399,10 +404,9 @@ spec:
 				"k3d node %s should start", shutdownNodeName)
 
 			By("Verifying startup job completes")
-			Eventually(func() bool {
-				return utils.WaitForJobCompletion(namespace, "type=startup", jobCompletionTimeout)
-			}, jobCompletionTimeout, checkInterval).Should(BeTrue(),
-				"Startup job should complete")
+			success, jobLogs, jobEvents := utils.WaitForJobCompletionWithError(namespace, "type=startup", jobCompletionTimeout)
+			Expect(success).To(BeTrue(),
+				"Startup job should complete successfully. Job Logs: %s. Job Events: %s", jobLogs, jobEvents)
 
 			By("Verifying Node CR progress becomes ready")
 			Eventually(func() string {

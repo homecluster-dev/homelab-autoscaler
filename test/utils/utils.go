@@ -339,6 +339,84 @@ func WaitForJobCompletion(namespace string, jobLabel string, timeout time.Durati
 	return false
 }
 
+// WaitForJobCompletionWithError waits for a job to complete and returns error details if it fails
+func WaitForJobCompletionWithError(namespace string, jobLabel string, timeout time.Duration) (bool, string, string) {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		cmd := exec.Command("kubectl", "get", "jobs",
+			"-l", jobLabel,
+			"-n", namespace,
+			"-o", "jsonpath={.items[*].status.succeeded}")
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+		output, err := cmd.CombinedOutput()
+		if err == nil && strings.Contains(string(output), "1") {
+			return true, "", ""
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	jobLogs, _ := GetJobLogs(namespace, jobLabel)
+	jobEvents, _ := GetJobEvents(namespace, jobLabel)
+	return false, jobLogs, jobEvents
+}
+
+// GetJobLogs retrieves logs from the first pod of a job
+func GetJobLogs(namespace string, jobLabel string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "pods",
+		"-l", jobLabel,
+		"-n", namespace,
+		"-o", "jsonpath={.items[*].metadata.name}")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+
+	podNames := strings.Fields(string(output))
+	if len(podNames) == 0 {
+		return "", fmt.Errorf("no pods found for job label %s", jobLabel)
+	}
+
+	cmd = exec.Command("kubectl", "logs", podNames[0],
+		"-n", namespace)
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+// GetJobEvents retrieves events for a job
+func GetJobEvents(namespace string, jobLabel string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "jobs",
+		"-l", jobLabel,
+		"-n", namespace,
+		"-o", "jsonpath={.items[*].metadata.name}")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+
+	jobNames := strings.Fields(string(output))
+	if len(jobNames) == 0 {
+		return "", fmt.Errorf("no jobs found for label %s", jobLabel)
+	}
+
+	cmd = exec.Command("kubectl", "get", "events",
+		"-n", namespace,
+		"--field-selector", "involvedObject.name="+jobNames[0],
+		"-o", "jsonpath={.items[*].message}")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
 // Node Verification utilities
 
 // WaitForNodeState waits for a Node CR to reach a specific progress state
