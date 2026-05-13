@@ -17,14 +17,31 @@ spec:
       - /bin/sh
     args:
       - -c
-      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-0
+      - |
+        source /config/startup-config.sh
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-0
+    serviceAccount: controller-manager
+    volumes:
+      - name: config
+        configMapName: startup-config
+        mountPath: /config
   shutdownPodSpec:
     image: curlimages/curl:latest
     command:
       - /bin/sh
     args:
       - -c
-      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-0
+      - |
+        source /config/shutdown-config.sh
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-0
+    serviceAccount: controller-manager
+    volumes:
+      - name: config
+        configMapName: shutdown-config
+        mountPath: /config
+      - name: auth
+        secretName: auth-secrets
+        mountPath: /auth
 ---
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Node
@@ -45,11 +62,29 @@ spec:
       - /bin/sh
     args:
       - -c
-      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-1
+      - |
+        source /config/startup-config.sh
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/start?vm=k3d-homelab-autoscaler-agent-1
+    serviceAccount: controller-manager
+    volumes:
+      - name: config
+        configMapName: startup-config
+        mountPath: /config
   shutdownPodSpec:
     image: curlimages/curl:latest
     command:
       - /bin/sh
     args:
       - -c
-      - curl http://host-internal.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-1
+      - |
+        source /config/shutdown-config.sh
+        curl http://vm-control-host.homelab-autoscaler-system.svc.cluster.local:8080/stop?vm=k3d-homelab-autoscaler-agent-1
+    serviceAccount: controller-manager
+    volumes:
+      - name: config
+        configMapName: shutdown-config
+        mountPath: /config
+      - name: auth
+        secretName: auth-secrets
+        mountPath: /auth
+

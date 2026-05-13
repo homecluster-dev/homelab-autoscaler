@@ -356,15 +356,18 @@ func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 					},
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					ServiceAccountName: "default",
 					Containers: []corev1.Container{
 						{
-							Name:    "startup",
-							Image:   nm.node.Spec.StartupPodSpec.Image,
-							Command: nm.node.Spec.StartupPodSpec.Command,
-							Args:    nm.node.Spec.StartupPodSpec.Args,
+							Name:         "startup",
+							Image:        nm.node.Spec.StartupPodSpec.Image,
+							Command:      nm.node.Spec.StartupPodSpec.Command,
+							Args:         nm.node.Spec.StartupPodSpec.Args,
+							VolumeMounts: []corev1.VolumeMount{},
 						},
 					},
+					Volumes: []corev1.Volume{},
 				},
 			},
 		},
@@ -372,6 +375,48 @@ func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 
 	// Set owner reference
 	nm.setOwnerReference(job)
+
+	// Apply ServiceAccount if specified
+	if nm.node.Spec.StartupPodSpec.ServiceAccount != nil {
+		job.Spec.Template.Spec.ServiceAccountName = *nm.node.Spec.StartupPodSpec.ServiceAccount
+	}
+
+	// Apply volumes and volume mounts
+	startupContainerIndex := 0
+	for _, volSpec := range nm.node.Spec.StartupPodSpec.Volumes {
+		// Create volume
+		vol := corev1.Volume{
+			Name: volSpec.Name,
+		}
+
+		if volSpec.SecretName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: volSpec.SecretName,
+				},
+			}
+		} else if volSpec.ConfigMapName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: volSpec.ConfigMapName,
+					},
+				},
+			}
+		}
+
+		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, vol)
+
+		// Create volume mount for the container
+		volumeMount := corev1.VolumeMount{
+			Name:      volSpec.Name,
+			MountPath: volSpec.MountPath,
+			ReadOnly:  true, // Secret/ConfigMap volumes are read-only
+		}
+
+		job.Spec.Template.Spec.Containers[startupContainerIndex].VolumeMounts =
+			append(job.Spec.Template.Spec.Containers[startupContainerIndex].VolumeMounts, volumeMount)
+	}
 
 	// Create the job
 	if err := nm.client.Create(context.TODO(), job); err != nil {
@@ -405,15 +450,18 @@ func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 					},
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					ServiceAccountName: "default",
 					Containers: []corev1.Container{
 						{
-							Name:    "shutdown",
-							Image:   nm.node.Spec.ShutdownPodSpec.Image,
-							Command: nm.node.Spec.ShutdownPodSpec.Command,
-							Args:    nm.node.Spec.ShutdownPodSpec.Args,
+							Name:         "shutdown",
+							Image:        nm.node.Spec.ShutdownPodSpec.Image,
+							Command:      nm.node.Spec.ShutdownPodSpec.Command,
+							Args:         nm.node.Spec.ShutdownPodSpec.Args,
+							VolumeMounts: []corev1.VolumeMount{},
 						},
 					},
+					Volumes: []corev1.Volume{},
 				},
 			},
 		},
@@ -421,6 +469,48 @@ func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 
 	// Set owner reference
 	nm.setOwnerReference(job)
+
+	// Apply ServiceAccount if specified
+	if nm.node.Spec.ShutdownPodSpec.ServiceAccount != nil {
+		job.Spec.Template.Spec.ServiceAccountName = *nm.node.Spec.ShutdownPodSpec.ServiceAccount
+	}
+
+	// Apply volumes and volume mounts
+	shutdownContainerIndex := 0
+	for _, volSpec := range nm.node.Spec.ShutdownPodSpec.Volumes {
+		// Create volume
+		vol := corev1.Volume{
+			Name: volSpec.Name,
+		}
+
+		if volSpec.SecretName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: volSpec.SecretName,
+				},
+			}
+		} else if volSpec.ConfigMapName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: volSpec.ConfigMapName,
+					},
+				},
+			}
+		}
+
+		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, vol)
+
+		// Create volume mount for the container
+		volumeMount := corev1.VolumeMount{
+			Name:      volSpec.Name,
+			MountPath: volSpec.MountPath,
+			ReadOnly:  true, // Secret/ConfigMap volumes are read-only
+		}
+
+		job.Spec.Template.Spec.Containers[shutdownContainerIndex].VolumeMounts =
+			append(job.Spec.Template.Spec.Containers[shutdownContainerIndex].VolumeMounts, volumeMount)
+	}
 
 	// Create the job
 	if err := nm.client.Create(context.TODO(), job); err != nil {

@@ -17,6 +17,11 @@ spec:
     spec:
       nodeSelector:
         infra.homecluster.dev/group: group1
+      tolerations:
+      - key: node.kubernetes.io/role
+        operator: Equal
+        value: agent
+        effect: NoSchedule
       containers:
       - name: hello-world
         image: busybox:latest

@@ -104,8 +104,8 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	group := &infrav1alpha1.Group{}
 	if err := r.Get(ctx, types.NamespacedName{Name: groupName, Namespace: node.Namespace}, group); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("Group referenced by node label not found", "group", groupName, "node", node.Name)
-			return ctrl.Result{}, nil
+			logger.Info("Group referenced by node label not found, requeuing", "group", groupName, "node", node.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		logger.Error(err, "Failed to get Group", "group", groupName)
 		return ctrl.Result{}, err
@@ -114,6 +114,12 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.SetControllerReference(ctx, node, group); err != nil {
 		logger.Error(err, "Failed to set controller reference", "node", node.Name, "group", group.Name)
 		return ctrl.Result{}, err
+	}
+
+	// Set providerID for Cluster Autoscaler integration
+	if err := r.setProviderIDForKubernetesNode(ctx, node); err != nil {
+		logger.Error(err, "Failed to set providerID", "node", node.Name)
+		// Don't fail reconciliation, just log and continue
 	}
 
 	if !node.DeletionTimestamp.IsZero() {
@@ -243,6 +249,37 @@ func (r *NodeReconciler) addLabelToKubernetesNodeWithPatch(ctx context.Context, 
 	}
 
 	logger.Info("Successfully patched Kubernetes node with label", "node", nodeName, "label", labelKey, "value", labelValue)
+	return nil
+}
+
+func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
+	logger := log.FromContext(ctx)
+
+	// Get the Kubernetes node
+	kubernetesNode := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: node.Spec.KubernetesNodeName}, kubernetesNode); err != nil {
+		logger.Error(err, "Failed to get Kubernetes node", "node", node.Spec.KubernetesNodeName)
+		return err
+	}
+
+	// Check if providerID is already set
+	if kubernetesNode.Spec.ProviderID != "" {
+		return nil
+	}
+
+	// Create a patch to set the providerID
+	patch := client.MergeFrom(kubernetesNode.DeepCopy())
+
+	// Set the providerID using the homelab scheme
+	kubernetesNode.Spec.ProviderID = fmt.Sprintf("homelab://%s", node.Name)
+
+	// Apply the patch
+	if err := r.Patch(ctx, kubernetesNode, patch); err != nil {
+		logger.Error(err, "Failed to patch Kubernetes node with providerID", "node", node.Spec.KubernetesNodeName)
+		return err
+	}
+
+	logger.Info("Successfully set providerID for Kubernetes node", "node", node.Spec.KubernetesNodeName, "providerID", kubernetesNode.Spec.ProviderID)
 	return nil
 }
 

@@ -125,6 +125,18 @@ create_namespace() {
     fi
 }
 
+# Create ServiceAccount for jobs
+create_serviceaccount() {
+    print_status "Creating controller-manager ServiceAccount..."
+    
+    if kubectl get serviceaccount controller-manager -n "$NAMESPACE" >/dev/null 2>&1; then
+        print_warning "ServiceAccount 'controller-manager' already exists"
+    else
+        kubectl create serviceaccount controller-manager -n "$NAMESPACE"
+        print_success "ServiceAccount 'controller-manager' created"
+    fi
+}
+
 # Apply local service forwarder (after Helm install to avoid conflicts)
 apply_service_forwarder() {
     print_status "Applying development local service forwarder..."
@@ -245,6 +257,7 @@ main() {
     create_cluster
     setup_kubeconfig
     create_namespace
+    create_serviceaccount
     validate_chart
     install_cluster_autoscaler
     apply_service_forwarder
