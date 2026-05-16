@@ -88,6 +88,8 @@ spec:
                     type: array
                   image:
                     type: string
+                  priorityClassName:
+                    type: string
                   serviceAccount:
                     type: string
                   volumes:
@@ -123,6 +125,8 @@ spec:
                       type: string
                     type: array
                   image:
+                    type: string
+                  priorityClassName:
                     type: string
                   serviceAccount:
                     type: string
