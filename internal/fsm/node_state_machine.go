@@ -434,6 +434,10 @@ func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 		},
 	}
 
+	if nm.node.Spec.StartupPodSpec.PriorityClassName != nil {
+		job.Spec.Template.Spec.PriorityClassName = *nm.node.Spec.StartupPodSpec.PriorityClassName
+	}
+
 	// Set owner reference
 	nm.setOwnerReference(job)
 
@@ -524,6 +528,10 @@ func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 				},
 			},
 		},
+	}
+
+	if nm.node.Spec.ShutdownPodSpec.PriorityClassName != nil {
+		job.Spec.Template.Spec.PriorityClassName = *nm.node.Spec.ShutdownPodSpec.PriorityClassName
 	}
 
 	// Set owner reference

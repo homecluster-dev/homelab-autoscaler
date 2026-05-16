@@ -88,6 +88,8 @@ spec:
                     type: array
                   image:
                     type: string
+                  priorityClassName:
+                    type: string
                   serviceAccount:
                     type: string
                   ttlSecondsAfterFinished:
@@ -129,6 +131,8 @@ spec:
                       type: string
                     type: array
                   image:
+                    type: string
+                  priorityClassName:
                     type: string
                   serviceAccount:
                     type: string
