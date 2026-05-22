@@ -220,13 +220,42 @@ func (s *HomeClusterProviderServer) PricingNodePrice(ctx context.Context, req *p
 	}, nil
 }
 
-// PricingPodPrice returns a theoretical minimum price of running a pod
+// PricingPodPrice returns a theoretical minimum price of running a pod.
+//
+// Returning Unimplemented here silently kills cluster-autoscaler's price expander:
+// the expander loops over candidate node groups, drops any whose PodPrice errors,
+// and ends up with an empty set — which then bypasses any chained tiebreaker
+// (e.g. price,least-waste). See externalgrpc PricingModel + expander/price.
+//
+// The model mirrors PricingNodePrice: each Node CR carries PricingSpec.PodRate
+// as a per-pod hourly rate; we return the cheapest configured rate as a
+// "theoretical minimum" baseline that's stable across node groups. When no
+// rates are configured we return 0, which is still a valid finite price.
 func (s *HomeClusterProviderServer) PricingPodPrice(ctx context.Context, req *pb.PricingPodPriceRequest) (*pb.PricingPodPriceResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("PricingPodPrice called", "podBytes", len(req.PodBytes))
 
-	// This is an optional method - return Unimplemented
-	return nil, status.Errorf(codes.Unimplemented, "PricingPodPrice not implemented")
+	nodes := &infrav1alpha1.NodeList{}
+	if err := s.Client.List(ctx, nodes); err != nil {
+		logger.Error(err, "failed to list nodes for pod pricing")
+		return nil, status.Errorf(codes.Internal, "failed to list nodes: %v", err)
+	}
+
+	var price float64
+	haveRate := false
+	for _, n := range nodes.Items {
+		rate, err := strconv.ParseFloat(n.Spec.Pricing.PodRate, 64)
+		if err != nil {
+			logger.Info("skipping unparseable PodRate", "node", n.Name, "podRate", n.Spec.Pricing.PodRate)
+			continue
+		}
+		if !haveRate || rate < price {
+			price = rate
+			haveRate = true
+		}
+	}
+
+	return &pb.PricingPodPriceResponse{Price: price}, nil
 }
 
 // GPULabel returns the label added to nodes with GPU resource
