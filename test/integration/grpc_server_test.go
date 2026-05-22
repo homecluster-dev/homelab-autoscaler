@@ -23,7 +23,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -452,11 +451,11 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(resp).NotTo(BeNil())
 				Expect(resp.NodeBytes).NotTo(BeEmpty())
 
-				// Unmarshal the node bytes to verify contents
+				// Unmarshal the node bytes the same way the cluster-autoscaler
+				// externalgrpc client does (v1.Node#Unmarshal), matching the
+				// externalgrpc.proto NodeBytes contract.
 				templateNode := &corev1.Node{}
-				decoder := serializer.NewCodecFactory(scheme.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
-				_, _, err = decoder.Decode(resp.NodeBytes, nil, templateNode)
-				Expect(err).NotTo(HaveOccurred())
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
 				Expect(templateNode.Name).To(ContainSubstring("test-group-template"))
 				Expect(templateNode.Spec.Unschedulable).To(BeFalse())
 
@@ -491,11 +490,10 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(resp).NotTo(BeNil())
 				Expect(resp.NodeBytes).NotTo(BeEmpty())
 
-				// Unmarshal the node bytes to verify contents
+				// Unmarshal the node bytes the same way the cluster-autoscaler
+				// externalgrpc client does (v1.Node#Unmarshal).
 				templateNode := &corev1.Node{}
-				decoder := serializer.NewCodecFactory(scheme.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
-				_, _, err = decoder.Decode(resp.NodeBytes, nil, templateNode)
-				Expect(err).NotTo(HaveOccurred())
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
 
 				// Ensure the custom taint is not present in the template node's taints
 				for _, t := range templateNode.Spec.Taints {
