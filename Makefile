@@ -113,7 +113,7 @@ test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with fu
 	@echo "Killing existing control server and controller"
 	lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
 	lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
-
+	
 	@echo "Setting up development environment..."
 	./development/install-dev.sh
 	
@@ -127,32 +127,7 @@ test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with fu
 	sleep 5
 	
 	@echo "Running e2e tests..."
-	@KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration" || TEST_FAILED=true
-	
-	@echo "Cleaning up local server..."
-	@if [ -f /tmp/local-server.pid ]; then \
-		source /tmp/local-server.pid; \
-		kill $$SERVER_PID 2>/dev/null || true; \
-		rm -f /tmp/local-server.pid; \
-	fi
-	
-	@echo "Cleaning up VM control server..."
-	@if [ -f /tmp/vm-control.pid ]; then \
-		source /tmp/vm-control.pid; \
-		kill $$VM_CONTROL_PID 2>/dev/null || true; \
-		rm -f /tmp/vm-control.pid; \
-	fi
-	
-	@echo "Deleting cluster..."
-	./examples/k3d/delete-cluster.sh
-	
-	@echo "Killing existing control server and controller"
-	lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
-	lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
-	
-	@if [ "$$TEST_FAILED" = "true" ]; then \
-		exit 1; \
-	fi
+	KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 
 .PHONY: run-e2e
 run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without cleanup
@@ -181,9 +156,28 @@ run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without 
 	@echo "  kill \$$(cat /tmp/vm-control.pid | cut -d'=' -f2) 2>/dev/null || true"
 	@echo "  ./examples/k3d/delete-cluster.sh"
 
-.PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the k3d cluster used for e2e tests
+.PHONY: cleanup-e2e
+cleanup-e2e: ## Clean up all e2e test resources (servers, cluster, etc.)
+	@echo "Cleaning up local server..."
+	@if [ -f /tmp/local-server.pid ]; then \
+		source /tmp/local-server.pid; \
+		kill $$SERVER_PID 2>/dev/null || true; \
+		rm -f /tmp/local-server.pid; \
+	fi
+	@echo "Cleaning up VM control server..."
+	@if [ -f /tmp/vm-control.pid ]; then \
+		source /tmp/vm-control.pid; \
+		kill $$VM_CONTROL_PID 2>/dev/null || true; \
+		rm -f /tmp/vm-control.pid; \
+	fi
+	@echo "Deleting cluster..."
 	./examples/k3d/delete-cluster.sh
+	@echo "Killing any remaining processes..."
+	lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+	lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+
+.PHONY: cleanup-test-e2e
+cleanup-test-e2e: cleanup-e2e ## Tear down the k3d cluster used for e2e tests (alias for cleanup-e2e)
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
