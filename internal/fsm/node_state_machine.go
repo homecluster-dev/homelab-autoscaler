@@ -624,12 +624,6 @@ func (nm *NodeStateMachine) setNodeUnschedulable(nodeName string) error {
 	return nil
 }
 
-// setNodeSchedulable uncordons the Kubernetes node to allow new pods to be scheduled
-// This function retries to handle cases where the node hasn't registered yet
-func (nm *NodeStateMachine) setNodeSchedulable(nodeName string) error {
-	return nm.setNodeSchedulableWithRetry(nodeName)
-}
-
 // setNodeSchedulableInternal performs the actual uncordon operation without retry
 func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon")
