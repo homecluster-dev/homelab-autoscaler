@@ -112,43 +112,51 @@ test: helm-sync-crds generate fmt vet setup-envtest ## Run tests.
 test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with full cleanup
 	@echo "Killing existing control server and controller"
 	lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
-	lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+	lsof -i :9052 | awk '{print $2}' | tail -n 1 | xargs kill -9 || echo "ok"
+	lsof -ti :50052 | xargs kill -9 2>/dev/null || true
 	
 	@echo "Setting up development environment..."
 	./development/install-dev.sh
 	
 	@echo "Starting VM control server..."
-	@cd examples/k3d && python3 vm_control_server.py & \
+	@cd examples/k3d; nohup python3 vm_control_server.py > /tmp/vm-control.log 2>&1 & \
+	VMPID=$$!; echo $$VMPID > /tmp/vm-control.pid; \
+	echo "VM control server started with PID: $$VMPID"
 	
 	@echo "Starting local server..."
-	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 > /tmp/homelab-autoscaler.log 2>&1 & \
+	@cd $(CURDIR); KUBECONFIG=$(CURDIR)/kubeconfig ENABLE_WEBHOOKS=false nohup go run cmd/main.go --grpc-server-address :50052 > /tmp/homelab-autoscaler.log 2>&1 & \
+	SERVERPID=$$!; echo $$SERVERPID > /tmp/local-server.pid; \
+	echo "Local server started with PID: $$SERVERPID"; \
+	sleep 5
 	SERVER_PID=$$!; \
 	echo "export SERVER_PID=$$SERVER_PID" > /tmp/local-server.pid; \
 	sleep 5
 	
 	@echo "Running e2e tests..."
-	KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
+	KUBECONFIG=$(CURDIR)/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 
 .PHONY: run-e2e
 run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without cleanup
+	@echo "Killing any existing gRPC server processes..."
+	@lsof -ti :50052 | xargs kill -9 2>/dev/null || true
+	@sleep 1
+	
 	@echo "Setting up development environment..."
 	./development/install-dev.sh
 	
 	@echo "Starting VM control server..."
-	@cd examples/k3d && python3 vm_control_server.py & \
-	VM_CONTROL_PID=$$!; \
-	echo "export VM_CONTROL_PID=$$VM_CONTROL_PID" > /tmp/vm-control.pid; \
-	echo "VM control server started with PID: $$VM_CONTROL_PID"
+	@cd examples/k3d; nohup python3 vm_control_server.py > /tmp/vm-control.log 2>&1 & \
+	VMPID=$$!; echo $$VMPID > /tmp/vm-control.pid; \
+	echo "VM control server started with PID: $$VMPID"
 	
 	@echo "Starting local server..."
-	@KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 > /tmp/homelab-autoscaler.log 2>&1 & \
-	SERVER_PID=$$!; \
-	echo "export SERVER_PID=$$SERVER_PID" > /tmp/local-server.pid; \
-	echo "Local server started with PID: $$SERVER_PID"; \
+	@cd $(CURDIR); KUBECONFIG=$(CURDIR)/kubeconfig ENABLE_WEBHOOKS=false nohup go run cmd/main.go --grpc-server-address :50052 > /tmp/homelab-autoscaler.log 2>&1 & \
+	SERVERPID=$$!; echo $$SERVERPID > /tmp/local-server.pid; \
+	echo "Local server started with PID: $$SERVERPID"; \
 	sleep 5
 	
 	@echo "Running e2e tests..."
-	KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
+	KUBECONFIG=$(CURDIR)/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 	
 	@echo "E2E tests completed! Environment is still running for inspection."
 	@echo "To clean up manually:"
@@ -158,6 +166,19 @@ run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without 
 
 .PHONY: cleanup-e2e
 cleanup-e2e: ## Clean up all e2e test resources (servers, cluster, etc.)
+	@echo "Cleaning up test environment..."
+	@echo "Untainting agent nodes..."
+	@kubectl taint nodes k3d-homelab-autoscaler-agent-0 k3d-agent-role:NoSchedule- --ignore-not-found || true
+	@kubectl taint nodes k3d-homelab-autoscaler-agent-1 k3d-agent-role:NoSchedule- --ignore-not-found || true
+	@echo "Uncordoning agent nodes..."
+	@kubectl uncordon k3d-homelab-autoscaler-agent-0 --ignore-not-found || true
+	@kubectl uncordon k3d-homelab-autoscaler-agent-1 --ignore-not-found || true
+	@echo "Cleaning up Node CRs..."
+	@kubectl delete -f ./examples/k3d/nodes1.yaml --ignore-not-found || true
+	@echo "Cleaning up test deployment..."
+	@kubectl delete -f examples/k3d/hello-world-deployment.yaml --ignore-not-found || true
+	@echo "Cleaning up Group CR..."
+	@kubectl delete group group1 -n homelab-autoscaler-system --ignore-not-found || true
 	@echo "Cleaning up local server..."
 	@if [ -f /tmp/local-server.pid ]; then \
 		source /tmp/local-server.pid; \
@@ -174,7 +195,7 @@ cleanup-e2e: ## Clean up all e2e test resources (servers, cluster, etc.)
 	./examples/k3d/delete-cluster.sh
 	@echo "Killing any remaining processes..."
 	lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
-	lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+	lsof -i :9052 | awk '{print $2}' | tail -n 1 | xargs kill -9 || echo "ok"
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: cleanup-e2e ## Tear down the k3d cluster used for e2e tests (alias for cleanup-e2e)

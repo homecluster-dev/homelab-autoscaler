@@ -37,7 +37,7 @@ const (
 	grpcServerPort   = "50052"
 	kubeconfigPath   = "./kubeconfig"
 	namespace        = "homelab-autoscaler-system"
-	vmControlPort    = 8080
+	vmControlPort    = 9052
 	vmControlHost    = "localhost"
 	vmControlLogFile = "/tmp/vm-control-requests.log"
 
@@ -87,33 +87,6 @@ var _ = BeforeSuite(func() {
 	// Clear VM control server log
 	err = utils.ClearLogFile(vmControlLogFile)
 	Expect(err).NotTo(HaveOccurred())
-})
-
-var _ = AfterSuite(func() {
-	By("Cleaning up test environment")
-
-	// Untaint nodes
-	By("Untainting agent nodes")
-	_ = utils.UntaintNode(agentNode0, "node.kubernetes.io/role")
-	_ = utils.UntaintNode(agentNode1, "node.kubernetes.io/role")
-
-	// Cleanup Node CRs
-	By("Cleaning up Node CRs")
-	cmd := exec.Command("kubectl", "delete", "-f", "./examples/k3d/nodes1.yaml", "--ignore-not-found")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, _ = utils.Run(cmd)
-
-	// Cleanup test deployment
-	By("Cleaning up test deployment")
-	cmd = exec.Command("kubectl", "delete", "-f", "examples/k3d/hello-world-deployment.yaml", "--ignore-not-found")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, _ = utils.Run(cmd)
-
-	// Cleanup Group CR
-	By("Cleaning up Group CR")
-	cmd = exec.Command("kubectl", "delete", "group", "group1", "-n", namespace, "--ignore-not-found")
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-	_, _ = utils.Run(cmd)
 })
 
 var _ = Describe("K3d Integration", Serial, func() {
@@ -185,12 +158,6 @@ var _ = Describe("K3d Integration", Serial, func() {
 			}, 30*time.Second, checkInterval).Should(Succeed(),
 				"Node CRs should be created")
 
-			By("Setup & Environment Validation completed successfully")
-		})
-	})
-
-	Context("Scale-Down Workflow", func() {
-		It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
 			By("Applying Group CR with aggressive scale-down settings")
 			groupYAML := `
 apiVersion: infra.homecluster.dev/v1alpha1
@@ -215,11 +182,17 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			tmpFile.Close()
 
-			cmd := exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+			cmd = exec.Command("kubectl", "apply", "-f", tmpFile.Name())
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-			output, err := utils.Run(cmd)
+			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply Group: %s", output)
 
+			By("Setup & Environment Validation completed successfully")
+		})
+	})
+
+	Context("Scale-Down Workflow", func() {
+It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
 			By("Waiting for Cluster Autoscaler to detect unneeded nodes")
 			Eventually(func() bool {
 				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)

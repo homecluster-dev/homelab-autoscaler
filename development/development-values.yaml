@@ -17,8 +17,8 @@ clusterAutoscaler:
     endpoint: "homelab-autoscaler-grpc-local:50051"
   
   # Scaling policies - same as production
-  scaleDownDelay: "10m"
-  scaleDownUnneededTime: "10m"
+  scaleDownDelay: "30s"
+  scaleDownUnneededTime: "30s"
   scaleDownUtilizationThreshold: 0.5
   skipNodesWithLocalStorage: true
   skipNodesWithSystemPods: true
@@ -27,10 +27,11 @@ clusterAutoscaler:
   extraArgs:
     - --balance-similar-node-groups
     - --skip-nodes-with-local-storage=false
-    - --max-node-provision-time=15m
+    - --max-node-provision-time=2m
     - --scale-down-delay-after-failure=3m
     - --unremovable-node-recheck-timeout=1m0s  
     - --scale-down-delay-after-add=1m0s
+    - --scale-down-delay-after-delete=0s
   
   # Resource limits and requests for cluster autoscaler pod
   resources:

@@ -31,8 +31,8 @@ spec:
   type: ClusterIP
   clusterIP: None
   ports:
-  - port: 8080
-    targetPort: 8080
+  - port: 9052
+    targetPort: 9052
 ---
 apiVersion: v1
 kind: Endpoints
@@ -43,7 +43,7 @@ subsets:
 - addresses:
   - ip: ${GATEWAY_IP}
   ports:
-  - port: 8080
+  - port: 9052
 EOF
 
 echo "VM control host service configured successfully"
