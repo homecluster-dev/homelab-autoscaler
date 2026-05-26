@@ -158,7 +158,7 @@ var _ = Describe("K3d Integration", Serial, func() {
 			}, 30*time.Second, checkInterval).Should(Succeed(),
 				"Node CRs should be created")
 
-			By("Applying Group CR with aggressive scale-down settings")
+			By("Applying Group CR with scale-down settings that allow pod startup time")
 			groupYAML := `
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Group
@@ -169,9 +169,9 @@ spec:
   ignoreDaemonSetsUtilization: true
   maxNodeProvisionTime: 2m
   scaleDownGpuUtilizationThreshold: "30"
-  scaleDownUnneededTime: 30s
+  scaleDownUnneededTime: 2m
   scaleDownUnreadyTime: 30s
-  scaleDownUtilizationThreshold: "0.1"
+  scaleDownUtilizationThreshold: "0.05"
   zeroOrMaxNodeScaling: false
 `
 			tmpFile, err := os.CreateTemp("", "group-*.yaml")
@@ -396,6 +396,9 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 				return utils.WaitForNodeReady(shutdownNodeName, true, nodeStateTimeout)
 			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
 				"Kubernetes node should be Ready")
+
+			By("Waiting for node stabilization before workload scheduling")
+			time.Sleep(30 * time.Second)
 
 			By("Verifying deployment pod is scheduled and running")
 			Eventually(func() bool {
