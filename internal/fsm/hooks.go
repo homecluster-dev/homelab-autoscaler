@@ -69,29 +69,30 @@ func (nm *NodeStateMachine) beforeShutdownNode(ctx context.Context, e *fsm.Event
 func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
 
-	logger.Info("Job completed, releasing coordination lock", "node", nm.node.Name, "state", e.Dst)
-
 	// If transitioning to Ready state (startup completed), uncordon the Kubernetes node
 	if e.Dst == StateReady {
 		logger.Info("Transitioning to Ready state, uncordonning Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 
-		// Retry uncordon with 90s timeout to handle node registration delays
-		if err := nm.setNodeSchedulableWithRetry(nm.node.Spec.KubernetesNodeName, 90*time.Second); err != nil {
+		// Retry uncordon with timeout to handle node registration delays
+		// Note: We do this BEFORE releasing the lock to ensure the node is schedulable
+		// before other operations can proceed
+		if err := nm.setNodeSchedulableWithRetry(nm.node.Spec.KubernetesNodeName); err != nil {
 			logger.Error(err, "Failed to uncordon Kubernetes node after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
-			// Don't update status to Ready if uncordon failed - stay in StartingUp and keep retrying
-			return
+			// Continue anyway - don't block the operation if uncordon fails
+			// The node will remain cordoned until manually uncordoned or until next startup
+		} else {
+			logger.Info("Successfully uncordoned Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 		}
-		logger.Info("Successfully uncordoned Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 	}
 
-	// Release coordination lock after successful completion
+	// Release coordination lock after job completion
 	if err := nm.coordinationManager.ReleaseLock(ctx, nm.node); err != nil {
 		logger.Error(err, "Failed to release coordination lock after job completion", "node", nm.node.Name)
 	} else {
 		logger.Info("Successfully released coordination lock after job completion", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect new state (only after successful uncordon for Ready state)
+	// Update node status to reflect new state
 	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
 
 	// Jobs are cleaned up automatically via TTL - no manual cleanup needed

@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -154,7 +155,11 @@ func TestAfterJobCompleted(t *testing.T) {
 	t.Run("successful lock release and status update", func(t *testing.T) {
 		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 		mockCoord := NewMockCoordinationManager()
-		fakeClient := CreateFakeClient(scheme, node)
+
+		// Create a Kubernetes node that is Ready but unschedulable (cordoned)
+		kubeNode := CreateTestKubernetesNode("test-node-k8s", true)
+
+		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 		nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
 		ctx := context.TODO()
@@ -184,6 +189,12 @@ func TestAfterJobCompleted(t *testing.T) {
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
 		assert.Equal(t, infrav1alpha1.Progress(StateReady), updatedNode.Status.Progress)
+
+		// Verify Kubernetes node was uncordoned
+		updatedKubeNode := &corev1.Node{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-node-k8s"}, updatedKubeNode)
+		assert.NoError(t, err)
+		assert.False(t, updatedKubeNode.Spec.Unschedulable, "Kubernetes node should be uncordoned")
 	})
 
 	t.Run("lock release failure is logged but doesn't fail", func(t *testing.T) {
@@ -505,6 +516,7 @@ func TestHooksIntegration(t *testing.T) {
 	fakeClient := CreateFakeClient(scheme, node)
 
 	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	nm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 	t.Run("complete startup flow with hooks", func(t *testing.T) {
 		// Start the node - should trigger before and enter hooks

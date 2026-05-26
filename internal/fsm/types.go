@@ -56,9 +56,10 @@ const (
 
 // Default timeouts and backoff settings
 const (
-	DefaultJobTimeout  = 5 * time.Minute
-	DefaultLockTimeout = 5 * time.Minute
-	MaxRetries         = 3
+	DefaultJobTimeout      = 5 * time.Minute
+	DefaultLockTimeout     = 5 * time.Minute
+	MaxRetries             = 3
+	DefaultUncordonTimeout = 90 * time.Second
 )
 
 // NodeStateMachine represents the FSM for node state management
@@ -81,6 +82,9 @@ type NodeStateMachine struct {
 
 	// Backoff strategy
 	backoff *BackoffStrategy
+
+	// Configuration
+	uncordonTimeout time.Duration
 }
 
 // BackoffStrategy implements smart backoff for state transitions

@@ -78,6 +78,7 @@ func TestNewNodeStateMachine(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 			assert.NotNil(t, fsm)
 			assert.Equal(t, tt.expectedState, fsm.GetCurrentState())
@@ -209,6 +210,7 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 			assert.Equal(t, tt.canTransition, fsm.CanTransition(tt.event))
 		})
@@ -226,6 +228,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -263,6 +266,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.Error(t, err)
@@ -284,6 +288,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.Error(t, err)
@@ -309,6 +314,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -351,6 +357,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node) // No Kubernetes node
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err) // Should not fail even if Kubernetes node doesn't exist
@@ -372,6 +379,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.Error(t, err)
@@ -400,6 +408,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.JobCompleted(nil)
 		assert.NoError(t, err)
@@ -425,6 +434,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.JobCompleted(nil)
 		assert.NoError(t, err)
@@ -518,6 +528,8 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 			err := tt.event(fsm)
 			assert.NoError(t, err)
@@ -536,6 +548,7 @@ func TestNodeStateMachine_CalculateBackoff(t *testing.T) {
 	fakeClient := CreateFakeClient(scheme, node)
 
 	fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 	t.Run("no backoff strategy returns default", func(t *testing.T) {
 		backoff := fsm.CalculateBackoff()
@@ -598,6 +611,7 @@ func TestNodeStateMachine_IsTransitionStuck(t *testing.T) {
 	fakeClient := CreateFakeClient(scheme, node)
 
 	fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 	t.Run("no backoff strategy is not stuck", func(t *testing.T) {
 		assert.False(t, fsm.IsTransitionStuck())
@@ -641,7 +655,8 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		require.NoError(t, err)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.jobTimeout = 2 * time.Second // Short timeout for testing
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.jobTimeout = 2 * time.Second             // Short timeout for testing
 
 		// Start monitoring in a goroutine
 		done := make(chan bool)
@@ -677,7 +692,8 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		require.NoError(t, err)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.jobTimeout = 2 * time.Second // Short timeout for testing
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.jobTimeout = 2 * time.Second             // Short timeout for testing
 
 		// Start monitoring in a goroutine
 		done := make(chan bool)
@@ -713,7 +729,8 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		require.NoError(t, err)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.jobTimeout = 100 * time.Millisecond // Very short timeout for testing
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.jobTimeout = 100 * time.Millisecond      // Very short timeout for testing
 
 		// Start monitoring in a goroutine
 		done := make(chan bool)
@@ -760,6 +777,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, pendingStartupJob, pendingShutdownJob, completedJob, otherNodeJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		// Call cleanup
 		err := fsm.cleanupPendingJobs("test-node-k8s")
@@ -790,6 +808,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		// Call cleanup when no jobs exist
 		err := fsm.cleanupPendingJobs("test-node-k8s")
@@ -809,6 +828,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		// Call cleanup with empty node name
 		err := fsm.cleanupPendingJobs("")
@@ -828,6 +848,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, startupJob, shutdownJob, otherTypeJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		// Call cleanup
 		err := fsm.cleanupPendingJobs("test-node-k8s")
@@ -859,6 +880,7 @@ func TestNodeStateMachine_StartNodeWithCleanup(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		// Start node
 		err := fsm.StartNode()
@@ -894,6 +916,7 @@ func TestNodeStateMachine_ShutdownNodeWithCleanup(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		// Shutdown node
 		err := fsm.ShutdownNode()
@@ -925,6 +948,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -947,6 +971,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -974,6 +999,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -1012,6 +1038,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -1055,6 +1082,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -1093,6 +1121,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1115,6 +1144,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1142,6 +1172,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1180,6 +1211,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1225,6 +1257,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)

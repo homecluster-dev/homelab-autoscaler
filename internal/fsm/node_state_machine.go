@@ -48,6 +48,7 @@ func NewNodeStateMachine(
 		scheme:              scheme,
 		coordinationManager: coordMgr,
 		jobTimeout:          DefaultJobTimeout,
+		uncordonTimeout:     DefaultUncordonTimeout,
 	}
 
 	// Initialize FSM with current state from node progress
@@ -297,7 +298,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("Job monitoring timeout", "node", nm.node.Name, "job", jobName)
+			logger.Info("Job monitoring nm.uncordonTimeout", "node", nm.node.Name, "job", jobName)
 			if err := nm.JobTimeout(); err != nil {
 				logger.Error(err, "Failed to trigger JobTimeout event", "node", nm.node.Name)
 			}
@@ -624,7 +625,13 @@ func (nm *NodeStateMachine) setNodeUnschedulable(nodeName string) error {
 }
 
 // setNodeSchedulable uncordons the Kubernetes node to allow new pods to be scheduled
+// This function retries to handle cases where the node hasn't registered yet
 func (nm *NodeStateMachine) setNodeSchedulable(nodeName string) error {
+	return nm.setNodeSchedulableWithRetry(nodeName)
+}
+
+// setNodeSchedulableInternal performs the actual uncordon operation without retry
+func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon")
 
 	if nodeName == "" {
@@ -685,7 +692,7 @@ func (nm *NodeStateMachine) setNodeSchedulable(nodeName string) error {
 
 // setNodeSchedulableWithRetry attempts to uncordon a Kubernetes node with exponential backoff
 // This is used after node startup to handle the case where the node hasn't registered yet
-func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string, timeout time.Duration) error {
+func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon-retry")
 
 	if nodeName == "" {
@@ -699,8 +706,8 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string, timeout
 
 	for {
 		elapsed := time.Since(start)
-		if elapsed >= timeout {
-			return fmt.Errorf("timeout after %v: failed to uncordon node %s", timeout, nodeName)
+		if elapsed >= nm.uncordonTimeout {
+			return fmt.Errorf("nm.uncordonTimeout after %v: failed to uncordon node %s", nm.uncordonTimeout, nodeName)
 		}
 
 		// Get current node status
@@ -735,8 +742,8 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string, timeout
 			continue
 		}
 
-		// Try to uncordon
-		err := nm.setNodeSchedulable(nodeName)
+		// Try to uncordon using internal method (no retry)
+		err := nm.setNodeSchedulableInternal(nodeName)
 		if err == nil {
 			logger.Info("Successfully uncordoned Kubernetes node", "elapsed", elapsed.String())
 			return nil
@@ -858,8 +865,7 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 		return fmt.Errorf("failed to list jobs: %w", err)
 	}
 
-	// No manual cleanup needed - jobs have TTL
-
+	// Delete pending startup/shutdown jobs to ensure clean state
 	for _, job := range jobList.Items {
 		// Check if this is a startup or shutdown job
 		jobType, exists := job.Labels["type"]
@@ -869,15 +875,18 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 
 		// Check if job is still pending or running (not completed)
 		if job.Status.Succeeded == 0 && job.Status.Failed == 0 {
-			// Jobs with TTL will be cleaned up automatically
-			// We just log them for visibility
-			logger.Info("Found pending job (will be auto-cleaned by TTL)", "job", job.Name, "type", jobType)
+			// Delete pending job to ensure clean state
+			if err := nm.client.Delete(ctx, &job); err != nil {
+				logger.Error(err, "Failed to delete pending job", "job", job.Name)
+				continue
+			}
+			logger.Info("Deleted pending job", "job", job.Name, "type", jobType)
 		} else {
 			logger.V(1).Info("Skipping completed job", "job", job.Name, "type", jobType, "succeeded", job.Status.Succeeded, "failed", job.Status.Failed)
 		}
 	}
 
-	logger.Info("Job cleanup skipped - using TTL-based automatic cleanup")
+	logger.Info("Job cleanup completed")
 
 	return nil
 }
