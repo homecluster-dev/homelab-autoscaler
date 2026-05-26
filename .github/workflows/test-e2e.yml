@@ -36,7 +36,3 @@ jobs:
 
       - name: Run E2E tests
         run: make test-e2e
-      
-      - name: Cleanup E2E resources
-        if: always()
-        run: make cleanup-e2e
