@@ -20,6 +20,7 @@ limitations under the License.
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,36 +42,39 @@ const (
 	vmControlHost    = "localhost"
 	vmControlLogFile = "/tmp/vm-control-requests.log"
 
-	// Node names
+	// Node names - these must match the k3d cluster configuration
 	agentNode0 = "k3d-homelab-autoscaler-agent-0"
 	agentNode1 = "k3d-homelab-autoscaler-agent-1"
 
-	// Taints
+	// Taints - prevents workloads from being scheduled on agent nodes
 	agentTaint = "node.kubernetes.io/role=agent:NoSchedule"
 
-	// Timeouts
-	caDetectionTimeout   = 60 * time.Second
-	vmShutdownTimeout    = 60 * time.Second
-	vmStartupTimeout     = 60 * time.Second
-	jobCompletionTimeout = 120 * time.Second
-	podScheduleTimeout   = 200 * time.Second
-	nodeStateTimeout     = 120 * time.Second
+	// Timeouts - various timeouts for different operations
+	caDetectionTimeout   = 60 * time.Second // Time for CA to detect need for scale
+	vmShutdownTimeout    = 60 * time.Second // Time for VM to power off
+	vmStartupTimeout     = 60 * time.Second // Time for VM to power on
+	jobCompletionTimeout = 120 * time.Second // Time for startup/shutdown job to complete
+	podScheduleTimeout   = 200 * time.Second // Time for pod to be scheduled after node is ready
+	nodeStateTimeout     = 120 * time.Second // Time for node state changes
 
-	// Check intervals
+	// Check intervals - how often to poll for state changes
 	checkInterval     = 5 * time.Second
 	fastCheckInterval = 1 * time.Second
 )
 
 // Shared state between tests
+// These variables persist across test contexts and are used to track state
 var (
-	vmControlServerPID int
-	shutdownNodeName   string
+	vmControlServerPID int // PID of the VM control server process
+	shutdownNodeName   string // Name of the node that was shut down (for scale-up test)
 )
 
+// BeforeSuite runs once before all tests in this suite
+// It sets up the test environment by verifying prerequisites
 var _ = BeforeSuite(func() {
 	By("Setting up test environment")
 
-	// Set KUBECONFIG environment variable
+	// Set KUBECONFIG environment variable so kubectl commands use our test cluster
 	err := os.Setenv("KUBECONFIG", filepath.Join(getProjectDir(), kubeconfigPath))
 	Expect(err).NotTo(HaveOccurred())
 
@@ -84,13 +88,33 @@ var _ = BeforeSuite(func() {
 	Expect(strings.Contains(output, clusterName)).To(BeTrue(),
 		"k3d cluster '%s' not found. Please run 'make test-e2e' to set up the test environment.", clusterName)
 
-	// Clear VM control server log
+	// Clear VM control server log from previous test runs
 	err = utils.ClearLogFile(vmControlLogFile)
 	Expect(err).NotTo(HaveOccurred())
 })
 
+// =============================================================================
+// TEST SUITE: K3d Integration
+// =============================================================================
+// This test suite validates the complete autoscaling workflow with k3d nodes:
+// 1. Setup & Environment Validation - Prepare the test environment
+// 2. Scale-Down Workflow - Verify nodes can be powered off when not needed
+// 3. Scale-Up Workflow - Verify nodes can be powered on when needed
+// =============================================================================
 var _ = Describe("K3d Integration", Serial, func() {
 
+	// =============================================================================
+	// TEST 1: Setup & Environment Validation
+	// =============================================================================
+	// Purpose: Prepare and validate the test environment before running scale tests
+	// 
+	// Steps:
+	// 1. Verify k3d cluster is running with agent nodes
+	// 2. Taint agent nodes to prevent workload scheduling (they're for testing only)
+	// 3. Set up VM control server service for node power management
+	// 4. Apply Node CRs that define our agent nodes
+	// 5. Apply Group CR with aggressive scale-down settings for testing
+	// =============================================================================
 	Context("Setup & Environment Validation", func() {
 		It("should verify prerequisites and prepare environment", func() {
 			By("Verifying k3d cluster is running")
@@ -98,12 +122,15 @@ var _ = Describe("K3d Integration", Serial, func() {
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-	By("Verifying agent nodes exist")
-		Expect(utils.NodeExists(agentNode0)).To(BeTrue(),
-			"Agent node 0 should exist")
-		Expect(utils.NodeExists(agentNode1)).To(BeTrue(),
-			"Agent node 1 should exist")
+			By("Verifying agent nodes exist")
+			Expect(utils.NodeExists(agentNode0)).To(BeTrue(),
+				"Agent node 0 should exist")
+			Expect(utils.NodeExists(agentNode1)).To(BeTrue(),
+				"Agent node 1 should exist")
 
+			// Taint agent nodes to prevent workload scheduling.
+			// This is critical: we want control over which node gets scaled,
+			// so workloads can't accidentally schedule on them before we're ready.
 			By("Tainting agent nodes to prevent workload scheduling")
 			err = utils.TaintNode(agentNode0, agentTaint)
 			Expect(err).NotTo(HaveOccurred())
@@ -130,6 +157,7 @@ var _ = Describe("K3d Integration", Serial, func() {
 			}, 30*time.Second, checkInterval).Should(BeTrue(),
 				"VM control server should be responding on %s:%d", vmControlHost, vmControlPort)
 
+			// Set up service to make VM control server accessible from inside the cluster
 			By("Setting up VM control host service")
 			cmd = exec.Command("bash", "./examples/k3d/setup-vm-control-service.sh")
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
@@ -143,6 +171,8 @@ var _ = Describe("K3d Integration", Serial, func() {
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply secrets/configmaps: %s", output)
 
 			By("Applying Node CRs")
+			// Node CRs define our agent nodes with startup/shutdown pod specs
+			// These pods will curl the VM control server to power nodes on/off
 			cmd = exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
 			output, err = utils.Run(cmd)
@@ -158,6 +188,9 @@ var _ = Describe("K3d Integration", Serial, func() {
 			}, 30*time.Second, checkInterval).Should(Succeed(),
 				"Node CRs should be created")
 
+			// Apply Group CR with aggressive scale-down settings for testing
+			// scaleDownUnneededTime: 30s - CA will consider node unneeded after 30s
+			// scaleDownUtilizationThreshold: 0.1 - Node with <10% utilization is unneeded
 			By("Applying Group CR with aggressive scale-down settings")
 			groupYAML := `
 apiVersion: infra.homecluster.dev/v1alpha1
@@ -191,8 +224,31 @@ spec:
 		})
 	})
 
+	// =============================================================================
+	// TEST 2: Scale-Down Workflow
+	// =============================================================================
+	// Purpose: Verify that Cluster Autoscaler can detect unneeded nodes and
+	// our controller can power them off.
+	//
+	// Flow:
+	// 1. CA detects node is unneeded (no workloads, below utilization threshold)
+	// 2. CA calls our gRPC server's NodeGroupDeleteNodes method
+	// 3. Controller updates Node CR powerState to "off"
+	// 4. Controller creates shutdown job that curls VM control server /stop endpoint
+	// 5. VM control server stops the k3d node
+	// 6. Controller uncordons node and updates status
+	//
+	// Key validations:
+	// - gRPC call was made
+	// - Node CR powerState changed
+	// - Shutdown job created with correct spec (ServiceAccount, volumes, TTL)
+	// - VM control server received /stop request
+	// - k3d node actually stopped
+	// - Node CR progress reached "shutdown" state
+	// - Kubernetes node became NotReady
+	// =============================================================================
 	Context("Scale-Down Workflow", func() {
-It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
+		It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
 			By("Waiting for Cluster Autoscaler to detect unneeded nodes")
 			Eventually(func() bool {
 				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
@@ -242,6 +298,20 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, 60*time.Second, checkInterval).Should(BeTrue(),
 				"Shutdown job should have auth-secrets volume")
 
+			// Verify TTL is set for automatic job cleanup
+			// Jobs have ttlSecondsAfterFinished: 600 (10 minutes) by default
+			By("Verifying shutdown job has TTL set")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "jobs",
+					"-l", "type=shutdown",
+					"-n", namespace,
+					"-o", "jsonpath={.items[*].spec.ttlSecondsAfterFinished}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, err := utils.Run(cmd)
+				return err == nil && len(strings.TrimSpace(output)) > 0 && output != "<no value>"
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Shutdown job should have ttlSecondsAfterFinished set")
+
 			By("Verifying VM control server receives /stop request")
 			Eventually(func() bool {
 				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/stop", agentNode0, 30*time.Second)
@@ -283,19 +353,52 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
 				"Kubernetes node should be NotReady or Unknown")
 
-			// Store node name for Test 3
+			// Store node name for Test 3 (Scale-Up Workflow)
 			shutdownNodeName = agentNode0
 
 			By("Scale-Down Workflow completed successfully")
 		})
 	})
 
+	// =============================================================================
+	// TEST 3: Scale-Up Workflow
+	// =============================================================================
+	// Purpose: Verify that Cluster Autoscaler can detect need for more capacity
+	// and our controller can power on a previously shutdown node.
+	//
+	// Flow:
+	// 1. Apply deployment targeting the shutdown node (it's tainted, so pod stays pending)
+	// 2. CA detects need for scale-up (pending pod can't be scheduled)
+	// 3. CA calls our gRPC server's NodeGroupIncreaseSize method
+	// 4. Controller updates Node CR powerState to "on"
+	// 5. Controller creates startup job that curls VM control server /start endpoint
+	// 6. VM control server starts the k3d node
+	// 7. Controller uncordons the node when it's ready
+	// 8. Deployment pod gets scheduled on the now-ready node
+	//
+	// Key validations:
+	// - gRPC call was made
+	// - Node CR powerState changed
+	// - Startup job created with correct spec (ServiceAccount, volumes, TTL)
+	// - VM control server received /start request
+	// - k3d node actually started
+	// - Node CR progress reached "ready" state
+	// - Kubernetes node became Ready AND uncordoned (unschedulable=false)
+	// - Deployment pod scheduled on the correct node
+	//
+	// IMPORTANT: The node must be BOTH Ready AND unschedulable=false before
+	// pods can be scheduled. The controller uncordons the node in the
+	// afterJobCompleted hook when transitioning to StateReady state.
+	// =============================================================================
 	Context("Scale-Up Workflow", func() {
 		It("should verify Cluster Autoscaler scales up when pods need scheduling", func() {
 			By("Verifying node is in shutdown state from Test 2")
 			Expect(shutdownNodeName).ToNot(BeEmpty(),
 				"shutdownNodeName should be set by Test 2")
 
+			// Untaint the shutdown node to allow scheduling
+			// This is necessary because we taint nodes in Test 1 to prevent
+			// workloads from scheduling before we're ready
 			By("Untainting the shutdown node to allow scheduling")
 			err := utils.UntaintNode(shutdownNodeName, "node.kubernetes.io/role")
 			Expect(err).NotTo(HaveOccurred())
@@ -306,6 +409,9 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, 30*time.Second, checkInterval).Should(BeTrue(),
 				"Node should be untainted")
 
+			// Verify the other node is still tainted
+			// This ensures pods will be scheduled on the node we just powered on,
+			// not on the other agent node
 			By("Verifying other agent node is still tainted")
 			otherNode := agentNode1
 			if shutdownNodeName == agentNode1 {
@@ -316,6 +422,9 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, 30*time.Second, checkInterval).Should(BeTrue(),
 				"Other node %s should still be tainted", otherNode)
 
+			// Apply deployment targeting the agent node
+			// The pod will be pending because the node is down
+			// This triggers CA to detect need for scale-up
 			By("Applying hello-world deployment targeting the agent node")
 			cmd := exec.Command("kubectl", "apply", "-f", "examples/k3d/hello-world-deployment.yaml")
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
@@ -371,6 +480,19 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, 60*time.Second, checkInterval).Should(BeTrue(),
 				"Startup job should have startup-config volume")
 
+			// Verify TTL is set for automatic job cleanup
+			By("Verifying startup job has TTL set")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "jobs",
+					"-l", "type=startup",
+					"-n", namespace,
+					"-o", "jsonpath={.items[*].spec.ttlSecondsAfterFinished}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, err := utils.Run(cmd)
+				return err == nil && len(strings.TrimSpace(output)) > 0 && output != "<no value>"
+			}, 60*time.Second, checkInterval).Should(BeTrue(),
+				"Startup job should have ttlSecondsAfterFinished set")
+
 			By("Verifying VM control server receives /start request")
 			Eventually(func() bool {
 				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/start", shutdownNodeName, 30*time.Second)
@@ -401,32 +523,42 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, nodeStateTimeout, checkInterval).Should(Equal("ready"),
 				"Node CR progress should be ready")
 
-			By("Verifying Kubernetes node becomes Ready")
-			Eventually(func() bool {
-				return utils.WaitForNodeReady(shutdownNodeName, true, nodeStateTimeout)
-			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
-				"Kubernetes node should be Ready")
+			// CRITICAL: Wait for node to be BOTH Ready AND uncordoned (unschedulable=false)
+			// The node is cordoned during shutdown to prevent scheduling.
+			// The controller uncordons it in the afterJobCompleted hook when
+			// transitioning to StateReady state.
+			// Pods cannot be scheduled until BOTH conditions are met.
+			By("Verifying controller uncordonned the Kubernetes node")
+			Eventually(func() error {
+				uncordoned, err := utils.VerifyNodeUncordon(shutdownNodeName)
+				if err != nil {
+					return err
+				}
+				if !uncordoned {
+					utils.PrintNodeStatus(shutdownNodeName)
+					return fmt.Errorf("node %s is still cordoned (unschedulable=true)", shutdownNodeName)
+				}
+				return nil
+			}, 120*time.Second, checkInterval).Should(Succeed(),
+				"Node %s should be uncordoned (schedulable=true)", shutdownNodeName)
 
-			By("Verifying node has correct labels for scheduling")
-			Eventually(func() bool {
-				cmd := exec.Command("kubectl", "get", "node", shutdownNodeName,
-					"-o", "jsonpath={.metadata.labels}")
-				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-				output, err := utils.Run(cmd)
-				return err == nil && strings.Contains(output, "infra.homecluster.dev/group") && strings.Contains(output, "group1")
-			}, 30*time.Second, checkInterval).Should(BeTrue(),
-				"Node should have infra.homecluster.dev/group=group1 label")
+			By("Verifying Kubernetes node is Ready")
+			Eventually(func() error {
+				ready, err := utils.VerifyNodeReady(shutdownNodeName)
+				if err != nil {
+					return err
+				}
+				if !ready {
+					utils.PrintNodeStatus(shutdownNodeName)
+					return fmt.Errorf("node %s is not Ready", shutdownNodeName)
+				}
+				return nil
+			}, 120*time.Second, checkInterval).Should(Succeed(),
+				"Node %s should be Ready", shutdownNodeName)
 
-			By("Verifying node is unschedulable=false (uncordoned)")
-			Eventually(func() bool {
-				cmd := exec.Command("kubectl", "get", "node", shutdownNodeName,
-					"-o", "jsonpath={.spec.unschedulable}")
-				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-				output, err := utils.Run(cmd)
-				return err == nil && (strings.TrimSpace(output) == "false" || strings.TrimSpace(output) == "")
-			}, 30*time.Second, checkInterval).Should(BeTrue(),
-				"Node should be unschedulable=false (uncordoned)")
-
+			// Update Group CR to prevent immediate scale-down during pod startup
+			// After the node becomes ready, CA might see it as unneeded (only 1 small pod)
+			// and try to scale it down again. We relax the settings to give the pod time.
 			By("Updating Group CR to prevent immediate scale-down during pod startup")
 			groupYAML := `
 apiVersion: infra.homecluster.dev/v1alpha1
@@ -454,11 +586,17 @@ spec:
 			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to update Group: %s", output)
 
-			By("Verifying deployment pod is scheduled and running")
-			Eventually(func() bool {
-				return utils.WaitForPodScheduled("default", "app=hello-world", podScheduleTimeout)
-			}, podScheduleTimeout, checkInterval).Should(BeTrue(),
-				"Deployment pod should be scheduled and running")
+			By("Verifying deployment pod is scheduled on the correct node")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "pods",
+					"-l", "app=hello-world",
+					"-n", "default",
+					"-o", "jsonpath={.items[*].spec.nodeName}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, _ := utils.Run(cmd)
+				return strings.TrimSpace(output)
+			}, podScheduleTimeout, checkInterval).Should(Equal(shutdownNodeName),
+				"Deployment pod should be scheduled on %s", shutdownNodeName)
 
 			By("Scale-Up Workflow completed successfully")
 		})

@@ -79,6 +79,12 @@ spec:
                     type: string
                   serviceAccount:
                     type: string
+                  ttlSecondsAfterFinished:
+                    description: |-
+                      TTLSecondsAfterFinished limits the lifetime of the Job.
+                      Defaults to 600 seconds (10 minutes) if not specified.
+                    format: int32
+                    type: integer
                   volumes:
                     description: Each volume mounts a Secret or ConfigMap
                     items:
@@ -115,6 +121,12 @@ spec:
                     type: string
                   serviceAccount:
                     type: string
+                  ttlSecondsAfterFinished:
+                    description: |-
+                      TTLSecondsAfterFinished limits the lifetime of the Job.
+                      Defaults to 600 seconds (10 minutes) if not specified.
+                    format: int32
+                    type: integer
                   volumes:
                     description: Each volume mounts a Secret or ConfigMap
                     items:

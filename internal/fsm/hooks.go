@@ -21,9 +21,7 @@ import (
 	"fmt"
 	"time"
 
-	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/looplab/fsm"
@@ -75,10 +73,15 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 
 	// If transitioning to Ready state (startup completed), uncordon the Kubernetes node
 	if e.Dst == StateReady {
-		if err := nm.setNodeSchedulable(nm.node.Spec.KubernetesNodeName); err != nil {
+		logger.Info("Transitioning to Ready state, uncordonning Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
+
+		// Retry uncordon with 90s timeout to handle node registration delays
+		if err := nm.setNodeSchedulableWithRetry(nm.node.Spec.KubernetesNodeName, 90*time.Second); err != nil {
 			logger.Error(err, "Failed to uncordon Kubernetes node after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
-			// Continue with the operation even if uncordoning fails
+			// Don't update status to Ready if uncordon failed - stay in StartingUp and keep retrying
+			return
 		}
+		logger.Info("Successfully uncordoned Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 	}
 
 	// Release coordination lock after successful completion
@@ -88,22 +91,10 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 		logger.Info("Successfully released coordination lock after job completion", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect new state
+	// Update node status to reflect new state (only after successful uncordon for Ready state)
 	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
 
-	// Check if we have job arguments and handle job cleanup if provided
-	if len(e.Args) > 0 && e.Args[0] != nil {
-		if job, ok := e.Args[0].(*batchv1.Job); ok && job != nil {
-			deletePolicy := metav1.DeletePropagationForeground
-			deleteOpts := &client.DeleteOptions{
-				PropagationPolicy: &deletePolicy,
-			}
-
-			if err := nm.client.Delete(ctx, job, deleteOpts); err != nil {
-				logger.Error(err, "Failed to delete completed job", "job", job.Name)
-			}
-		}
-	}
+	// Jobs are cleaned up automatically via TTL - no manual cleanup needed
 }
 
 func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {

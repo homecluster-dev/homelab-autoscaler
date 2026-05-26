@@ -41,7 +41,8 @@ func Run(cmd *exec.Cmd) (string, error) {
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	command := strings.Join(cmd.Args, " ")
-	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
+	timestamp := time.Now().Format("15:04:05.000")
+	_, _ = fmt.Fprintf(GinkgoWriter, "[%s] running: %q\n", timestamp, command)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(output), fmt.Errorf("%q failed with error %q: %w", command, string(output), err)
@@ -571,6 +572,74 @@ func GetNodeStatus(nodeName string) (string, error) {
 	return string(output), nil
 }
 
+// VerifyNodeUncordon checks if a Kubernetes node is uncordoned (schedulable)
+func VerifyNodeUncordon(nodeName string) (bool, error) {
+	cmd := exec.Command("kubectl", "get", "node", nodeName,
+		"-o", "jsonpath={.spec.unschedulable}")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, err
+	}
+
+	unschedulable := strings.TrimSpace(string(output))
+	// Node is uncordoned if unschedulable is false or empty (empty means not set, which is schedulable)
+	return unschedulable == "false" || unschedulable == "", nil
+}
+
+// VerifyNodeReady checks if a Kubernetes node is Ready
+func VerifyNodeReady(nodeName string) (bool, error) {
+	cmd := exec.Command("kubectl", "get", "node", nodeName,
+		"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, err
+	}
+
+	return strings.TrimSpace(string(output)) == "True", nil
+}
+
+// WaitForNodeUncordon waits for a Kubernetes node to become uncordoned (schedulable)
+func WaitForNodeUncordon(nodeName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		uncordoned, err := VerifyNodeUncordon(nodeName)
+		if err == nil && uncordoned {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("node %s did not become uncordoned within %v", nodeName, timeout)
+}
+
+// WaitForNodeReadyAndSchedulable waits for a Kubernetes node to be both Ready and schedulable
+func WaitForNodeReadyAndSchedulable(nodeName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		ready, err1 := VerifyNodeReady(nodeName)
+		uncordoned, err2 := VerifyNodeUncordon(nodeName)
+
+		if err1 == nil && err2 == nil && ready && uncordoned {
+			return nil
+		}
+
+		// Log progress for debugging
+		if err1 == nil {
+			fmt.Printf("Node %s Ready=%v ", nodeName, ready)
+		}
+		if err2 == nil {
+			fmt.Printf("Schedulable=%v\n", uncordoned)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("node %s did not become Ready and schedulable within %v", nodeName, timeout)
+}
+
 // GetSchedulerLogs gets recent scheduler logs
 func GetSchedulerLogs(namespace string, tailLines int) (string, error) {
 	cmd := exec.Command("kubectl", "logs",
@@ -622,4 +691,30 @@ func ReadLogFile(logFile string) (string, error) {
 // ClearLogFile clears a log file
 func ClearLogFile(logFile string) error {
 	return os.WriteFile(logFile, []byte{}, 0644)
+}
+
+// PrintNodeStatus prints detailed node status for debugging
+func PrintNodeStatus(nodeName string) {
+	timestamp := time.Now().Format("15:04:05.000")
+
+	readyCmd := exec.Command("kubectl", "get", "node", nodeName,
+		"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+	readyCmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	readyOutput, _ := readyCmd.CombinedOutput()
+
+	unschedulableCmd := exec.Command("kubectl", "get", "node", nodeName,
+		"-o", "jsonpath={.spec.unschedulable}")
+	unschedulableCmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	unschedulableOutput, _ := unschedulableCmd.CombinedOutput()
+
+	taintsCmd := exec.Command("kubectl", "get", "node", nodeName,
+		"-o", "jsonpath={.spec.taints}")
+	taintsCmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	taintsOutput, _ := taintsCmd.CombinedOutput()
+
+	fmt.Printf("[%s] Node %s status: Ready=%s, Unschedulable=%s, Taints=%s\n",
+		timestamp, nodeName,
+		strings.TrimSpace(string(readyOutput)),
+		strings.TrimSpace(string(unschedulableOutput)),
+		strings.TrimSpace(string(taintsOutput)))
 }
