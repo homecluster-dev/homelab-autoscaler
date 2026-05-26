@@ -40,3 +40,6 @@ AGENTS.md
 **/.DS_Store
 
 **/kubeconfig
+
+# opencode generated files
+.opencode/
