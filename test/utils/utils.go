@@ -532,6 +532,59 @@ func WaitForPodScheduled(namespace string, labelSelector string, timeout time.Du
 	return false
 }
 
+// GetPodStatus gets detailed pod status information
+func GetPodStatus(namespace string, labelSelector string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "pods",
+		"-l", labelSelector,
+		"-n", namespace,
+		"-o", "wide")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+// GetPodEvents gets events related to pods with the given label
+func GetPodEvents(namespace string, labelSelector string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "events",
+		"-n", namespace,
+		"--field-selector", "involvedObject.kind=Pod",
+		"-o", "jsonpath={.items[*].message}")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+// GetNodeStatus gets detailed node status information
+func GetNodeStatus(nodeName string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "wide")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+// GetSchedulerLogs gets recent scheduler logs
+func GetSchedulerLogs(namespace string, tailLines int) (string, error) {
+	cmd := exec.Command("kubectl", "logs",
+		"-l", "component=scheduler",
+		"-n", namespace,
+		fmt.Sprintf("--tail=%d", tailLines))
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
 // GetK3dGatewayIP returns the gateway IP for the k3d network
 func GetK3dGatewayIP(clusterName string) (string, error) {
 	cmd := exec.Command("docker", "network", "inspect", "k3d-"+clusterName,

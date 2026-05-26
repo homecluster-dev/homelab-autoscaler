@@ -53,7 +53,7 @@ const (
 	vmShutdownTimeout    = 60 * time.Second
 	vmStartupTimeout     = 60 * time.Second
 	jobCompletionTimeout = 120 * time.Second
-	podScheduleTimeout   = 5 * time.Minute
+	podScheduleTimeout   = 200 * time.Second
 	nodeStateTimeout     = 120 * time.Second
 
 	// Check intervals
@@ -158,7 +158,7 @@ var _ = Describe("K3d Integration", Serial, func() {
 			}, 30*time.Second, checkInterval).Should(Succeed(),
 				"Node CRs should be created")
 
-			By("Applying Group CR with scale-down settings that allow pod startup time")
+			By("Applying Group CR with aggressive scale-down settings")
 			groupYAML := `
 apiVersion: infra.homecluster.dev/v1alpha1
 kind: Group
@@ -169,9 +169,9 @@ spec:
   ignoreDaemonSetsUtilization: true
   maxNodeProvisionTime: 2m
   scaleDownGpuUtilizationThreshold: "30"
-  scaleDownUnneededTime: 2m
+  scaleDownUnneededTime: 30s
   scaleDownUnreadyTime: 30s
-  scaleDownUtilizationThreshold: "0.05"
+  scaleDownUtilizationThreshold: "0.1"
   zeroOrMaxNodeScaling: false
 `
 			tmpFile, err := os.CreateTemp("", "group-*.yaml")
@@ -306,6 +306,16 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, 30*time.Second, checkInterval).Should(BeTrue(),
 				"Node should be untainted")
 
+			By("Verifying other agent node is still tainted")
+			otherNode := agentNode1
+			if shutdownNodeName == agentNode1 {
+				otherNode = agentNode0
+			}
+			Eventually(func() bool {
+				return utils.VerifyNodeTaint(otherNode, "role")
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"Other node %s should still be tainted", otherNode)
+
 			By("Applying hello-world deployment targeting the agent node")
 			cmd := exec.Command("kubectl", "apply", "-f", "examples/k3d/hello-world-deployment.yaml")
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
@@ -397,8 +407,52 @@ It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdow
 			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
 				"Kubernetes node should be Ready")
 
-			By("Waiting for node stabilization before workload scheduling")
-			time.Sleep(30 * time.Second)
+			By("Verifying node has correct labels for scheduling")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "node", shutdownNodeName,
+					"-o", "jsonpath={.metadata.labels}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, err := utils.Run(cmd)
+				return err == nil && strings.Contains(output, "infra.homecluster.dev/group") && strings.Contains(output, "group1")
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"Node should have infra.homecluster.dev/group=group1 label")
+
+			By("Verifying node is unschedulable=false (uncordoned)")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "node", shutdownNodeName,
+					"-o", "jsonpath={.spec.unschedulable}")
+				cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+				output, err := utils.Run(cmd)
+				return err == nil && (strings.TrimSpace(output) == "false" || strings.TrimSpace(output) == "")
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"Node should be unschedulable=false (uncordoned)")
+
+			By("Updating Group CR to prevent immediate scale-down during pod startup")
+			groupYAML := `
+apiVersion: infra.homecluster.dev/v1alpha1
+kind: Group
+metadata:
+  name: group1
+  namespace: homelab-autoscaler-system
+spec:
+  ignoreDaemonSetsUtilization: true
+  maxNodeProvisionTime: 2m
+  scaleDownGpuUtilizationThreshold: "30"
+  scaleDownUnneededTime: 2m
+  scaleDownUnreadyTime: 30s
+  scaleDownUtilizationThreshold: "0.05"
+  zeroOrMaxNodeScaling: false
+`
+			tmpFile, err := os.CreateTemp("", "group-scaleup-*.yaml")
+			Expect(err).NotTo(HaveOccurred())
+			defer os.Remove(tmpFile.Name())
+			_, err = tmpFile.WriteString(groupYAML)
+			Expect(err).NotTo(HaveOccurred())
+			tmpFile.Close()
+			cmd = exec.Command("kubectl", "apply", "-f", tmpFile.Name())
+			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to update Group: %s", output)
 
 			By("Verifying deployment pod is scheduled and running")
 			Eventually(func() bool {
