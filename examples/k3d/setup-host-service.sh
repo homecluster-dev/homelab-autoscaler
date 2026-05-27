@@ -29,8 +29,8 @@ metadata:
 spec:
   clusterIP: None
   ports:
-  - port: 8080
-    targetPort: 8080
+  - port: 9052
+    targetPort: 9052
     protocol: TCP
 ---
 apiVersion: v1
@@ -42,9 +42,9 @@ subsets:
 - addresses:
   - ip: ${GATEWAY_IP}
   ports:
-  - port: 8080
+  - port: 9052
     protocol: TCP
 EOF
 
 echo "Service created successfully"
-echo "Pods can now use: http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local:8080"
+echo "Pods can now use: http://${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local:9052"

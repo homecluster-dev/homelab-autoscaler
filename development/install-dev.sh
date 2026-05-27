@@ -15,7 +15,6 @@ RELEASE_NAME="homelab-autoscaler-dev"
 CHART_PATH="dist/chart"
 VALUES_FILE="development/development-values.yaml"
 K3D_SCRIPT="examples/k3d/create-cluster.sh"
-SERVICE_FORWARDER="development/local-service-forwarder-dev.yaml"
 
 # Colors for output
 RED='\033[0;31m'
@@ -125,18 +124,34 @@ create_namespace() {
     fi
 }
 
+# Create ServiceAccount for jobs
+create_serviceaccount() {
+    print_status "Creating controller-manager ServiceAccount..."
+    
+    if kubectl get serviceaccount controller-manager -n "$NAMESPACE" >/dev/null 2>&1; then
+        print_warning "ServiceAccount 'controller-manager' already exists"
+    else
+        kubectl create serviceaccount controller-manager -n "$NAMESPACE"
+        print_success "ServiceAccount 'controller-manager' created"
+    fi
+}
+
 # Apply local service forwarder (after Helm install to avoid conflicts)
 apply_service_forwarder() {
     print_status "Applying development local service forwarder..."
     
-    if [ ! -f "$SERVICE_FORWARDER" ]; then
-        print_error "Service forwarder file not found: $SERVICE_FORWARDER"
+    # Use the dynamic setup script instead of static YAML
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    FORWARDER_SCRIPT="${SCRIPT_DIR}/setup-service-forwarder.sh"
+    
+    if [ ! -f "$FORWARDER_SCRIPT" ]; then
+        print_error "Service forwarder script not found: $FORWARDER_SCRIPT"
         exit 1
     fi
     
     # Apply the local service forwarder which creates services with different names
     # to avoid conflicts with Helm-managed services
-    kubectl apply -f "$SERVICE_FORWARDER"
+    bash "$FORWARDER_SCRIPT"
     print_success "Development local service forwarder applied"
 }
 
@@ -245,6 +260,7 @@ main() {
     create_cluster
     setup_kubeconfig
     create_namespace
+    create_serviceaccount
     validate_chart
     install_cluster_autoscaler
     apply_service_forwarder

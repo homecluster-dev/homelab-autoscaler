@@ -32,7 +32,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -660,12 +659,11 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	// Ensure node is schedulable
 	templateNode.Spec.Unschedulable = false
 
-	// Serialize the node to bytes using the scheme's encoder
-	// Create a legacy codec for the corev1 API group
-	encoder := serializer.NewCodecFactory(s.Scheme).LegacyCodec(corev1.SchemeGroupVersion)
-	nodeBytes, err := runtime.Encode(encoder, templateNode)
+	// Serialize the node to bytes using protobuf Marshal
+	// This format is expected by the cluster autoscaler which will use Unmarshal() to deserialize
+	nodeBytes, err := templateNode.Marshal()
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to encode node: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to marshal node: %v", err)
 	}
 
 	return &pb.NodeGroupTemplateNodeInfoResponse{

@@ -112,6 +112,10 @@ type MinimalPodSpec struct {
 	// Each volume mounts a Secret or ConfigMap
 	Volumes        []VolumeMountSpec `json:"volumes,omitempty"`
 	ServiceAccount *string           `json:"serviceAccount,omitempty"`
+	// TTLSecondsAfterFinished limits the lifetime of the Job.
+	// Defaults to 600 seconds (10 minutes) if not specified.
+	// +optional
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 }
 
 type VolumeMountSpec struct {

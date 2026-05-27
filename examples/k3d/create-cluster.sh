@@ -19,5 +19,8 @@ k3d kubeconfig get ${CLUSTER_NAME} > ./kubeconfig
 export KUBECONFIG=$(pwd)/kubeconfig
 echo "KUBECONFIG exported to: ${KUBECONFIG}"
 
+echo "Fixing kubeconfig to use 127.0.0.1 instead of 0.0.0.0..."
+sed -i 's|server: https://0\.0\.0\.0:|server: https://127.0.0.1:|g' ./kubeconfig
+
 echo "Cluster created successfully!"
 kubectl cluster-info

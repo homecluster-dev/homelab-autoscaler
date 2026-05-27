@@ -2,13 +2,29 @@
 """
 Simple HTTP server to control k3d nodes
 Usage: python3 vm_control_server.py [port]
-Default port: 8080
+Default port: 9052
 """
 
 import subprocess
 import sys
+import os
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
+
+# Log file for e2e test verification
+LOG_FILE = os.environ.get('VM_CONTROL_LOG_FILE', '/tmp/vm-control-requests.log')
+
+
+def log_request(endpoint, vm_name):
+    """Log request to file for e2e test verification"""
+    try:
+        timestamp = datetime.now().isoformat()
+        log_line = f"[{timestamp}] {endpoint} vm={vm_name}\n"
+        with open(LOG_FILE, 'a') as f:
+            f.write(log_line)
+    except Exception as e:
+        print(f"Warning: Failed to log request: {e}", file=sys.stderr)
 
 
 class VMControlHandler(BaseHTTPRequestHandler):
@@ -25,6 +41,9 @@ class VMControlHandler(BaseHTTPRequestHandler):
         if not vm_name:
             self.send_error_response(400, "Missing 'vm' parameter")
             return
+        
+        # Log the request for e2e test verification
+        log_request(parsed_path.path, vm_name)
         
         # Route to appropriate handler
         if parsed_path.path == '/start':
@@ -45,6 +64,9 @@ class VMControlHandler(BaseHTTPRequestHandler):
             )
             
             if result.returncode == 0:
+                # Wait a bit for kubelet to reconnect to API server
+                import time
+                time.sleep(15)
                 self.send_success_response(f"VM '{vm_name}' started successfully")
             else:
                 self.send_error_response(500, f"Failed to start VM: {result.stderr}")
@@ -95,7 +117,7 @@ class VMControlHandler(BaseHTTPRequestHandler):
         sys.stdout.write(f"[{self.log_date_time_string()}] {format % args}\n")
 
 
-def run_server(port=8080):
+def run_server(port=9052):
     """Start the HTTP server"""
     server_address = ('', port)
     httpd = HTTPServer(server_address, VMControlHandler)
@@ -114,5 +136,5 @@ def run_server(port=8080):
 
 
 if __name__ == '__main__':
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9052
     run_server(port)

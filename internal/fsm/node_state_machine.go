@@ -48,6 +48,7 @@ func NewNodeStateMachine(
 		scheme:              scheme,
 		coordinationManager: coordMgr,
 		jobTimeout:          DefaultJobTimeout,
+		uncordonTimeout:     DefaultUncordonTimeout,
 	}
 
 	// Initialize FSM with current state from node progress
@@ -297,7 +298,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("Job monitoring timeout", "node", nm.node.Name, "job", jobName)
+			logger.Info("Job monitoring nm.uncordonTimeout", "node", nm.node.Name, "job", jobName)
 			if err := nm.JobTimeout(); err != nil {
 				logger.Error(err, "Failed to trigger JobTimeout event", "node", nm.node.Name)
 			}
@@ -356,15 +357,18 @@ func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 					},
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					ServiceAccountName: "default",
 					Containers: []corev1.Container{
 						{
-							Name:    "startup",
-							Image:   nm.node.Spec.StartupPodSpec.Image,
-							Command: nm.node.Spec.StartupPodSpec.Command,
-							Args:    nm.node.Spec.StartupPodSpec.Args,
+							Name:         "startup",
+							Image:        nm.node.Spec.StartupPodSpec.Image,
+							Command:      nm.node.Spec.StartupPodSpec.Command,
+							Args:         nm.node.Spec.StartupPodSpec.Args,
+							VolumeMounts: []corev1.VolumeMount{},
 						},
 					},
+					Volumes: []corev1.Volume{},
 				},
 			},
 		},
@@ -372,6 +376,56 @@ func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 
 	// Set owner reference
 	nm.setOwnerReference(job)
+
+	// Apply ServiceAccount if specified
+	if nm.node.Spec.StartupPodSpec.ServiceAccount != nil {
+		job.Spec.Template.Spec.ServiceAccountName = *nm.node.Spec.StartupPodSpec.ServiceAccount
+	}
+
+	// Apply volumes and volume mounts
+	startupContainerIndex := 0
+	for _, volSpec := range nm.node.Spec.StartupPodSpec.Volumes {
+		// Create volume
+		vol := corev1.Volume{
+			Name: volSpec.Name,
+		}
+
+		if volSpec.SecretName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: volSpec.SecretName,
+				},
+			}
+		} else if volSpec.ConfigMapName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: volSpec.ConfigMapName,
+					},
+				},
+			}
+		}
+
+		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, vol)
+
+		// Create volume mount for the container
+		volumeMount := corev1.VolumeMount{
+			Name:      volSpec.Name,
+			MountPath: volSpec.MountPath,
+			ReadOnly:  true, // Secret/ConfigMap volumes are read-only
+		}
+
+		job.Spec.Template.Spec.Containers[startupContainerIndex].VolumeMounts =
+			append(job.Spec.Template.Spec.Containers[startupContainerIndex].VolumeMounts, volumeMount)
+	}
+
+	// Apply TTL for automatic cleanup (default 600 seconds if not specified)
+	if nm.node.Spec.StartupPodSpec.TTLSecondsAfterFinished != nil {
+		job.Spec.TTLSecondsAfterFinished = nm.node.Spec.StartupPodSpec.TTLSecondsAfterFinished
+	} else {
+		defaultTTL := int32(600)
+		job.Spec.TTLSecondsAfterFinished = &defaultTTL
+	}
 
 	// Create the job
 	if err := nm.client.Create(context.TODO(), job); err != nil {
@@ -405,15 +459,18 @@ func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 					},
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					ServiceAccountName: "default",
 					Containers: []corev1.Container{
 						{
-							Name:    "shutdown",
-							Image:   nm.node.Spec.ShutdownPodSpec.Image,
-							Command: nm.node.Spec.ShutdownPodSpec.Command,
-							Args:    nm.node.Spec.ShutdownPodSpec.Args,
+							Name:         "shutdown",
+							Image:        nm.node.Spec.ShutdownPodSpec.Image,
+							Command:      nm.node.Spec.ShutdownPodSpec.Command,
+							Args:         nm.node.Spec.ShutdownPodSpec.Args,
+							VolumeMounts: []corev1.VolumeMount{},
 						},
 					},
+					Volumes: []corev1.Volume{},
 				},
 			},
 		},
@@ -421,6 +478,56 @@ func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 
 	// Set owner reference
 	nm.setOwnerReference(job)
+
+	// Apply ServiceAccount if specified
+	if nm.node.Spec.ShutdownPodSpec.ServiceAccount != nil {
+		job.Spec.Template.Spec.ServiceAccountName = *nm.node.Spec.ShutdownPodSpec.ServiceAccount
+	}
+
+	// Apply volumes and volume mounts
+	shutdownContainerIndex := 0
+	for _, volSpec := range nm.node.Spec.ShutdownPodSpec.Volumes {
+		// Create volume
+		vol := corev1.Volume{
+			Name: volSpec.Name,
+		}
+
+		if volSpec.SecretName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: volSpec.SecretName,
+				},
+			}
+		} else if volSpec.ConfigMapName != "" {
+			vol.VolumeSource = corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: volSpec.ConfigMapName,
+					},
+				},
+			}
+		}
+
+		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, vol)
+
+		// Create volume mount for the container
+		volumeMount := corev1.VolumeMount{
+			Name:      volSpec.Name,
+			MountPath: volSpec.MountPath,
+			ReadOnly:  true, // Secret/ConfigMap volumes are read-only
+		}
+
+		job.Spec.Template.Spec.Containers[shutdownContainerIndex].VolumeMounts =
+			append(job.Spec.Template.Spec.Containers[shutdownContainerIndex].VolumeMounts, volumeMount)
+	}
+
+	// Apply TTL for automatic cleanup (default 600 seconds if not specified)
+	if nm.node.Spec.ShutdownPodSpec.TTLSecondsAfterFinished != nil {
+		job.Spec.TTLSecondsAfterFinished = nm.node.Spec.ShutdownPodSpec.TTLSecondsAfterFinished
+	} else {
+		defaultTTL := int32(600)
+		job.Spec.TTLSecondsAfterFinished = &defaultTTL
+	}
 
 	// Create the job
 	if err := nm.client.Create(context.TODO(), job); err != nil {
@@ -517,8 +624,8 @@ func (nm *NodeStateMachine) setNodeUnschedulable(nodeName string) error {
 	return nil
 }
 
-// setNodeSchedulable uncordons the Kubernetes node to allow new pods to be scheduled
-func (nm *NodeStateMachine) setNodeSchedulable(nodeName string) error {
+// setNodeSchedulableInternal performs the actual uncordon operation without retry
+func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon")
 
 	if nodeName == "" {
@@ -535,14 +642,38 @@ func (nm *NodeStateMachine) setNodeSchedulable(nodeName string) error {
 		return nil // Don't fail the operation if the node doesn't exist
 	}
 
-	// Check if already schedulable
-	if !kubeNode.Spec.Unschedulable {
+	// Check if already schedulable and has no unschedulable taint
+	needsUpdate := kubeNode.Spec.Unschedulable
+	needsTaintRemoval := false
+
+	for _, taint := range kubeNode.Spec.Taints {
+		if taint.Key == "node.kubernetes.io/unschedulable" {
+			needsTaintRemoval = true
+			break
+		}
+	}
+
+	if !needsUpdate && !needsTaintRemoval {
 		logger.V(1).Info("Kubernetes node is already schedulable")
 		return nil
 	}
 
 	// Set node as schedulable
-	kubeNode.Spec.Unschedulable = false
+	if needsUpdate {
+		kubeNode.Spec.Unschedulable = false
+	}
+
+	// Remove unschedulable taint if present
+	if needsTaintRemoval {
+		newTaints := []corev1.Taint{}
+		for _, taint := range kubeNode.Spec.Taints {
+			if taint.Key != "node.kubernetes.io/unschedulable" {
+				newTaints = append(newTaints, taint)
+			}
+		}
+		kubeNode.Spec.Taints = newTaints
+		logger.Info("Removed unschedulable taint", "taintKey", "node.kubernetes.io/unschedulable")
+	}
 
 	if err := nm.client.Update(ctx, kubeNode); err != nil {
 		logger.Error(err, "Failed to uncordon Kubernetes node")
@@ -551,6 +682,79 @@ func (nm *NodeStateMachine) setNodeSchedulable(nodeName string) error {
 
 	logger.Info("Successfully uncordoned Kubernetes node")
 	return nil
+}
+
+// setNodeSchedulableWithRetry attempts to uncordon a Kubernetes node with exponential backoff
+// This is used after node startup to handle the case where the node hasn't registered yet
+func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
+	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon-retry")
+
+	if nodeName == "" {
+		logger.V(1).Info("No Kubernetes node name specified, skipping uncordon operation")
+		return nil
+	}
+
+	start := time.Now()
+	retryInterval := 2 * time.Second
+	maxRetryInterval := 10 * time.Second
+
+	for {
+		elapsed := time.Since(start)
+		if elapsed >= nm.uncordonTimeout {
+			return fmt.Errorf("nm.uncordonTimeout after %v: failed to uncordon node %s", nm.uncordonTimeout, nodeName)
+		}
+
+		// Get current node status
+		ctx := context.TODO()
+		kubeNode := &corev1.Node{}
+		if err := nm.client.Get(ctx, client.ObjectKey{Name: nodeName}, kubeNode); err != nil {
+			logger.Info("Node not found yet, retrying", "error", err.Error(), "elapsed", elapsed.String())
+			time.Sleep(retryInterval)
+			retryInterval *= 2
+			if retryInterval > maxRetryInterval {
+				retryInterval = maxRetryInterval
+			}
+			continue
+		}
+
+		// Check if node is Ready
+		isReady := false
+		for _, cond := range kubeNode.Status.Conditions {
+			if cond.Type == corev1.NodeReady {
+				isReady = cond.Status == corev1.ConditionTrue
+				break
+			}
+		}
+
+		if !isReady {
+			logger.Info("Node not Ready yet, retrying", "elapsed", elapsed.String())
+			time.Sleep(retryInterval)
+			retryInterval *= 2
+			if retryInterval > maxRetryInterval {
+				retryInterval = maxRetryInterval
+			}
+			continue
+		}
+
+		// Try to uncordon using internal method (no retry)
+		err := nm.setNodeSchedulableInternal(nodeName)
+		if err == nil {
+			logger.Info("Successfully uncordoned Kubernetes node", "elapsed", elapsed.String())
+			return nil
+		}
+
+		// Log the retry attempt
+		logger.Info("Retrying uncordon operation", "error", err.Error(), "elapsed", elapsed.String(), "nextRetry", retryInterval.String())
+
+		// Wait before retrying
+		time.Sleep(retryInterval)
+
+		// Exponential backoff with max interval
+		retryInterval *= 2
+		if retryInterval > maxRetryInterval {
+			retryInterval = maxRetryInterval
+		}
+	}
 }
 
 // removeClusterAutoscalerTaint removes the ToBeDeletedByClusterAutoscaler taint from the Kubernetes node if present
@@ -655,9 +859,7 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 		return fmt.Errorf("failed to list jobs: %w", err)
 	}
 
-	var deletedJobs []string
-	var errors []error
-
+	// Delete pending startup/shutdown jobs to ensure clean state
 	for _, job := range jobList.Items {
 		// Check if this is a startup or shutdown job
 		jobType, exists := job.Labels["type"]
@@ -667,37 +869,18 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 
 		// Check if job is still pending or running (not completed)
 		if job.Status.Succeeded == 0 && job.Status.Failed == 0 {
-			logger.Info("Deleting pending job", "job", job.Name, "type", jobType)
-
-			// Delete the job with proper cleanup
-			deletePolicy := metav1.DeletePropagationForeground
-			deleteOpts := &client.DeleteOptions{
-				PropagationPolicy: &deletePolicy,
+			// Delete pending job to ensure clean state
+			if err := nm.client.Delete(ctx, &job); err != nil {
+				logger.Error(err, "Failed to delete pending job", "job", job.Name)
+				continue
 			}
-
-			if err := nm.client.Delete(ctx, &job, deleteOpts); err != nil {
-				logger.Error(err, "Failed to delete pending job", "job", job.Name, "type", jobType)
-				errors = append(errors, fmt.Errorf("failed to delete job %s: %w", job.Name, err))
-			} else {
-				deletedJobs = append(deletedJobs, job.Name)
-			}
+			logger.Info("Deleted pending job", "job", job.Name, "type", jobType)
 		} else {
 			logger.V(1).Info("Skipping completed job", "job", job.Name, "type", jobType, "succeeded", job.Status.Succeeded, "failed", job.Status.Failed)
 		}
 	}
 
-	if len(deletedJobs) > 0 {
-		logger.Info("Successfully cleaned up pending jobs", "deletedJobs", deletedJobs)
-	} else {
-		logger.V(1).Info("No pending jobs found to cleanup")
-	}
-
-	// Return combined errors if any occurred, but don't fail the operation
-	if len(errors) > 0 {
-		logger.Error(fmt.Errorf("some job cleanup operations failed"), "Job cleanup completed with errors", "errorCount", len(errors))
-		// Return the first error for logging purposes, but operation continues
-		return errors[0]
-	}
+	logger.Info("Job cleanup completed")
 
 	return nil
 }
