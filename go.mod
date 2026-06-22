@@ -4,8 +4,8 @@ go 1.25.0
 
 require (
 	github.com/looplab/fsm v1.0.3
-	github.com/onsi/ginkgo/v2 v2.29.0
-	github.com/onsi/gomega v1.41.0
+	github.com/onsi/ginkgo/v2 v2.32.0
+	github.com/onsi/gomega v1.42.0
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
