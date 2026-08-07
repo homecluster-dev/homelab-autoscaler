@@ -614,6 +614,71 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 	})
 
+	Describe("PricingPodPrice endpoint", func() {
+		Context("when nodes have PodRate set", func() {
+			It("should return the minimum PodRate across nodes", func() {
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("group-a").
+					WithGroup("group-b").
+					WithNode(
+						"node-a-1",
+						mocks.WithNodeGroup("group-a"),
+						mocks.WithNodePricing("0.10", "0.02"),
+					).
+					WithNode(
+						"node-b-1",
+						mocks.WithNodeGroup("group-b"),
+						mocks.WithNodePricing("0.05", "0.005"),
+					).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.PricingPodPrice(testCtx, &pb.PricingPodPriceRequest{})
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp).NotTo(BeNil())
+				Expect(resp.Price).To(Equal(0.005))
+			})
+		})
+
+		Context("when nodes have unparseable PodRate", func() {
+			It("should skip those nodes and use the next cheapest valid rate", func() {
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("group-a").
+					WithNode(
+						"node-bad",
+						mocks.WithNodeGroup("group-a"),
+						mocks.WithNodePricing("0.10", "not-a-number"),
+					).
+					WithNode(
+						"node-good",
+						mocks.WithNodeGroup("group-a"),
+						mocks.WithNodePricing("0.10", "0.03"),
+					).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.PricingPodPrice(testCtx, &pb.PricingPodPriceRequest{})
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp.Price).To(Equal(0.03))
+			})
+		})
+
+		Context("when no nodes are configured", func() {
+			It("should return zero price without error", func() {
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.PricingPodPrice(testCtx, &pb.PricingPodPriceRequest{})
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp).NotTo(BeNil())
+				Expect(resp.Price).To(Equal(0.0))
+			})
+		})
+	})
+
 	Describe("GPULabel endpoint", func() {
 		It("should return the GPU label", func() {
 			// Setup mock client
