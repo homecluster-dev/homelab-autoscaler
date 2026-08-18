@@ -5,7 +5,7 @@ controllerManager:
   container:
     image:
       repository: homeclusterdev/autoscaler
-      tag: 0.1.14
+      tag: 0.1.14@sha256:306cf20d5c9199290535f644a3b18e577454ed622c6cca294e279331a16e2851
     imagePullPolicy: IfNotPresent
     args:
       - "--leader-elect"
@@ -95,7 +95,7 @@ clusterAutoscaler:
   enabled: false
   image:
     repository: registry.k8s.io/autoscaling/cluster-autoscaler
-    tag: v1.35.0@sha256:2fc9433dd3b47baef0e68d6b1110b770a3c93db10c7bead4c5bc6cb21c72b875
+    tag: v1.36.1@sha256:461388d03eb5b55db58941ee7a81d9a619dd15302b01cbab9f5a9946715994b4
     pullPolicy: IfNotPresent
   
   # gRPC provider configuration
