@@ -41,6 +41,10 @@ controllerManager:
       type: RuntimeDefault
   terminationGracePeriodSeconds: 10
   serviceAccountName: homelab-autoscaler-controller-manager
+  # Node selector, tolerations, and affinity for the controller manager pod.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # [RBAC]: To enable RBAC (Permissions) configurations
 rbac:
