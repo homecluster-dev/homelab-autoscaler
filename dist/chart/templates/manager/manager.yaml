@@ -38,13 +38,18 @@ spec:
           {{- if .Values.controllerManager.container.imagePullPolicy }}
           imagePullPolicy: {{ .Values.controllerManager.container.imagePullPolicy }}
           {{- end }}
-          {{- if .Values.controllerManager.container.env }}
           env:
+            # The core controller and gRPC server look up Node and Group CRs
+            # in this namespace (see internal/config/namespace.go). Default it
+            # to the release namespace so an install just works regardless of
+            # which namespace it lands in. Users can still override via
+            # .Values.controllerManager.container.env if needed.
+            - name: HOMELAB_AUTOSCALER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             {{- range $key, $value := .Values.controllerManager.container.env }}
             - name: {{ $key }}
-              value: {{ $value }}
+              value: {{ $value | quote }}
             {{- end }}
-          {{- end }}
           livenessProbe:
             {{- toYaml .Values.controllerManager.container.livenessProbe | nindent 12 }}
           readinessProbe:
