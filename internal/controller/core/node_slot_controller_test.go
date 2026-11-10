@@ -177,6 +177,40 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 	}
 }
 
+// TestNodeSlotReconcilerSkipsSeedAfterFSMRan guards against hiding a machine that is
+// actually running. status.lastStartupTime is set by the state machine when it starts a
+// slot, so a slot that carries it has been provisioned at least once: its corev1.Node object
+// can be absent because the machine was deleted, because it never joined, or because an
+// earlier status write failed. Seeding off/shutdown would drop a running machine from the
+// target size, so the seeder leaves such a slot alone.
+func TestNodeSlotReconcilerSkipsSeedAfterFSMRan(t *testing.T) {
+	emptyStatusSlot := slot("slot-ever-started", infrav1alpha1.PowerStateOff, "", "")
+	started := metav1.Now()
+	emptyStatusSlot.Status.LastStartupTime = &started
+
+	r := newSlotReconciler(t, emptyStatusSlot)
+
+	reconcileSlot(t, r, "slot-ever-started")
+
+	node := getNodeCR(t, r, "slot-ever-started")
+	assert.Empty(t, node.Status.PowerState, "a slot the state machine has started must not be seeded")
+	assert.Empty(t, node.Status.Progress)
+	assert.NotNil(t, node.Status.LastStartupTime)
+}
+
+// TestNodeSlotReconcilerSeedsSlotNeverStarted pins the intended behaviour: a slot without a
+// recorded startup and without a Kubernetes node is a never-provisioned placeholder and is
+// seeded.
+func TestNodeSlotReconcilerSeedsSlotNeverStarted(t *testing.T) {
+	r := newSlotReconciler(t, slot("slot-never-started", infrav1alpha1.PowerStateOff, "", ""))
+
+	reconcileSlot(t, r, "slot-never-started")
+
+	node := getNodeCR(t, r, "slot-never-started")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState)
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress)
+}
+
 func TestNodeSlotReconcilerCompletesPartialStatus(t *testing.T) {
 	// progress already shutdown, power state never observed: only the power state is filled in.
 	r := newSlotReconciler(t, slot("slot-partial", infrav1alpha1.PowerStateOff, "", infrav1alpha1.ProgressShutdown))

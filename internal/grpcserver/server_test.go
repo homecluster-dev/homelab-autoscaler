@@ -64,12 +64,20 @@ func nodeCR(name string, desired infrav1alpha1.PowerState, status infrav1alpha1.
 }
 
 // k8sNode builds a Kubernetes node, optionally with a providerID set by a
-// cloud-controller-manager.
+// cloud-controller-manager or by the operator.
 func k8sNode(name, providerID string) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec:       corev1.NodeSpec{ProviderID: providerID},
 	}
+}
+
+// slotWithoutKubernetesNodeName builds a Node CR whose spec.kubernetesNodeName is empty.
+func slotWithoutKubernetesNodeName(name string, desired infrav1alpha1.PowerState) *infrav1alpha1.Node {
+	node := nodeCR(name, desired, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	node.Spec.KubernetesNodeName = ""
+
+	return node
 }
 
 func newServer(t *testing.T, objects ...client.Object) *HomeClusterProviderServer {
@@ -104,7 +112,7 @@ func TestNodeGroupNodes(t *testing.T) {
 				nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
-				"slot-1": pb.InstanceStatus_instanceCreating,
+				"homelab://slot-1": pb.InstanceStatus_instanceCreating,
 			},
 		},
 		{
@@ -118,13 +126,22 @@ func TestNodeGroupNodes(t *testing.T) {
 			},
 		},
 		{
-			name: "empty providerID falls back to the kubernetes node name",
+			name: "empty providerID falls back to the provider id the operator writes",
 			objects: []client.Object{
 				nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
 				k8sNode("slot-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
-				"slot-1": pb.InstanceStatus_instanceRunning,
+				"homelab://slot-1": pb.InstanceStatus_instanceRunning,
+			},
+		},
+		{
+			name: "slot without a kubernetes node name is provisioning and keeps an id",
+			objects: []client.Object{
+				slotWithoutKubernetesNodeName("slot-1", infrav1alpha1.PowerStateOn),
+			},
+			expected: map[string]pb.InstanceStatus_InstanceState{
+				"homelab://slot-1": pb.InstanceStatus_instanceCreating,
 			},
 		},
 		{
@@ -139,8 +156,8 @@ func TestNodeGroupNodes(t *testing.T) {
 				k8sNode("omni-remote-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
-				"slot-new":      pb.InstanceStatus_instanceCreating,
-				"omni-remote-1": pb.InstanceStatus_instanceRunning,
+				"homelab://slot-new":      pb.InstanceStatus_instanceCreating,
+				"homelab://omni-remote-1": pb.InstanceStatus_instanceRunning,
 			},
 		},
 	}
@@ -163,6 +180,47 @@ func TestNodeGroupNodes(t *testing.T) {
 			assert.Len(t, resp.Instances, len(tc.expected))
 			assert.Equal(t, tc.expected, got)
 		})
+	}
+}
+
+// TestNodeGroupNodesStableIdentityAcrossProvisioning covers the identity of a slot while it
+// crosses the provisioning boundary. Cluster-autoscaler keys instances by id, and the
+// operator stamps the Kubernetes node with providerID "homelab://<Node CR name>" when the
+// machine joins. The id reported before the node exists must be the same, otherwise the
+// in-flight instance is invisible and a single pending pod produces two scale ups.
+func TestNodeGroupNodesStableIdentityAcrossProvisioning(t *testing.T) {
+	server := newServer(t, nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp))
+
+	ctx := context.Background()
+
+	resp, err := server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
+	require.NoError(t, err)
+	require.Len(t, resp.Instances, 1)
+	provisioningID := resp.Instances[0].Id
+	assert.Equal(t, pb.InstanceStatus_instanceCreating, resp.Instances[0].Status.InstanceState)
+
+	// The machine joins and the operator patches the providerID onto the Kubernetes node.
+	require.NoError(t, server.Client.Create(ctx, k8sNode("slot-1", "homelab://slot-1")))
+
+	resp, err = server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
+	require.NoError(t, err)
+	require.Len(t, resp.Instances, 1)
+	assert.Equal(t, pb.InstanceStatus_instanceRunning, resp.Instances[0].Status.InstanceState)
+	assert.Equal(t, provisioningID, resp.Instances[0].Id, "instance id must not change once the node joins")
+}
+
+// TestNodeGroupNodesIgnoresEmptyKubernetesNodeName covers a slot that has no
+// spec.kubernetesNodeName yet: the Get must be skipped so the call keeps returning a
+// stable provisioning instance instead of a non-NotFound error every time.
+func TestNodeGroupNodesIgnoresEmptyKubernetesNodeName(t *testing.T) {
+	server := newServer(t, slotWithoutKubernetesNodeName("slot-1", infrav1alpha1.PowerStateOn))
+
+	for range 3 {
+		resp, err := server.NodeGroupNodes(context.Background(), &pb.NodeGroupNodesRequest{Id: testGroup})
+		require.NoError(t, err)
+		require.Len(t, resp.Instances, 1)
+		assert.Equal(t, "homelab://slot-1", resp.Instances[0].Id)
+		assert.Equal(t, pb.InstanceStatus_instanceCreating, resp.Instances[0].Status.InstanceState)
 	}
 }
 

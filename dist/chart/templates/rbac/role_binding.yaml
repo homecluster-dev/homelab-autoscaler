@@ -8,24 +8,10 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  # Must match the ClusterRole rendered by ./role.yaml.
   name: {{ include "chart.name" . }}-manager-role
 subjects:
 - kind: ServiceAccount
   name: {{ .Values.controllerManager.serviceAccountName }}
   namespace: {{ .Release.Namespace }}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  labels:
-    {{- include "chart.labels" . | nindent 4 }}
-  name: {{ include "chart.name" . }}-controller-manager-rolebinding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "chart.name" . }}-manager-role
-subjects:
-- kind: ServiceAccount
-  name: homelab-autoscaler-controller-manager
-  namespace: homelab-autoscaler-system
 {{- end -}}

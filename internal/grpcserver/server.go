@@ -521,22 +521,24 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 		// Until then the instance is still provisioning.
 		instanceState := pb.InstanceStatus_instanceCreating
 		kubernetesNode := &corev1.Node{}
-		err = s.Client.Get(ctx, client.ObjectKey{Name: node.Spec.KubernetesNodeName}, kubernetesNode)
-		if err == nil {
-			instanceState = pb.InstanceStatus_instanceRunning
-		} else if !errors.IsNotFound(err) {
-			logger.Error(err, "Failed to get Kubernetes node", "node", node.Spec.KubernetesNodeName, "nodeCR", node.Name)
+		if name := node.Spec.KubernetesNodeName; name != "" {
+			err = s.Client.Get(ctx, client.ObjectKey{Name: name}, kubernetesNode)
+			if err == nil {
+				instanceState = pb.InstanceStatus_instanceRunning
+			} else if !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to get Kubernetes node", "node", name, "nodeCR", node.Name)
+			}
 		}
 
-		// There may be no cloud-controller-manager setting spec.providerID, so fall back
-		// to the Kubernetes node name (the NodeGroupNodes contract requires a stable,
-		// non-empty id; NodeGroupDeleteNodes resolves instances by node name).
+		// Cluster-autoscaler keys instances by id, and the operator stamps the Kubernetes node
+		// with providerID "homelab://<Node CR name>" once the machine joins. Use that same
+		// identity as the fallback so the id does not change when the slot crosses the
+		// provisioning boundary (an empty providerID, i.e. no cloud-controller-manager, would
+		// otherwise report the bare node name and then the providerID). Keep the providerID of
+		// the Kubernetes node when it is set, it is the authoritative identity.
 		instanceID := kubernetesNode.Spec.ProviderID
 		if instanceID == "" {
-			instanceID = node.Spec.KubernetesNodeName
-		}
-		if instanceID == "" {
-			instanceID = node.Name
+			instanceID = fmt.Sprintf("homelab://%s", node.Name)
 		}
 
 		instance := &pb.Instance{

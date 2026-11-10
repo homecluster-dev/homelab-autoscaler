@@ -18,14 +18,15 @@ package core
 
 import (
 	"context"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
@@ -44,6 +45,10 @@ import (
 // that is desired to be off, and whose status was never observed, is reported as
 // off/shutdown so that it is excluded from the target size and can be picked up by
 // NodeGroupIncreaseSize.
+//
+// Slots whose status records a startup (status.lastStartupTime) are never seeded: the
+// state machine ran for them at least once, so the machine may well be running while its
+// Kubernetes node object is absent (for example after a failed status write).
 type NodeSlotReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -65,6 +70,21 @@ func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	if !needsStatusSeed(nodeCR) {
+		return ctrl.Result{}, nil
+	}
+
+	// A slot whose FSM has run at least once may have a real machine behind it: the
+	// Kubernetes node object can be missing because the machine was never created, because
+	// it was removed from the cluster, or because an earlier status write failed. Seeding
+	// off/shutdown in that case excludes a running machine from the target size, so leave
+	// the status to the controllers that observe the machine.
+	if nodeCR.Status.LastStartupTime != nil {
+		logger.Info("Skipping status seed for a slot the state machine has already started",
+			"node", nodeCR.Name,
+			"lastStartupTime", nodeCR.Status.LastStartupTime,
+			"warning", "the machine may still be running while its Kubernetes node object is absent; "+
+				"verify it out of band, the operator will not re-report its state")
+
 		return ctrl.Result{}, nil
 	}
 
@@ -90,7 +110,9 @@ func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Use status subresource to avoid conflicts with spec updates
 	if err := r.Status().Update(ctx, nodeCRCopy); err != nil {
 		logger.Error(err, "Failed to seed Node status", "node", nodeCR.Name)
-		return ctrl.Result{RequeueAfter: time.Second * 30}, err
+		// controller-runtime discards the Result when the error is non-nil, the requeue
+		// backoff is decided by the controller, so only the error is returned here.
+		return ctrl.Result{}, err
 	}
 
 	logger.Info("Seeded status of never-provisioned slot",
@@ -130,9 +152,14 @@ func needsStatusSeed(node *infrav1alpha1.Node) bool {
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// The seeding only depends on spec and on the fields written by the other reconcilers, so
+// the watch is narrowed to create events and spec changes (generation bumps). Status-only
+// updates from KubernetesNodeReconciler and the FSM bump the resourceVersion without
+// changing the generation and must not re-trigger this reconciler.
 func (r *NodeSlotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&infrav1alpha1.Node{}).
+		For(&infrav1alpha1.Node{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("core-node-slot").
 		Complete(r)
 }

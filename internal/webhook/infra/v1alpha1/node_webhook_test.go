@@ -18,13 +18,18 @@ package v1alpha1
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -71,9 +76,9 @@ var _ = Describe("Node Webhook", func() {
 	)
 
 	BeforeEach(func() {
-		scheme := runtime.NewScheme()
-		Expect(infrav1alpha1.AddToScheme(scheme)).To(Succeed())
-		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		testScheme := runtime.NewScheme()
+		Expect(infrav1alpha1.AddToScheme(testScheme)).To(Succeed())
+		Expect(corev1.AddToScheme(testScheme)).To(Succeed())
 
 		// The cluster contains the Group CR and a Kubernetes node for a slot that is
 		// already running, but no Kubernetes node for the slot under test.
@@ -84,7 +89,7 @@ var _ = Describe("Node Webhook", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "omni-remote-1"},
 		}
 		k8sClient = fake.NewClientBuilder().
-			WithScheme(scheme).
+			WithScheme(testScheme).
 			WithObjects(clusterGroup, runningNode).
 			Build()
 
@@ -120,20 +125,25 @@ var _ = Describe("Node Webhook", func() {
 	})
 
 	Context("When creating a Node with a power state of on", func() {
-		It("Should reject a slot whose Kubernetes node does not exist", func() {
+		It("Should admit a slot whose Kubernetes node does not exist, warning about it", func() {
 			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
 
-			_, err := validator.ValidateCreate(context.Background(), obj)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("kubernetes node '" + testNodeName + "' does not exist"))
+			warnings, err := validator.ValidateCreate(context.Background(), obj)
+			Expect(err).NotTo(HaveOccurred(),
+				"the power-on path writes powerState on before the machine joins, so a missing node must never deny")
+			Expect(warnings).To(HaveLen(1))
+			Expect(warnings[0]).To(ContainSubstring(
+				"kubernetes node \"" + testNodeName + "\" does not exist in the cluster"))
+			Expect(warnings[0]).To(ContainSubstring("the operator will create it when the slot is powered on"))
 		})
 
-		It("Should admit a slot whose Kubernetes node exists", func() {
+		It("Should admit a slot whose Kubernetes node exists, without warnings", func() {
 			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
 			obj.Spec.KubernetesNodeName = "omni-remote-1"
 
-			_, err := validator.ValidateCreate(context.Background(), obj)
+			warnings, err := validator.ValidateCreate(context.Background(), obj)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(warnings).To(BeNil())
 		})
 	})
 
@@ -160,13 +170,153 @@ var _ = Describe("Node Webhook", func() {
 			Expect(err.Error()).To(ContainSubstring("group"))
 		})
 
-		It("Should reject powering on a slot whose Kubernetes node does not exist", func() {
+		It("Should admit powering on a slot whose Kubernetes node does not exist, warning about it", func() {
 			oldObj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
 			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
 
-			_, err := validator.ValidateUpdate(context.Background(), oldObj, obj)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("kubernetes node '" + testNodeName + "' does not exist"))
+			warnings, err := validator.ValidateUpdate(context.Background(), oldObj, obj)
+			Expect(err).NotTo(HaveOccurred(),
+				"the operator powers slots on before the Kubernetes node joins, admission must not deny")
+			Expect(warnings).To(HaveLen(1))
+			Expect(warnings[0]).To(ContainSubstring(
+				"kubernetes node \"" + testNodeName + "\" does not exist in the cluster"))
 		})
+	})
+})
+
+// warningRecorder captures the warning headers the API server returns to a client. The
+// warnings produced by a validating webhook are surfaced to clients as HTTP Warning
+// headers with code 299, which is how the real admission path is asserted on.
+type warningRecorder struct {
+	mu       sync.Mutex
+	warnings []string
+}
+
+func (w *warningRecorder) HandleWarningHeader(code int, agent, text string) {
+	if code != 299 {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.warnings = append(w.warnings, text)
+}
+
+func (w *warningRecorder) drain() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	got := w.warnings
+	w.warnings = nil
+
+	return got
+}
+
+// newWarningCapturingClient builds a client that records the warnings returned by the API
+// server, so that tests can assert on the warnings emitted by the deployed webhook.
+func newWarningCapturingClient(recorder *warningRecorder) (client.Client, error) {
+	testCfg := rest.CopyConfig(cfg)
+	testCfg.WarningHandler = recorder
+
+	return client.New(testCfg, client.Options{Scheme: scheme.Scheme})
+}
+
+var _ = Describe("Node Webhook through the API server", Ordered, func() {
+	const (
+		envtestGroup     = "envtest-workers"
+		envtestSlot      = "envtest-slot-1"
+		envtestNamespace = "default"
+	)
+
+	var (
+		rec       *warningRecorder
+		advClient client.Client
+		nodeKey   client.ObjectKey
+	)
+
+	BeforeAll(func() {
+		rec = &warningRecorder{}
+
+		var err error
+		advClient, err = newWarningCapturingClient(rec)
+		Expect(err).NotTo(HaveOccurred())
+
+		group := &infrav1alpha1.Group{
+			ObjectMeta: metav1.ObjectMeta{Name: envtestGroup, Namespace: envtestNamespace},
+			Spec: infrav1alpha1.GroupSpec{
+				ScaleDownUtilizationThreshold:    "0.5",
+				ScaleDownGpuUtilizationThreshold: "0.5",
+				ScaleDownUnneededTime:            &metav1.Duration{Duration: 10 * time.Minute},
+				ScaleDownUnreadyTime:             &metav1.Duration{Duration: 20 * time.Minute},
+				MaxNodeProvisionTime:             &metav1.Duration{Duration: 30 * time.Minute},
+			},
+		}
+		Expect(advClient.Create(ctx, group)).To(Succeed())
+
+		nodeKey = client.ObjectKey{Name: envtestSlot, Namespace: envtestNamespace}
+	})
+
+	It("admits a never-provisioned slot powered off, without warnings", func() {
+		node := &infrav1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      envtestSlot,
+				Namespace: envtestNamespace,
+				Labels:    map[string]string{"group": envtestGroup},
+			},
+			Spec: infrav1alpha1.NodeSpec{
+				DesiredPowerState:  infrav1alpha1.PowerStateOff,
+				KubernetesNodeName: envtestSlot,
+				Pricing: infrav1alpha1.PricingSpec{
+					HourlyRate: "0",
+					PodRate:    "0",
+				},
+			},
+		}
+
+		// The validator reads the Group through the manager cache, which needs to observe
+		// it before the request is admitted, so retry until the webhook admits the create.
+		Eventually(func() error {
+			err := advClient.Create(ctx, node)
+			if apierrors.IsAlreadyExists(err) {
+				return nil
+			}
+
+			return err
+		}).WithTimeout(30 * time.Second).WithPolling(500 * time.Millisecond).Should(Succeed())
+
+		Expect(rec.drain()).To(BeEmpty(), "a powered off slot must not produce warnings")
+	})
+
+	It("admits powering on a slot without a Kubernetes node and returns the warning", func() {
+		rec.drain()
+
+		// This drives the real admission path: k8sClient -> API server -> deployed validating
+		// webhook. Denying this write is what blocked the operator power-on path.
+		Eventually(func() error {
+			fresh := &infrav1alpha1.Node{}
+			if err := advClient.Get(ctx, nodeKey, fresh); err != nil {
+				return err
+			}
+
+			fresh.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+
+			return advClient.Update(ctx, fresh)
+		}).WithTimeout(30 * time.Second).WithPolling(500 * time.Millisecond).Should(Succeed())
+
+		// Confirm the slot really is powered on and no corev1.Node exists for it.
+		updated := &infrav1alpha1.Node{}
+		Expect(advClient.Get(ctx, nodeKey, updated)).To(Succeed())
+		Expect(updated.Spec.DesiredPowerState).To(Equal(infrav1alpha1.PowerStateOn))
+
+		k8sNode := &corev1.Node{}
+		Expect(apierrors.IsNotFound(advClient.Get(ctx, client.ObjectKey{Name: envtestSlot}, k8sNode))).To(BeTrue())
+
+		warnings := rec.drain()
+		Expect(warnings).To(ContainElement(
+			ContainSubstring("kubernetes node \""+envtestSlot+"\" does not exist in the cluster")),
+			"the missing Kubernetes node must be reported as an admission warning")
+		Expect(warnings).To(ContainElement(
+			ContainSubstring("the operator will create it when the slot is powered on")))
 	})
 })
