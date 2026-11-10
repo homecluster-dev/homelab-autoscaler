@@ -333,28 +333,67 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 	}
 }
 
+// lifecycleObjectMeta builds the ObjectMeta shared by the startup and shutdown Jobs,
+// so the two builders (and their pod templates) cannot drift apart.
+func (nm *NodeStateMachine) lifecycleObjectMeta(name string, phase string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{
+		Name:        name,
+		Namespace:   nm.node.Namespace,
+		Labels:      nm.lifecycleLabels(phase),
+		Annotations: nm.lifecycleAnnotations(),
+	}
+}
+
+// lifecycleLabels returns the label set for a lifecycle Job of the given phase
+// (PhaseStartup or PhaseShutdown) and for its pod template.
+//
+// Provenance is carried by the labels below plus the controller ownerReference that
+// setOwnerReference() sets - that ownerReference is what makes Argo CD show the Job
+// under the Node CR in its resource tree. Do NOT add `argocd.argoproj.io/instance`
+// (or any other Argo tracking label) here: these Jobs are created by the controller,
+// they are not Argo-managed children, and a tracking label would make Argo claim them
+// and prune them for not existing in Git.
+func (nm *NodeStateMachine) lifecycleLabels(phase string) map[string]string {
+	return map[string]string{
+		// Keys relied upon by cleanupPendingJobs, the gRPC server and the tests.
+		LabelApp:        LifecycleAppName,
+		LabelGroup:      nm.node.Labels[LabelGroup],
+		LabelNodeLegacy: nm.node.Spec.KubernetesNodeName,
+		LabelType:       phase,
+
+		// Standard labels, so the operator's Jobs are identifiable by convention.
+		LabelK8sName:      LifecycleAppName,
+		LabelK8sComponent: LifecycleComponentName,
+		LabelK8sManagedBy: LifecycleAppName,
+
+		// Explicit provenance: the Node CR a human / Argo CD sees is nm.node.Name,
+		// which can differ from spec.kubernetesNodeName carried by LabelNodeLegacy.
+		LabelNodeCR: nm.node.Name,
+		LabelPhase:  phase,
+	}
+}
+
+// lifecycleAnnotations returns the annotations recording which Node CR created the Job.
+func (nm *NodeStateMachine) lifecycleAnnotations() map[string]string {
+	return map[string]string{
+		AnnotationNodeUID:   string(nm.node.UID),
+		AnnotationNodeGroup: nm.node.Labels[LabelGroup],
+		AnnotationCreatedBy: LifecycleAppName,
+	}
+}
+
 // createStartupJob creates a Kubernetes Job for node startup
 func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-startup-%d", nm.node.Name, time.Now().Unix()),
-			Namespace: nm.node.Namespace,
-			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"group": nm.node.Labels["group"],
-				"node":  nm.node.Spec.KubernetesNodeName,
-				"type":  "startup",
-			},
-		},
+		ObjectMeta: nm.lifecycleObjectMeta(
+			fmt.Sprintf("%s-startup-%d", nm.node.Name, time.Now().Unix()),
+			PhaseStartup,
+		),
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
+				// Keep the pod template labels in sync with the Job's own labels.
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"group": nm.node.Labels["group"],
-						"node":  nm.node.Spec.KubernetesNodeName,
-						"type":  "startup",
-					},
+					Labels: nm.lifecycleLabels(PhaseStartup),
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyOnFailure,
@@ -438,25 +477,15 @@ func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 // createShutdownJob creates a Kubernetes Job for node shutdown
 func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-shutdown-%d", nm.node.Name, time.Now().Unix()),
-			Namespace: nm.node.Namespace,
-			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"group": nm.node.Labels["group"],
-				"node":  nm.node.Spec.KubernetesNodeName,
-				"type":  "shutdown",
-			},
-		},
+		ObjectMeta: nm.lifecycleObjectMeta(
+			fmt.Sprintf("%s-shutdown-%d", nm.node.Name, time.Now().Unix()),
+			PhaseShutdown,
+		),
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
+				// Keep the pod template labels in sync with the Job's own labels.
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"group": nm.node.Labels["group"],
-						"node":  nm.node.Spec.KubernetesNodeName,
-						"type":  "shutdown",
-					},
+					Labels: nm.lifecycleLabels(PhaseShutdown),
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyOnFailure,
@@ -844,7 +873,7 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 
 	// Create label selector for jobs belonging to this node
 	labelSelector := labels.SelectorFromSet(labels.Set{
-		"node": nodeKubernetesName,
+		LabelNodeLegacy: nodeKubernetesName,
 	})
 
 	// List all jobs with the node label
@@ -862,8 +891,8 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 	// Delete pending startup/shutdown jobs to ensure clean state
 	for _, job := range jobList.Items {
 		// Check if this is a startup or shutdown job
-		jobType, exists := job.Labels["type"]
-		if !exists || (jobType != "startup" && jobType != "shutdown") {
+		jobType, exists := job.Labels[LabelType]
+		if !exists || (jobType != PhaseStartup && jobType != PhaseShutdown) {
 			continue
 		}
 
