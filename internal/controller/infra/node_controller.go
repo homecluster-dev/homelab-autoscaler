@@ -161,7 +161,9 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 
 		if err := stateMachine.StartNode(); err != nil {
 			logger.Error(err, "FSM failed to start node", "node", node.Name)
-			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, err
+			// controller-runtime discards the Result when the error is non-nil, the requeue
+			// backoff is decided by the controller, so only the error is returned here.
+			return ctrl.Result{}, err
 		}
 
 	} else if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOff &&
@@ -170,7 +172,9 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 
 		if err := stateMachine.ShutdownNode(); err != nil {
 			logger.Error(err, "FSM failed to shutdown node", "node", node.Name)
-			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, err
+			// controller-runtime discards the Result when the error is non-nil, the requeue
+			// backoff is decided by the controller, so only the error is returned here.
+			return ctrl.Result{}, err
 		}
 
 	} else {

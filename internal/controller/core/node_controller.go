@@ -18,7 +18,6 @@ package core
 
 import (
 	"context"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -103,7 +102,9 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Use status subresource to avoid conflicts with spec updates
 	if err := r.Status().Update(ctx, nodeCRCopy); err != nil {
 		logger.Error(err, "Failed to update Node status", "node", node.Name, "powerstate", nodeCRCopy.Status.PowerState)
-		return ctrl.Result{RequeueAfter: time.Second * 30}, err
+		// controller-runtime discards the Result when the error is non-nil, the requeue
+		// backoff is decided by the controller, so only the error is returned here.
+		return ctrl.Result{}, err
 	}
 
 	logger.Info("Successfully updated Node status", "node", node.Name, "powerstate", nodeCRCopy.Status.PowerState, "progress", nodeCRCopy.Status.Progress)

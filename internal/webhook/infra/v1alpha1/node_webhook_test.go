@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
@@ -69,20 +71,22 @@ func groupLabels() map[string]string {
 
 var _ = Describe("Node Webhook", func() {
 	var (
-		obj       *infrav1alpha1.Node
-		oldObj    *infrav1alpha1.Node
-		validator NodeCustomValidator
-		k8sClient client.Client
+		obj          *infrav1alpha1.Node
+		oldObj       *infrav1alpha1.Node
+		validator    NodeCustomValidator
+		k8sClient    client.Client
+		testScheme   *runtime.Scheme
+		clusterGroup *infrav1alpha1.Group
 	)
 
 	BeforeEach(func() {
-		testScheme := runtime.NewScheme()
+		testScheme = runtime.NewScheme()
 		Expect(infrav1alpha1.AddToScheme(testScheme)).To(Succeed())
 		Expect(corev1.AddToScheme(testScheme)).To(Succeed())
 
 		// The cluster contains the Group CR and a Kubernetes node for a slot that is
 		// already running, but no Kubernetes node for the slot under test.
-		clusterGroup := &infrav1alpha1.Group{
+		clusterGroup = &infrav1alpha1.Group{
 			ObjectMeta: metav1.ObjectMeta{Name: testGroup, Namespace: testNamespace},
 		}
 		runningNode := &corev1.Node{
@@ -133,8 +137,43 @@ var _ = Describe("Node Webhook", func() {
 				"the power-on path writes powerState on before the machine joins, so a missing node must never deny")
 			Expect(warnings).To(HaveLen(1))
 			Expect(warnings[0]).To(ContainSubstring(
-				"kubernetes node \"" + testNodeName + "\" does not exist in the cluster"))
-			Expect(warnings[0]).To(ContainSubstring("the operator will create it when the slot is powered on"))
+				"kubernetes node \"" + testNodeName + "\" has not joined the cluster yet"))
+			Expect(warnings[0]).To(ContainSubstring("kubelet registers it when the machine boots"))
+		})
+
+		// The guarantee behind the fix: a webhook that cannot read the cluster must not turn
+		// that into a denial, otherwise every power-on write fails with a transport error.
+		It("Should admit a slot whose node lookup fails, without warnings", func() {
+			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+
+			lookupFailed := false
+			failingClient := fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(clusterGroup).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(callCtx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
+						// Only the corev1.Node lookup under test fails, the Group lookup succeeds.
+						if _, ok := o.(*corev1.Node); ok {
+							lookupFailed = true
+							return apierrors.NewInternalError(fmt.Errorf("injected lookup failure for %q", key.Name))
+						}
+						return c.Get(callCtx, key, o, opts...)
+					},
+				}).
+				Build()
+
+			failingValidator := NodeCustomValidator{Client: failingClient}
+
+			warnings, err := failingValidator.ValidateCreate(context.Background(), obj)
+			Expect(lookupFailed).To(BeTrue(), "expected the corev1.Node lookup to be intercepted")
+			Expect(err).NotTo(HaveOccurred(),
+				"a lookup failure must never deny admission, the operator reconciles the state anyway")
+			Expect(warnings).To(BeNil(), "a lookup failure must not fabricate warnings about the node")
+
+			warnings, err = failingValidator.ValidateUpdate(context.Background(), oldObj, obj)
+			Expect(err).NotTo(HaveOccurred(),
+				"a lookup failure must never deny admission on the update path either")
+			Expect(warnings).To(BeNil())
 		})
 
 		It("Should admit a slot whose Kubernetes node exists, without warnings", func() {
@@ -179,7 +218,7 @@ var _ = Describe("Node Webhook", func() {
 				"the operator powers slots on before the Kubernetes node joins, admission must not deny")
 			Expect(warnings).To(HaveLen(1))
 			Expect(warnings[0]).To(ContainSubstring(
-				"kubernetes node \"" + testNodeName + "\" does not exist in the cluster"))
+				"kubernetes node \"" + testNodeName + "\" has not joined the cluster yet"))
 		})
 	})
 })
@@ -314,9 +353,9 @@ var _ = Describe("Node Webhook through the API server", Ordered, func() {
 
 		warnings := rec.drain()
 		Expect(warnings).To(ContainElement(
-			ContainSubstring("kubernetes node \""+envtestSlot+"\" does not exist in the cluster")),
+			ContainSubstring("kubernetes node \""+envtestSlot+"\" has not joined the cluster yet")),
 			"the missing Kubernetes node must be reported as an admission warning")
 		Expect(warnings).To(ContainElement(
-			ContainSubstring("the operator will create it when the slot is powered on")))
+			ContainSubstring("kubelet registers it when the machine boots")))
 	})
 })

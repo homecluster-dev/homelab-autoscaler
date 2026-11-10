@@ -89,11 +89,14 @@ func (v *NodeCustomValidator) ValidateDelete(ctx context.Context, node *infrav1a
 // node. It never denies a request.
 //
 // A slot that is desired to be on legitimately has no corev1.Node yet: nothing creates the
-// Kubernetes node, it joins the cluster when the machine powers on. Denying a write that
-// carries powerState "on" would block the operator's own power-on path (NodeGroupIncreaseSize,
-// the FSM startup locks and the owner reference patch all write the Node CR with the desired
-// state set to on, before the node can exist), so the missing node is surfaced as an
-// admission warning only.
+// Kubernetes node, the kubelet registers it when the machine boots and the operator only
+// patches providerID and labels on it. Denying a write that carries powerState "on" would
+// block the operator's own power-on path (NodeGroupIncreaseSize, the FSM startup locks and
+// the owner reference patch all write the Node CR with the desired state set to on, before
+// the node can exist), so the missing node is surfaced as an admission warning only.
+//
+// A failed lookup is never turned into a denial either: the admission webhook must not fail
+// a request because it could not read the cluster.
 func (v *NodeCustomValidator) kubernetesNodeWarnings(ctx context.Context, node *infrav1alpha1.Node) admission.Warnings {
 	if node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOn {
 		nodelog.V(1).Info("Skipping kubernetes node existence check for powered off node",
@@ -105,11 +108,11 @@ func (v *NodeCustomValidator) kubernetesNodeWarnings(ctx context.Context, node *
 	err := v.Client.Get(ctx, types.NamespacedName{Name: node.Spec.KubernetesNodeName}, &k8sNode)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			nodelog.V(1).Info("Kubernetes node does not exist yet",
+			nodelog.V(1).Info("Kubernetes node has not joined the cluster yet",
 				"nodeName", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
 
 			return admission.Warnings{fmt.Sprintf(
-				"kubernetes node %q does not exist in the cluster; the operator will create it when the slot is powered on",
+				"kubernetes node %q has not joined the cluster yet; kubelet registers it when the machine boots",
 				node.Spec.KubernetesNodeName,
 			)}
 		}

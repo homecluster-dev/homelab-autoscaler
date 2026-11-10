@@ -1,3 +1,12 @@
+{{- /*
+WARNING: this binding is derived from config/rbac/role_binding.yaml, the kustomize source, and
+is deliberately NOT identical to it: the source file still carries a second, duplicate
+ClusterRoleBinding named homelab-autoscaler-controller-manager-rolebinding, which this chart
+removed on purpose (it bound the same role to a hardcoded service account name, while the
+chart templates the name). Copying the source file over by hand would reintroduce that
+duplicate, so drop it again. The templated metadata.name and the roleRef.name must stay
+consistent with the ClusterRole rendered by ./role.yaml.
+*/ -}}
 {{- if and .Values.rbac.enable .Values.controllerManager.enabled }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

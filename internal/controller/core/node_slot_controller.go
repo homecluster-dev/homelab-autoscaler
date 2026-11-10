@@ -79,11 +79,11 @@ func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// off/shutdown in that case excludes a running machine from the target size, so leave
 	// the status to the controllers that observe the machine.
 	if nodeCR.Status.LastStartupTime != nil {
-		logger.Info("Skipping status seed for a slot the state machine has already started",
+		logger.Info("Skipping status seed, the state machine has already run for this slot; "+
+			"the machine may still be running while its Kubernetes node object is absent, so its "+
+			"state must be verified out of band",
 			"node", nodeCR.Name,
-			"lastStartupTime", nodeCR.Status.LastStartupTime,
-			"warning", "the machine may still be running while its Kubernetes node object is absent; "+
-				"verify it out of band, the operator will not re-report its state")
+			"lastStartupTime", nodeCR.Status.LastStartupTime)
 
 		return ctrl.Result{}, nil
 	}
@@ -153,10 +153,11 @@ func needsStatusSeed(node *infrav1alpha1.Node) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 //
-// The seeding only depends on spec and on the fields written by the other reconcilers, so
-// the watch is narrowed to create events and spec changes (generation bumps). Status-only
-// updates from KubernetesNodeReconciler and the FSM bump the resourceVersion without
-// changing the generation and must not re-trigger this reconciler.
+// What has to be seeded is decided by the spec (spec.desiredPowerState), so the watch uses
+// GenerationChangedPredicate: it lets create events and spec changes through, and ignores
+// updates that only touch fields written by the other reconcilers. A status write bumps the
+// resourceVersion, never the generation, so status-only updates from
+// KubernetesNodeReconciler and the FSM do not re-trigger this reconciler.
 func (r *NodeSlotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1alpha1.Node{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
