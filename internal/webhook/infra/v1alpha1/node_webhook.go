@@ -83,8 +83,19 @@ func (v *NodeCustomValidator) ValidateDelete(ctx context.Context, node *infrav1a
 	return nil, nil
 }
 
-// validateKubernetesNode checks if the referenced Kubernetes node exists
+// validateKubernetesNode checks if the referenced Kubernetes node exists.
+//
+// The check only applies to slots that are desired to be on. A powered-off slot is a
+// placeholder for a machine that does not exist yet: the operator powers it on and the
+// Kubernetes node joins later, so requiring the node to exist would make it impossible
+// to declare the initial off state of a pool.
 func (v *NodeCustomValidator) validateKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
+	if node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOn {
+		nodelog.V(1).Info("Skipping kubernetes node existence check for powered off node",
+			"nodeName", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
+		return nil
+	}
+
 	var k8sNode corev1.Node
 	err := v.Client.Get(ctx, types.NamespacedName{Name: node.Spec.KubernetesNodeName}, &k8sNode)
 	if err != nil {

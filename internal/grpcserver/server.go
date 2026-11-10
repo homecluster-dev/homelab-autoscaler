@@ -510,15 +510,39 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 	// Convert nodes to instances
 	instances := make([]*pb.Instance, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
+		// A slot that is not desired to be on is capacity the provider could create,
+		// not an instance that exists. Reporting it as running inflates the current
+		// size of the group, which makes the autoscaler provision extra machines.
+		if node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOn {
+			continue
+		}
+
+		// The Kubernetes node only exists once the machine has joined the cluster.
+		// Until then the instance is still provisioning.
+		instanceState := pb.InstanceStatus_instanceCreating
 		kubernetesNode := &corev1.Node{}
 		err = s.Client.Get(ctx, client.ObjectKey{Name: node.Spec.KubernetesNodeName}, kubernetesNode)
-		if err != nil {
-			logger.Error(err, "Node not found", "node", node.Spec.KubernetesNodeName, "nodeCR", node.Name)
+		if err == nil {
+			instanceState = pb.InstanceStatus_instanceRunning
+		} else if !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to get Kubernetes node", "node", node.Spec.KubernetesNodeName, "nodeCR", node.Name)
 		}
+
+		// There may be no cloud-controller-manager setting spec.providerID, so fall back
+		// to the Kubernetes node name (the NodeGroupNodes contract requires a stable,
+		// non-empty id; NodeGroupDeleteNodes resolves instances by node name).
+		instanceID := kubernetesNode.Spec.ProviderID
+		if instanceID == "" {
+			instanceID = node.Spec.KubernetesNodeName
+		}
+		if instanceID == "" {
+			instanceID = node.Name
+		}
+
 		instance := &pb.Instance{
-			Id: kubernetesNode.Spec.ProviderID,
+			Id: instanceID,
 			Status: &pb.InstanceStatus{
-				InstanceState: pb.InstanceStatus_instanceRunning,
+				InstanceState: instanceState,
 				ErrorInfo: &pb.InstanceErrorInfo{
 					ErrorCode:    "",
 					ErrorMessage: "",
