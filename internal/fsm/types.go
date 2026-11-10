@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
@@ -105,6 +106,11 @@ const (
 	DefaultLockTimeout     = 5 * time.Minute
 	MaxRetries             = 3
 	DefaultUncordonTimeout = 90 * time.Second
+
+	// StuckTransitionThreshold is how long a transitional state (startingup,
+	// shuttingdown) may last before CheckStuckState forces a cleanup. The event recorded
+	// for that cleanup quotes it, so it is a named constant rather than a literal.
+	StuckTransitionThreshold = 15 * time.Minute
 )
 
 // NodeStateMachine represents the FSM for node state management
@@ -116,6 +122,10 @@ type NodeStateMachine struct {
 	node   *infrav1alpha1.Node
 	client client.Client
 	scheme *runtime.Scheme
+
+	// eventRecorder publishes Kubernetes Events on the Node CR for the lifecycle
+	// transitions the FSM performs. Optional: nil records nothing (see WithEventRecorder).
+	eventRecorder record.EventRecorder
 
 	// Coordination management
 	coordinationManager CoordinationManager

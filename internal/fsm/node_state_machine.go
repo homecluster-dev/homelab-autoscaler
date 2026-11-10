@@ -35,12 +35,18 @@ import (
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
 
-// NewNodeStateMachine creates a new FSM instance for node state management
+// NewNodeStateMachine creates a new FSM instance for node state management.
+//
+// Options are optional: with none the FSM behaves exactly as it did before the event
+// recorder existed, which keeps every existing caller and test working. Pass
+// WithEventRecorder(mgr.GetEventRecorderFor(...)) to have the lifecycle transitions
+// recorded on the Node CR.
 func NewNodeStateMachine(
 	node *infrav1alpha1.Node,
 	k8sClient client.Client,
 	scheme *runtime.Scheme,
 	coordMgr CoordinationManager,
+	opts ...Option,
 ) *NodeStateMachine {
 	nm := &NodeStateMachine{
 		node:                node,
@@ -49,6 +55,10 @@ func NewNodeStateMachine(
 		coordinationManager: coordMgr,
 		jobTimeout:          DefaultJobTimeout,
 		uncordonTimeout:     DefaultUncordonTimeout,
+	}
+
+	for _, opt := range opts {
+		opt(nm)
 	}
 
 	// Initialize FSM with current state from node progress
@@ -111,12 +121,17 @@ func (nm *NodeStateMachine) StartNode() error {
 
 	// Trigger FSM event
 	if err := nm.fsm.Event(ctx, EventStartNode); err != nil {
+		nm.recordScaleFailure(false, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
 		return fmt.Errorf("FSM transition failed: %w", err)
 	}
 
 	// Create and start Kubernetes Job
 	job, err := nm.createStartupJob()
 	if err != nil {
+		// Record the failure before rolling the FSM back, and record it only here: the
+		// JobFailed transition into shutdown suppresses its completion event, so a
+		// failed scale up produces exactly one Warning.
+		nm.recordScaleFailure(false, fmt.Sprintf("failed to create startup job: %s", errorDetail(err)))
 		// Trigger failure event to rollback
 		if err := nm.fsm.Event(ctx, EventJobFailed); err != nil {
 			logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
@@ -155,12 +170,16 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 
 	// Trigger FSM event
 	if err := nm.fsm.Event(ctx, EventShutdownNode); err != nil {
+		nm.recordScaleFailure(true, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
 		return fmt.Errorf("FSM transition failed: %w", err)
 	}
 
 	// Create and start Kubernetes Job
 	job, err := nm.createShutdownJob()
 	if err != nil {
+		// See StartNode: the failure is recorded once, here, and the rollback
+		// transition suppresses its completion event.
+		nm.recordScaleFailure(true, fmt.Sprintf("failed to create shutdown job: %s", errorDetail(err)))
 		// Trigger failure event to rollback
 		if err := nm.fsm.Event(ctx, EventJobFailed); err != nil {
 			logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
@@ -234,7 +253,7 @@ func (nm *NodeStateMachine) IsTransitionStuck() bool {
 	}
 
 	elapsed := time.Since(nm.backoff.transitionStart)
-	return elapsed > 15*time.Minute
+	return elapsed > StuckTransitionThreshold
 }
 
 // CheckStuckState checks for stuck transitions and forces cleanup if needed
@@ -288,6 +307,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 
 		if job.Status.Failed > 0 {
 			logger.Info("Job failed", "node", nm.node.Name, "job", jobName)
+			nm.recordObservedJobFailure(job)
 			if err := nm.JobFailed(); err != nil {
 				logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
 			}
@@ -322,6 +342,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 
 			if job.Status.Failed > 0 {
 				logger.Info("Job failed", "node", nm.node.Name, "job", jobName)
+				nm.recordObservedJobFailure(job)
 				if err := nm.JobFailed(); err != nil {
 					logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
 				}

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -128,6 +129,15 @@ func (nm *NodeStateMachine) afterForceCleanup(ctx context.Context, e *fsm.Event)
 
 	logger.Info("Force cleanup executed, releasing coordination lock", "node", nm.node.Name)
 
+	// A forced cleanup means the operation in flight got stuck, which is a failed
+	// scale up/down from the operator's point of view. The enter_ hooks suppress their
+	// completion event for this event, so exactly one Warning is recorded.
+	if e != nil {
+		nm.recordScaleFailure(e.Src == StateShuttingDown,
+			fmt.Sprintf("transition was stuck for more than %v, forced cleanup moved %s to %s",
+				StuckTransitionThreshold, e.Src, e.Dst))
+	}
+
 	// Force release coordination lock
 	if err := nm.coordinationManager.ForceReleaseLock(ctx, nm.node); err != nil {
 		logger.Error(err, "Failed to force release coordination lock", "node", nm.node.Name)
@@ -173,6 +183,11 @@ func (nm *NodeStateMachine) enterStartingUp(ctx context.Context, e *fsm.Event) {
 		Reason:             "NodeStarting",
 		Message:            "Node startup operation initiated",
 	})
+
+	// Reached only when the shutdown -> startingup transition actually happened, so this
+	// records one event per scale-up request and never on a plain resync.
+	nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleUpRequested,
+		fmt.Sprintf("Scale up requested for %s: machine is being powered on", nm.lifecycleTarget()))
 }
 
 func (nm *NodeStateMachine) enterShuttingDown(ctx context.Context, e *fsm.Event) {
@@ -198,6 +213,10 @@ func (nm *NodeStateMachine) enterShuttingDown(ctx context.Context, e *fsm.Event)
 		Reason:             "NodeShuttingDown",
 		Message:            "Node shutdown operation initiated",
 	})
+
+	// See enterStartingUp: entered on the real ready -> shuttingdown transition only.
+	nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleDownRequested,
+		fmt.Sprintf("Scale down requested for %s: machine is being powered off", nm.lifecycleTarget()))
 }
 
 func (nm *NodeStateMachine) enterReady(ctx context.Context, e *fsm.Event) {
@@ -219,6 +238,23 @@ func (nm *NodeStateMachine) enterReady(ctx context.Context, e *fsm.Event) {
 		Reason:             "NodeReady",
 		Message:            "Node is ready and operational",
 	})
+
+	// Arriving in ready is a completed scale up when the startup Job finished. A failed
+	// rollback back into ready is recorded by the site that knows the error (StartNode,
+	// ShutdownNode, the Job monitor), so it is not recorded twice here.
+	if e == nil {
+		return
+	}
+
+	switch e.Event {
+	case EventJobCompleted:
+		nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleUpCompleted,
+			fmt.Sprintf("Scale up completed for %s: startup job finished, machine is on and the slot is ready",
+				nm.lifecycleTarget()))
+	case EventJobTimeout:
+		nm.recordScaleFailure(true,
+			fmt.Sprintf("shutdown job did not finish in time, slot stayed on and returned to %s", e.Dst))
+	}
 }
 
 func (nm *NodeStateMachine) enterShutdown(ctx context.Context, e *fsm.Event) {
@@ -240,6 +276,22 @@ func (nm *NodeStateMachine) enterShutdown(ctx context.Context, e *fsm.Event) {
 		Reason:             "NodeShutdown",
 		Message:            "Node is shutdown and powered off",
 	})
+
+	// See enterReady: entering shutdown is a completed scale down when the shutdown Job
+	// finished; a startup that died on the way is recorded by the site that has the error.
+	if e == nil {
+		return
+	}
+
+	switch e.Event {
+	case EventJobCompleted:
+		nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleDownCompleted,
+			fmt.Sprintf("Scale down completed for %s: shutdown job finished, machine is off and the slot is shut down",
+				nm.lifecycleTarget()))
+	case EventJobTimeout:
+		nm.recordScaleFailure(false,
+			fmt.Sprintf("startup job did not finish in time, slot returned to %s", e.Dst))
+	}
 }
 
 // Helper methods for status updates are implemented in node_state_machine.go

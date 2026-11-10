@@ -5,6 +5,8 @@ grants cluster-scoped CRUD on configmaps and secrets, which the generated role d
 (no RBAC marker emits it - it backs the Secret/ConfigMap volumes the startup and shutdown
 Jobs mount). Run `make manifests` and merge the rules over by hand, they are not rendered
 from the markers, and keep the configmaps/secrets rule: a plain copy silently drops it.
+Rules the markers DO generate must be mirrored here identically and in the generated order -
+the events create/patch rule (scale up/down Events recorded on the Node CR) is one such rule.
 The templated metadata.name must stay name-consistent with the roleRef in ./role_binding.yaml.
 */ -}}
 {{- if and .Values.rbac.enable .Values.controllerManager.enabled }}
@@ -15,6 +17,13 @@ metadata:
     {{- include "chart.labels" . | nindent 4 }}
   name: {{ include "chart.name" . }}-manager-role
 rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - ""
   resources:

@@ -145,6 +145,12 @@ grpcurl -plaintext -d '{}' localhost:50051 externalgrpc.CloudProvider/NodeGroups
 # Check node status
 kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system
 
+# Why a machine was powered on or off: the controller records every scale up/down
+# transition on the Node CR (ScaleUpRequested, ScaleUpCompleted, ScaleDownRequested,
+# ScaleDownCompleted, and ScaleUpFailed / ScaleDownFailed as warnings)
+kubectl describe nodes.infra.homecluster.dev -n homelab-autoscaler-system <node-cr-name>
+kubectl get events -n homelab-autoscaler-system --field-selector involvedObject.name=<node-cr-name>
+
 # Check power operation jobs
 kubectl get jobs -n homelab-autoscaler-system
 
