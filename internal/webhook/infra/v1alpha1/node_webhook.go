@@ -63,7 +63,8 @@ func (v *NodeCustomValidator) ValidateCreate(ctx context.Context, node *infrav1a
 	if err := v.validateGroupLabel(ctx, node); err != nil {
 		return nil, err
 	}
-	return nil, v.validateKubernetesNode(ctx, node)
+
+	return v.kubernetesNodeWarnings(ctx, node), nil
 }
 
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type Node.
@@ -73,7 +74,8 @@ func (v *NodeCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj
 	if err := v.validateGroupLabel(ctx, newObj); err != nil {
 		return nil, err
 	}
-	return nil, v.validateKubernetesNode(ctx, newObj)
+
+	return v.kubernetesNodeWarnings(ctx, newObj), nil
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type Node.
@@ -83,22 +85,46 @@ func (v *NodeCustomValidator) ValidateDelete(ctx context.Context, node *infrav1a
 	return nil, nil
 }
 
-// validateKubernetesNode checks if the referenced Kubernetes node exists
-func (v *NodeCustomValidator) validateKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
+// kubernetesNodeWarnings reports informational warnings about the referenced Kubernetes
+// node. It never denies a request.
+//
+// A slot that is desired to be on legitimately has no corev1.Node yet: nothing creates the
+// Kubernetes node, the kubelet registers it when the machine boots and the operator only
+// patches providerID and labels on it. Denying a write that carries powerState "on" would
+// block the operator's own power-on path (NodeGroupIncreaseSize, the FSM startup locks and
+// the owner reference patch all write the Node CR with the desired state set to on, before
+// the node can exist), so the missing node is surfaced as an admission warning only.
+//
+// A failed lookup is never turned into a denial either: the admission webhook must not fail
+// a request because it could not read the cluster.
+func (v *NodeCustomValidator) kubernetesNodeWarnings(ctx context.Context, node *infrav1alpha1.Node) admission.Warnings {
+	if node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOn {
+		nodelog.V(1).Info("Skipping kubernetes node existence check for powered off node",
+			"nodeName", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
+		return nil
+	}
+
 	var k8sNode corev1.Node
 	err := v.Client.Get(ctx, types.NamespacedName{Name: node.Spec.KubernetesNodeName}, &k8sNode)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return field.Invalid(
-				field.NewPath("spec").Child("kubernetesNodeName"),
+			nodelog.V(1).Info("Kubernetes node has not joined the cluster yet",
+				"nodeName", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
+
+			return admission.Warnings{fmt.Sprintf(
+				"kubernetes node %q has not joined the cluster yet; kubelet registers it when the machine boots",
 				node.Spec.KubernetesNodeName,
-				fmt.Sprintf("kubernetes node '%s' does not exist in the cluster", node.Spec.KubernetesNodeName),
-			)
+			)}
 		}
-		return fmt.Errorf("failed to verify kubernetes node existence: %w", err)
+
+		// Never deny on a lookup failure: the operator reconciles the state anyway.
+		nodelog.Error(err, "Failed to verify kubernetes node existence",
+			"nodeName", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
+
+		return nil
 	}
 
-	nodelog.Info("Validated kubernetes node exists", "nodeName", node.Spec.KubernetesNodeName)
+	nodelog.V(1).Info("Validated kubernetes node exists", "nodeName", node.Spec.KubernetesNodeName)
 	return nil
 }
 

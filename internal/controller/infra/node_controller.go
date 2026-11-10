@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -57,11 +58,20 @@ type OperationLock struct {
 type NodeReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// EventRecorder publishes Kubernetes Events on the Node CR for the scale up/down
+	// transitions the FSM runs (nil = no events, which is what the unit tests use).
+	// Built once in cmd/main.go with mgr.GetEventRecorderFor.
+	EventRecorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes/finalizers,verbs=update
+
+// Needed to record why a slot was powered on/off on the Node CR, so that
+// `kubectl describe node.infra.homecluster.dev <name>` shows the lifecycle transitions.
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -146,8 +156,9 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 	// Create coordination manager
 	coordMgr := fsm.NewCoordinationManager(r.Client, fsm.NodeControllerOwner)
 
-	// Create FSM instance
-	stateMachine := fsm.NewNodeStateMachine(node, r.Client, r.Scheme, coordMgr)
+	// Create FSM instance, recording the lifecycle transitions on the Node CR.
+	stateMachine := fsm.NewNodeStateMachine(node, r.Client, r.Scheme, coordMgr,
+		fsm.WithEventRecorder(r.EventRecorder))
 
 	logger.Info("Using FSM for state management",
 		"node", node.Name,
@@ -161,7 +172,9 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 
 		if err := stateMachine.StartNode(); err != nil {
 			logger.Error(err, "FSM failed to start node", "node", node.Name)
-			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, err
+			// controller-runtime discards the Result when the error is non-nil, the requeue
+			// backoff is decided by the controller, so only the error is returned here.
+			return ctrl.Result{}, err
 		}
 
 	} else if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOff &&
@@ -170,7 +183,9 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 
 		if err := stateMachine.ShutdownNode(); err != nil {
 			logger.Error(err, "FSM failed to shutdown node", "node", node.Name)
-			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, err
+			// controller-runtime discards the Result when the error is non-nil, the requeue
+			// backoff is decided by the controller, so only the error is returned here.
+			return ctrl.Result{}, err
 		}
 
 	} else {

@@ -24,6 +24,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -254,6 +255,12 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		assert.Equal(t, "startup", job.Labels["type"])
 		assert.Equal(t, "test/startup:latest", job.Spec.Template.Spec.Containers[0].Image)
 
+		// The startup Job must be attributable to the Node CR that caused it.
+		assert.Equal(t, "test-node", job.Labels["infra.homecluster.dev/node"])
+		assert.Equal(t, "startup", job.Labels["infra.homecluster.dev/phase"])
+		assert.Equal(t, "homelab-autoscaler", job.Labels["app.kubernetes.io/name"])
+		assert.Equal(t, job.Labels, job.Spec.Template.Labels, "pod template labels must match the job labels")
+
 		// Verify job tracking
 		assert.Equal(t, job.Name, fsm.currentJob)
 		assert.False(t, fsm.jobStartTime.IsZero())
@@ -345,6 +352,12 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		assert.Equal(t, "homelab-autoscaler-system", job.Namespace)
 		assert.Equal(t, "shutdown", job.Labels["type"])
 		assert.Equal(t, "test/shutdown:latest", job.Spec.Template.Spec.Containers[0].Image)
+
+		// The shutdown Job must be attributable to the Node CR that caused it.
+		assert.Equal(t, "test-node", job.Labels["infra.homecluster.dev/node"])
+		assert.Equal(t, "shutdown", job.Labels["infra.homecluster.dev/phase"])
+		assert.Equal(t, "homelab-autoscaler", job.Labels["app.kubernetes.io/managed-by"])
+		assert.Equal(t, job.Labels, job.Spec.Template.Labels, "pod template labels must match the job labels")
 
 		// Verify job tracking
 		assert.Equal(t, job.Name, fsm.currentJob)
@@ -1283,4 +1296,103 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 			assert.True(t, mount.ReadOnly)
 		}
 	})
+}
+
+// TestNodeStateMachine_LifecycleJobProvenance asserts that the startup/shutdown Jobs the
+// controller creates carry the label + annotation set that makes them attributable to the
+// Node CR that caused them, that the pod template labels stay in sync with the Job's own
+// labels, and that the controller ownerReference to the Node CR is still what ties the
+// Job to the Node (Argo CD reads that ownerReference; no Argo tracking label is added).
+func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	const nodeUID = types.UID("11111111-2222-3333-4444-555555555555")
+
+	tests := []struct {
+		name     string
+		phase    string
+		power    infrav1alpha1.PowerState
+		progress infrav1alpha1.Progress
+		action   func(*NodeStateMachine) error
+	}{
+		{
+			name:     "startup job",
+			phase:    PhaseStartup,
+			power:    infrav1alpha1.PowerStateOff,
+			progress: infrav1alpha1.ProgressShutdown,
+			action:   func(f *NodeStateMachine) error { return f.StartNode() },
+		},
+		{
+			name:     "shutdown job",
+			phase:    PhaseShutdown,
+			power:    infrav1alpha1.PowerStateOn,
+			progress: infrav1alpha1.ProgressReady,
+			action:   func(f *NodeStateMachine) error { return f.ShutdownNode() },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), tt.power, tt.progress)
+			node.UID = nodeUID
+			mockCoord := NewMockCoordinationManager()
+			fakeClient := CreateFakeClient(scheme, node)
+
+			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+
+			require.NoError(t, tt.action(fsm))
+
+			jobs := &batchv1.JobList{}
+			require.NoError(t, fakeClient.List(context.TODO(), jobs))
+			require.Len(t, jobs.Items, 1)
+
+			job := jobs.Items[0]
+
+			// Expected label set, written out literally so an accidental change to the
+			// shared helper shows up here.
+			expectedLabels := map[string]string{
+				// existing keys, kept as-is for the cleanup selector and the gRPC server
+				"app":   "homelab-autoscaler",
+				"group": "test-group",
+				"node":  "test-node-k8s", // spec.kubernetesNodeName, deliberately not the CR name
+				"type":  tt.phase,
+				// standard Kubernetes recommended labels
+				"app.kubernetes.io/name":       "homelab-autoscaler",
+				"app.kubernetes.io/component":  "node-lifecycle",
+				"app.kubernetes.io/managed-by": "homelab-autoscaler",
+				// explicit provenance: the Node CR a human / Argo CD sees
+				"infra.homecluster.dev/node":  "test-node",
+				"infra.homecluster.dev/phase": tt.phase,
+			}
+			assert.Equal(t, expectedLabels, job.Labels, "job labels")
+			assert.Equal(t, expectedLabels, job.Spec.Template.Labels,
+				"pod template labels must stay in sync with the job labels")
+
+			expectedAnnotations := map[string]string{
+				"infra.homecluster.dev/node-uid":   string(nodeUID),
+				"infra.homecluster.dev/node-group": "test-group",
+				"infra.homecluster.dev/created-by": "homelab-autoscaler",
+			}
+			assert.Equal(t, expectedAnnotations, job.Annotations, "job annotations")
+
+			// The Jobs are controller-owned, not Argo-managed children: an Argo tracking
+			// label would make Argo claim and prune them.
+			assert.NotContains(t, job.Labels, "argocd.argoproj.io/instance")
+			assert.NotContains(t, job.Spec.Template.Labels, "argocd.argoproj.io/instance")
+
+			// The controller ownerReference to the Node CR is what Argo CD's resource
+			// tree uses to show the Job under the Node.
+			refs := job.GetOwnerReferences()
+			require.Len(t, refs, 1, "job must have exactly one owner reference")
+			assert.Equal(t, infrav1alpha1.GroupVersion.String(), refs[0].APIVersion)
+			assert.Equal(t, "Node", refs[0].Kind)
+			assert.Equal(t, "test-node", refs[0].Name)
+			assert.Equal(t, nodeUID, refs[0].UID)
+			require.NotNil(t, refs[0].Controller)
+			assert.True(t, *refs[0].Controller, "owner reference must be the controller ref")
+		})
+	}
 }

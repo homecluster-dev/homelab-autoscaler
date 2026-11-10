@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
@@ -54,12 +55,62 @@ const (
 	OperationScaleDown = "scale-down"
 )
 
+// Lifecycle phases, used as the value of the "type" label and of
+// LabelPhase on the startup/shutdown Jobs the controller creates.
+const (
+	PhaseStartup  = "startup"
+	PhaseShutdown = "shutdown"
+)
+
+// Label and annotation keys carried by every startup/shutdown Job the
+// controller creates, and by its pod template (labels only), so that
+// kubectl, Argo CD and anyone reading the cluster can tell which Node CR
+// a Job belongs to. See (NodeStateMachine).lifecycleLabels for the rules
+// about which keys may be added.
+const (
+	// Legacy keys. cleanupPendingJobs() selects on LabelNodeLegacy and filters on
+	// LabelType, the gRPC server groups resources by LabelGroup, and tests assert on
+	// all four - keep the values exactly as they are.
+	LabelApp   = "app"
+	LabelGroup = "group"
+	// LabelNodeLegacy holds spec.kubernetesNodeName, which can differ from the
+	// Node CR name - see LabelNodeCR for the CR name.
+	LabelNodeLegacy = "node"
+	LabelType       = "type"
+
+	// Standard Kubernetes recommended labels.
+	LabelK8sName      = "app.kubernetes.io/name"
+	LabelK8sComponent = "app.kubernetes.io/component"
+	LabelK8sManagedBy = "app.kubernetes.io/managed-by"
+
+	// Explicit provenance: the Node CR that caused this Job.
+	LabelNodeCR = "infra.homecluster.dev/node"
+	LabelPhase  = "infra.homecluster.dev/phase"
+
+	// Annotations repeat the provenance so it stays legible in `kubectl describe`
+	// and survives a dropped ownerReference.
+	AnnotationNodeUID   = "infra.homecluster.dev/node-uid"
+	AnnotationNodeGroup = "infra.homecluster.dev/node-group"
+	AnnotationCreatedBy = "infra.homecluster.dev/created-by"
+)
+
+// Label and annotation values used for the lifecycle Jobs.
+const (
+	LifecycleAppName       = "homelab-autoscaler"
+	LifecycleComponentName = "node-lifecycle"
+)
+
 // Default timeouts and backoff settings
 const (
 	DefaultJobTimeout      = 5 * time.Minute
 	DefaultLockTimeout     = 5 * time.Minute
 	MaxRetries             = 3
 	DefaultUncordonTimeout = 90 * time.Second
+
+	// StuckTransitionThreshold is how long a transitional state (startingup,
+	// shuttingdown) may last before CheckStuckState forces a cleanup. The event recorded
+	// for that cleanup quotes it, so it is a named constant rather than a literal.
+	StuckTransitionThreshold = 15 * time.Minute
 )
 
 // NodeStateMachine represents the FSM for node state management
@@ -71,6 +122,10 @@ type NodeStateMachine struct {
 	node   *infrav1alpha1.Node
 	client client.Client
 	scheme *runtime.Scheme
+
+	// eventRecorder publishes Kubernetes Events on the Node CR for the lifecycle
+	// transitions the FSM performs. Optional: nil records nothing (see WithEventRecorder).
+	eventRecorder record.EventRecorder
 
 	// Coordination management
 	coordinationManager CoordinationManager

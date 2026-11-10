@@ -35,12 +35,18 @@ import (
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 )
 
-// NewNodeStateMachine creates a new FSM instance for node state management
+// NewNodeStateMachine creates a new FSM instance for node state management.
+//
+// Options are optional: with none the FSM behaves exactly as it did before the event
+// recorder existed, which keeps every existing caller and test working. Pass
+// WithEventRecorder(mgr.GetEventRecorderFor(...)) to have the lifecycle transitions
+// recorded on the Node CR.
 func NewNodeStateMachine(
 	node *infrav1alpha1.Node,
 	k8sClient client.Client,
 	scheme *runtime.Scheme,
 	coordMgr CoordinationManager,
+	opts ...Option,
 ) *NodeStateMachine {
 	nm := &NodeStateMachine{
 		node:                node,
@@ -49,6 +55,10 @@ func NewNodeStateMachine(
 		coordinationManager: coordMgr,
 		jobTimeout:          DefaultJobTimeout,
 		uncordonTimeout:     DefaultUncordonTimeout,
+	}
+
+	for _, opt := range opts {
+		opt(nm)
 	}
 
 	// Initialize FSM with current state from node progress
@@ -111,12 +121,17 @@ func (nm *NodeStateMachine) StartNode() error {
 
 	// Trigger FSM event
 	if err := nm.fsm.Event(ctx, EventStartNode); err != nil {
+		nm.recordScaleFailure(false, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
 		return fmt.Errorf("FSM transition failed: %w", err)
 	}
 
 	// Create and start Kubernetes Job
 	job, err := nm.createStartupJob()
 	if err != nil {
+		// Record the failure before rolling the FSM back, and record it only here: the
+		// JobFailed transition into shutdown suppresses its completion event, so a
+		// failed scale up produces exactly one Warning.
+		nm.recordScaleFailure(false, fmt.Sprintf("failed to create startup job: %s", errorDetail(err)))
 		// Trigger failure event to rollback
 		if err := nm.fsm.Event(ctx, EventJobFailed); err != nil {
 			logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
@@ -155,12 +170,16 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 
 	// Trigger FSM event
 	if err := nm.fsm.Event(ctx, EventShutdownNode); err != nil {
+		nm.recordScaleFailure(true, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
 		return fmt.Errorf("FSM transition failed: %w", err)
 	}
 
 	// Create and start Kubernetes Job
 	job, err := nm.createShutdownJob()
 	if err != nil {
+		// See StartNode: the failure is recorded once, here, and the rollback
+		// transition suppresses its completion event.
+		nm.recordScaleFailure(true, fmt.Sprintf("failed to create shutdown job: %s", errorDetail(err)))
 		// Trigger failure event to rollback
 		if err := nm.fsm.Event(ctx, EventJobFailed); err != nil {
 			logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
@@ -234,7 +253,7 @@ func (nm *NodeStateMachine) IsTransitionStuck() bool {
 	}
 
 	elapsed := time.Since(nm.backoff.transitionStart)
-	return elapsed > 15*time.Minute
+	return elapsed > StuckTransitionThreshold
 }
 
 // CheckStuckState checks for stuck transitions and forces cleanup if needed
@@ -288,6 +307,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 
 		if job.Status.Failed > 0 {
 			logger.Info("Job failed", "node", nm.node.Name, "job", jobName)
+			nm.recordObservedJobFailure(job)
 			if err := nm.JobFailed(); err != nil {
 				logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
 			}
@@ -322,6 +342,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 
 			if job.Status.Failed > 0 {
 				logger.Info("Job failed", "node", nm.node.Name, "job", jobName)
+				nm.recordObservedJobFailure(job)
 				if err := nm.JobFailed(); err != nil {
 					logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
 				}
@@ -333,28 +354,67 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 	}
 }
 
+// lifecycleObjectMeta builds the ObjectMeta shared by the startup and shutdown Jobs,
+// so the two builders (and their pod templates) cannot drift apart.
+func (nm *NodeStateMachine) lifecycleObjectMeta(name string, phase string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{
+		Name:        name,
+		Namespace:   nm.node.Namespace,
+		Labels:      nm.lifecycleLabels(phase),
+		Annotations: nm.lifecycleAnnotations(),
+	}
+}
+
+// lifecycleLabels returns the label set for a lifecycle Job of the given phase
+// (PhaseStartup or PhaseShutdown) and for its pod template.
+//
+// Provenance is carried by the labels below plus the controller ownerReference that
+// setOwnerReference() sets - that ownerReference is what makes Argo CD show the Job
+// under the Node CR in its resource tree. Do NOT add `argocd.argoproj.io/instance`
+// (or any other Argo tracking label) here: these Jobs are created by the controller,
+// they are not Argo-managed children, and a tracking label would make Argo claim them
+// and prune them for not existing in Git.
+func (nm *NodeStateMachine) lifecycleLabels(phase string) map[string]string {
+	return map[string]string{
+		// Keys relied upon by cleanupPendingJobs, the gRPC server and the tests.
+		LabelApp:        LifecycleAppName,
+		LabelGroup:      nm.node.Labels[LabelGroup],
+		LabelNodeLegacy: nm.node.Spec.KubernetesNodeName,
+		LabelType:       phase,
+
+		// Standard labels, so the operator's Jobs are identifiable by convention.
+		LabelK8sName:      LifecycleAppName,
+		LabelK8sComponent: LifecycleComponentName,
+		LabelK8sManagedBy: LifecycleAppName,
+
+		// Explicit provenance: the Node CR a human / Argo CD sees is nm.node.Name,
+		// which can differ from spec.kubernetesNodeName carried by LabelNodeLegacy.
+		LabelNodeCR: nm.node.Name,
+		LabelPhase:  phase,
+	}
+}
+
+// lifecycleAnnotations returns the annotations recording which Node CR created the Job.
+func (nm *NodeStateMachine) lifecycleAnnotations() map[string]string {
+	return map[string]string{
+		AnnotationNodeUID:   string(nm.node.UID),
+		AnnotationNodeGroup: nm.node.Labels[LabelGroup],
+		AnnotationCreatedBy: LifecycleAppName,
+	}
+}
+
 // createStartupJob creates a Kubernetes Job for node startup
 func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-startup-%d", nm.node.Name, time.Now().Unix()),
-			Namespace: nm.node.Namespace,
-			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"group": nm.node.Labels["group"],
-				"node":  nm.node.Spec.KubernetesNodeName,
-				"type":  "startup",
-			},
-		},
+		ObjectMeta: nm.lifecycleObjectMeta(
+			fmt.Sprintf("%s-startup-%d", nm.node.Name, time.Now().Unix()),
+			PhaseStartup,
+		),
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
+				// Keep the pod template labels in sync with the Job's own labels.
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"group": nm.node.Labels["group"],
-						"node":  nm.node.Spec.KubernetesNodeName,
-						"type":  "startup",
-					},
+					Labels: nm.lifecycleLabels(PhaseStartup),
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyOnFailure,
@@ -438,25 +498,15 @@ func (nm *NodeStateMachine) createStartupJob() (*batchv1.Job, error) {
 // createShutdownJob creates a Kubernetes Job for node shutdown
 func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-shutdown-%d", nm.node.Name, time.Now().Unix()),
-			Namespace: nm.node.Namespace,
-			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"group": nm.node.Labels["group"],
-				"node":  nm.node.Spec.KubernetesNodeName,
-				"type":  "shutdown",
-			},
-		},
+		ObjectMeta: nm.lifecycleObjectMeta(
+			fmt.Sprintf("%s-shutdown-%d", nm.node.Name, time.Now().Unix()),
+			PhaseShutdown,
+		),
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
+				// Keep the pod template labels in sync with the Job's own labels.
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"group": nm.node.Labels["group"],
-						"node":  nm.node.Spec.KubernetesNodeName,
-						"type":  "shutdown",
-					},
+					Labels: nm.lifecycleLabels(PhaseShutdown),
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyOnFailure,
@@ -844,7 +894,7 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 
 	// Create label selector for jobs belonging to this node
 	labelSelector := labels.SelectorFromSet(labels.Set{
-		"node": nodeKubernetesName,
+		LabelNodeLegacy: nodeKubernetesName,
 	})
 
 	// List all jobs with the node label
@@ -862,8 +912,8 @@ func (nm *NodeStateMachine) cleanupPendingJobs(nodeKubernetesName string) error 
 	// Delete pending startup/shutdown jobs to ensure clean state
 	for _, job := range jobList.Items {
 		// Check if this is a startup or shutdown job
-		jobType, exists := job.Labels["type"]
-		if !exists || (jobType != "startup" && jobType != "shutdown") {
+		jobType, exists := job.Labels[LabelType]
+		if !exists || (jobType != PhaseStartup && jobType != PhaseShutdown) {
 			continue
 		}
 

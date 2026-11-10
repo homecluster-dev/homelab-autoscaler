@@ -145,8 +145,21 @@ grpcurl -plaintext -d '{}' localhost:50051 externalgrpc.CloudProvider/NodeGroups
 # Check node status
 kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system
 
+# Why a machine was powered on or off: the controller records every scale up/down
+# transition on the Node CR (ScaleUpRequested, ScaleUpCompleted, ScaleDownRequested,
+# ScaleDownCompleted, and ScaleUpFailed / ScaleDownFailed as warnings)
+kubectl describe nodes.infra.homecluster.dev -n homelab-autoscaler-system <node-cr-name>
+kubectl get events -n homelab-autoscaler-system --field-selector involvedObject.name=<node-cr-name>
+
 # Check power operation jobs
 kubectl get jobs -n homelab-autoscaler-system
+
+# Only the jobs created for one Node CR (startup + shutdown), and their pods
+kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-cr-name>
+kubectl get pods -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-cr-name>
+
+# Find the Node CR behind a job: check its labels/annotations, or its owner reference
+kubectl get job -n homelab-autoscaler-system <job-name> -o jsonpath='{.metadata.labels}{"\n"}{.metadata.annotations}{"\n"}'
 
 # Check job logs
 kubectl logs -n homelab-autoscaler-system job/<job-name>

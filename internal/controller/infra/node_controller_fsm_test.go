@@ -332,8 +332,9 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		result, err := reconciler.Reconcile(ctx, req)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "FSM transition failed")
-		// Should requeue with backoff
-		assert.True(t, result.RequeueAfter > 0)
+		// A failed transition is returned as an error only: controller-runtime ignores the
+		// Result when the error is non-nil and requeues with its own backoff.
+		assert.Equal(t, ctrl.Result{}, result)
 
 		// Verify no job was created due to lock conflict
 		jobs := &batchv1.JobList{}
@@ -538,7 +539,8 @@ func TestNodeReconciler_ErrorHandling(t *testing.T) {
 		// The FSM creates the job first, then the job will fail when it tries to run
 		if err != nil {
 			assert.Contains(t, err.Error(), "FSM transition failed")
-			assert.True(t, result.RequeueAfter > 0) // Should requeue with backoff
+			// an error is returned as an error only, controller-runtime ignores the Result
+			assert.Equal(t, ctrl.Result{}, result)
 		} else {
 			// FSM successfully creates the job, but the job will fail during execution
 			// This is the expected behavior - the FSM doesn't pre-validate k8s node existence
