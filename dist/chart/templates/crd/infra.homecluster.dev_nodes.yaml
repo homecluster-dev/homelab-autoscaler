@@ -89,6 +89,11 @@ spec:
                   image:
                     type: string
                   priorityClassName:
+                    description: |-
+                      PriorityClassName is assigned to the Pod created by the startup/shutdown Job.
+                      Use it to keep power-management Pods schedulable (and non-preemptible) under
+                      resource pressure, e.g. "system-cluster-critical". Empty means the cluster
+                      default (priority 0), which is today's behaviour.
                     type: string
                   serviceAccount:
                     type: string
@@ -133,6 +138,11 @@ spec:
                   image:
                     type: string
                   priorityClassName:
+                    description: |-
+                      PriorityClassName is assigned to the Pod created by the startup/shutdown Job.
+                      Use it to keep power-management Pods schedulable (and non-preemptible) under
+                      resource pressure, e.g. "system-cluster-critical". Empty means the cluster
+                      default (priority 0), which is today's behaviour.
                     type: string
                   serviceAccount:
                     type: string

@@ -1396,3 +1396,84 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 		})
 	}
 }
+
+// TestNodeStateMachine_PriorityClassName asserts that spec.startupPodSpec.priorityClassName /
+// spec.shutdownPodSpec.priorityClassName land on the Pod template of the Job the FSM creates,
+// and that leaving the field unset keeps the historical empty value (backwards compatibility).
+func TestNodeStateMachine_PriorityClassName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	tests := []struct {
+		name     string
+		priority *string
+		podSpec  func(*infrav1alpha1.Node, *string)
+		power    infrav1alpha1.PowerState
+		progress infrav1alpha1.Progress
+		action   func(*NodeStateMachine) error
+		expected string
+	}{
+		{
+			name:     "startup job applies priorityClassName",
+			priority: ptrToString("system-cluster-critical"),
+			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.StartupPodSpec.PriorityClassName = p },
+			power:    infrav1alpha1.PowerStateOff,
+			progress: infrav1alpha1.ProgressShutdown,
+			action:   func(f *NodeStateMachine) error { return f.StartNode() },
+			expected: "system-cluster-critical",
+		},
+		{
+			name:     "shutdown job applies priorityClassName",
+			priority: ptrToString("power-management"),
+			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.ShutdownPodSpec.PriorityClassName = p },
+			power:    infrav1alpha1.PowerStateOn,
+			progress: infrav1alpha1.ProgressReady,
+			action:   func(f *NodeStateMachine) error { return f.ShutdownNode() },
+			expected: "power-management",
+		},
+		{
+			name:     "startup job without priorityClassName stays empty",
+			priority: nil,
+			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.StartupPodSpec.PriorityClassName = p },
+			power:    infrav1alpha1.PowerStateOff,
+			progress: infrav1alpha1.ProgressShutdown,
+			action:   func(f *NodeStateMachine) error { return f.StartNode() },
+			expected: "",
+		},
+		{
+			name:     "shutdown job without priorityClassName stays empty",
+			priority: nil,
+			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.ShutdownPodSpec.PriorityClassName = p },
+			power:    infrav1alpha1.PowerStateOn,
+			progress: infrav1alpha1.ProgressReady,
+			action:   func(f *NodeStateMachine) error { return f.ShutdownNode() },
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := CreateTestNode("test-node-priority", config.NewNamespaceConfig().Get(), tt.power, tt.progress)
+			tt.podSpec(node, tt.priority)
+
+			mockCoord := NewMockCoordinationManager()
+			fakeClient := CreateFakeClient(scheme, node)
+
+			f := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+			f.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+
+			require.NoError(t, tt.action(f))
+
+			jobs := &batchv1.JobList{}
+			require.NoError(t, fakeClient.List(context.TODO(), jobs))
+			require.Len(t, jobs.Items, 1)
+
+			assert.Equal(t, tt.expected, jobs.Items[0].Spec.Template.Spec.PriorityClassName)
+		})
+	}
+}
+
+func ptrToString(s string) *string {
+	return &s
+}

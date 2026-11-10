@@ -39,6 +39,7 @@ const (
 | `args` | `[]string` | No | Arguments for the command |
 | `volumes` | `[]VolumeMountSpec` | No | Volume mounts for secrets/configmaps |
 | `serviceAccount` | `*string` | No | ServiceAccount for the pod |
+| `priorityClassName` | `*string` | No | PriorityClass assigned to the job pod, e.g. `system-cluster-critical` |
 
 #### VolumeMountSpec
 
