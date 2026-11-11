@@ -13,9 +13,8 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | `string` | Yes | Unique identifier for the group |
-| `scaleDownUtilizationThreshold` | `float64` | Yes | CPU utilization threshold for scale-down (0.0-1.0) |
-| `scaleDownGpuUtilizationThreshold` | `float64` | Yes | GPU utilization threshold for scale-down (0.0-1.0) |
+| `scaleDownUtilizationThreshold` | `string` | Yes | CPU utilization threshold for scale-down, a decimal string (`"0.5"`) |
+| `scaleDownGpuUtilizationThreshold` | `string` | Yes | GPU utilization threshold for scale-down, a decimal string (`"0.5"`) |
 | `scaleDownUnneededTime` | `*metav1.Duration` | Yes | Time a node must be unneeded before scale-down |
 | `scaleDownUnreadyTime` | `*metav1.Duration` | Yes | Time an unready node waits before scale-down |
 | `maxNodeProvisionTime` | `*metav1.Duration` | Yes | Maximum time to wait for node provisioning |
@@ -32,15 +31,10 @@ metadata:
   name: worker-nodes
   namespace: homelab-autoscaler-system
 spec:
-  name: worker-nodes
-  maxSize: 5
   # Keep one node of the pool up; omit for a group that may scale to nothing.
   minSize: 1
-  nodeSelector:
-    node-type: worker
-    zone: homelab
-  scaleDownUtilizationThreshold: 0.5
-  scaleDownGpuUtilizationThreshold: 0.5
+  scaleDownUtilizationThreshold: "0.5"
+  scaleDownGpuUtilizationThreshold: "0.5"
   scaleDownUnneededTime: "10m"
   scaleDownUnreadyTime: "20m"
   maxNodeProvisionTime: "15m"
@@ -55,6 +49,10 @@ spec:
 1. **Set scaling thresholds** for CPU and GPU utilization
 2. **Configure timing parameters** for scale-down behavior
 3. **Apply the Group resource** to your cluster
+
+The size of a group is not part of the spec beyond `minSize`: its max size is the number
+of Node CRs labelled `group: <group name>`, so a pool grows and shrinks by committing
+slots, not by editing the Group.
 
 ```bash
 kubectl apply -f group.yaml
