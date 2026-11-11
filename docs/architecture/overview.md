@@ -70,7 +70,8 @@ Implements Cluster Autoscaler CloudProvider interface:
 The one definition of the target size of a group (`targetSizeOf`, reported by
 `NodeGroupTargetSize`) counts a slot when it is **claimed** - `spec.desiredPowerState: on`, its
 machine booting or running - and does not count a slot that is genuinely being torn down
-(`spec.desiredPowerState: off` with a progress of `shuttingdown`/`shutdown`).
+(`spec.desiredPowerState: off` with a progress of `shuttingdown`/`shutdown`/`startingup`: a
+machine still up on its way out counts, a cancelled startup doesn't).
 
 `spec.desiredPowerState` is the request and `status.progress` is what the machine is doing, and
 the autoscaler reads the request: `NodeGroupIncreaseSize` claims a slot with a spec write, and

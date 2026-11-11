@@ -59,25 +59,58 @@ annotations:
 A transition that loses the lock is a deferral, not a failure of the slot, and the rules below
 are what keep it from stranding one:
 
-- The acquisition happens in the `before_` hook, before the state change and before the
-  `enter_` hooks, which are the only writers of `status.progress`. A refused transition
-  therefore writes nothing: the slot keeps the stable progress it had (`ready` for a
-  scale-down that lost to a scale-up, `shutdown` the other way round). That matters because a
-  progress of `startingup`/`shuttingdown` is excluded from the provider's target size, and
-  `validateStateTransition` refuses to start a transition from a transitional progress, so a
-  slot left there is only freed by the stuck-transition cleanup after 15 minutes.
+- The acquisition happens in the `before_` hook, before `looplab/fsm` applies the state change
+  and before the `enter_` hooks, the writers of `status.progress` inside the FSM. A refused
+  transition writes nothing: the slot keeps the stable progress it had (`ready` for a
+  scale-down that lost to a scale-up, `shutdown` the other way round).
 - The lifecycle entry points (`StartNode`, `ShutdownNode`) trigger the event, and so take the
   lock, before touching anything: cordoning the Kubernetes node, clearing the
   `ToBeDeletedByClusterAutoscaler` taint and deleting the pending lifecycle Job all happen
-  only on a slot the operation owns.
-- The refusal is reported as a `LockConflictError` carrying the remaining lifetime of the
-  lock. The node controller requeues for that deadline, and the intent of the refused
-  operation is `spec.desiredPowerState` - written by cluster-autoscaler's `DeleteNodes` /
-  `DecreaseTargetSize` - so the transition is retried on the next pass, without a second
-  request from the autoscaler.
+  only on a slot the operation owns. A refused operation takes nothing apart on a slot it
+  doesn't own.
+- The refusal is reported as a `LockConflictError` carrying the remaining lifetime of the lock.
+  The node controller requeues for that deadline and records a `ScaleUpDeferred` /
+  `ScaleDownDeferred` event, a Normal one: a collision is the lock doing its job, not an
+  incident. The intent of the refused operation is `spec.desiredPowerState` - written by
+  cluster-autoscaler's `DeleteNodes` / `DecreaseTargetSize` - so the transition runs on the next
+  pass without a second request from the autoscaler.
 - Every transition that ends an operation releases the lock, including `JobTimeout`: a lock
   must not outlive the operation that wrote it, or the next operation on the slot is refused
   by a lock nothing is running under.
+
+### Why a transitional progress has to come from a transition
+
+`status.progress: startingup`/`shuttingdown` says a power operation is in flight, and that isn't
+cosmetic: the provider leaves those slots out of the target size (`countsTowardsTargetSize`),
+and `validateStateTransition` in the node controller gates every transition of a transitional
+slot out, so no lifecycle operation starts on one.
+
+Nothing in a reconcile fixes a transitional slot that nothing is driving, either:
+
+- `applyObservedPowerState` (core node controller) never overwrites a transitional progress;
+- the FSM can't fire `ShutdownNode`/`StartNode` from `startingup`/`shuttingdown`;
+- the stuck-transition cleanup (`ForceCleanup` at `StuckTransitionThreshold`, 15m) reads the
+  backoff record of the state machine that ran the transition. The reconciler builds a fresh
+  machine on every pass, so `IsTransitionStuck()` is false there and `ForceCleanup` is never
+  reached from a reconcile. Past 15m `validateStateTransition` force-releases the coordination
+  lock and lets the pass run - it doesn't move the progress.
+
+The writer that moves a transitional progress is the operation that wrote it: the lifecycle Job
+monitor of the machine that started it fires `JobCompleted`, `JobFailed` or `JobTimeout`. That's
+the whole recovery story, and it's why the rules above matter:
+
+- a transition refused by the lock must not write a progress it will never drive;
+- a writer outside the FSM must not write one at all. `NodeGroupDecreaseTargetSize` cancels a
+  starting slot with a `spec.desiredPowerState: off` write and leaves `status.progress` to the
+  FSM, so the shutdown runs through `ShutdownNode` with its Job, its lock and its timestamps.
+  It used to write `status.progress: shuttingdown` directly - no transition, no Job, no lock -
+  and the slot was only freed by the monitor of the startup it collided with, a goroutine a
+  manager restart takes away.
+
+`updateNodeProgress` guards the writes that go through the FSM: it persists only the progress of
+the state the machine is in. `status.progress` has writers outside the FSM (the gRPC server, the
+core node controller, the node slot controller provisioning a slot), and none of them runs under
+that check.
 
 ## Async Operations
 
@@ -127,10 +160,13 @@ The FSM provides robust error recovery:
 ### Timeout Handling
 - 5-minute timeout for job completion
 - State-aware backoff (30s → 2m → 5m)
-- Force cleanup after 15 minutes of stuck state
+- A transition older than 15m gets its coordination lock force-released, and the next pass runs
+  (see [Why a transitional progress has to come from a transition](#why-a-transitional-progress-has-to-come-from-a-transition))
 
 ### Coordination Conflicts
 - FSM prevents invalid concurrent transitions
+- A lost lock is a deferral: a `ScaleUpDeferred`/`ScaleDownDeferred` event and a requeue at the
+  lock's remaining lifetime
 - Clear error reporting and retry logic
 - Automatic lock cleanup
 
