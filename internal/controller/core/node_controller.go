@@ -82,7 +82,8 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Only update when the recorded status disagrees with what is observed. A status
 	// write on every reconcile would keep this controller hot, so the fast path covers
-	// "power state unchanged AND progress already consistent with it".
+	// "power state unchanged AND progress needing no correction (consistent, or
+	// transitional and owned by the state machine)".
 	if !applyObservedPowerState(nodeCR.DeepCopy(), nodeStatus) {
 		logger.V(1).Info("Node status unchanged, skipping update", "node", node.Name, "status", nodeStatus)
 		return ctrl.Result{}, nil
@@ -142,12 +143,29 @@ func expectedProgress(powerState infrav1alpha1.PowerState) (infrav1alpha1.Progre
 // status.progress to the value that corresponds to it. It returns true when the object
 // was changed, so the caller can skip the status write when there is nothing to do.
 //
-// The progress correction is deliberately not gated on the power state changing. A slot
-// that was shut down and started again through a path this controller did not observe
-// (desiredPowerState flipped back to on, machine booted) keeps status.powerState: on
-// while status.progress stays "shutdown". That stale progress is not cosmetic:
-// NodeGroupTargetSize excludes slots whose progress is shutdown/shuttingdown, so a group
-// with one Ready node reports targetSize 0 and cluster-autoscaler refuses to scale.
+// The two observations are not equally trustworthy, so they are not gated the same way.
+//
+// An observed on (the node reports NodeReady=True) is positive evidence that the machine
+// is up, and the progress correction runs whether or not the power state changed. That is
+// the live bug: a slot that was shut down and started again through a path this
+// controller did not observe (desiredPowerState flipped back to on, machine booted) keeps
+// status.powerState: on while status.progress stays "shutdown". That stale progress is
+// not cosmetic: NodeGroupTargetSize excludes slots whose progress is
+// shutdown/shuttingdown, so a group with one Ready node reports targetSize 0 and
+// cluster-autoscaler refuses to scale.
+//
+// An observed off (the node does not report NodeReady=True) is not evidence that the
+// machine is off, so the shutdown correction only runs on an actual power state change,
+// which is the ordering this controller had before the progress correction existed.
+// enterReady is written by the state machine when the startup Job finishes
+// (fsm.hooks.enterReady), the Job being only the power-on command, and the node object
+// appears later, when the kubelet registers: fsm.setNodeSchedulableWithRetry retries for
+// 90s precisely because the node is not Ready yet. So {desired: on, status.powerState:
+// off, progress: ready} plus a NotReady node object is the normal state of every boot
+// window, and writing shutdown there would restart the state machine (the FSM reads its
+// state from progress): a second startup Job, a second scale-up event, the
+// cluster-autoscaler taint removed from a node that has not joined, targetSize dipping
+// to 0.
 //
 // The transitional progress values (startingup/shuttingdown) are never overwritten: they
 // are owned by the state machine, which is the only one that knows a power operation is
@@ -155,7 +173,8 @@ func expectedProgress(powerState infrav1alpha1.PowerState) (infrav1alpha1.Progre
 func applyObservedPowerState(node *infrav1alpha1.Node, powerState infrav1alpha1.PowerState) bool {
 	changed := false
 
-	if node.Status.PowerState != powerState {
+	powerStateChanged := node.Status.PowerState != powerState
+	if powerStateChanged {
 		node.Status.PowerState = powerState
 		changed = true
 	}
@@ -168,7 +187,10 @@ func applyObservedPowerState(node *infrav1alpha1.Node, powerState infrav1alpha1.
 	switch node.Status.Progress {
 	case infrav1alpha1.ProgressStartingUp, infrav1alpha1.ProgressShuttingDown:
 		// Transition in flight, the state machine owns status.progress.
-	default:
+		return changed
+	}
+
+	if powerState == infrav1alpha1.PowerStateOn || powerStateChanged {
 		if node.Status.Progress != desiredProgress {
 			node.Status.Progress = desiredProgress
 			changed = true
@@ -178,6 +200,11 @@ func applyObservedPowerState(node *infrav1alpha1.Node, powerState infrav1alpha1.
 	return changed
 }
 
+// getNodeStatus maps the Ready condition of the Kubernetes node onto a power state. A
+// node that is not Ready is reported as off: the kubelet registers the node when the
+// machine boots and the object is left behind, NotReady, when it is powered off. NotReady
+// is therefore a weak observation, which is why applyObservedPowerState only corrects
+// progress for it when the recorded power state actually changes.
 func (r *KubernetesNodeReconciler) getNodeStatus(node *corev1.Node) infrav1alpha1.PowerState {
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {

@@ -125,20 +125,48 @@ func TestK8sNodeReconcilerCorrectsProgressWhenPowerStateUnchanged(t *testing.T) 
 	assert.Equal(t, infrav1alpha1.PowerStateOn, node.Spec.DesiredPowerState, "spec must not be touched")
 }
 
-// TestK8sNodeReconcilerCorrectsProgressToShutdownForOffNode is the mirror case: the node
-// went away (NotReady) while the recorded power state was already off, so only the stale
-// "ready" progress has to be corrected.
-func TestK8sNodeReconcilerCorrectsProgressToShutdownForOffNode(t *testing.T) {
+// TestK8sNodeReconcilerRecordsABootWindowWithoutTouchingProgress is the regression test
+// for the boot-window stomp. enterReady runs when the startup Job succeeds, and the Job
+// is only the power-on command: the node object appears later, when the kubelet
+// registers (setNodeSchedulableWithRetry retries for 90s because the node is not Ready
+// yet). So {desired: on, status.powerState: off, progress: ready} plus a NotReady node is
+// the normal state of every boot. A NotReady node is not evidence that the machine is
+// off, so the slot must come out of the reconcile exactly as it went in: rewriting
+// progress to shutdown here makes the state machine, which reads its state from progress,
+// start the machine again (second startup Job, second scale-up event, autoscaler taint
+// removed from a node that has not joined, targetSize dipping to 0).
+func TestK8sNodeReconcilerRecordsABootWindowWithoutTouchingProgress(t *testing.T) {
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady),
+		slot("omni-remote-2", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady),
 		managedNode("omni-remote-2", false),
 	)
 
+	before := slotFrom(t, r.Client, "omni-remote-2")
+	reconcileK8sNode(t, r, "omni-remote-2")
 	reconcileK8sNode(t, r, "omni-remote-2")
 
 	node := slotFrom(t, r.Client, "omni-remote-2")
+	assert.Equal(t, infrav1alpha1.ProgressReady, node.Status.Progress, "a NotReady node during boot must not stomp ready")
 	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress)
+	assert.Equal(t, before.Status, node.Status)
+	assert.Equal(t, before.ResourceVersion, node.ResourceVersion, "nothing to record during the boot window, so no status write")
+}
+
+// TestK8sNodeReconcilerCorrectsProgressToShutdownWhenTheMachineTurnsOff is the mirror
+// case, and the one the shutdown correction exists for: the recorded power state was on
+// and the machine went away, so the observed off is a real change and the stale "ready"
+// progress has to be corrected in the same write.
+func TestK8sNodeReconcilerCorrectsProgressToShutdownWhenTheMachineTurnsOff(t *testing.T) {
+	r := newK8sNodeReconciler(t,
+		slot("omni-remote-5", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		managedNode("omni-remote-5", false),
+	)
+
+	reconcileK8sNode(t, r, "omni-remote-5")
+
+	node := slotFrom(t, r.Client, "omni-remote-5")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState, "the power state change is recorded")
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress, "a real power state change corrects the progress")
 }
 
 // TestK8sNodeReconcilerLeavesTransitionalProgressAlone: startingup and shuttingdown are
@@ -294,8 +322,10 @@ func TestApplyObservedPowerState(t *testing.T) {
 	}{
 		{"power state change derives progress", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
 		{"progress corrected without a power state change", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
-		{"stale ready corrected for an off slot", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown},
-		{"empty progress is filled in", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, "", true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown},
+		{"observed on fills in an empty progress", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, "", true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
+		{"power state change to off corrects ready to shutdown", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown},
+		{"boot window: not ready node, slot already recorded off, keeps ready", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady},
+		{"boot window: unrecorded progress of a slot that is already off is left alone", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, "", false, infrav1alpha1.PowerStateOff, ""},
 		{"startingup is owned by the state machine", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
 		{"shuttingdown is owned by the state machine", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown, false, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown},
 		{"startingup survives a power state change", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
