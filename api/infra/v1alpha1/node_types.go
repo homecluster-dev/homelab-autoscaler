@@ -96,8 +96,45 @@ type NodeSpec struct {
 	Pricing            PricingSpec    `json:"pricing"`
 	// TaintsToRemove is a list of taints that should be stripped from the node when generating a template.
 	// It allows users to declare custom taints that the autoscaler must ignore.
+	//
+	// It is unrelated to NodeTaints: this field filters taints out of the node template,
+	// NodeTaints puts them in. Do not conflate them.
 	// +optional
 	TaintsToRemove []corev1.Taint `json:"taintsToRemove,omitempty"`
+
+	// NodeTaints are the taints this slot's machine must carry.
+	//
+	// What the field gives you: what cluster-autoscaler simulates matches what the pool boots
+	// with, the taints are declared in Git, and they survive node recreation. The provider puts
+	// them in the node template it reports for scale-up simulation, so the autoscaler sees
+	// dedicated=remote:NoSchedule before the machine has registered and stops placing pods on a
+	// node that rejects them.
+	//
+	// The controller applies them to the Kubernetes node as soon as the node object exists: the
+	// scale-up path stamps them in the same hook that uncordons the node, so the machine is
+	// tainted before it becomes schedulable, and every later reconcile re-applies them. A taint
+	// you remove by hand with `kubectl taint <node> <key>-` is put back on the next reconcile:
+	// the field only adds, and the declaration is the intent.
+	//
+	// Keys a Kubernetes component owns are skipped, and the skip is recorded as a Warning event
+	// on the Node CR: the node lifecycle controller and the kubelet own node.kubernetes.io/
+	// not-ready, unreachable, unschedulable, out-of-service, memory-pressure, disk-pressure,
+	// pid-pressure and network-unavailable, cluster-autoscaler owns
+	// ToBeDeletedByClusterAutoscaler and DeletionCandidateOfClusterAutoscaler. The node prefix is
+	// a namespace, not an ownership claim: node.kubernetes.io/role=agent, the taint the k3d
+	// setups use, is yours to declare.
+	//
+	// Declare taints here instead of tainting from a startup Job. A Job can only taint a node
+	// that already joined, which is after the autoscaler simulated a placement on an untainted
+	// template and after the node was schedulable, so pods get bound to a machine that rejects
+	// them.
+	//
+	// The window this closes is the one the controller drives. It can only patch a node that
+	// exists, so a machine you booted by hand, or one that registered while the controller was
+	// down, can be Ready and schedulable for a pass before the taint lands. Keep the tolerations
+	// of your own startup tooling correct.
+	// +optional
+	NodeTaints []corev1.Taint `json:"nodeTaints,omitempty"`
 }
 
 type PricingSpec struct {

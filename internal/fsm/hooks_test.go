@@ -18,6 +18,8 @@ package fsm
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -231,6 +233,96 @@ func TestAfterJobCompleted(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, infrav1alpha1.Progress(StateShutdown), updatedNode.Status.Progress)
 	})
+}
+
+// writeOrderClient records every write it performs on a corev1.Node, in order, with the state
+// the object was written with. Ordering tests need it: the end state of "the node is tainted and
+// schedulable" is the same whether the taint landed before or after the uncordon, and only the
+// first of those closes the window in which a pod can be bound to an untainted machine.
+type writeOrderClient struct {
+	client.Client
+	writes []string
+}
+
+func (c *writeOrderClient) record(op string, obj client.Object) {
+	kubeNode, isKubeNode := obj.(*corev1.Node)
+	if !isKubeNode {
+		return
+	}
+
+	keys := make([]string, 0, len(kubeNode.Spec.Taints))
+	for i := range kubeNode.Spec.Taints {
+		keys = append(keys, kubeNode.Spec.Taints[i].Key)
+	}
+
+	c.writes = append(c.writes, fmt.Sprintf("%s unschedulable=%v taints=[%s]", op, kubeNode.Spec.Unschedulable, strings.Join(keys, ",")))
+}
+
+func (c *writeOrderClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	err := c.Client.Patch(ctx, obj, patch, opts...)
+	c.record("patch", obj)
+
+	return err
+}
+
+func (c *writeOrderClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	err := c.Client.Update(ctx, obj, opts...)
+	c.record("update", obj)
+
+	return err
+}
+
+// TestAfterJobCompletedStampsDeclaredTaintsBeforeUncordon is the window a tainting startup Job
+// cannot close: the scale-up path used to uncordon the node, and only the next reconcile stamped
+// the declared taints, so a non-tolerating pod could be bound in between. The hook must taint
+// first, on the pass that finds the node object, and the uncordon must not wipe the taint (it
+// writes the whole node object it read).
+func TestAfterJobCompletedStampsDeclaredTaintsBeforeUncordon(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	node.Spec.NodeTaints = []corev1.Taint{role}
+
+	// Ready and cordoned, the state of a machine that has just registered after startup
+	kubeNode := CreateTestKubernetesNode("test-node-k8s", true)
+	base := CreateFakeClient(scheme, node, kubeNode)
+	recorder := &writeOrderClient{Client: base}
+
+	mockCoord := NewMockCoordinationManager()
+	nm := NewNodeStateMachine(node, recorder, scheme, mockCoord)
+	nm.uncordonTimeout = 5 * time.Second
+
+	ctx := context.TODO()
+	event := &fsm.Event{
+		FSM:   nm.fsm,
+		Event: EventJobCompleted,
+		Src:   StateStartingUp,
+		Dst:   StateReady,
+		Args:  []interface{}{CreateTestJob("test-job", config.NewNamespaceConfig().Get(), "startup")},
+	}
+
+	nm.afterJobCompleted(ctx, event)
+
+	updatedKubeNode := &corev1.Node{}
+	require.NoError(t, base.Get(ctx, client.ObjectKey{Name: "test-node-k8s"}, updatedKubeNode))
+
+	keys := make([]string, 0, len(updatedKubeNode.Spec.Taints))
+	for i := range updatedKubeNode.Spec.Taints {
+		keys = append(keys, updatedKubeNode.Spec.Taints[i].Key)
+	}
+
+	assert.False(t, updatedKubeNode.Spec.Unschedulable, "the node ends up schedulable")
+	assert.Equal(t, []string{"node.kubernetes.io/role"}, keys, "the declared taint is on the node")
+
+	require.Len(t, recorder.writes, 2, "one write stamps the taints, one uncordons")
+	assert.Contains(t, recorder.writes[0], "patch unschedulable=true taints=[node.kubernetes.io/role]",
+		"the taint must land while the node is still cordoned: \"%s\"", recorder.writes[0])
+	assert.Contains(t, recorder.writes[1], "update unschedulable=false taints=[node.kubernetes.io/role]",
+		"the uncordon must keep the taint it read: \"%s\"", recorder.writes[1])
 }
 
 func TestAfterJobFailed(t *testing.T) {

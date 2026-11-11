@@ -34,6 +34,7 @@ import (
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
 // Coordination annotation keys for preventing race conditions with cluster autoscaler
@@ -134,6 +135,12 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Set providerID for Cluster Autoscaler integration
 	if err := r.setProviderIDForKubernetesNode(ctx, node); err != nil {
 		logger.Error(err, "Failed to set providerID", "node", node.Name)
+		// Don't fail reconciliation, just log and continue
+	}
+
+	// Stamp the taints the slot declares (spec.nodeTaints) onto the Kubernetes node
+	if err := r.applyNodeTaintsToKubernetesNode(ctx, node); err != nil {
+		logger.Error(err, "Failed to apply declared taints", "node", node.Name)
 		// Don't fail reconciliation, just log and continue
 	}
 
@@ -301,6 +308,32 @@ func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, nod
 
 	logger.Info("Successfully set providerID for Kubernetes node", "node", node.Spec.KubernetesNodeName, "providerID", kubernetesNode.Spec.ProviderID)
 	return nil
+}
+
+// applyNodeTaintsToKubernetesNode stamps the taints the Node CR declares (spec.nodeTaints)
+// onto the Kubernetes node. It is a thin wrapper over taints.ApplyToKubernetesNode, the single
+// implementation the FSM's uncordon path calls too, so the two writers cannot drift.
+//
+// Semantics, in short (taints.ApplyToKubernetesNode and taints.Merge hold the rules):
+//   - a declared taint is added, an existing taint with the same key is overwritten;
+//   - taints that are not declared are never removed, and a declared taint an operator deleted
+//     with `kubectl taint <node> ...-` is put back on the next reconcile: the declaration is
+//     the intent, a hand removal is not;
+//   - the keys a Kubernetes component owns are skipped, and the skip is surfaced with a Warning
+//     event on the Node CR. The set is explicit in taints.IsProtectedKey - the lifecycle and
+//     kubelet keys (node.kubernetes.io/not-ready, /unreachable, /unschedulable,
+//     /out-of-service, /memory-pressure, /disk-pressure, /pid-pressure,
+//     /network-unavailable) and the two cluster-autoscaler keys. A key that merely shares the
+//     node.kubernetes.io namespace, role=agent for instance, is not protected: the e2e pools
+//     declare exactly that and must be applied.
+//
+// It is idempotent: when the node already carries every declared taint nothing is patched.
+//
+// Spec.TaintsToRemove is unrelated to this field: it filters taints out of the node template
+// the provider reports to the autoscaler, it never touches the live node. Do not conflate
+// them.
+func (r *NodeReconciler) applyNodeTaintsToKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
+	return taints.ApplyToKubernetesNode(ctx, r.Client, node, r.EventRecorder)
 }
 
 // validateStateTransition validates that a state transition is valid and implements smart backoff strategy

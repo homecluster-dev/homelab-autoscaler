@@ -32,6 +32,7 @@ import (
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 	"github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
 	"github.com/homecluster-dev/homelab-autoscaler/test/integration/testdata"
@@ -508,6 +509,100 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				}
 			})
 		})
+
+		Context("when a pool mixes powered off slots with a slot that has a Kubernetes node", func() {
+			It("builds the template from the slot with a node, and carries the declared taints", func() {
+				// The shape of the machine (allocatable, taints, labels) can only be read from a
+				// corev1.Node, so the off slots, which have none, must not be the representative.
+				// The declared spec.nodeTaints must reach the template, so a pod that does not
+				// tolerate dedicated=remote:NoSchedule is never simulated onto this group.
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
+					WithNode("test-node-2", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff)).
+					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group")).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+
+				templateNode := &corev1.Node{}
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
+
+				Expect(templateNode.Status.Allocatable).To(HaveKey(corev1.ResourceCPU),
+					"the template must come from the node object, not from a placeholder")
+				Expect(templateNode.Spec.Taints).To(ContainElement(corev1.Taint{
+					Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule,
+				}))
+			})
+		})
+
+		Context("when no slot of the group has a Kubernetes node", func() {
+			It("answers with a placeholder that carries the declared taints and no capacity", func() {
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff),
+						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+
+				templateNode := &corev1.Node{}
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
+
+				// capacity of a machine that never registered cannot be read, so it is not invented
+				Expect(templateNode.Status.Allocatable).To(BeEmpty())
+				Expect(templateNode.Spec.Taints).To(ConsistOf(corev1.Taint{
+					Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule,
+				}))
+				Expect(templateNode.Labels).To(HaveKeyWithValue("infra.homecluster.dev/group", "test-group"))
+			})
+		})
+
+		Context("when the representative node is being evaluated for scale-down", func() {
+			It("keeps the autoscaler taints out of the template and keeps the pool's own taint", func() {
+				// The template is copied from a live node, so the taints cluster-autoscaler stamped
+				// on that node describe its scale-down state, not the shape of a new machine. Left
+				// in, the estimator sees a taint no pod tolerates and never scales the group up.
+				// The pool's own node.kubernetes.io/role taint, the one the k3d e2e uses, must stay:
+				// it is declared in spec.nodeTaints and the workload tolerates it.
+				role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
+						mocks.WithNodeTaints([]corev1.Taint{role})).
+					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group"),
+						mocks.WithKubernetesNodeTaint("node.kubernetes.io/role", "agent", corev1.TaintEffectNoSchedule),
+						mocks.WithKubernetesNodeTaint(taints.DeletionCandidateOfClusterAutoscaler, "", corev1.TaintEffectNoSchedule),
+						mocks.WithKubernetesNodeTaint(taints.ToBeDeletedByClusterAutoscaler, "1763000000", corev1.TaintEffectNoSchedule)).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+
+				templateNode := &corev1.Node{}
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
+
+				keys := make([]string, 0, len(templateNode.Spec.Taints))
+				for _, t := range templateNode.Spec.Taints {
+					keys = append(keys, t.ToString())
+				}
+
+				Expect(keys).To(ConsistOf("node.kubernetes.io/role=agent:NoSchedule"),
+					"both cluster-autoscaler taints are stripped, the pool's own taint is not")
+				Expect(templateNode.Status.Allocatable).To(HaveKey(corev1.ResourceCPU))
+			})
+		})
+
 		Context("when group has no nodes", func() {
 			It("should return unimplemented error for scale from zero", func() {
 				// Setup test data with empty group

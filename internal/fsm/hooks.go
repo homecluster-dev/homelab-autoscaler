@@ -77,6 +77,11 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 		// Retry uncordon with timeout to handle node registration delays
 		// Note: We do this BEFORE releasing the lock to ensure the node is schedulable
 		// before other operations can proceed
+		//
+		// The retry loop also stamps the taints the slot declares (spec.nodeTaints) onto the
+		// node, on every pass, before the node is uncordoned: the taint has to be on the machine
+		// before a pod can be bound to it, and the loop is the first place this controller knows
+		// the node object exists. See setNodeSchedulableWithRetry.
 		if err := nm.setNodeSchedulableWithRetry(nm.node.Spec.KubernetesNodeName); err != nil {
 			logger.Error(err, "Failed to uncordon Kubernetes node after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 			// Continue anyway - don't block the operation if uncordon fails
