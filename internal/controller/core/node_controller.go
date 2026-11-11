@@ -18,6 +18,7 @@ package core
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -88,11 +89,16 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	nodeStatus := r.getNodeStatus(node)
 	logger.Info("Node status retrieved", "name", node.Name, "status", nodeStatus)
 
-	// What cluster-autoscaler decided about this node is an observation of the same node object,
-	// so it is derived and written together with the power state. It is deduplicated on the slot:
-	// a marker that is already recorded is no change, and a pass that records nothing writes
-	// nothing.
-	_, markerChanged := autoscaler.ApplyMarker(nodeCR.DeepCopy(), node)
+	// The moment this pass read the node object. It is a single value on purpose: the marker record
+	// quotes it in its message, and internal/autoscaler's condition timestamp is not the observation
+	// (SetStatusCondition keeps the old one whenever the Status does not flip, and both deletion
+	// markers are Status True), so the time an operator asks about has to come from here.
+	observedAt := time.Now()
+
+	// What cluster-autoscaler decided about this node is an observation of the same node object, so
+	// it is derived and written together with the power state. It is deduplicated on the slot: a
+	// marker that is already recorded is no change, and a pass that records nothing writes nothing.
+	_, markerChanged := autoscaler.ApplyMarker(nodeCR.DeepCopy(), node, observedAt)
 
 	// Only update when the recorded status disagrees with what is observed. A status
 	// write on every reconcile would keep this controller hot, so the fast path covers
@@ -106,7 +112,10 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// The state machine writes the transitional progress values concurrently, so re-read
 	// the CR and re-derive the correction on every attempt. Same status-update and
 	// conflict-retry pattern as fsm.NodeStateMachine.updateNodeProgress.
-	var recorded autoscaler.Decision
+	var (
+		recorded autoscaler.Decision
+		wrote    bool
+	)
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &infrav1alpha1.Node{}
@@ -116,7 +125,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 		powerChanged := applyObservedPowerState(fresh, nodeStatus)
 
-		decision, markerChanged := autoscaler.ApplyMarker(fresh, node)
+		decision, markerChanged := autoscaler.ApplyMarker(fresh, node, observedAt)
 		if !powerChanged && !markerChanged {
 			// Someone (usually the state machine) already recorded what we observed.
 			return nil
@@ -126,6 +135,8 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
+
+		wrote = true
 
 		// Remember what landed, so the event is published for a write that succeeded and not
 		// for one that a concurrent writer answered first.
@@ -147,7 +158,15 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully updated Node status", "node", node.Name, "powerstate", nodeStatus)
+	// The audit line for a write that landed. A pass that the retry loop resolved with no write - a
+	// concurrent writer recorded the same observation first - must not claim one: this is the line an
+	// operator reads to date a power-state change of a slot, and a per-resync copy of it is a log that
+	// says nothing.
+	if wrote {
+		logger.Info("Successfully updated Node status", "node", node.Name, "powerstate", nodeStatus)
+	} else {
+		logger.V(1).Info("Node status was recorded by another writer, nothing to update", "node", node.Name, "status", nodeStatus)
+	}
 
 	// Publish the autoscaler decision the write above recorded: the Event on the Node CR, the
 	// node's taints and spec.unschedulable in the log. After the write, so a record is never

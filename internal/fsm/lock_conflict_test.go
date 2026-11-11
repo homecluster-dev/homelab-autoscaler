@@ -93,6 +93,7 @@ func (e *conflictTestEnv) machine(t *testing.T, node *infrav1alpha1.Node) *NodeS
 
 	nm := NewNodeStateMachine(node, e.fakeClient, e.scheme, e.coordMgr, WithEventRecorder(e.recorder))
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	return nm
 }
@@ -412,6 +413,7 @@ func TestShutdownJobCreationFailureRollsTheSlotBackOutOfShuttingDown(t *testing.
 	rec := events.NewFakeRecorder(20)
 	nm := NewNodeStateMachine(node, failing, scheme, mockCoord, WithEventRecorder(rec))
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	err := nm.ShutdownNode()
 	require.Error(t, err)
@@ -589,6 +591,7 @@ func TestStartNodeSurvivesAPlainWriteConflictOnTheLock(t *testing.T) {
 
 	nm := NewNodeStateMachine(env.stored(t, node), racy, env.scheme, coord, WithEventRecorder(env.recorder))
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	err := nm.StartNode()
 	require.NoError(t, err, "a write race with no lock in the API is retried, it is not a lock conflict")

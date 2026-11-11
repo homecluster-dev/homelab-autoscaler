@@ -17,19 +17,26 @@ limitations under the License.
 package core
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
@@ -552,4 +559,138 @@ func drainK8sEvents(recorder *events.FakeRecorder) []string {
 			return collected
 		}
 	}
+}
+
+// statusConflictClient is the fake the two write-path tests need: it answers every status write with
+// a Conflict (a concurrent writer that never loses), and the second one stamps a condition on the
+// slot the retry loop reads back, the shape of a writer that recorded the same observation first.
+type statusConflictClient struct {
+	client.Client
+
+	statusWrites int
+	// stampOnReread is applied to the Node CR handed back by the second Get, which is the read
+	// inside the retry loop.
+	stampOnReread func(*infrav1alpha1.Node)
+	gets          int
+}
+
+func (c *statusConflictClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.Client.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+
+	if slot, isSlot := obj.(*infrav1alpha1.Node); isSlot {
+		c.gets++
+
+		if c.stampOnReread != nil && c.gets >= 2 {
+			c.stampOnReread(slot)
+		}
+	}
+
+	return nil
+}
+
+func (c *statusConflictClient) Status() client.SubResourceWriter {
+	return &conflictStatusWriter{client: c, owner: c}
+}
+
+type conflictStatusWriter struct {
+	client client.Client
+	owner  *statusConflictClient
+}
+
+func (w *conflictStatusWriter) Create(_ context.Context, _ client.Object, _ client.Object, _ ...client.SubResourceCreateOption) error {
+	return fmt.Errorf("unexpected Create")
+}
+
+func (w *conflictStatusWriter) Update(_ context.Context, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+	w.owner.statusWrites++
+
+	return apierrors.NewConflict(
+		schema.GroupResource{Group: infrav1alpha1.GroupVersion.Group, Resource: "nodes"},
+		"omni-remote-12", fmt.Errorf("the slot moved under the write"))
+}
+
+func (w *conflictStatusWriter) Patch(_ context.Context, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
+	return fmt.Errorf("unexpected Patch")
+}
+
+func (w *conflictStatusWriter) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.SubResourceApplyOption) error {
+	return fmt.Errorf("unexpected Apply")
+}
+
+// TestK8sNodeReconcilerEmitsNothingWhenTheWriteDoesNotLand is the half of the marker recording that
+// keeps it honest: an Event is the claim "this is recorded on the slot", and publishing one for a
+// status update the API server refused is a record of something that is not in the cluster. The write
+// failing is also the case where the log line must stay silent: "Successfully updated Node status" is
+// the line an operator dates a power-state change from, and a per-reconcile copy of a write that never
+// landed is a log that says nothing.
+func TestK8sNodeReconcilerEmitsNothingWhenTheWriteDoesNotLand(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	slotCR := slot("omni-remote-12", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := markNode(managedNode("omni-remote-12", true), true, poolRoleTaint, hardMarker)
+
+	base := newK8sNodeReconciler(t, slotCR, node)
+	c := &statusConflictClient{Client: base.Client}
+	base.Client = c
+	base.EventRecorder = recorder
+
+	logs := &bytes.Buffer{}
+	ctx := log.IntoContext(context.Background(), zap.New(zap.WriteTo(logs), zap.UseDevMode(true)))
+
+	_, err := base.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "omni-remote-12"}})
+
+	require.Error(t, err, "a write the API server refused is reported, not swallowed")
+	assert.Greater(t, c.statusWrites, 0, "the retry loop tried, as it is designed to")
+
+	assert.Zero(t, len(drainK8sEvents(recorder)),
+		"and no marker event is published for a status update that never landed")
+
+	contents := logs.String()
+	assert.NotContains(t, contents, "Successfully updated Node status",
+		"nothing was updated, so the audit line stays out of the log")
+	assert.Contains(t, contents, "Failed to update Node status")
+
+	// The slot carries no record of a marker the controller never managed to write.
+	after := slotFrom(t, c, "omni-remote-12")
+	assert.Nil(t, meta.FindStatusCondition(after.Status.Conditions, autoscalerpkg.ConditionMarkedForDeletion))
+}
+
+// TestK8sNodeReconcilerSilentWhenAnotherWriterGotThereFirst is the other shape of a write that does
+// not land: the retry loop re-reads the slot, finds the observation it was about to record already
+// recorded - by the state machine, by a resync of this same controller - and returns with nothing to
+// write. No status write, no event, and no "Successfully updated" line claiming an update.
+func TestK8sNodeReconcilerSilentWhenAnotherWriterGotThereFirst(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	slotCR := slot("omni-remote-13", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := markNode(managedNode("omni-remote-13", true), true, poolRoleTaint, hardMarker)
+
+	base := newK8sNodeReconciler(t, slotCR, node)
+	c := &statusConflictClient{
+		Client: base.Client,
+		stampOnReread: func(fresh *infrav1alpha1.Node) {
+			meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+				Type:               autoscalerpkg.ConditionMarkedForDeletion,
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+				Reason:             autoscalerpkg.ReasonDeletionRequested,
+				Message:            "recorded by a concurrent pass",
+			})
+		},
+	}
+	base.Client = c
+	base.EventRecorder = recorder
+
+	logs := &bytes.Buffer{}
+	ctx := log.IntoContext(context.Background(), zap.New(zap.WriteTo(logs), zap.UseDevMode(true)))
+
+	_, err := base.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "omni-remote-13"}})
+	require.NoError(t, err, "someone else recorded what we observed: that is success, not a failure")
+	assert.Zero(t, c.statusWrites, "so the loop wrote nothing")
+
+	assert.Zero(t, len(drainK8sEvents(recorder)), "and the event that would have announced it is not published")
+	assert.NotContains(t, logs.String(), "Successfully updated Node status",
+		"the audit line is only for a write that landed")
 }

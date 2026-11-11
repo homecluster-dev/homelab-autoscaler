@@ -118,6 +118,37 @@ func (nm *NodeStateMachine) cancelLockedTransition(logger logr.Logger, e *fsm.Ev
 	}
 }
 
+// renewOperationLock re-stamps the coordination lock this machine's operation holds on the slot.
+//
+// It exists for the one path that holds a slot open longer than the lock's own timeout: the
+// scale-up transition into ready runs setNodeSchedulableWithRetry, which can spend 90s waiting for
+// the node object to register and then 4 minutes on the readiness gate - more than
+// DefaultLockTimeout. A lock that ages out mid-wait is not a lock: the next acquisition takes it
+// over, validateStateTransition cleans it up, and the progress watchdog's lock gate stops
+// protecting the slot while its own grace is measured against the very loop that is running. The
+// caller that owns the slot therefore renews it on every pass of that loop, and nothing else does:
+// renewal never acquires, never touches a lock owned by another component, and never resurrects an
+// expired one (see DefaultCoordinationManager.RenewLock).
+func (nm *NodeStateMachine) renewOperationLock() {
+	renewed, err := nm.coordinationManager.RenewLock(context.TODO(), nm.node)
+	if err != nil {
+		// The slot is ours and the stamp did not land. Log it, do not stop the loop: the gate
+		// keeps running, and a watchdog that settles past a stale lock heals the slot to a stable
+		// progress, which is survivable, unlike abandoning the readiness gate on a transient write
+		// failure.
+		log.Log.WithName("fsm").Error(err, "Failed to re-stamp the coordination lock while holding the slot",
+			"node", nm.node.Name)
+
+		return
+	}
+
+	if !renewed {
+		log.Log.WithName("fsm").V(1).Info("No live coordination lock to re-stamp",
+			"node", nm.node.Name,
+			"why", "the lock is absent, owned by another component, or expired: renewal takes nothing over")
+	}
+}
+
 // After hooks - executed after state transitions for lock release and status updates
 func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
@@ -126,22 +157,30 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 	if e.Dst == StateReady {
 		logger.Info("Transitioning to Ready state, uncordonning Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 
-		// Retry uncordon with timeout to handle node registration delays
-		// Note: We do this BEFORE releasing the lock to ensure the node is schedulable
-		// before other operations can proceed
+		// Retry uncordon with the registration timeout, then hold the transition open on the
+		// readiness gate, and only then release the lock: the node has to be schedulable and usable
+		// before other operations can proceed.
 		//
-		// The retry loop also stamps the taints the slot declares (spec.nodeTaints) onto the
-		// node, on every pass, before the node is uncordoned: the taint has to be on the machine
-		// before a pod can be bound to it, and the loop is the first place this controller knows
-		// the node object exists. See setNodeSchedulableWithRetry.
+		// The loop first stamps the taints the slot declares (spec.nodeTaints) onto the node, on
+		// every pass, before the node is uncordoned: the taint has to be on the machine before a pod
+		// can be bound to it, and the loop is the first place this controller knows the node object
+		// exists. See setNodeSchedulableWithRetry.
 		//
-		// The loop holds this transition open until the machine can take the pool's pods: Ready
-		// plus Cilium's bootstrap taint gone (fsm.TaintCiliumAgentNotReady), because the update of
-		// status.progress below is what the autoscaler reads as usable capacity. It is bounded, and
-		// a timeout does not wedge the transition: the loop uncordons the node on the way out,
-		// returns an error that is logged here, and the transition completes as it always has, so
-		// a readiness gate nothing can answer for never blocks the lock release below and never
-		// leaves the slot transitional.
+		// The gate is the second half of the same loop: the node has to report Ready and be free of
+		// the readiness taints the Group declares (spec.nodeReadinessTaints, by default Cilium's
+		// node.cilium.io/agent-not-ready), because the update of status.progress below is what the
+		// autoscaler reads as usable capacity. It has its own deadline
+		// (fsm.DefaultReadinessGateTimeout, 4m), counted from the moment the node object appears:
+		// sharing the 90s registration budget with it means a slow boot leaves no time for the gate
+		// at all, and the slot is declared ready with the taint on it - the churn this gate exists to
+		// close, plus a 90s hook and an ERROR per boot.
+		//
+		// A timeout does not wedge the transition: the loop uncordons the node on the way out, writes
+		// a Warning on the slot naming the gate, and the transition completes as it always has, so a
+		// readiness gate nothing can answer for never blocks the lock release below and never leaves
+		// the slot transitional. While the gate runs, the loop re-stamps this operation's coordination
+		// lock, because the gate is longer than the lock's own timeout and an aged lock protects
+		// nothing (see renewOperationLock).
 		if err := nm.setNodeSchedulableWithRetry(nm.node.Spec.KubernetesNodeName); err != nil {
 			logger.Error(err, "Failed to confirm the Kubernetes node is usable after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 			// Continue anyway - don't block the operation if the gate cannot be satisfied. The

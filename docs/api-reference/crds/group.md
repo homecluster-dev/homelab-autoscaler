@@ -21,6 +21,48 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 | `zeroOrMaxNodeScaling` | `bool` | Yes | Whether to scale to zero or max nodes only |
 | `ignoreDaemonSetsUtilization` | `bool` | Yes | Ignore DaemonSet pods in utilization calculations |
 | `minSize` | `int32` | No | Floor cluster-autoscaler must not scale the group below. Defaults to `0` |
+| `nodeReadinessTaints` | `[]corev1.Taint` | No | Taints a machine of this group must be free of before the controller calls the slot ready and uncordons it, on top of the node reporting `Ready`. Defaults to Cilium's `node.cilium.io/agent-not-ready` (`NoExecute`); an empty list gates on `Ready` alone |
+
+## Readiness Gate
+
+`nodeReadinessTaints` is the list the **scale-up** transition into `ready` (`JobCompleted` → Ready)
+waits for. The kubelet marks a node Ready long before the CNI has programmed its datapath, and the
+pool's workloads do not tolerate the bootstrap taint the CNI stamps while it works, so a slot declared
+ready in that window is read by cluster-autoscaler as capacity its pending pod cannot land on - and
+the pool buys a second machine for a node that is about to work. The controller holds the scale-up
+open until the taint is gone, so pool workloads need no toleration for it.
+
+- The **key** is what the gate matches; Kubernetes keeps one taint per key on a node object, so a
+  declaration's `value` and `effect` are documentation and are not compared.
+- The CRD defaults the list to Cilium's key (Cilium has stamped `node.cilium.io/agent-not-ready`
+  since v1.9; the pool this chart deploys runs 1.16.x). A Group written before the field existed gets
+  the gate it was already getting.
+- `nodeReadinessTaints: []` turns the gate off: a pool on a CNI that stamps no bootstrap taint gates
+  on `Ready` alone.
+- These are the taints the gate **reads**. The taints to stamp on the machine are
+  `spec.nodeTaints` of the Node CR, and a key must not be in both: the gate's key is stamped and
+  removed by its owner, so a declaration that stamps it makes the slot's own scale-up wait for a
+  taint the slot keeps putting back. `taints.IsProtectedKey` refuses Cilium's key in `nodeTaints`.
+- The gate is bounded: 90s for the node object to register, then 4m for readiness, counted from the
+  moment the object appears. A timeout **uncordons** the node, records a `ReadinessGateTimeout`
+  Warning on the slot, and completes the transition, because a cordoned node is skipped by
+  cluster-autoscaler's scale-down - never drained, never deleted, and paid for forever.
+
+```yaml
+spec:
+  # The pool boots on a CNI that stamps its own startup taint.
+  nodeReadinessTaints:
+  - key: node.cilium.io/agent-not-ready
+    effect: NoExecute
+---
+spec:
+  # flannel / a cloud CNI: no bootstrap taint, so no gate beyond Ready.
+  nodeReadinessTaints: []
+```
+
+The keys a slot is gated on are recorded on the slot as the `NodeReadinessTaints` condition, so a slot
+that has been booting for ten minutes says what it is waiting for. See
+[State Management](../../architecture/state.md).
 
 ## Example
 

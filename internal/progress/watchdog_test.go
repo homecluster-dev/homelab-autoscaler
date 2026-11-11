@@ -18,6 +18,7 @@ package progress
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +38,7 @@ import (
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
 const testNamespace = "homelab-autoscaler-system"
@@ -206,25 +209,283 @@ func TestSettleSettlesMachinelessSlot(t *testing.T) {
 	}
 }
 
-// TestSettleNeverOverridesAClaim is the gate that keeps the watchdog out of the claim: a slot
-// that is wanted on and reports ready with no machine is a startup that has to run, not a slot
-// to settle. Settling it would tell the provider its requested capacity does not exist, which is
-// the failure the target-size fix removed.
-func TestSettleNeverOverridesAClaim(t *testing.T) {
+// TestSettleNeverOverridesTheClaimIsTheRearm is the M3 rule. A slot that was claimed
+// (spec.desiredPowerState: on), whose startup Job completed, and whose node never registered ends at
+// {desired: on, powerState: off, progress: ready}. Nothing in the system can heal that: the
+// settlement refuses it (the claim gate), CanTransition(StartNode) is false from ready,
+// NodeGroupTargetSize counts it forever, DecreaseTargetSize cannot cancel it (isStartingUpSlot wants
+// progress: startingup), and the autoscaler believes the group has capacity that never materialises.
+//
+// So the slot is re-armed, not settled: the progress and the power state are the lie about the
+// machine, and they are removed; spec.desiredPowerState is the request, and it stays. That is the
+// pair the FSM's StartNode is legal from, so the pool retries the machine.
+func TestSettleNeverOverridesTheClaimIsTheRearm(t *testing.T) {
 	recorder := events.NewFakeRecorder(8)
 	node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node.Status.PowerState = infrav1alpha1.PowerStateOff
 	c := newClient(t, node)
 
-	before := readSlot(t, c)
 	outcome := settle(t, c, node, recorder)
 
-	assert.False(t, outcome.Settled)
-	assert.Contains(t, outcome.Reason, "claim")
+	require.True(t, outcome.Rearmed, "a claimed slot whose machine is gone is re-armed, not left pointing at one")
+	assert.Equal(t, ActionRearm, outcome.Action)
+	assert.Equal(t, infrav1alpha1.ProgressReady, outcome.Previous, "the outcome names the progress it replaced")
+	assert.Equal(t, 1, outcome.Attempts, "the first re-arm is attempt 1")
 
 	after := readSlot(t, c)
-	assert.Equal(t, before.Status, after.Status, "a claimed slot is untouched")
-	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "and nothing is written")
-	assert.Zero(t, len(recorder.Events))
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress, "progress: shutdown is the state StartNode is legal from")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState, "and the power state the machine is really in")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState,
+		"spec.desiredPowerState is the claim and is never dropped here: that is the provider's arithmetic")
+
+	// The FSM consequence, asserted on the machine the node controller builds from this shape.
+	stateMachine := fsm.NewNodeStateMachine(after, c, watchdogScheme(t),
+		fsm.NewCoordinationManager(c, fsm.NodeControllerOwner))
+	assert.Equal(t, fsm.StateShutdown, stateMachine.GetCurrentState(), "the FSM reads shutdown from the progress")
+	assert.True(t, stateMachine.CanTransition(fsm.EventStartNode),
+		"and StartNode is legal again, which is what makes the pool retry the machine")
+
+	require.Len(t, recorder.Events, 1, "one re-arm, one event")
+
+	event := <-recorder.Events
+	assert.Contains(t, event, corev1.EventTypeNormal, "a re-arm is the system healing itself, not an incident")
+	assert.Contains(t, event, ReasonClaimRearmed)
+	assert.Contains(t, event, "1 of 3", "the event counts the attempts, so a pool that keeps buying machines is legible")
+	assert.Contains(t, event, string(infrav1alpha1.ProgressReady), "and names the progress it replaced")
+}
+
+// TestSettleRearmIsTheSameGateAsTheSettlement: the actions share every gate, so the evidence that
+// lets a settlement is the evidence that lets a re-arm and the cordon fix. Each row is one gate: a
+// claimed slot with the gate open gets its action, and the same slot with the gate closed gets
+// nothing at all - no write, no event, no drift between the three.
+func TestSettleRearmIsTheSameGateAsTheSettlement(t *testing.T) {
+	tests := []struct {
+		name       string
+		object     client.Object
+		mutate     func(*infrav1alpha1.Node)
+		wantAction Action
+		wantReason string
+	}{
+		{
+			name:       "no machine, no job, no lock: the claim is re-armed",
+			wantAction: ActionRearm,
+		},
+		{
+			name:   "the slot has a Kubernetes node: the observation controllers own it",
+			object: liveNode(),
+		},
+		{
+			name:       "a node object that is cordoned: the safety net uncordons it",
+			object:     cordonedNode(),
+			wantAction: ActionUncordon,
+		},
+		{
+			name:   "a cordoned node cluster-autoscaler marked: its decision stands",
+			object: markedNode(),
+		},
+		{
+			name:   "a lifecycle job in flight",
+			object: lifecycleJob(fsm.PhaseStartup, time.Time{}),
+		},
+		{
+			name:   "a lifecycle job that just finished",
+			object: lifecycleJob(fsm.PhaseStartup, time.Now().Add(-time.Minute)),
+		},
+		{
+			name: "a live coordination lock",
+			mutate: func(node *infrav1alpha1.Node) {
+				node.Annotations = map[string]string{
+					fsm.OperationLockAnnotation: fsm.OperationScaleUp,
+					fsm.LockOwnerAnnotation:     fsm.NodeControllerOwner,
+					fsm.LockTimestampAnnotation: time.Now().Format(time.RFC3339),
+					fsm.LockTimeoutAnnotation:   "300",
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := events.NewFakeRecorder(8)
+
+			node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+			node.Status.PowerState = infrav1alpha1.PowerStateOff
+
+			if tc.mutate != nil {
+				tc.mutate(node)
+			}
+
+			objects := []client.Object{node}
+			if tc.object != nil {
+				objects = append(objects, tc.object)
+			}
+
+			c := newClient(t, objects...)
+			before := readSlot(t, c)
+
+			outcome := settle(t, c, node, recorder)
+
+			assert.Equal(t, tc.wantAction, outcome.Action)
+
+			after := readSlot(t, c)
+
+			if tc.wantAction == ActionNone {
+				assert.NotEmpty(t, outcome.Reason, "a refusal always says why")
+				assert.Equal(t, before.Status, after.Status, "the gate owns the slot, so nothing is written")
+				assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
+				assert.Zero(t, len(recorder.Events))
+
+				return
+			}
+
+			assert.Empty(t, outcome.Reason, "an action is reported by its event, not by a refusal reason")
+
+			switch tc.wantAction {
+			case ActionRearm:
+				assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress)
+				assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState)
+			case ActionUncordon:
+				assert.Equal(t, infrav1alpha1.ProgressReady, after.Status.Progress, "the cordon fix writes no progress")
+				assert.False(t, readKubernetesNode(t, c).Spec.Unschedulable, "it clears the cordon, on the node object")
+			}
+		})
+	}
+}
+
+// cordonedNode is the residue of an operation that ended: the machine is Ready, the slot is claimed
+// on, and spec.unschedulable is still set from the shutdown that did not finish.
+func cordonedNode() *corev1.Node {
+	node := liveNode()
+	node.Spec.Unschedulable = true
+
+	return node
+}
+
+// markedNode is the same machine cordoned by cluster-autoscaler, with its deletion marker on it.
+func markedNode() *corev1.Node {
+	node := cordonedNode()
+	node.Spec.Taints = []corev1.Taint{
+		{Key: taints.ToBeDeletedByClusterAutoscaler, Effect: corev1.TaintEffectNoSchedule},
+	}
+
+	return node
+}
+
+// readKubernetesNode reads the corev1.Node of the slot back from the client.
+func readKubernetesNode(t *testing.T, c client.Client) *corev1.Node {
+	t.Helper()
+
+	node := &corev1.Node{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "worker-1-k8s"}, node))
+
+	return node
+}
+
+// TestSettleRearmBoundIsEnforcedStopsTheLoopAndSaysSoOnce is the bound: each re-arm is a real startup
+// of a real machine, so a claim whose machine cannot boot may not recreate a server every grace
+// period forever. At ClaimRearmLimit the re-arming stops, the slot keeps the progress it had (it is
+// not being healed any more), a Warning names the phantom, and the passes after it write and record
+// nothing.
+func TestSettleRearmBoundIsEnforcedStopsTheLoopAndSaysSoOnce(t *testing.T) {
+	node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node.Status.PowerState = infrav1alpha1.PowerStateOff
+	c := newClient(t, node)
+
+	for attempt := 1; attempt <= ClaimRearmLimit; attempt++ {
+		recorder := events.NewFakeRecorder(8)
+
+		// Each attempt is the shape the previous one left: progress shutdown, desired on, and the
+		// startup that ran from it finished with no node behind it.
+		current := readSlot(t, c)
+		current.Status.Progress = infrav1alpha1.ProgressReady
+		require.NoError(t, c.Status().Update(context.Background(), current))
+
+		outcome := settle(t, c, current, recorder)
+
+		require.True(t, outcome.Rearmed, "attempt %d of %d re-arms", attempt, ClaimRearmLimit)
+		assert.Equal(t, attempt, outcome.Attempts, "the counter is on the slot, not in the process")
+
+		condition := rearmCondition(t, c)
+		assert.Equal(t, ReasonClaimRearmAttempt+fmt.Sprint(attempt), condition.Reason, "the record is the counter")
+
+		event := <-recorder.Events
+		assert.Contains(t, event, ReasonClaimRearmed)
+		assert.Contains(t, event, fmt.Sprintf("%d of %d", attempt, ClaimRearmLimit))
+	}
+
+	// The bound is used up. The slot is a phantom: it stays at a progress that names a machine, it is
+	// counted as requested capacity, and the controller says so - once.
+	recorder := events.NewFakeRecorder(8)
+
+	current := readSlot(t, c)
+	current.Status.Progress = infrav1alpha1.ProgressReady
+	require.NoError(t, c.Status().Update(context.Background(), current))
+
+	outcome := settle(t, c, current, recorder)
+
+	assert.Equal(t, ActionNone, outcome.Action, "the re-arming stopped")
+	assert.False(t, outcome.Rearmed)
+	assert.Zero(t, outcome.RequeueAfter, "and it is not scheduled to resume: the bound is the end of the loop")
+	assert.Contains(t, outcome.Reason, "limit")
+
+	after := readSlot(t, c)
+	assert.Equal(t, infrav1alpha1.ProgressReady, after.Status.Progress, "a slot nothing is healing is not moved")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "and its claim is untouched")
+
+	require.Len(t, recorder.Events, 1, "the limit is an operator-visible Warning")
+	event := <-recorder.Events
+	assert.Contains(t, event, corev1.EventTypeWarning, "this one is the shape that costs money: a slot counted as capacity with no machine")
+	assert.Contains(t, event, ReasonClaimRearmLimitReached)
+	assert.Contains(t, event, fmt.Sprint(ClaimRearmLimit), "the event names the bound that was hit")
+
+	before := readSlot(t, c)
+
+	for range 3 {
+		quiet := events.NewFakeRecorder(8)
+		again := settle(t, c, readSlot(t, c), quiet)
+
+		assert.Equal(t, ActionNone, again.Action)
+		assert.Zero(t, len(quiet.Events), "a phantom is reported once, not on every resync")
+	}
+
+	assert.Equal(t, before.ResourceVersion, readSlot(t, c).ResourceVersion, "and the note is written exactly once")
+	assert.Equal(t, ReasonClaimRearmLimitReached, rearmCondition(t, c).Reason)
+}
+
+// TestSettleRearmIsIdempotent: a slot that was re-armed and has not run a startup since is at
+// shutdown, which implies no machine, so the passes after the re-arm write nothing and record
+// nothing - the same rule that keeps a healthy pool quiet.
+func TestSettleRearmIsIdempotent(t *testing.T) {
+	node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node.Status.PowerState = infrav1alpha1.PowerStateOff
+	c := newClient(t, node)
+
+	settle(t, c, node, events.NewFakeRecorder(8))
+
+	before := readSlot(t, c)
+
+	for range 3 {
+		recorder := events.NewFakeRecorder(8)
+		outcome := settle(t, c, readSlot(t, c), recorder)
+
+		assert.False(t, outcome.Rearmed, "a re-armed slot is re-armed once per startup that dies")
+		assert.Zero(t, outcome.RequeueAfter)
+		assert.Zero(t, len(recorder.Events), "nothing to do, nothing recorded")
+	}
+
+	after := readSlot(t, c)
+	assert.Equal(t, before.Status, after.Status)
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
+}
+
+// rearmCondition reads the re-arm record back off the slot in the client.
+func rearmCondition(t *testing.T, c client.Client) *metav1.Condition {
+	t.Helper()
+
+	condition := meta.FindStatusCondition(readSlot(t, c).Status.Conditions, ConditionClaimRearmed)
+	require.NotNil(t, condition, "the re-arm record lives on the slot")
+
+	return condition
 }
 
 // TestSettleLeavesASlotWithAJobAlone is the FSM's ownership: the lifecycle Job is the operation
@@ -399,31 +660,49 @@ func TestSettleLeavesASlotBehindALiveLockAlone(t *testing.T) {
 	})
 }
 
-// TestDecideIsTheRule keeps the rule itself readable without any client in the way: the table is
-// the contract, and each row says which gate stopped the settlement.
+// TestDecideIsTheRule keeps the rule itself readable without any client in the way: the table is the
+// contract, and each row says which gate stopped the action, or which action the evidence allows.
 func TestDecideIsTheRule(t *testing.T) {
 	now := time.Now()
+
+	claimed := func(progress infrav1alpha1.Progress) *infrav1alpha1.Node {
+		node := slot(infrav1alpha1.PowerStateOn, progress)
+		node.Status.PowerState = infrav1alpha1.PowerStateOff
+
+		return node
+	}
 
 	tests := []struct {
 		name         string
 		node         *infrav1alpha1.Node
-		nodePresent  bool
-		lockHeld     bool
-		jobs         []batchv1.Job
-		wantSettle   bool
+		obs          observations
+		wantAction   Action
 		wantRequeue  time.Duration
 		wantReasonIs string
 	}{
 		{
 			name:         "ready, off, nothing behind it",
 			node:         slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady),
-			wantSettle:   true,
+			wantAction:   ActionSettle,
 			wantReasonIs: "no Kubernetes node",
 		},
 		{
-			name:         "claimed slot",
-			node:         slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-			wantReasonIs: "claim is never overridden",
+			name:         "claimed, no node: re-arm, never settle",
+			node:         claimed(infrav1alpha1.ProgressReady),
+			wantAction:   ActionRearm,
+			wantReasonIs: "no Kubernetes node behind it",
+		},
+		{
+			name:         "claimed, startingup, no node: the same shape, the same action",
+			node:         claimed(infrav1alpha1.ProgressStartingUp),
+			wantAction:   ActionRearm,
+			wantReasonIs: "startup finished",
+		},
+		{
+			name:         "claimed, at the re-arm bound: stop, and say the reason is the bound",
+			node:         claimed(infrav1alpha1.ProgressReady),
+			obs:          observations{rearmAttempts: ClaimRearmLimit},
+			wantReasonIs: "limit",
 		},
 		{
 			name:         "progress that implies no machine",
@@ -431,77 +710,154 @@ func TestDecideIsTheRule(t *testing.T) {
 			wantReasonIs: "does not imply a machine",
 		},
 		{
-			name:         "machine present",
+			name:         "machine present, desired off: the observation controllers own it",
 			node:         slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady),
-			nodePresent:  true,
+			obs:          observations{nodePresent: true},
+			wantReasonIs: "observation controllers",
+		},
+		{
+			name:         "machine present, claimed, cordoned, no marker: the safety net",
+			node:         claimed(infrav1alpha1.ProgressReady),
+			obs:          observations{nodePresent: true, nodeCordoned: true},
+			wantAction:   ActionUncordon,
+			wantReasonIs: "cordoned with no Job",
+		},
+		{
+			name:         "machine present, claimed, cordoned by cluster-autoscaler: its decision stands",
+			node:         claimed(infrav1alpha1.ProgressReady),
+			obs:          observations{nodePresent: true, nodeCordoned: true, nodeMarked: true},
+			wantReasonIs: "observation controllers",
+		},
+		{
+			name:         "machine present, claimed, cordoned, transitional progress: the operation owns it",
+			node:         claimed(infrav1alpha1.ProgressStartingUp),
+			obs:          observations{nodePresent: true, nodeCordoned: true},
 			wantReasonIs: "observation controllers",
 		},
 		{
 			name:         "lock held",
 			node:         slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown),
-			lockHeld:     true,
+			obs:          observations{lockHeld: true},
+			wantReasonIs: "owns the slot",
+		},
+		{
+			name:         "lock held, claimed: the lock gate is in front of the re-arm too",
+			node:         claimed(infrav1alpha1.ProgressStartingUp),
+			obs:          observations{lockHeld: true},
 			wantReasonIs: "owns the slot",
 		},
 		{
 			name:         "job in flight",
 			node:         slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-			jobs:         []batchv1.Job{*lifecycleJob(fsm.PhaseStartup, time.Time{})},
+			obs:          observations{jobs: []batchv1.Job{*lifecycleJob(fsm.PhaseStartup, time.Time{})}},
+			wantAction:   ActionNone,
+			wantRequeue:  SettleGracePeriod,
+			wantReasonIs: "in flight",
+		},
+		{
+			name:         "job in flight, claimed: the grace is the settlement's gate and the re-arm's",
+			node:         claimed(infrav1alpha1.ProgressStartingUp),
+			obs:          observations{jobs: []batchv1.Job{*lifecycleJob(fsm.PhaseStartup, time.Time{})}},
+			wantAction:   ActionNone,
 			wantRequeue:  SettleGracePeriod,
 			wantReasonIs: "in flight",
 		},
 		{
 			name: "job finished inside the grace",
 			node: slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-			jobs: []batchv1.Job{*lifecycleJob(fsm.PhaseStartup, now.Add(-90*time.Second))},
-			// 2m of grace, 90s since the Job finished: the look is scheduled for the rest.
-			wantRequeue:  30 * time.Second,
+			obs: observations{
+				jobs: []batchv1.Job{*lifecycleJob(fsm.PhaseStartup, now.Add(-90*time.Second))},
+				now:  now,
+			},
+			// The grace is SettleGracePeriod, 90s of it spent: the look is scheduled for the rest.
+			wantRequeue:  SettleGracePeriod - 90*time.Second,
 			wantReasonIs: "inside the settle grace",
 		},
 		{
-			name:         "job finished past the grace",
-			node:         slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-			jobs:         []batchv1.Job{*lifecycleJob(fsm.PhaseStartup, now.Add(-3*time.Minute))},
-			wantSettle:   true,
+			name: "job finished past the grace",
+			node: slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+			obs: observations{
+				jobs: []batchv1.Job{*lifecycleJob(fsm.PhaseStartup, now.Add(-SettleGracePeriod-time.Minute))},
+				now:  now,
+			},
+			wantAction:   ActionSettle,
 			wantReasonIs: "no Kubernetes node",
 		},
 		{
 			name: "the tightest deadline of several jobs wins",
 			node: slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown),
-			jobs: []batchv1.Job{
-				*lifecycleJob(fsm.PhaseStartup, now.Add(-5*time.Minute)),
-				*lifecycleJob(fsm.PhaseShutdown, now.Add(-110*time.Second)),
+			obs: observations{
+				jobs: []batchv1.Job{
+					*lifecycleJob(fsm.PhaseStartup, now.Add(-5*time.Minute)),
+					*lifecycleJob(fsm.PhaseShutdown, now.Add(-110*time.Second)),
+				},
+				now: now,
 			},
-			wantRequeue:  10 * time.Second,
+			wantRequeue:  SettleGracePeriod - 5*time.Minute,
 			wantReasonIs: "inside the settle grace",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			d := decide(tc.node, tc.nodePresent, tc.lockHeld, tc.jobs, now, SettleGracePeriod)
+			obs := tc.obs
+			obs.grace = SettleGracePeriod
 
-			assert.Equal(t, tc.wantSettle, d.settle)
+			if obs.now.IsZero() {
+				obs.now = now
+			}
+
+			d := decide(tc.node, obs)
+
+			assert.Equal(t, tc.wantAction, d.action)
 			assert.Equal(t, tc.wantRequeue, d.requeueAfter)
 			assert.Contains(t, d.reason, tc.wantReasonIs)
 
-			if tc.wantSettle {
-				assert.Equal(t, tc.node.Status.Progress, d.previous, "the settlement records what it replaces")
+			if tc.wantAction == ActionSettle || tc.wantAction == ActionRearm {
+				assert.Equal(t, tc.node.Status.Progress, d.previous, "the action records what it replaces")
+			}
+
+			if tc.wantAction == ActionUncordon {
+				assert.Empty(t, d.previous, "the cordon fix writes no progress, so it replaces none")
 			}
 		})
 	}
 }
 
-// TestSettleGracePeriodIsLongerThanTheWritersItWaitsFor pins the reasoning behind the value: the
-// grace exists so a Job that finished, whose after_JobCompleted has not run, is not stomped. The
-// monitor that runs it polls every 30s, so the grace must be several polls, and it has to stay
-// well under the Job timeout and the stuck-transition threshold, so a slot whose monitor really
-// died is settled long before an operator notices it.
-func TestSettleGracePeriodIsLongerThanTheWritersItWaitsFor(t *testing.T) {
-	assert.GreaterOrEqual(t, SettleGracePeriod, 4*fsm.JobMonitorPollInterval,
-		"the grace must cover several monitor polls, the writer it waits for")
-	assert.Greater(t, SettleGracePeriod, 30*time.Second, "a reconcile is seconds, the grace must be minutes")
-	assert.Less(t, SettleGracePeriod, fsm.DefaultJobTimeout, "a Job of a live monitor is not settled away")
-	assert.Less(t, SettleGracePeriod, fsm.StuckTransitionThreshold, "a slot heals long before the stuck threshold")
+// TestSettleGracePeriodOutlivesTheWritersItDefersTo is the M1 invariant. The grace exists so a
+// lifecycle Job that finished, whose after_JobCompleted has not finished running, is not stomped - and
+// that hook is not instantaneous: it runs setNodeSchedulableWithRetry, which can spend one monitor poll
+// noticing the Job, the whole registration budget waiting for the node object, the whole readiness gate
+// waiting for it to be usable, and one sleep at the ceiling of its backoff. The grace must be strictly
+// longer than that sum, which is what the expression computes: a value that only covers the monitor
+// poll (the 2m this constant used to be) settles a slot whose hook has minutes of gate left, and the
+// hook then writes ready on top of the settlement.
+//
+// The bound it has to respect is the stuck-transition threshold, not the Job timeout: the grace only
+// applies to a *finished* Job, so a Job of a live monitor is protected by the Job, at any length.
+func TestSettleGracePeriodOutlivesTheWritersItDefersTo(t *testing.T) {
+	writersWindow := fsm.JobMonitorPollInterval +
+		fsm.DefaultUncordonTimeout +
+		fsm.DefaultReadinessGateTimeout +
+		fsm.MaxUncordonRetryInterval
+
+	assert.Greater(t, SettleGracePeriod, writersWindow,
+		"the grace must be longer than the whole path a completed Job's hook can take: %v of writers, %v of grace",
+		writersWindow.String(), SettleGracePeriod.String())
+
+	assert.Greater(t, SettleGracePeriod, fsm.JobMonitorPollInterval,
+		"a Job that finished is polled by the writer it defers to, so the grace is more than one poll")
+	assert.Greater(t, SettleGracePeriod, time.Minute, "a reconcile is seconds; the grace is minutes")
+	assert.Less(t, SettleGracePeriod, fsm.StuckTransitionThreshold,
+		"a slot whose monitor died with its manager heals well inside the horizon an operator calls stuck")
+
+	// The gate and the grace are measured against the same loop: a gate with no deadline of its own is
+	// the bug this round closed, and the sum above silently stops meaning anything if the two budgets
+	// are merged again.
+	assert.Greater(t, fsm.DefaultReadinessGateTimeout, fsm.DefaultUncordonTimeout,
+		"the readiness gate needs a longer budget than the registration wait it used to share")
+	assert.Greater(t, fsm.DefaultReadinessGateTimeout+fsm.DefaultUncordonTimeout, fsm.DefaultLockTimeout,
+		"the gate can outlast the coordination lock, which is why the loop renews it")
 }
 
 // TestFinishedAtCoversEveryShapeAFinishedJobTakes: a lifecycle Job that cannot be measured must
@@ -612,4 +968,271 @@ func TestSettlementNoteNamesTheEvidence(t *testing.T) {
 	}
 
 	assert.False(t, strings.Contains(note, "\n"), "an Event message is one line")
+}
+
+// rerereadClient is the fake the two write-path tests need: it intercepts the reads of a pass and
+// changes what the caller sees, so the write path is exercised against an object that moved under it.
+// The watchdog re-derives its whole rule from a freshly read copy inside the retry, and these are the
+// tests that prove it does.
+type rerereadClient struct {
+	client.Client
+
+	// onNodeGet rewrites the Node CR handed back by a Get, the first time it is asked for. That is
+	// the read inside the write path: the decision was made on the copy the pass started with, and
+	// this is the shape the slot has turned into in the meantime.
+	onNodeGet func(*infrav1alpha1.Node)
+
+	// nodeGetCount counts the reads of the Node CR, so "the first time" is precise.
+	nodeGetCount int
+
+	// onKubernetesNodeGet is the same hook for the corev1.Node read: it returns the error that
+	// read answers with.
+	onKubernetesNodeGet func() error
+}
+
+func (c *rerereadClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.Client.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+
+	if slot, isSlot := obj.(*infrav1alpha1.Node); isSlot {
+		c.nodeGetCount++
+
+		if c.onNodeGet != nil && c.nodeGetCount == 1 {
+			c.onNodeGet(slot)
+		}
+
+		return nil
+	}
+
+	if _, isKubeNode := obj.(*corev1.Node); isKubeNode && c.onKubernetesNodeGet != nil {
+		return c.onKubernetesNodeGet()
+	}
+
+	return nil
+}
+
+// TestSettleStopsQualifyingOnRereadWritesNothing is the write path's own gate. The pass decided on the
+// slot it was handed; the write re-reads it, and an operation, a claim, or a machine that arrived in
+// between owns the slot. A settlement that goes through on a stale decision is a controller stomping
+// an operation - the one failure mode of this package that matters - so the re-derived answer wins.
+func TestSettleStopsQualifyingOnRereadWritesNothing(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*infrav1alpha1.Node)
+		hint   string
+	}{
+		{
+			name: "a coordination lock appeared",
+			mutate: func(node *infrav1alpha1.Node) {
+				node.Annotations = map[string]string{
+					fsm.OperationLockAnnotation: fsm.OperationScaleUp,
+					fsm.LockOwnerAnnotation:     fsm.NodeControllerOwner,
+					fsm.LockTimestampAnnotation: time.Now().Format(time.RFC3339),
+					fsm.LockTimeoutAnnotation:   "300",
+				}
+			},
+		},
+		{
+			name:   "the claim was dropped",
+			mutate: func(node *infrav1alpha1.Node) { node.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff },
+		},
+		{
+			name:   "the progress already moved",
+			mutate: func(node *infrav1alpha1.Node) { node.Status.Progress = infrav1alpha1.ProgressShutdown },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := events.NewFakeRecorder(8)
+
+			node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+			node.Status.PowerState = infrav1alpha1.PowerStateOff
+
+			base := newClient(t, node)
+			c := &rerereadClient{Client: base, onNodeGet: tc.mutate}
+
+			before := readSlot(t, base)
+			outcome := settle(t, c, node, recorder)
+
+			assert.Equal(t, ActionNone, outcome.Action, "the write path re-decided and stopped")
+			assert.False(t, outcome.Rearmed)
+			assert.Contains(t, outcome.Reason, "re-read")
+
+			after := readSlot(t, base)
+			assert.Equal(t, infrav1alpha1.ProgressReady, after.Status.Progress, "the slot is exactly as the operation left it")
+			assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "nothing was written")
+			assert.Zero(t, len(recorder.Events), "and nothing was recorded for a decision that no longer holds")
+		})
+	}
+}
+
+// TestSettleAnAPIErrorOnTheNodeReadIsNotEvidence: not knowing whether the machine is there is not
+// knowing that it is not. A read that fails - the API server is unreachable, the RBAC is missing, the
+// request timed out - must surface as the error it is, with no write and no event, so the controller's
+// backoff brings the pass back. A settlement written from a failed read is a settlement written
+// against a live machine, and it is the churn this package exists to stop.
+func TestSettleAnAPIErrorOnTheNodeReadIsNotEvidence(t *testing.T) {
+	recorder := events.NewFakeRecorder(8)
+
+	node := slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady)
+	base := newClient(t, node, liveNode())
+	c := &rerereadClient{
+		Client: base,
+		onKubernetesNodeGet: func() error {
+			return fmt.Errorf("connection refused")
+		},
+	}
+
+	before := readSlot(t, base)
+
+	outcome, err := Settle(context.Background(), c, node, recorder, SettleGracePeriod)
+	require.Error(t, err, "the caller reports the read it could not make")
+	assert.Contains(t, err.Error(), "connection refused", "the reason travels, it is not flattened into a refusal")
+	assert.Contains(t, err.Error(), "worker-1-k8s", "and it names the node the pass could not read")
+	assert.Empty(t, outcome, "nothing was decided, so nothing is reported")
+
+	after := readSlot(t, base)
+	assert.Equal(t, before.Status, after.Status, "a slot with a machine is not settled on a failed read")
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
+	assert.Zero(t, len(recorder.Events))
+}
+
+// TestSettleUncordonsTheResidueOfAnOperationThatEnded is the safety net. The paths that roll a slot
+// back into ready - JobTimeout, JobFailed - never call the uncordon hook, so a machine cordoned by the
+// shutdown that did not finish stays cordoned under a slot the autoscaler believes is running. A
+// cordoned node is skipped by cluster-autoscaler when it picks scale-down candidates: it is never
+// drained, never deleted, and paid for forever.
+func TestSettleUncordonsTheResidueOfAnOperationThatEnded(t *testing.T) {
+	recorder := events.NewFakeRecorder(8)
+
+	node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node.Status.PowerState = infrav1alpha1.PowerStateOn
+
+	kubeNode := cordonedNode()
+	kubeNode.Spec.Taints = []corev1.Taint{
+		{Key: taints.NodeUnschedulable, Effect: corev1.TaintEffectNoSchedule},
+	}
+
+	c := newClient(t, node, kubeNode)
+	before := readSlot(t, c)
+
+	outcome := settle(t, c, node, recorder)
+
+	require.True(t, outcome.Uncordoned, "a ready slot that is claimed on and cordoned with nothing running is uncordoned")
+	assert.Equal(t, ActionUncordon, outcome.Action)
+	assert.Empty(t, outcome.Previous, "the progress of this slot is the truth, so no progress is replaced")
+
+	updated := readKubernetesNode(t, c)
+	assert.False(t, updated.Spec.Unschedulable, "the cordon is gone")
+	assert.Empty(t, updated.Spec.Taints, "and so is the kubelet's unschedulable taint that goes with it")
+
+	after := readSlot(t, c)
+	assert.Equal(t, before.Status, after.Status, "the slot's status is untouched: the cordon was the fact that was wrong")
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "so the slot is not even written")
+
+	require.Len(t, recorder.Events, 1)
+	event := <-recorder.Events
+	assert.Contains(t, event, corev1.EventTypeWarning, "an operation that ended and left its machine cordoned is worth a look")
+	assert.Contains(t, event, ReasonCordonReconciled)
+	assert.Contains(t, event, "worker-1-k8s", "the event names the node it made schedulable")
+
+	// The pass after it: the node is uncordoned, so the safety net is a no-op, and a resync of a
+	// healthy pool writes and records nothing.
+	quiet := events.NewFakeRecorder(8)
+	again := settle(t, c, readSlot(t, c), quiet)
+
+	assert.Equal(t, ActionNone, again.Action)
+	assert.Zero(t, len(quiet.Events), "an uncordoned slot is uncordoned once")
+}
+
+// TestSettleLeavesACordonThatMeansSomethingAlone: the safety net is narrow, and every gate it shares
+// with the settlement applies. A slot whose node cluster-autoscaler has marked is the autoscaler's
+// decision; a slot that is transitioning has an operation running under its lock; a slot whose
+// lifecycle Job is in flight is mid-operation, and its cordon is the shutdown doing its work.
+func TestSettleLeavesACordonThatMeansSomethingAlone(t *testing.T) {
+	tests := []struct {
+		name       string
+		desired    infrav1alpha1.PowerState
+		progress   infrav1alpha1.Progress
+		node       *corev1.Node
+		lock       bool
+		job        *batchv1.Job
+		wantReason string
+	}{
+		{
+			name:       "cluster-autoscaler marked the node it is draining",
+			desired:    infrav1alpha1.PowerStateOn,
+			progress:   infrav1alpha1.ProgressReady,
+			node:       markedNode(),
+			wantReason: "observation controllers",
+		},
+		{
+			name:       "the slot is shutting down, so the cordon is the operation",
+			desired:    infrav1alpha1.PowerStateOff,
+			progress:   infrav1alpha1.ProgressShuttingDown,
+			node:       cordonedNode(),
+			wantReason: "observation controllers",
+		},
+		{
+			name:       "a lifecycle job is in flight",
+			desired:    infrav1alpha1.PowerStateOn,
+			progress:   infrav1alpha1.ProgressReady,
+			node:       cordonedNode(),
+			job:        lifecycleJob(fsm.PhaseShutdown, time.Time{}),
+			wantReason: "in flight",
+		},
+		{
+			name:       "a coordination lock owns the slot",
+			desired:    infrav1alpha1.PowerStateOn,
+			progress:   infrav1alpha1.ProgressReady,
+			node:       cordonedNode(),
+			lock:       true,
+			wantReason: "coordination lock",
+		},
+		{
+			name:       "the slot is not wanted on, so its cordon is the shutdown's intent",
+			desired:    infrav1alpha1.PowerStateOff,
+			progress:   infrav1alpha1.ProgressReady,
+			node:       cordonedNode(),
+			wantReason: "observation controllers",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := events.NewFakeRecorder(8)
+
+			node := slot(tc.desired, tc.progress)
+
+			if tc.lock {
+				node.Annotations = map[string]string{
+					fsm.OperationLockAnnotation: fsm.OperationScaleDown,
+					fsm.LockOwnerAnnotation:     fsm.NodeControllerOwner,
+					fsm.LockTimestampAnnotation: time.Now().Format(time.RFC3339),
+					fsm.LockTimeoutAnnotation:   "300",
+				}
+			}
+
+			objects := []client.Object{node, tc.node}
+			if tc.job != nil {
+				objects = append(objects, tc.job)
+			}
+
+			c := newClient(t, objects...)
+			beforeNode := readKubernetesNode(t, c)
+			beforeSlot := readSlot(t, c)
+
+			outcome := settle(t, c, node, recorder)
+
+			assert.Equal(t, ActionNone, outcome.Action)
+			assert.Contains(t, outcome.Reason, tc.wantReason)
+
+			assert.Equal(t, beforeNode.Spec.Unschedulable, readKubernetesNode(t, c).Spec.Unschedulable,
+				"the node keeps the cordon that means something")
+			assert.Equal(t, beforeSlot.ResourceVersion, readSlot(t, c).ResourceVersion, "and the slot is not written")
+			assert.Zero(t, len(recorder.Events))
+		})
+	}
 }

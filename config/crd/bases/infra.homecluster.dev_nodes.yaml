@@ -121,9 +121,12 @@ spec:
                   on the Node CR: the node lifecycle controller and the kubelet own node.kubernetes.io/
                   not-ready, unreachable, unschedulable, out-of-service, memory-pressure, disk-pressure,
                   pid-pressure and network-unavailable, cluster-autoscaler owns
-                  ToBeDeletedByClusterAutoscaler and DeletionCandidateOfClusterAutoscaler. The node prefix is
-                  a namespace, not an ownership claim: node.kubernetes.io/role=agent, the taint the k3d
-                  setups use, is yours to declare.
+                  ToBeDeletedByClusterAutoscaler and DeletionCandidateOfClusterAutoscaler, and Cilium owns
+                  node.cilium.io/agent-not-ready (the bootstrap taint the scale-up readiness gate waits for,
+                  see the Group's spec.nodeReadinessTaints - declaring it here makes the slot's own scale-up
+                  wait for a taint the slot keeps putting back). The node prefix is a namespace, not an
+                  ownership claim: node.kubernetes.io/role=agent, the taint the k3d setups use, is yours to
+                  declare.
 
                   Declare taints here instead of tainting from a startup Job. A Job can only taint a node
                   that already joined, which is after the autoscaler simulated a placement on an untainted

@@ -39,23 +39,41 @@ limitations under the License.
 // not have; and validateStateTransition gates every transition of a transitional slot out, so
 // the slot itself is frozen: no lifecycle operation can start on it and none can finish it.
 //
-// This package is the one writer that settles such a slot, and it is deliberately narrow. It
-// acts only on a slot that claims to have a machine (ready / startingup / shuttingdown), has no
-// corev1.Node, has no lifecycle Job in flight, and whose spec.desiredPowerState asks for the
-// machine to be off. It writes the stable off / shutdown pair the observation controllers agree
-// on, and records a Warning event naming the progress it replaced. It never overrides a claim:
-// settling a claimed slot that never booted is a different decision (abandoning the claim) and
-// is not made here.
+// This package is the one writer that settles such a slot, and it is deliberately narrow. It acts
+// only on a slot that claims to have a machine (ready / startingup / shuttingdown), has no
+// corev1.Node, has no lifecycle Job in flight and no live coordination lock, and whose grace has
+// elapsed. Three outcomes come out of that one gate, and they share it so they cannot drift:
+//
+//   - a slot whose spec.desiredPowerState is off is settled: the stable off / shutdown pair the
+//     observation controllers agree on, with a Warning naming the progress it replaced;
+//   - a slot whose spec.desiredPowerState is on - a claim - is never settled, and never was, but
+//     it is not left pointing at a machine that does not exist either: it is re-armed. The slot
+//     moves to off / shutdown and keeps spec.desiredPowerState: on, which is the shape the FSM's
+//     StartNode is legal from, so the pool retries the machine. Bounded by ClaimRearmLimit, because
+//     a claim whose startup keeps failing must not recreate a server in a loop; at the bound the
+//     re-arming stops and a Warning names the phantom. See ClaimRearmLimit for why the claim cannot
+//     simply be given up on;
+//   - a slot that has a node object, is at ready, is claimed on, and is cordoned with nothing
+//     running on it is uncordoned. That is the safety net for the paths into ready that never call
+//     the uncordon hook (JobTimeout and JobFailed roll a slot back to ready), where a cordoned
+//     machine is invisible to cluster-autoscaler's scale-down and is therefore paid for forever.
+//
+// It records a Warning for each, and writes nothing else: the claim is the request, and this package
+// does not answer it, it only makes the slot able to answer it again.
 package progress
 
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
@@ -64,6 +82,7 @@ import (
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
 // SettleGracePeriod is how long a *finished* lifecycle Job keeps its slot out of reach of the
@@ -71,37 +90,147 @@ import (
 //
 // The Job is the operation and the state machine that started it is the writer that settles the
 // progress it moved: fsm.monitorJobCompletion polls the Job and fires JobCompleted, whose
-// after_ hook writes the stable progress. The monitor polls every 30s in production, and it
-// runs in the goroutine StartNode / ShutdownNode spawned, so a Job that completed a second ago
-// has not necessarily been acted on yet. Stomping the progress in that window writes over a
-// transition its owner is about to record, and the FSM reads its state from progress, so the
-// write is how a duplicate lifecycle Job - and a second scale-up - is born.
+// after_ hook writes the stable progress. The monitor polls every fsm.JobMonitorPollInterval in
+// production, and it runs in the goroutine StartNode / ShutdownNode spawned, so a Job that
+// completed a second ago has not necessarily been acted on yet. Stomping the progress in that
+// window writes over a transition its owner is about to record, and the FSM reads its state from
+// progress, so the write is how a duplicate lifecycle Job - and a second scale-up - is born.
 //
-// The value is therefore a multiple of the monitor's 30s poll, and far longer than one reconcile
-// (seconds), while staying well under the 5m Job timeout and the 15m stuck-transition threshold.
-// A slot whose monitor is really gone - the manager restarted and the goroutine died with it -
-// is settled within ~2 minutes, which is the point of having the watchdog at all.
-const SettleGracePeriod = 2 * time.Minute
+// That window is not one poll long, and this value is derived from it rather than picked, because
+// the after_JobCompleted hook of a completed startup Job runs setNodeSchedulableWithRetry *before*
+// it writes the progress. That loop can consume, in order:
+//
+//   - one monitor poll to notice the Job is done (fsm.JobMonitorPollInterval, 30s);
+//   - the registration wait for the corev1.Node to appear (fsm.DefaultUncordonTimeout, 90s);
+//   - the readiness gate for that node to be Ready and free of the readiness taints, counted from
+//     the pass the node object appears on (fsm.DefaultReadinessGateTimeout, 4m);
+//   - one sleep at the ceiling of the loop's backoff, which overshoots the deadline it checks
+//     (fsm.MaxUncordonRetryInterval, 10s).
+//
+// The grace is that sum plus a minute of slack: strictly longer than the path it has to be longer
+// than. TestSettleGracePeriodOutlivesTheWritersItDefersTo computes the same sum and fails when any
+// of those four numbers grows without the grace growing with it. The value this constant used to
+// carry (2m) covered the monitor poll alone, so a scale-up whose gate was still running was
+// settled to shutdown, and the hook then wrote ready on top of it: two writers, one slot, and a
+// startup Job that had just been paid for.
+//
+// What the grace is *not* measured against: the 5m Job timeout. The grace only ever applies to a
+// finished Job - a Job that is pending or running is an operation in flight, never settled on any
+// deadline, and is merely looked at again - so a Job of a live monitor is protected by the Job
+// itself, not by this number. The bound the value has to respect is fsm.StuckTransitionThreshold
+// (15m), the horizon past which a transitional slot is "stuck" from an operator's point of view: a
+// slot whose monitor died with its manager - the shape this package exists for, a manager restart
+// that takes the goroutine away - is healed inside the grace, well inside that horizon, and not on
+// every resync.
+const SettleGracePeriod = fsm.JobMonitorPollInterval +
+	fsm.DefaultUncordonTimeout +
+	fsm.DefaultReadinessGateTimeout +
+	fsm.MaxUncordonRetryInterval +
+	time.Minute
 
-// Reason and action recorded on the Node CR when the watchdog settles a slot, so that
-// `kubectl describe node.infra.homecluster.dev <name>` shows who moved status.progress and why.
+// Reason and action recorded on the Node CR when the watchdog acts, so that
+// `kubectl describe node.infra.homecluster.dev <name>` shows who moved status.progress, from what
+// evidence, and why.
 const (
 	// ReasonProgressReconciled is recorded for a status.progress that named a machine the
 	// cluster does not have.
 	ReasonProgressReconciled = "ProgressReconciled"
-	// ActionSettleProgress is the action the settlement belongs to.
+	// ReasonClaimRearmed is recorded when a claimed slot whose machine never arrived is sent back
+	// through the startup path.
+	ReasonClaimRearmed = "ClaimRearmed"
+	// ReasonClaimRearmLimitReached is recorded when a claim has been re-armed ClaimRearmLimit times
+	// and the watchdog stopped: the slot is a phantom, the pool asked for a machine that will not
+	// boot, and only an operator can say why.
+	ReasonClaimRearmLimitReached = "ClaimRearmLimitReached"
+	// ReasonCordonReconciled is recorded when the safety net uncordons a ready slot whose node is
+	// cordoned with no operation running on it.
+	ReasonCordonReconciled = "CordonReconciled"
+
+	// ActionSettleProgress is the action the settlement of a desired-off slot belongs to.
 	ActionSettleProgress = "SettleProgress"
+	// ActionRearmProgress is the action a re-arm of a claimed slot belongs to.
+	ActionRearmProgress = "RearmProgress"
+	// ActionUncordonNode is the action the cordon safety net belongs to.
+	ActionUncordonNode = "UncordonNode"
+)
+
+// The claim re-arm. A slot cluster-autoscaler asked for (spec.desiredPowerState: on) whose startup
+// Job completed and whose machine never registered ends at {desired: on, powerState: off, progress:
+// ready}. Nothing in the system heals that shape: the watchdog's settlement refuses it (the claim
+// gate), CanTransition(StartNode) is false from ready, NodeGroupTargetSize counts the slot forever
+// so the autoscaler believes the group has capacity that never materialises, and
+// NodeGroupDecreaseTargetSize cannot cancel it (isStartingUpSlot wants progress: startingup). So the
+// slot is re-armed rather than settled, and the re-arm is bounded.
+const (
+	// ClaimRearmLimit is how many times one slot's claim may be re-armed before the watchdog stops
+	// trying and tells the operator. It bounds the *watchdog's* retries, not the lifecycle's: each
+	// attempt is a real startup (the FSM's StartNode, a lifecycle Job, a power-on of a real
+	// machine), so the number is deliberately small - three attempts is three machines bought for
+	// one slot - and the operator sees the limit as a Warning rather than discovering it from the
+	// bill.
+	ClaimRearmLimit = 3
+
+	// ConditionClaimRearmed is the status.conditions entry that counts the re-arms of a slot. Its
+	// Reason carries the counter (ReasonClaimRearmAttempt + the count, e.g. ClaimRearmAttempt2),
+	// which is why no CRD field is needed to bound the loop: the record lives on the slot, survives
+	// a manager restart, shows in `kubectl describe`, and the deduplication of the limit Warning
+	// reads the same field the bound does.
+	ConditionClaimRearmed = "ClaimRearmed"
+	// ReasonClaimRearmAttempt prefixes the reason that carries the count.
+	ReasonClaimRearmAttempt = "ClaimRearmAttempt"
+)
+
+// Action is what one pass of the watchdog decided to do about the slot. The three actions share one
+// gate (see decide), so the evidence that allows a settlement is the evidence that allows a re-arm
+// and the cordon fix: they cannot drift apart, and a slot is never in the position of being acted on
+// by one and refused by another for a reason the first one did not check.
+type Action string
+
+const (
+	// ActionNone leaves the slot alone: an operation owns it, a machine is behind it, or its
+	// progress already says what the cluster looks like.
+	ActionNone Action = ""
+
+	// ActionSettle writes the stable off / shutdown pair of a slot whose
+	// spec.desiredPowerState is off and whose machine is gone.
+	ActionSettle Action = "settle"
+
+	// ActionRearm writes progress: shutdown and powerState: off for a *claimed* slot whose machine
+	// is gone, and leaves spec.desiredPowerState: on: the request stands, only the lie about the
+	// machine is removed, which is what makes the FSM's StartNode legal again.
+	ActionRearm Action = "rearm"
+
+	// ActionUncordon clears spec.unschedulable of the node of a ready slot that is claimed on and
+	// has no operation running on it. It writes no status at all: the cordon is the fact that is
+	// wrong, not the progress.
+	ActionUncordon Action = "uncordon"
 )
 
 // Outcome reports what one pass of the watchdog decided, so the caller can log it and, where it
 // has a say, come back at the deadline the watchdog names.
 type Outcome struct {
-	// Settled is true when status.progress was written.
+	// Action is what the pass did, ActionNone when it did nothing.
+	Action Action
+
+	// Settled is true when a desired-off slot was written: Action == ActionSettle. It is kept as
+	// the spelling the callers and the tests of the original settlement use.
 	Settled bool
+
+	// Rearmed is true when a claimed slot was sent back through the startup path:
+	// Action == ActionRearm.
+	Rearmed bool
+
+	// Uncordoned is true when the cordon safety net cleared spec.unschedulable:
+	// Action == ActionUncordon.
+	Uncordoned bool
 
 	// Previous is the progress the slot carried before the write; empty when nothing was
 	// written.
 	Previous infrav1alpha1.Progress
+
+	// Attempts is the re-arm count recorded by this pass, 0 for every other action. It is the
+	// number the operator sees in the event, and it is bounded by ClaimRearmLimit.
+	Attempts int
 
 	// RequeueAfter is how long the caller should wait before looking at this slot again: > 0
 	// when the slot was left alone because a lifecycle Job is in flight or is inside the grace
@@ -116,16 +245,9 @@ type Outcome struct {
 //
 // The rules, and why each one is there:
 //
-//   - spec.desiredPowerState must be off. The claim is the request and the watchdog never
-//     overrides it: a slot that is wanted on and reports ready with no machine is a startup that
-//     has to be retried, not a slot to settle, and settling it would tell the provider the
-//     requested capacity does not exist (see the package doc for the follow-up this leaves open).
 //   - the progress must be one that implies a machine: ready, startingup, shuttingdown.
 //     shutdown and the empty progress of a never-seeded slot are already the settled answer, so
 //     a pass over them writes nothing, which is what keeps this idempotent.
-//   - there must be no corev1.Node for the slot. A node object - Ready or not - is a machine, and
-//     the observation controllers own the status of a slot that has one: core.
-//     applyObservedPowerState is the writer for the NotReady and Ready windows of a real machine.
 //   - there must be no lifecycle Job in flight, and a Job that finished must be older than grace.
 //     The Job is the operation; the state machine that started it settles its progress, and the
 //     grace covers the gap between a Job finishing and that machine acting on it.
@@ -133,10 +255,33 @@ type Outcome struct {
 //     now - including the window in which the FSM has written the transitional progress and has
 //     not created the Job yet, and the scale-down the provider is running.
 //
-// On a settlement the slot's off/shutdown pair is written through the status subresource, using
-// the same read-fresh, re-decide, retry-on-conflict shape as fsm.updateNodeProgress, and a
-// Warning event names the progress it replaced. The caller's copy of the slot is updated in
-// place, so the pass that settled it does not act on the progress it just replaced.
+// What the slot's claim and its node object then decide:
+//
+//   - spec.desiredPowerState off, no node object -> settle: the stable off / shutdown pair the
+//     observation controllers agree on, one Warning naming the progress it replaced.
+//   - spec.desiredPowerState on, no node object -> re-arm: the same pair, with
+//     spec.desiredPowerState left on. The claim is the request and is never dropped here -
+//     dropping it is the provider's arithmetic (NodeGroupDecreaseTargetSize), and a watchdog that
+//     answered a scale-up request by declaring the capacity wanted is the failure the target-size
+//     fix removed. What is removed is the progress that names a machine that does not exist,
+//     because from ready the FSM cannot StartNode, and from shutdown it can: the pool retries the
+//     machine. Bounded by ClaimRearmLimit, and the limit is reported (ReasonClaimRearmLimitReached)
+//     so a slot that keeps failing is visible instead of infinite.
+//   - spec.desiredPowerState on, a node object that is cordoned, progress ready, and no marker of
+//     cluster-autoscaler on the node -> uncordon. The paths that roll a slot back into ready
+//     (JobTimeout, JobFailed) never call the uncordon hook, so a machine cordoned by the shutdown
+//     that did not finish stays cordoned: cluster-autoscaler skips cordoned nodes when it picks
+//     scale-down candidates, so it is never drained, never deleted, and paid for forever. A node
+//     cluster-autoscaler has marked for deletion is its decision and is left alone.
+//
+// A node object - Ready or not - is a machine, and the status of a slot that has one belongs to the
+// observation controllers: core.applyObservedPowerState is the writer for the NotReady and Ready
+// windows of a real machine, so nothing about a slot with a node is settled here except the cordon
+// above.
+//
+// Every write goes through the status subresource, using the same read-fresh, re-decide,
+// retry-on-conflict shape as fsm.updateNodeProgress. The caller's copy of the slot is updated in
+// place, so the pass that acted does not then run a transition on the progress it replaced.
 //
 // A nil recorder records nothing, which is what the unit tests use. grace <= 0 selects
 // SettleGracePeriod.
@@ -148,31 +293,38 @@ func Settle(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, reco
 	logger := log.FromContext(ctx).WithValues("node", slot.Name)
 	coord := fsm.NewCoordinationManager(c, fsm.NodeControllerOwner)
 
-	// Cheap gates first: the two reads below are only paid for a slot that is a candidate.
-	if slot.Spec.DesiredPowerState != infrav1alpha1.PowerStateOff {
-		return Outcome{Reason: "the slot is claimed (spec.desiredPowerState is not off), a claim is never overridden"}, nil
-	}
-
 	if !impliesMachine(slot.Status.Progress) {
 		return Outcome{Reason: fmt.Sprintf("status.progress %q does not imply a machine", slot.Status.Progress)}, nil
 	}
 
-	nodePresent, err := kubernetesNodePresent(ctx, c, slot)
+	obs, err := observe(ctx, c, coord, slot, grace)
 	if err != nil {
+		// The API server is unreachable, the slot is gone, ... Nothing was written, so the caller
+		// reports the error and the normal controller backoff brings the pass back.
 		return Outcome{}, err
 	}
 
-	jobs, err := lifecycleJobs(ctx, c, slot)
-	if err != nil {
-		return Outcome{}, err
-	}
+	decision := decide(slot, obs)
+	if decision.action == ActionNone {
+		// The bound is checked before anything is written, and the note is the only write the limit
+		// path performs: a claim that has used its attempts stops being re-armed, and the slot says so
+		// on itself exactly once, so the Warning is the operator's signal and not a per-resync storm.
+		if decision.limited {
+			limited, err := noteRearmLimit(ctx, c, coord, slot, grace)
+			if err != nil {
+				return Outcome{}, err
+			}
 
-	lockHeld, lockNote := lockIsHeld(ctx, coord, slot)
+			if limited && recorder != nil {
+				recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonClaimRearmLimitReached, ActionRearmProgress,
+					"%s", rearmLimitNote(slot, obs.rearmAttempts))
+			}
 
-	decision := decide(slot, nodePresent, lockHeld, jobs, time.Now(), grace)
-	if !decision.settle {
-		if lockHeld {
-			logger = logger.WithValues("lock", lockNote)
+			return Outcome{Attempts: obs.rearmAttempts, Reason: decision.reason}, nil
+		}
+
+		if obs.lockHeld {
+			logger = logger.WithValues("lock", obs.lockNote)
 		}
 
 		if decision.requeueAfter > 0 {
@@ -184,94 +336,232 @@ func Settle(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, reco
 			return Outcome{RequeueAfter: decision.requeueAfter, Reason: decision.reason}, nil
 		}
 
-		logger.V(1).Info("Nothing to settle", "progress", string(slot.Status.Progress), "reason", decision.reason)
+		logger.V(1).Info("Nothing to reconcile", "progress", string(slot.Status.Progress), "reason", decision.reason)
 
 		return Outcome{Reason: decision.reason}, nil
 	}
 
-	settled, previous, err := writeSettlement(ctx, c, coord, slot, grace)
+	wrote, previous, attempts, err := apply(ctx, c, coord, slot, decision, grace)
 	if err != nil {
-		// The slot is gone, the API server is unreachable, ... Nothing was written, so the
-		// caller reports the error and the normal controller backoff brings the pass back.
 		return Outcome{}, err
 	}
 
-	if !settled {
+	if !wrote {
 		// The object moved between the decision and the write and no longer qualifies: the
 		// machine of a lifecycle Job, an observation controller, a claim, got there first.
-		logger.V(1).Info("status.progress was settled by someone else while writing",
-			"progress", string(slot.Status.Progress))
+		logger.V(1).Info("The slot stopped qualifying while writing",
+			"progress", string(slot.Status.Progress),
+			"action", string(decision.action))
 
 		return Outcome{Reason: "the slot stopped qualifying on re-read"}, nil
 	}
 
-	note := settlementNote(slot, previous)
+	// Two channels, on purpose: the event is what `kubectl describe` shows for a slot the cluster
+	// disagrees with, the log line is the controller's own trail. None of the three actions is
+	// routine: a settlement means a machine was deleted behind the operator's back or an operation
+	// died with its manager, a re-arm means a machine the autoscaler paid for never booted, and a
+	// cordon left on a ready slot means a lifecycle operation rolled back and left the machine
+	// unschedulable.
+	outcome := Outcome{Action: decision.action, Previous: previous, Attempts: attempts}
 
-	// Two channels, on purpose: the Warning event is what `kubectl describe` shows for a slot
-	// that was left pointing at a machine that is gone, the log line is what the controller's
-	// own trail is. A settlement is not routine: it means a machine was deleted behind the
-	// operator's back, or an operation died with its manager, and that is worth a Warning.
-	logger.Info("Settled status.progress of a slot with no machine and no lifecycle Job",
-		"previousProgress", string(previous),
-		"progress", string(infrav1alpha1.ProgressShutdown),
-		"powerstate", string(infrav1alpha1.PowerStateOff),
-		"kubernetesNode", slot.Spec.KubernetesNodeName)
+	switch decision.action {
+	case ActionSettle:
+		outcome.Settled = true
 
-	if recorder != nil {
-		recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonProgressReconciled, ActionSettleProgress,
-			"%s", note)
+		logger.Info("Settled status.progress of a slot with no machine and no lifecycle Job",
+			"previousProgress", string(previous),
+			"progress", string(infrav1alpha1.ProgressShutdown),
+			"powerstate", string(infrav1alpha1.PowerStateOff),
+			"kubernetesNode", slot.Spec.KubernetesNodeName)
+
+		if recorder != nil {
+			recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonProgressReconciled, ActionSettleProgress,
+				"%s", settlementNote(slot, previous))
+		}
+
+	case ActionRearm:
+		outcome.Rearmed = true
+
+		logger.Info("Re-armed a claimed slot whose machine never arrived",
+			"previousProgress", string(previous),
+			"progress", string(infrav1alpha1.ProgressShutdown),
+			"powerstate", string(infrav1alpha1.PowerStateOff),
+			"desiredPowerState", string(slot.Spec.DesiredPowerState),
+			"attempts", attempts,
+			"limit", ClaimRearmLimit,
+			"kubernetesNode", slot.Spec.KubernetesNodeName)
+
+		if recorder != nil {
+			recorder.Eventf(slot, nil, corev1.EventTypeNormal, ReasonClaimRearmed, ActionRearmProgress,
+				"%s", rearmNote(slot, previous, attempts))
+		}
+
+	case ActionUncordon:
+		outcome.Uncordoned = true
+
+		logger.Info("Uncordoned the node of a ready slot with no operation running on it",
+			"kubernetesNode", slot.Spec.KubernetesNodeName,
+			"progress", string(slot.Status.Progress),
+			"desiredPowerState", string(slot.Spec.DesiredPowerState))
+
+		if recorder != nil {
+			recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonCordonReconciled, ActionUncordonNode,
+				"%s", uncordonNote(slot))
+		}
 	}
 
-	return Outcome{Settled: true, Previous: previous}, nil
+	return outcome, nil
 }
 
-// settlementNote renders the Warning event's message: the progress that was replaced, the
-// evidence that settled it, and the values it was settled to.
-func settlementNote(slot *infrav1alpha1.Node, previous infrav1alpha1.Progress) string {
-	kubernetesNode := slot.Spec.KubernetesNodeName
-	if kubernetesNode == "" {
-		kubernetesNode = "none"
+// observations is what one pass measured about a slot. It is a struct so the rule (decide) takes its
+// evidence in one place, the evidence cannot be passed in the wrong order, and the write path
+// re-measures it with the same call (see observe).
+type observations struct {
+	// nodePresent is true when the slot has a corev1.Node, Ready or not: a node object is a
+	// machine, and the status of a slot with one belongs to the observation controllers.
+	nodePresent bool
+
+	// nodeCordoned is spec.unschedulable of that node, and nodeMarked says whether
+	// cluster-autoscaler has put one of its deletion markers on it. Both are false with no node.
+	nodeCordoned bool
+	nodeMarked   bool
+
+	// lockHeld says a live coordination lock names an operation that owns the slot; lockNote
+	// describes it for the log.
+	lockHeld bool
+	lockNote string
+
+	// jobs are the slot's lifecycle Jobs.
+	jobs []batchv1.Job
+
+	// rearmAttempts is how many times this slot's claim has been re-armed before.
+	rearmAttempts int
+
+	// now and grace are the clock and the window the Job gates are measured against.
+	now   time.Time
+	grace time.Duration
+}
+
+// observe pays for the reads of one pass: the slot's node object, its lifecycle Jobs, its
+// coordination lock, and its re-arm record. The cheap in-memory gates live in decide, so this is
+// only ever called for a slot that is a candidate.
+func observe(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, grace time.Duration) (observations, error) {
+	obs := observations{now: time.Now(), grace: grace}
+
+	kubeNode, err := kubernetesNode(ctx, c, slot)
+	if err != nil {
+		return observations{}, err
 	}
 
+	if kubeNode != nil {
+		obs.nodePresent = true
+		obs.nodeCordoned = kubeNode.Spec.Unschedulable
+		obs.nodeMarked = hasAutoscalerMarker(kubeNode)
+	}
+
+	jobs, err := lifecycleJobs(ctx, c, slot)
+	if err != nil {
+		return observations{}, err
+	}
+
+	obs.jobs = jobs
+	obs.lockHeld, obs.lockNote = lockIsHeld(ctx, coord, slot)
+	obs.rearmAttempts = rearmAttempts(slot)
+
+	return obs, nil
+}
+
+// settlementNote renders the Warning's message for a settled slot: the progress that was replaced,
+// the evidence that settled it, and the values it was settled to.
+func settlementNote(slot *infrav1alpha1.Node, previous infrav1alpha1.Progress) string {
 	return fmt.Sprintf(
 		"Reconciled status.progress of node %s from %q to %q (status.powerState %q): spec.desiredPowerState is %q and "+
 			"the cluster has no Kubernetes node %q and no startup/shutdown Job for the slot, so nothing is running "+
 			"the transition the progress describes",
 		slot.Name, string(previous), string(infrav1alpha1.ProgressShutdown), string(infrav1alpha1.PowerStateOff),
-		string(infrav1alpha1.PowerStateOff), kubernetesNode)
+		string(infrav1alpha1.PowerStateOff), kubernetesNodeName(slot))
+}
+
+// rearmNote renders the Normal event of a re-arm, with the attempt count in it: the operator sees
+// that the pool is retrying a machine that never booted, how many times it has done so, and that the
+// claim is untouched. Normal, not Warning: a re-arm is the system healing itself, and the shape worth
+// a Warning is the one where it stops (see rearmLimitNote).
+func rearmNote(slot *infrav1alpha1.Node, previous infrav1alpha1.Progress, attempts int) string {
+	return fmt.Sprintf(
+		"Re-armed the claim on node %s (%d of %d): status.progress %q named a machine the cluster does not have, so it "+
+			"is recorded %q with status.powerState %q while spec.desiredPowerState stays %q - the startup Job of this slot "+
+			"finished and no Kubernetes node %q ever registered, so the machine has to be started again and the slot is "+
+			"now in the state that allows it",
+		slot.Name, attempts, ClaimRearmLimit, string(previous), string(infrav1alpha1.ProgressShutdown),
+		string(infrav1alpha1.PowerStateOff), string(infrav1alpha1.PowerStateOn), kubernetesNodeName(slot))
+}
+
+// rearmLimitNote renders the Warning that names the phantom: a claimed slot that has been re-armed
+// ClaimRearmLimit times and whose machine has not booted once. The re-arming has stopped, so the slot
+// reports capacity the cluster does not have and nothing will retry on its own - that is the fact an
+// operator has to be told, and the only safe response is a human looking at why this slot cannot
+// boot.
+func rearmLimitNote(slot *infrav1alpha1.Node, attempts int) string {
+	return fmt.Sprintf(
+		"Claim on node %s is not recoverable by re-arming: %d startup attempts, no Kubernetes node %q ever registered, "+
+			"and status.progress is left at %q. spec.desiredPowerState is still %q, so the slot is still counted as "+
+			"requested capacity. Scale the group down, or fix what keeps the machine from booting (startup command, "+
+			"image, power API credentials) - the controller will not create another server for this slot.",
+		slot.Name, attempts, kubernetesNodeName(slot), string(slot.Status.Progress), string(slot.Spec.DesiredPowerState))
+}
+
+// uncordonNote renders the event of the cordon safety net: which node was made schedulable, and why
+// the controller - which does not normally touch a machine's schedulability outside a lifecycle
+// operation - did it.
+func uncordonNote(slot *infrav1alpha1.Node) string {
+	return fmt.Sprintf(
+		"Uncordoned Kubernetes node %s: the slot is at status.progress %q with spec.desiredPowerState %q and no "+
+			"startup/shutdown Job, coordination lock, or deletion marker on it, so the cordon is the residue of an "+
+			"operation that ended (a shutdown that timed out, a startup that rolled back). A cordoned node is skipped "+
+			"by cluster-autoscaler's scale-down, so it is never drained, never deleted, and paid for.",
+		kubernetesNodeName(slot), string(slot.Status.Progress), string(slot.Spec.DesiredPowerState))
+}
+
+// kubernetesNodeName renders spec.kubernetesNodeName for a note, spelled out when empty so a message
+// never carries a blank field.
+func kubernetesNodeName(slot *infrav1alpha1.Node) string {
+	if slot.Spec.KubernetesNodeName == "" {
+		return "none"
+	}
+
+	return slot.Spec.KubernetesNodeName
 }
 
 // decision is the rule with no I/O in it, so the rule is testable on its own.
 type decision struct {
-	// settle says the slot must be moved to off/shutdown.
-	settle bool
+	// action is what the pass must do, ActionNone when it must do nothing.
+	action Action
 	// requeueAfter is > 0 when the slot was left alone for a reason with a deadline (a
 	// lifecycle Job in flight, or one that finished inside the grace), so the caller schedules
-	// the look that settles it.
+	// the look that acts on it.
 	requeueAfter time.Duration
 	// reason is the human-readable explanation for the log line.
 	reason string
-	// previous is the progress being replaced, set when settle is true.
+	// limited is true when the refusal is the re-arm bound: the claim of this slot has used its
+	// attempts. It is a field, not a string match on the reason, because the limit path has to write
+	// its note exactly once and has to re-derive the shape from the object read back (see
+	// noteRearmLimit) - a comparison against a formatted sentence is how a reworded log line breaks a
+	// deduplication.
+	limited bool
+	// previous is the progress being replaced, set when the action writes a progress.
 	previous infrav1alpha1.Progress
 }
 
-// decide applies the settlement rule to what the caller observed. See Settle for the rules and
-// for why each gate exists.
-func decide(slot *infrav1alpha1.Node, nodePresent, lockHeld bool, jobs []batchv1.Job, now time.Time, grace time.Duration) decision {
-	if slot.Spec.DesiredPowerState != infrav1alpha1.PowerStateOff {
-		return decision{reason: "spec.desiredPowerState is not off, a claim is never overridden"}
-	}
-
+// decide applies the rule to what the caller observed. See Settle for the rules and for why each
+// gate exists. Every action is behind every gate: the Job gates and the lock gate own the
+// transitional progress of an operation in flight, and the node-object gate decides between the
+// claim, the settlement and the cordon fix, so the three cannot drift apart.
+func decide(slot *infrav1alpha1.Node, obs observations) decision {
 	if !impliesMachine(slot.Status.Progress) {
 		return decision{reason: fmt.Sprintf("status.progress %q does not imply a machine", slot.Status.Progress)}
 	}
 
-	if nodePresent {
-		return decision{reason: fmt.Sprintf("the slot has a Kubernetes node %q, its status belongs to the observation controllers",
-			slot.Spec.KubernetesNodeName)}
-	}
-
-	if lockHeld {
+	if obs.lockHeld {
 		return decision{reason: "a coordination lock names an operation that owns the slot"}
 	}
 
@@ -279,17 +569,17 @@ func decide(slot *infrav1alpha1.Node, nodePresent, lockHeld bool, jobs []batchv1
 	// earliest one that is about to leave it.
 	var wait time.Duration
 
-	for i := range jobs {
-		job := &jobs[i]
+	for i := range obs.jobs {
+		job := &obs.jobs[i]
 
 		completed, finished := finishedAt(job)
 		if !finished {
 			// Pending or running: the operation is alive and its monitor is the writer. Look
 			// again on the grace, so a monitor that died with its manager is still caught.
-			return decision{requeueAfter: grace, reason: fmt.Sprintf("lifecycle Job %s is in flight", job.Name)}
+			return decision{requeueAfter: obs.grace, reason: fmt.Sprintf("lifecycle Job %s is in flight", job.Name)}
 		}
 
-		remaining := grace - now.Sub(completed)
+		remaining := obs.grace - obs.now.Sub(completed)
 		if remaining <= 0 {
 			continue
 		}
@@ -303,11 +593,51 @@ func decide(slot *infrav1alpha1.Node, nodePresent, lockHeld bool, jobs []batchv1
 		return decision{requeueAfter: wait, reason: "a lifecycle Job of the slot finished inside the settle grace"}
 	}
 
-	return decision{
-		settle:   true,
-		previous: slot.Status.Progress,
-		reason:   "no Kubernetes node, no lifecycle Job, no coordination lock",
+	// Nothing is running on the slot. What the claim and the node object say decides the action.
+	if slot.Spec.DesiredPowerState == infrav1alpha1.PowerStateOff {
+		if obs.nodePresent {
+			return decision{reason: fmt.Sprintf("the slot has a Kubernetes node %q, its status belongs to the observation controllers",
+				slot.Spec.KubernetesNodeName)}
+		}
+
+		return decision{
+			action:   ActionSettle,
+			previous: slot.Status.Progress,
+			reason:   "no Kubernetes node, no lifecycle Job, no coordination lock",
+		}
 	}
+
+	// A claim. The progress is not the request and is not the machine, so it is the thing that is
+	// wrong: from ready the FSM cannot StartNode, and from shutdown it can.
+	if !obs.nodePresent {
+		if obs.rearmAttempts >= ClaimRearmLimit {
+			return decision{
+				limited: true,
+				reason: fmt.Sprintf("the claim has already been re-armed %d times, the limit is %d: the slot is a phantom and only an operator can say why",
+					obs.rearmAttempts, ClaimRearmLimit),
+			}
+		}
+
+		return decision{
+			action:   ActionRearm,
+			previous: slot.Status.Progress,
+			reason:   "a claim whose startup finished with no Kubernetes node behind it",
+		}
+	}
+
+	// The slot has a machine. Its status belongs to the observation controllers, with one
+	// exception: a ready slot that is wanted on and is cordoned with nothing running on it. The
+	// paths that land in ready without the uncordon hook (JobTimeout, JobFailed) leave exactly
+	// that, and a cordoned node is skipped by cluster-autoscaler's scale-down forever.
+	if slot.Status.Progress == infrav1alpha1.ProgressReady && obs.nodeCordoned && !obs.nodeMarked {
+		return decision{
+			action: ActionUncordon,
+			reason: "a claimed ready slot whose node is cordoned with no Job, lock, or autoscaler marker behind it",
+		}
+	}
+
+	return decision{reason: fmt.Sprintf("the slot has a Kubernetes node %q, its status belongs to the observation controllers",
+		slot.Spec.KubernetesNodeName)}
 }
 
 // impliesMachine reports whether a progress value says there is a machine behind the slot. The
@@ -356,14 +686,21 @@ func finishedAt(job *batchv1.Job) (time.Time, bool) {
 	return job.CreationTimestamp.Time, true
 }
 
-// writeSettlement writes the settled pair, re-deriving the whole rule from the object read back.
-// A write that goes through on a slot someone else changed in the meantime is how a controller
-// stomps an operation, so the rule is evaluated against the fresh copy and the write is skipped
-// when the slot no longer qualifies. It reports whether it wrote, and the progress it replaced.
-func writeSettlement(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, grace time.Duration) (bool, infrav1alpha1.Progress, error) {
+// apply writes the decision, re-deriving the whole rule from the object read back. A write that
+// goes through on a slot someone else changed in the meantime is how a controller stomps an
+// operation, so the rule is evaluated against the fresh copy and the write is skipped when the slot
+// no longer qualifies, or qualifies for a different action than the one decided. It reports whether
+// it wrote, the progress it replaced, and the re-arm count it recorded.
+//
+// One function for all three actions on purpose: settle and re-arm differ by two lines (the re-arm
+// stamps the counter, and never touches spec.desiredPowerState), and the cordon fix runs on the node
+// object of a slot whose progress is already the truth. Splitting them is how the gates of the three
+// drift apart, which is the failure this package exists to avoid.
+func apply(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, d decision, grace time.Duration) (bool, infrav1alpha1.Progress, int, error) {
 	var (
-		settled  bool
+		wrote    bool
 		previous infrav1alpha1.Progress
+		attempts int
 	)
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -372,22 +709,34 @@ func writeSettlement(ctx context.Context, c client.Client, coord fsm.Coordinatio
 			return err
 		}
 
-		nodePresent, err := kubernetesNodePresent(ctx, c, fresh)
+		obs, err := observe(ctx, c, coord, fresh, grace)
 		if err != nil {
 			return err
 		}
 
-		jobs, err := lifecycleJobs(ctx, c, fresh)
-		if err != nil {
-			return err
-		}
-
-		lockHeld, _ := lockIsHeld(ctx, coord, fresh)
-
-		d := decide(fresh, nodePresent, lockHeld, jobs, time.Now(), grace)
-		if !d.settle {
-			// The slot stopped qualifying: an operation, a claim, or a machine appeared.
+		current := decide(fresh, obs)
+		if current.action != d.action {
+			// The slot stopped qualifying, or became a different action: an operation, a claim, a
+			// machine, or a cordon appeared.
 			return nil
+		}
+
+		if d.action == ActionUncordon {
+			// The progress of this slot is the truth, the cordon on its node is not: the write is on
+			// the node object, and the slot is not touched at all.
+			wrote, err = uncordonNode(ctx, c, fresh.Spec.KubernetesNodeName)
+			if err != nil {
+				return err
+			}
+
+			syncLocalCopy(slot, fresh)
+
+			return nil
+		}
+
+		if d.action == ActionRearm {
+			attempts = obs.rearmAttempts + 1
+			stampRearmCondition(fresh, attempts, current.previous)
 		}
 
 		fresh.Status.Progress = infrav1alpha1.ProgressShutdown
@@ -397,44 +746,251 @@ func writeSettlement(ctx context.Context, c client.Client, coord fsm.Coordinatio
 			return err
 		}
 
-		settled = true
-		previous = d.previous
+		// spec is never written: the claim of a re-armed slot stays on, and that is what makes the
+		// FSM's StartNode legal from the progress written here.
 
-		// Keep the caller's copy in step, so the pass that settled the slot acts on the
-		// settled values: the FSM reads its state from status.progress, and the node
-		// controller has just run this pass with this object in hand.
-		slot.Status.Progress = fresh.Status.Progress
-		slot.Status.PowerState = fresh.Status.PowerState
+		wrote = true
+		previous = current.previous
+
+		syncLocalCopy(slot, fresh)
 
 		return nil
 	})
 	if err != nil {
-		return false, "", err
+		return false, "", 0, err
 	}
 
-	return settled, previous, nil
+	return wrote, previous, attempts, nil
 }
 
-// kubernetesNodePresent reports whether the slot has a Kubernetes node object. Any object counts,
-// Ready or not: a node object is a machine, and the status of a slot with one is owned by the
-// observation controllers (core.applyObservedPowerState spells out why NotReady is a weak
-// observation of a machine, and never evidence that a machine is gone).
-func kubernetesNodePresent(ctx context.Context, c client.Client, slot *infrav1alpha1.Node) (bool, error) {
+// syncLocalCopy keeps the caller's copy of the slot in step with what was written, so the pass that
+// acted does not act again on the values it replaced: the FSM reads its state from status.progress,
+// and the node controller has just run this pass with this object in hand.
+func syncLocalCopy(slot *infrav1alpha1.Node, fresh *infrav1alpha1.Node) {
+	slot.Status.Progress = fresh.Status.Progress
+	slot.Status.PowerState = fresh.Status.PowerState
+}
+
+// noteRearmLimit records, once, that a claimed slot has used its re-arm attempts and is left as a
+// phantom. It is the only write the limit path performs - the progress is not touched, because the
+// slot is not being healed any more - and the condition it stamps is what the bound and this
+// deduplication both read, so the passes after it write nothing and record nothing.
+//
+// It reports whether the note was written, which is what the caller uses to record the Warning: an
+// event per resync for a slot that is permanently broken is an event storm on a pool that stopped
+// booting.
+func noteRearmLimit(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, grace time.Duration) (bool, error) {
+	noted := false
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1alpha1.Node{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(slot), fresh); err != nil {
+			return err
+		}
+
+		obs, err := observe(ctx, c, coord, fresh, grace)
+		if err != nil {
+			return err
+		}
+
+		current := decide(fresh, obs)
+		if !current.limited {
+			// The slot is not the limited shape any more: something arrived, a claim was dropped,
+			// an operation started. Nothing to note.
+			return nil
+		}
+
+		if rearmLimitNoted(fresh) {
+			// Steady state of a phantom: no write, no event.
+			return nil
+		}
+
+		stampRearmLimit(fresh, obs.rearmAttempts)
+
+		if err := c.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+
+		noted = true
+
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return noted, nil
+}
+
+// rearmAttempts returns how many times this slot's claim has been re-armed, read off the condition
+// the re-arm stamps. The count is in the condition's Reason (ReasonClaimRearmAttempt + the number)
+// so the bound needs no CRD field: the record is on the slot, survives a manager restart, and is
+// what `kubectl describe` shows. A slot with no record has never been re-armed, and a record whose
+// reason is the limit reads as the limit, so the bound cannot be escaped by a reason this package
+// does not write.
+func rearmAttempts(slot *infrav1alpha1.Node) int {
+	condition := meta.FindStatusCondition(slot.Status.Conditions, ConditionClaimRearmed)
+	if condition == nil {
+		return 0
+	}
+
+	if condition.Reason == ReasonClaimRearmLimitReached {
+		return ClaimRearmLimit
+	}
+
+	count, err := strconv.Atoi(strings.TrimPrefix(condition.Reason, ReasonClaimRearmAttempt))
+	if err != nil || count < 0 {
+		return 0
+	}
+
+	return count
+}
+
+// rearmLimitNoted reports whether the slot already carries the limit record, which is the
+// deduplication of the Warning: the passes after the first one write nothing.
+func rearmLimitNoted(slot *infrav1alpha1.Node) bool {
+	condition := meta.FindStatusCondition(slot.Status.Conditions, ConditionClaimRearmed)
+
+	return condition != nil && condition.Reason == ReasonClaimRearmLimitReached
+}
+
+// stampRearmCondition records the re-arm of attempt n on the slot. Status True says the claim of this
+// slot has been sent back through the startup path, the Reason is the counter, and the Message is the
+// evidence, so the whole history an operator needs to follow a pool that keeps buying machines is on
+// the slot.
+func stampRearmCondition(slot *infrav1alpha1.Node, attempts int, previous infrav1alpha1.Progress) {
+	meta.SetStatusCondition(&slot.Status.Conditions, metav1.Condition{
+		Type:               ConditionClaimRearmed,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: slot.Generation,
+		Reason:             ReasonClaimRearmAttempt + strconv.Itoa(attempts),
+		Message: fmt.Sprintf(
+			"re-arm attempt %d of %d: status.progress %q named a machine the cluster does not have, no Kubernetes node "+
+				"%q ever registered for it, so the progress is recorded %q and spec.desiredPowerState is left %q for the "+
+				"startup to run again",
+			attempts, ClaimRearmLimit, string(previous), kubernetesNodeName(slot),
+			string(infrav1alpha1.ProgressShutdown), string(infrav1alpha1.PowerStateOn)),
+	})
+}
+
+// stampRearmLimit records that the bound is used up. The reason is stable - that is what makes the
+// deduplication work - and the message says what the controller stopped doing and why.
+func stampRearmLimit(slot *infrav1alpha1.Node, attempts int) {
+	meta.SetStatusCondition(&slot.Status.Conditions, metav1.Condition{
+		Type:               ConditionClaimRearmed,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: slot.Generation,
+		Reason:             ReasonClaimRearmLimitReached,
+		Message: fmt.Sprintf(
+			"%d re-arm attempts, no Kubernetes node %q ever registered: the controller stopped re-arming this claim, so "+
+				"spec.desiredPowerState %q and status.progress %q stay as they are and the slot keeps being counted as "+
+				"requested capacity. Scale the group down, or fix what keeps the machine from booting.",
+			attempts, kubernetesNodeName(slot), string(slot.Spec.DesiredPowerState), string(slot.Status.Progress)),
+	})
+}
+
+// hasAutoscalerMarker reports whether cluster-autoscaler has put one of its deletion markers on a
+// node. A marker is a decision the autoscaler made and owns: it cordons the node it is draining, so
+// the cordon safety net leaves that alone. The keys are the autoscaler's (taints.IsProtectedKey
+// refuses to let spec.nodeTaints write them), and they are matched here rather than imported from
+// the marker recorder so this package does not depend on what that one records.
+func hasAutoscalerMarker(kubeNode *corev1.Node) bool {
+	for _, taint := range kubeNode.Spec.Taints {
+		if taint.Key == taints.ToBeDeletedByClusterAutoscaler ||
+			taint.Key == taints.DeletionCandidateOfClusterAutoscaler {
+			return true
+		}
+	}
+
+	return false
+}
+
+// uncordonNode clears spec.unschedulable of a Kubernetes node, and the node.kubernetes.io/
+// unschedulable taint that goes with a cordon, through a merge patch: a write that changes nothing
+// sends nothing. It reports whether it wrote, so a slot whose node was un-cordoned by the kubelet
+// between the read and the patch records no event.
+//
+// This is the safety net's own write, deliberately narrow: the scale-up path's uncordon is
+// fsm.setNodeSchedulableInternal, which also runs inside an operation that owns the slot.
+func uncordonNode(ctx context.Context, c client.Client, nodeName string) (bool, error) {
+	if nodeName == "" {
+		return false, nil
+	}
+
+	kubeNode := &corev1.Node{}
+	if err := c.Get(ctx, client.ObjectKey{Name: nodeName}, kubeNode); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("get kubernetes node %s: %w", nodeName, err)
+	}
+
+	if !kubeNode.Spec.Unschedulable && !hasUnschedulableTaint(kubeNode) {
+		return false, nil
+	}
+
+	patch := client.MergeFrom(kubeNode.DeepCopy())
+
+	kubeNode.Spec.Unschedulable = false
+
+	if hasUnschedulableTaint(kubeNode) {
+		kept := make([]corev1.Taint, 0, len(kubeNode.Spec.Taints))
+
+		for _, taint := range kubeNode.Spec.Taints {
+			if taint.Key == taints.NodeUnschedulable {
+				continue
+			}
+
+			kept = append(kept, taint)
+		}
+
+		kubeNode.Spec.Taints = kept
+	}
+
+	if err := c.Patch(ctx, kubeNode, patch); err != nil {
+		return false, fmt.Errorf("uncordon kubernetes node %s: %w", nodeName, err)
+	}
+
+	return true, nil
+}
+
+// hasUnschedulableTaint reports whether the kubelet's cordon taint is on the node.
+func hasUnschedulableTaint(kubeNode *corev1.Node) bool {
+	for _, taint := range kubeNode.Spec.Taints {
+		if taint.Key == taints.NodeUnschedulable {
+			return true
+		}
+	}
+
+	return false
+}
+
+// kubernetesNode returns the Kubernetes node of a slot, and nil when it has none. The slot has none
+// when it was never provisioned (no spec.kubernetesNodeName) and when the object is gone, which is
+// the evidence the watchdog acts on.
+//
+// Any object counts, Ready or not: a node object is a machine, and the status of a slot with one is
+// owned by the observation controllers (core.applyObservedPowerState spells out why NotReady is a
+// weak observation of a machine, and never evidence that a machine is gone). An API error other than
+// NotFound is returned: not knowing whether the machine is there is not evidence that it is not, and
+// a settlement written from a failed read is a settlement written against a live machine.
+func kubernetesNode(ctx context.Context, c client.Client, slot *infrav1alpha1.Node) (*corev1.Node, error) {
 	if slot.Spec.KubernetesNodeName == "" {
 		// The slot has never been provisioned, so there is no machine to look for.
-		return false, nil
+		return nil, nil
 	}
 
 	kubeNode := &corev1.Node{}
 	if err := c.Get(ctx, client.ObjectKey{Name: slot.Spec.KubernetesNodeName}, kubeNode); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return nil, nil
 		}
 
-		return false, fmt.Errorf("get kubernetes node %s: %w", slot.Spec.KubernetesNodeName, err)
+		return nil, fmt.Errorf("get kubernetes node %s: %w", slot.Spec.KubernetesNodeName, err)
 	}
 
-	return true, nil
+	return kubeNode, nil
 }
 
 // lifecycleJobs lists the startup and shutdown Jobs of the slot.

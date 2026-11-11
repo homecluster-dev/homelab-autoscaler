@@ -19,6 +19,7 @@ package fsm
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,14 @@ const (
 	ReasonScaleDownCompleted = "ScaleDownCompleted"
 	ReasonScaleDownFailed    = "ScaleDownFailed"
 	ReasonScaleDownDeferred  = "ScaleDownDeferred"
+
+	// ReasonReadinessGateTimeout is recorded when the scale-up gate (Ready, and free of the
+	// readiness taints the Group declares) ran out of its deadline: the machine is on and was
+	// uncordoned, and the slot is recorded ready, but the gate the pool's pods depend on was never
+	// satisfied. It is a Warning because the operator has to go and look at the CNI - the churn the
+	// gate closes is a machine paid for and unusable - and because the FSM has already done the only
+	// safe thing it can (uncordon, complete the transition) and will not try again.
+	ReasonReadinessGateTimeout = "ReadinessGateTimeout"
 )
 
 // Actions recorded on the Node CR. The new events API keeps `reason` (what happened,
@@ -45,6 +54,9 @@ const (
 const (
 	ActionPowerOn  = "PowerOn"
 	ActionPowerOff = "PowerOff"
+	// ActionUncordon is the action the readiness gate and its timeout belong to: the controller
+	// made the machine schedulable, which is the half of the scale-up that follows the power-on.
+	ActionUncordon = "Uncordon"
 )
 
 // Bounds on recorded messages. An Event is a real API object: `kubectl describe` shows it,
@@ -72,6 +84,29 @@ type Option func(*NodeStateMachine)
 // manager to build a recorder from.
 func WithEventRecorder(recorder events.EventRecorder) Option {
 	return func(nm *NodeStateMachine) { nm.eventRecorder = recorder }
+}
+
+// WithReadinessGateTimeout overrides DefaultReadinessGateTimeout, the deadline of the gate that
+// holds the transition into ready open until the node is Ready and free of the readiness taints.
+// Tests use it to exercise a gate timeout in milliseconds; a caller with a CNI that is known to be
+// slower (a large cluster, a pulled image, an encrypted overlay) can widen the budget for the whole
+// controller.
+func WithReadinessGateTimeout(timeout time.Duration) Option {
+	return func(nm *NodeStateMachine) {
+		if timeout > 0 {
+			nm.readinessGateTimeout = timeout
+		}
+	}
+}
+
+// WithReadinessTaintKeys declares the taint keys the readiness gate waits for the node to be free
+// of, on top of the Ready condition. The caller reads them from the slot's Group
+// (spec.nodeReadinessTaints, whose CRD default is Cilium's node.cilium.io/agent-not-ready): the
+// key is stamped by the CNI of the cluster, which this repository cannot verify, so it is
+// configuration and not a constant. An empty list gates on Ready alone - the behaviour of a CNI
+// that stamps no bootstrap taint, and the explicit way to turn the gate off.
+func WithReadinessTaintKeys(keys []string) Option {
+	return func(nm *NodeStateMachine) { nm.readinessTaintKeys = keys }
 }
 
 // recordLifecycleEvent attaches an Event to the Node CR. It is a no-op without a recorder.

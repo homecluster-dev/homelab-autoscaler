@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/progress"
@@ -628,7 +631,10 @@ func TestNodeReconcileHonoursTheWatchdogDeadline(t *testing.T) {
 	stamp := metav1.NewTime(time.Now().Add(-5 * time.Minute))
 	node.Status.LastShutdownTime = &stamp
 
-	completed := metav1.NewTime(time.Now().Add(-90 * time.Second))
+	// The Job finished 30s before the settle grace runs out, so the watchdog asks for 30s. Derived from
+	// progress.SettleGracePeriod: the row says "30s before the grace", not a number that only made
+	// sense next to the value the constant used to carry.
+	completed := metav1.NewTime(time.Now().Add(-(progress.SettleGracePeriod - 30*time.Second)))
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-node-shutdown-1700000000",
@@ -661,4 +667,299 @@ func TestNodeReconcileHonoursTheWatchdogDeadline(t *testing.T) {
 	require.NoError(t, reconciler.Get(context.Background(),
 		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
 	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, after.Status.Progress, "the Job is still inside its grace")
+}
+
+// TestShortenRequeue is the caller-side rule of the watchdog, tested directly: the pass honours a
+// deadline the watchdog asked for, and it never becomes later, never empty, and never a hot loop.
+//
+// The three properties that matter:
+//   - a deadline the FSM asked for (a lock to come back on, a transition backoff) is earlier, so it
+//     wins - the watchdog's grace is a look, not a mandate;
+//   - a result that asks to requeue *now* (Requeue: true, no RequeueAfter) is never turned into a
+//     delayed one: that is how a settlement makes a controller slow;
+//   - a non-positive watchdog deadline changes nothing, so the common path (no deadline) cannot
+//     produce a zero RequeueAfter with Requeue: true, which is an immediate re-dispatch.
+func TestShortenRequeue(t *testing.T) {
+	const (
+		watchdog = progress.SettleGracePeriod
+		fsmSoon  = 30 * time.Second
+	)
+
+	tests := []struct {
+		name         string
+		result       ctrl.Result
+		requeueAfter time.Duration
+		want         ctrl.Result
+	}{
+		{
+			name:         "no watchdog deadline: the result passes through untouched",
+			result:       ctrl.Result{RequeueAfter: 5 * time.Minute},
+			requeueAfter: 0,
+			want:         ctrl.Result{RequeueAfter: 5 * time.Minute},
+		},
+		{
+			name:         "a negative deadline is not a deadline",
+			result:       ctrl.Result{RequeueAfter: 5 * time.Minute},
+			requeueAfter: -time.Second,
+			want:         ctrl.Result{RequeueAfter: 5 * time.Minute},
+		},
+		{
+			name:         "the result requeues now: the watchdog does not delay it",
+			result:       ctrl.Result{Requeue: true},
+			requeueAfter: watchdog,
+			want:         ctrl.Result{Requeue: true},
+		},
+		{
+			name:         "an empty result takes the watchdog's deadline",
+			result:       ctrl.Result{},
+			requeueAfter: watchdog,
+			want:         ctrl.Result{RequeueAfter: watchdog},
+		},
+		{
+			name:         "a tighter FSM deadline wins",
+			result:       ctrl.Result{RequeueAfter: fsmSoon},
+			requeueAfter: watchdog,
+			want:         ctrl.Result{RequeueAfter: fsmSoon},
+		},
+		{
+			name:         "an equal deadline is left as the caller wrote it",
+			result:       ctrl.Result{RequeueAfter: watchdog},
+			requeueAfter: watchdog,
+			want:         ctrl.Result{RequeueAfter: watchdog},
+		},
+		{
+			name:         "a looser FSM deadline is shortened",
+			result:       ctrl.Result{RequeueAfter: 15 * time.Minute},
+			requeueAfter: watchdog,
+			want:         ctrl.Result{RequeueAfter: watchdog},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shortenRequeue(tc.result, tc.requeueAfter)
+
+			assert.Equal(t, tc.want, got)
+
+			if tc.result.RequeueAfter > 0 {
+				assert.LessOrEqual(t, got.RequeueAfter, tc.result.RequeueAfter,
+					"the watchdog never extends a deadline the caller already asked for")
+			}
+
+			//nolint:staticcheck // SA1019: Requeue is deprecated, and the property under test is about
+			// the pair of fields: shortening must never leave a result that asks to requeue now *and*
+			// names a deadline, which controller-runtime refuses.
+			assert.False(t, got.Requeue && got.RequeueAfter > 0,
+				"a shortened result is not also an immediate requeue: %v", got)
+		})
+	}
+}
+
+// claimedMachinelessSlot is the M3 shape seen from the reconcile: cluster-autoscaler asked for this
+// slot (spec.desiredPowerState: on), its startup Job completed, and its node never registered, so it
+// sits at {desired: on, powerState: off, progress: ready}. The FSM cannot StartNode from ready, the
+// provider counts it as capacity forever, and the autoscaler plans against a machine that does not
+// exist.
+func claimedMachinelessSlot(previous infrav1alpha1.Progress) *infrav1alpha1.Node {
+	node := createTestNode(infrav1alpha1.PowerStateOn, previous)
+	node.Status.PowerState = infrav1alpha1.PowerStateOff
+
+	return node
+}
+
+// TestNodeReconcileRearmsAClaimAndRetriesTheMachine is the phantom-claim hole closed at the reconcile
+// level: the watchdog re-arms the slot (progress: shutdown, powerState: off, desired: on) and the very
+// same pass then runs the FSM, which can StartNode from shutdown, so the pool retries the machine.
+// The claim is not dropped, and the retry is bounded: the startup Job of the attempt is the operation
+// that owns the slot on the next pass.
+func TestNodeReconcileRearmsAClaimAndRetriesTheMachine(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	node := claimedMachinelessSlot(infrav1alpha1.ProgressReady)
+	reconciler := newTaintReconciler(t, node, createTestGroup())
+	reconciler.EventRecorder = recorder
+
+	_, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
+	})
+	require.NoError(t, err)
+
+	after := &infrav1alpha1.Node{}
+	require.NoError(t, reconciler.Get(context.Background(),
+		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
+
+	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "the claim stands: it is the request")
+	assert.Equal(t, infrav1alpha1.ProgressStartingUp, after.Status.Progress,
+		"the pass re-armed the slot (shutdown) and the FSM then started it again (startingup)")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState, "the machine is off, and the status says so")
+
+	jobs := listLifecycleJobs(t, reconciler.Client)
+	require.Len(t, jobs, 1, "the retry is a real startup: one Job for one attempt")
+	assert.Equal(t, fsm.PhaseStartup, jobs[0].Labels[fsm.LabelType], "the pool retries the machine, it does not delete one")
+
+	var rearmed []string
+
+	for _, event := range drainEvents(recorder) {
+		if strings.Contains(event, progress.ReasonClaimRearmed) {
+			rearmed = append(rearmed, event)
+		}
+	}
+
+	require.Len(t, rearmed, 1, "one re-arm, one event")
+	assert.Contains(t, rearmed[0], "Normal", "a re-arm is the system healing itself")
+	assert.Contains(t, rearmed[0], "1 of "+fmt.Sprint(progress.ClaimRearmLimit), "and the event counts the attempt")
+	assert.NotContains(t, strings.Join(rearmed, "\n"), progress.ReasonProgressReconciled,
+		"a re-arm is not a settlement: the events distinguish the two, so an operator can tell a claim that is being retried from a machine that is gone")
+
+	condition := meta.FindStatusCondition(after.Status.Conditions, progress.ConditionClaimRearmed)
+	require.NotNil(t, condition, "the attempt count lives on the slot, so the bound survives a manager restart")
+	assert.Equal(t, progress.ReasonClaimRearmAttempt+"1", condition.Reason)
+}
+
+// TestNodeReconcileRearmIsBoundedAtTheReconcileLevel walks the reconcile to the bound and asserts the
+// pass stops creating servers: each pass re-arms and starts one Job, and at ClaimRearmLimit the pass
+// records one Warning and builds nothing. A claim whose machine cannot boot must not buy a machine per
+// grace period, forever.
+func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
+	node := claimedMachinelessSlot(infrav1alpha1.ProgressReady)
+	reconciler := newTaintReconciler(t, node, createTestGroup())
+
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"}}
+	recorder := events.NewFakeRecorder(64)
+	reconciler.EventRecorder = recorder
+
+	for attempt := 1; attempt <= progress.ClaimRearmLimit; attempt++ {
+		require.NoError(t, firstReconcile(reconciler, request))
+
+		// The startup Job of this attempt finished and its machine never registered: the shape the
+		// watchdog acts on again. The lifecycle Jobs are removed so the gate opens, exactly as the
+		// Job TTL does it in a cluster.
+		for i := range listLifecycleJobs(t, reconciler.Client) {
+			require.NoError(t, reconciler.Delete(context.Background(), &listLifecycleJobs(t, reconciler.Client)[i]))
+		}
+
+		current := &infrav1alpha1.Node{}
+		require.NoError(t, reconciler.Get(context.Background(),
+			types.NamespacedName{Name: "test-node", Namespace: "default"}, current))
+
+		// The startup of the attempt completed: its coordination lock is released, its Job is
+		// removed by the TTL, and the slot is left at a progress that names a machine. All three are
+		// what the watchdog's gates read, so all three are the real shape between attempts.
+		for _, key := range []string{
+			fsm.OperationLockAnnotation, fsm.LockOwnerAnnotation,
+			fsm.LockTimestampAnnotation, fsm.LockTimeoutAnnotation,
+		} {
+			delete(current.Annotations, key)
+		}
+
+		if len(current.Annotations) == 0 {
+			current.Annotations = nil
+		}
+
+		require.NoError(t, reconciler.Update(context.Background(), current))
+
+		current.Status.Progress = infrav1alpha1.ProgressReady
+		current.Status.PowerState = infrav1alpha1.PowerStateOff
+		require.NoError(t, reconciler.Status().Update(context.Background(), current))
+	}
+
+	// One more pass: the bound is used up, so the re-arming stops and the Warning goes out.
+	require.NoError(t, firstReconcile(reconciler, request))
+
+	current := &infrav1alpha1.Node{}
+	require.NoError(t, reconciler.Get(context.Background(),
+		types.NamespacedName{Name: "test-node", Namespace: "default"}, current))
+
+	condition := meta.FindStatusCondition(current.Status.Conditions, progress.ConditionClaimRearmed)
+	require.NotNil(t, condition)
+	assert.Equal(t, progress.ReasonClaimRearmLimitReached, condition.Reason)
+
+	assert.Empty(t, listLifecycleJobs(t, reconciler.Client),
+		"at the bound the controller creates no further server for the slot")
+
+	var warnings []string
+
+	for _, event := range drainEvents(recorder) {
+		if strings.Contains(event, progress.ReasonClaimRearmLimitReached) {
+			warnings = append(warnings, event)
+		}
+	}
+
+	require.Len(t, warnings, 1, "the phantom is reported once, not on every resync")
+	assert.Contains(t, warnings[0], "Warning")
+
+	require.NoError(t, firstReconcile(reconciler, request))
+	assert.Zero(t, len(drainEvents(recorder)), "and the passes after it are silent")
+}
+
+// TestReadinessTaintKeysStampedFromTheGroup is the wiring of the configurable gate key: the key belongs
+// to the CNI of the cluster, so it is read from the slot's Group and recorded on the slot, where an
+// operator looking at a slot that has been booting for ten minutes can read what it is waiting for. An
+// empty list is a real answer (the gate is off), and it is recorded as one.
+func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
+	tests := []struct {
+		name string
+		spec []corev1.Taint
+		want []string
+	}{
+		{
+			name: "the group declares a CNI key",
+			spec: []corev1.Taint{{Key: "node.cilium.io/agent-not-ready", Effect: corev1.TaintEffectNoExecute}},
+			want: []string{"node.cilium.io/agent-not-ready"},
+		},
+		{
+			name: "the gate is off",
+			spec: []corev1.Taint{},
+			want: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+			group := createTestGroup()
+			group.Spec.NodeReadinessTaints = tc.spec
+
+			reconciler := newTaintReconciler(t, node, group, createTestKubernetesNode())
+
+			keys := reconciler.readinessTaintKeys(context.Background(), node, group)
+			assert.Equal(t, tc.want, keys, "the FSM gets exactly the list the Group declares")
+
+			stamped := &infrav1alpha1.Node{}
+			require.NoError(t, reconciler.Get(context.Background(),
+				types.NamespacedName{Name: "test-node", Namespace: "default"}, stamped))
+
+			condition := meta.FindStatusCondition(stamped.Status.Conditions, autoscalerpkg.ConditionReadinessTaints)
+			require.NotNil(t, condition, "the gate is legible from the slot")
+
+			if len(tc.want) == 0 {
+				assert.Equal(t, "none", condition.Message, "an off gate reads differently from no record at all")
+
+				return
+			}
+
+			assert.Equal(t, tc.want[0], condition.Message)
+			assert.Equal(t, keys, autoscalerpkg.ReadinessTaintKeysOfSlot(stamped), "the record reads back as the gate's keys")
+
+			before := stamped.DeepCopy()
+
+			// The steady state: the same Group, the same record, no write.
+			assert.Equal(t, tc.want, reconciler.readinessTaintKeys(context.Background(), stamped, group))
+
+			after := &infrav1alpha1.Node{}
+			require.NoError(t, reconciler.Get(context.Background(),
+				types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
+			assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "a resync of an unchanged Group writes nothing")
+		})
+	}
+
+	t.Run("no group to read falls back to the slot's record", func(t *testing.T) {
+		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+		autoscalerpkg.StampReadinessTaints(node, []string{"node.cilium.io/agent-not-ready"})
+
+		reconciler := newTaintReconciler(t, node, createTestGroup())
+
+		assert.Equal(t, []string{"node.cilium.io/agent-not-ready"}, reconciler.readinessTaintKeys(context.Background(), node, nil),
+			"a pass without its Group keeps the gate the Group configured, it does not quietly become Ready-only")
+	})
 }

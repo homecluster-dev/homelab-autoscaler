@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -85,7 +86,8 @@ func TestNewNodeStateMachine(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 			assert.NotNil(t, fsm)
 			assert.Equal(t, tt.expectedState, fsm.GetCurrentState())
@@ -217,7 +219,8 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 			assert.Equal(t, tt.canTransition, fsm.CanTransition(tt.event))
 		})
@@ -235,7 +238,8 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -279,7 +283,8 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.Error(t, err)
@@ -301,7 +306,8 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.Error(t, err)
@@ -327,7 +333,8 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -376,7 +383,8 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node) // No Kubernetes node
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err) // Should not fail even if Kubernetes node doesn't exist
@@ -398,7 +406,8 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.Error(t, err)
@@ -427,7 +436,8 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.JobCompleted(nil)
 		assert.NoError(t, err)
@@ -453,7 +463,8 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.JobCompleted(nil)
 		assert.NoError(t, err)
@@ -547,8 +558,10 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
-			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
+			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 			err := tt.event(fsm)
 			assert.NoError(t, err)
@@ -567,7 +580,8 @@ func TestNodeStateMachine_CalculateBackoff(t *testing.T) {
 	fakeClient := CreateFakeClient(scheme, node)
 
 	fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-	fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+	fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+	fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	t.Run("no backoff strategy returns default", func(t *testing.T) {
 		backoff := fsm.CalculateBackoff()
@@ -630,7 +644,8 @@ func TestNodeStateMachine_IsTransitionStuck(t *testing.T) {
 	fakeClient := CreateFakeClient(scheme, node)
 
 	fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-	fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+	fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+	fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	t.Run("no backoff strategy is not stuck", func(t *testing.T) {
 		assert.False(t, fsm.IsTransitionStuck())
@@ -674,8 +689,9 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		require.NoError(t, err)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
-		fsm.jobTimeout = 2 * time.Second             // Short timeout for testing
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
+		fsm.jobTimeout = 2 * time.Second                  // Short timeout for testing
 
 		// Start monitoring in a goroutine
 		done := make(chan bool)
@@ -711,8 +727,9 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		require.NoError(t, err)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
-		fsm.jobTimeout = 2 * time.Second             // Short timeout for testing
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
+		fsm.jobTimeout = 2 * time.Second                  // Short timeout for testing
 
 		// Start monitoring in a goroutine
 		done := make(chan bool)
@@ -748,8 +765,9 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		require.NoError(t, err)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
-		fsm.jobTimeout = 100 * time.Millisecond      // Very short timeout for testing
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
+		fsm.jobTimeout = 100 * time.Millisecond           // Very short timeout for testing
 
 		// Start monitoring in a goroutine
 		done := make(chan bool)
@@ -796,7 +814,8 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, pendingStartupJob, pendingShutdownJob, completedJob, otherNodeJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		// Call cleanup
 		err := fsm.cleanupPendingJobs("test-node-k8s")
@@ -827,7 +846,8 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		// Call cleanup when no jobs exist
 		err := fsm.cleanupPendingJobs("test-node-k8s")
@@ -847,7 +867,8 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		// Call cleanup with empty node name
 		err := fsm.cleanupPendingJobs("")
@@ -867,7 +888,8 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, startupJob, shutdownJob, otherTypeJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		// Call cleanup
 		err := fsm.cleanupPendingJobs("test-node-k8s")
@@ -899,7 +921,8 @@ func TestNodeStateMachine_StartNodeWithCleanup(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		// Start node
 		err := fsm.StartNode()
@@ -935,7 +958,8 @@ func TestNodeStateMachine_ShutdownNodeWithCleanup(t *testing.T) {
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		// Shutdown node
 		err := fsm.ShutdownNode()
@@ -967,7 +991,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -990,7 +1015,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -1018,7 +1044,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -1057,7 +1084,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -1101,7 +1129,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.StartNode()
 		assert.NoError(t, err)
@@ -1140,7 +1169,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1163,7 +1193,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1191,7 +1222,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1230,7 +1262,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1276,7 +1309,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 		fakeClient := CreateFakeClient(scheme, node)
 
 		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-		fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		err := fsm.ShutdownNode()
 		assert.NoError(t, err)
@@ -1347,7 +1381,8 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-			fsm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 			require.NoError(t, tt.action(fsm))
 
@@ -1467,7 +1502,8 @@ func TestNodeStateMachine_PriorityClassName(t *testing.T) {
 			fakeClient := CreateFakeClient(scheme, node)
 
 			f := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-			f.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+			f.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+			f.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 			require.NoError(t, tt.action(f))
 
@@ -1491,9 +1527,12 @@ func ptrToString(s string) *string {
 type taintLiftClient struct {
 	client.Client
 	liftFrom int
-	key      string
-	gets     int
-	writes   []string
+	// readyFrom reports the node NotReady until the readyFrom-th read, the shape of a kubelet that
+	// has registered the object and is not Ready yet - the window the registration deadline is for.
+	readyFrom int
+	key       string
+	gets      int
+	writes    []string
 }
 
 func (c *taintLiftClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -1507,6 +1546,12 @@ func (c *taintLiftClient) Get(ctx context.Context, key client.ObjectKey, obj cli
 	}
 
 	c.gets++
+
+	if c.readyFrom > 0 && c.gets < c.readyFrom {
+		kubeNode.Status.Conditions = []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+		}
+	}
 
 	if c.key != "" && c.liftFrom > 0 && c.gets >= c.liftFrom {
 		kept := make([]corev1.Taint, 0, len(kubeNode.Spec.Taints))
@@ -1572,7 +1617,8 @@ func TestSetNodeSchedulableWaitsForTheCiliumBootstrapTaint(t *testing.T) {
 	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
 	recorder := &taintLiftClient{Client: base, key: TaintCiliumAgentNotReady, liftFrom: 2}
 
-	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager(),
+		WithReadinessTaintKeys([]string{TaintCiliumAgentNotReady}))
 	nm.uncordonTimeout = 20 * time.Second
 
 	start := time.Now()
@@ -1611,7 +1657,8 @@ func TestSetNodeSchedulableDoesNotWaitForACiliumItDoesNotHave(t *testing.T) {
 	base := CreateFakeClient(scheme, node, ciliumNode(role, unreachable))
 	recorder := &taintLiftClient{Client: base}
 
-	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager(),
+		WithReadinessTaintKeys([]string{TaintCiliumAgentNotReady}))
 	nm.uncordonTimeout = 20 * time.Second
 
 	start := time.Now()
@@ -1656,8 +1703,10 @@ func TestSetNodeSchedulableTimeoutUncordonsAndLogs(t *testing.T) {
 	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
 	recorder := &taintLiftClient{Client: base}
 
-	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager(),
+		WithReadinessTaintKeys([]string{TaintCiliumAgentNotReady}))
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
 
@@ -1692,6 +1741,7 @@ func TestSetNodeSchedulableOnMissingNodeTimesOutWithoutWriting(t *testing.T) {
 
 	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	require.Error(t, nm.setNodeSchedulableWithRetry("test-node-k8s"))
 	assert.Empty(t, recorder.writes, "nothing to uncordon, so nothing is written")
@@ -1726,8 +1776,187 @@ func TestNodeUsability(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			reason := nodeUsability(tc.node)
+			reason := nodeUsability(tc.node, []string{TaintCiliumAgentNotReady})
 			assert.Contains(t, reason, tc.wantReason)
 		})
 	}
+
+	// The keys are the configuration the Group carries. With no keys the gate is the Ready condition
+	// alone - which is the explicit "this CNI stamps no bootstrap taint" declaration - and a key the
+	// node does not carry never holds the transition open.
+	assert.Equal(t, "", nodeUsability(ciliumNode(bootstrap), nil), "no keys, no gate: Ready is enough")
+	// A declared key the node carries is the reason to wait, and the key is configuration: the gate is
+	// not Cilium-specific.
+	other := ciliumNode(corev1.Taint{Key: "some.other/cni", Effect: corev1.TaintEffectNoExecute})
+	assert.Contains(t, nodeUsability(other, []string{"some.other/cni"}), "some.other/cni",
+		"any declared key the node carries holds the transition open")
+	assert.Equal(t, "", nodeUsability(other, []string{"node.kubelet.io/startup"}),
+		"a declared key the node does not carry is not a reason to wait")
+}
+
+// newGateMachine is the loop with both budgets spelled out, so a test says which half it is
+// exercising: registration is the wait for the node object, the gate is the wait for that object to
+// be Ready and free of the readiness taints, counted from the pass it appears on.
+func newGateMachine(node *infrav1alpha1.Node, c client.Client, scheme *runtime.Scheme, coord CoordinationManager, keys []string, registration, gate time.Duration) *NodeStateMachine {
+	nm := NewNodeStateMachine(node, c, scheme, coord, WithReadinessTaintKeys(keys))
+	nm.uncordonTimeout = registration
+	nm.readinessGateTimeout = gate
+
+	return nm
+}
+
+// TestSetNodeSchedulableGateHasItsOwnDeadline is the M2 fix, and it fails against a single shared
+// budget: the registration wait must not spend the readiness gate's time.
+//
+// The shape is a cold boot. The node object registers on the first read (registration is satisfied
+// in milliseconds), and the kubelet reports NotReady for two seconds while it finishes joining. With
+// one 100ms budget the loop times out on the machine it exists to protect: it uncordons a NotReady
+// node, logs an operator-visible failure, holds the hook open for the whole budget, and the slot is
+// declared ready anyway - which is exactly the symptom the gate was added for, on every boot. With
+// the gate's own deadline, the same boot passes.
+func TestSetNodeSchedulableGateHasItsOwnDeadline(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node, ciliumNode())
+
+	// Ready on the 3rd read: the loop must still be waiting for the gate, not out of budget.
+	recorder := &taintLiftClient{Client: base, readyFrom: 3}
+
+	nm := newGateMachine(node, recorder, scheme, NewMockCoordinationManager(),
+		[]string{TaintCiliumAgentNotReady}, 100*time.Millisecond, 20*time.Second)
+
+	start := time.Now()
+	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "the registration budget is spent, the gate budget is not")
+	assert.Greater(t, elapsed, 100*time.Millisecond,
+		"a shared budget of 100ms would have returned an error by now: it took %v", elapsed.String())
+	assert.GreaterOrEqual(t, recorder.gets, 3, "the loop kept polling the gate after the registration deadline passed")
+
+	updated := &corev1.Node{}
+	require.NoError(t, base.Get(context.TODO(), client.ObjectKey{Name: "test-node-k8s"}, updated))
+	assert.False(t, updated.Spec.Unschedulable, "and the node is uncordoned on the pass the gate is satisfied")
+}
+
+// TestSetNodeSchedulableRegistrationDeadlineIsTheNodeObject: the registration budget is the other
+// half, and it is the one that applies while there is no node object at all. A machine that never
+// registers fails fast, writes no node object, and says what it was waiting for.
+func TestSetNodeSchedulableRegistrationDeadlineIsTheNodeObject(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node)
+	recorder := &taintLiftClient{Client: base}
+
+	nm := newGateMachine(node, recorder, scheme, NewMockCoordinationManager(), nil, 100*time.Millisecond, 20*time.Second)
+
+	start := time.Now()
+	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has not appeared", "the timeout names the half of the loop that ran out")
+	assert.NotContains(t, err.Error(), TaintCiliumAgentNotReady, "the readiness gate was never opened, so it is not the reason")
+	assert.Less(t, time.Since(start), 5*time.Second, "the registration budget, not the gate, decided: %v", time.Since(start).String())
+	assert.Empty(t, recorder.writes, "there is no node object to uncordon, so nothing is written")
+}
+
+// TestReadinessGateKeepsTheCoordinationLockAlive is why the gate loop re-stamps the lock. The gate is
+// bounded by 4m and the registration wait by 90s - together longer than DefaultLockTimeout (5m). A
+// lock that ages out mid-gate is not a lock: the progress watchdog's lock gate stops protecting the
+// slot, validateStateTransition cleans the lock up, and the next acquisition takes the slot over,
+// while the operation that acquired it is still running. So the loop that holds the slot open renews
+// the lock that says the slot is held.
+//
+// The lock's timeout is 5s and the loop runs for 6s with sleeps of 2s and 4s, so an un-renewed lock
+// is expired before the loop finishes: the assertion is about the lock's age at the end, not about a
+// call count alone.
+func TestReadinessGateKeepsTheCoordinationLockAlive(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node, ciliumNode())
+	recorder := &taintLiftClient{Client: base, readyFrom: 3}
+
+	coord := NewMockCoordinationManager()
+	require.NoError(t, coord.AcquireLock(context.TODO(), node, OperationScaleUp, 5*time.Second))
+
+	nm := newGateMachine(node, recorder, scheme, coord, nil, 20*time.Second, 20*time.Second)
+
+	require.NoError(t, nm.setNodeSchedulableWithRetry("test-node-k8s"))
+
+	assert.NotEmpty(t, coord.GetRenewCalls(), "the gate re-stamps the lock it runs under")
+
+	lock := coord.GetLock("test-node")
+	require.NotNil(t, lock, "the operation still holds the lock it acquired")
+	assert.Equal(t, OperationScaleUp, lock.Operation, "renewal keeps the operation the lock names")
+	assert.Equal(t, 5*time.Second, lock.Timeout, "and its timeout")
+	assert.False(t, coord.IsLockExpired(lock),
+		"the lock is live at the end of a gate that outlasted its timeout: age %v, timeout %v",
+		time.Since(lock.Timestamp).String(), lock.Timeout.String())
+}
+
+// TestReadinessGateTimeoutRecordsAWarningOnTheSlot is the operator-visible half of the gate timeout.
+// The log line rolls away; a pool whose nodes come up unable to take the pool's work has to say so on
+// the slot, which is the repo's convention for "go and look". The uncordon still happens: the slot is
+// recorded ready, and a cordoned machine is one the autoscaler will never remove.
+func TestReadinessGateTimeoutRecordsAWarningOnTheSlot(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	bootstrap := corev1.Taint{Key: TaintCiliumAgentNotReady, Value: "true", Effect: corev1.TaintEffectNoExecute}
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
+	recorder := &taintLiftClient{Client: base}
+	rec := events.NewFakeRecorder(16)
+
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager(),
+		WithEventRecorder(rec),
+		WithReadinessTaintKeys([]string{TaintCiliumAgentNotReady}),
+		WithReadinessGateTimeout(100*time.Millisecond))
+	nm.uncordonTimeout = 20 * time.Second
+
+	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
+	require.Error(t, err, "the caller is told the gate timed out, and continues past it")
+
+	// The registration budget is 20s, so the timeout below can only be the gate's: the deadline that
+	// started when the node object appeared.
+	assert.Contains(t, err.Error(), "timeout after 100ms", "the error quotes the gate's own budget")
+
+	warnings := drainEvents(rec)
+
+	require.Len(t, warnings, 1, "one gate, one event")
+	assert.Contains(t, warnings[0], corev1.EventTypeWarning)
+	assert.Contains(t, warnings[0], ReasonReadinessGateTimeout)
+	assert.Contains(t, warnings[0], TaintCiliumAgentNotReady, "the event names the taint the gate was waiting for")
+	assert.Contains(t, warnings[0], "readiness gate", "and which half of the loop timed out")
+
+	updated := &corev1.Node{}
+	require.NoError(t, base.Get(context.TODO(), client.ObjectKey{Name: "test-node-k8s"}, updated))
+	assert.False(t, updated.Spec.Unschedulable, "the timeout path uncordons: a cordoned machine is invisible to scale-down")
+}
+
+// TestWithReadinessGateTimeoutZeroKeepsTheDefault: an option that zeroes the gate budget would make
+// the loop time out on the pass the node appears, which is the failure the gate exists to close. A
+// non-positive override is ignored, so only a real budget changes the default.
+func TestWithReadinessGateTimeoutZeroKeepsTheDefault(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	nm := NewNodeStateMachine(node, CreateFakeClient(scheme, node), scheme, NewMockCoordinationManager(),
+		WithReadinessGateTimeout(0))
+
+	assert.Equal(t, DefaultReadinessGateTimeout, nm.readinessGateTimeout)
+	assert.Empty(t, nm.readinessTaintKeys, "no option, no keys: the gate is Ready-only until the Group configures it")
 }

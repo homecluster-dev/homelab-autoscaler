@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/progress"
@@ -181,18 +183,20 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	// Handle power state transitions using FSM
-	result, err := r.handleStateTransitionsWithFSM(ctx, node)
+	result, err := r.handleStateTransitionsWithFSM(ctx, node, group)
 
 	return shortenRequeue(result, watchdogRequeue), err
 }
 
 // reconcileObservedProgress settles a slot whose status.progress names a machine the cluster does
-// not have, and returns how long the watchdog wants to be looked at again (0 = no deadline). See
-// internal/progress for the rule, the grace period it is built on, and the event it records.
+// not have, re-arms a claimed slot whose machine never arrived, or uncordons a ready slot whose node
+// is cordoned with nothing running on it, and returns how long the watchdog wants to be looked at
+// again (0 = no deadline). See internal/progress for the rule, the grace period it is built on, and
+// the events it records.
 //
-// A failure of the watchdog is never fatal to the pass: it means the settlement did not happen,
-// and the next pass is the next attempt. Failing a reconcile because a slot that is already
-// broken could not be repaired would hide the reason it is broken.
+// A failure of the watchdog is never fatal to the pass: it means the reconciliation did not happen,
+// and the next pass is the next attempt. Failing a reconcile because a slot that is already broken
+// could not be repaired would hide the reason it is broken.
 func (r *NodeReconciler) reconcileObservedProgress(ctx context.Context, node *infrav1alpha1.Node) time.Duration {
 	outcome, err := progress.Settle(ctx, r.Client, node, r.EventRecorder, progress.SettleGracePeriod)
 	if err != nil {
@@ -205,11 +209,71 @@ func (r *NodeReconciler) reconcileObservedProgress(ctx context.Context, node *in
 	return outcome.RequeueAfter
 }
 
+// readinessTaintKeys returns the taint keys the scale-up readiness gate of this slot's Group waits
+// for (spec.nodeReadinessTaints), and records them on the slot (autoscaler.ConditionReadinessTaints)
+// so the gate is legible from the slot itself: "the slot has been booting for ten minutes, waiting
+// for what" is a question an operator asks from `kubectl describe`, and the answer lives in a Group
+// they will not think to open.
+//
+// The write is status-only, on a fresh copy, and only when the record differs, so a resync of a slot
+// whose Group says the same thing as the slot writes nothing. It is best-effort: the keys the FSM
+// gets come from the Group read in this pass, so a status write that fails costs the record, never
+// the gate.
+//
+// With no Group to read (the pass has none in hand), the slot's own record is the fallback, so the
+// gate keeps the keys the Group configured for the slot instead of quietly becoming Ready-only.
+func (r *NodeReconciler) readinessTaintKeys(ctx context.Context, node *infrav1alpha1.Node, group *infrav1alpha1.Group) []string {
+	if group == nil {
+		return autoscalerpkg.ReadinessTaintKeysOfSlot(node)
+	}
+
+	keys := autoscalerpkg.ReadinessTaintKeys(group)
+
+	if !autoscalerpkg.StampReadinessTaints(node, keys) {
+		return keys
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1alpha1.Node{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
+			return err
+		}
+
+		if !autoscalerpkg.StampReadinessTaints(fresh, keys) {
+			return nil
+		}
+
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		log.FromContext(ctx).V(1).Info("Failed to record the readiness taints of the Group on the slot",
+			"node", node.Name, "group", group.Name, "taints", strings.Join(keys, ","), "error", err.Error())
+
+		return keys
+	}
+
+	// Keep the caller's copy in step, so the pass does not write the same condition again.
+	autoscalerpkg.StampReadinessTaints(node, keys)
+
+	return keys
+}
+
 // shortenRequeue moves a reconcile result forward to an earlier deadline the caller was asked to
 // honour, and never delays one: a requeue the FSM asked for, a transition that finished and wants
 // to run now, wins over the watchdog's deadline.
+//
+// A result that asks to requeue immediately is returned untouched, twice over: "now" is already
+// earlier than any grace, and controller-runtime refuses a Result that sets Requeue and
+// RequeueAfter together, so writing a deadline onto that result would fail the reconcile.
 func shortenRequeue(result ctrl.Result, requeueAfter time.Duration) ctrl.Result {
 	if requeueAfter <= 0 {
+		return result
+	}
+
+	//nolint:staticcheck // SA1019: Requeue is deprecated, and reading it is the point: a caller
+	// that asks to requeue now must not get a deadline stamped onto the result, because
+	// controller-runtime refuses a Result that sets both fields. No caller in this repository
+	// returns Requeue today, and the guard is what keeps that true if one does.
+	if result.Requeue {
 		return result
 	}
 
@@ -222,8 +286,12 @@ func shortenRequeue(result ctrl.Result, requeueAfter time.Duration) ctrl.Result 
 	return result
 }
 
-// handleStateTransitionsWithFSM uses the FSM for state management
-func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node *infrav1alpha1.Node) (ctrl.Result, error) {
+// handleStateTransitionsWithFSM runs the lifecycle transition the slot's spec asks for.
+//
+// The state machine is built with the readiness taint keys of the slot's Group, because the key the
+// scale-up gate waits for belongs to the CNI of the cluster (spec.nodeReadinessTaints, whose CRD
+// default is Cilium's node.cilium.io/agent-not-ready) and is not verifiable from this repository.
+func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node *infrav1alpha1.Node, group *infrav1alpha1.Group) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Create coordination manager
@@ -231,7 +299,8 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 
 	// Create FSM instance, recording the lifecycle transitions on the Node CR.
 	stateMachine := fsm.NewNodeStateMachine(node, r.Client, r.Scheme, coordMgr,
-		fsm.WithEventRecorder(r.EventRecorder))
+		fsm.WithEventRecorder(r.EventRecorder),
+		fsm.WithReadinessTaintKeys(r.readinessTaintKeys(ctx, node, group)))
 
 	logger.Info("Using FSM for state management",
 		"node", node.Name,
@@ -423,9 +492,11 @@ func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, nod
 //     event on the Node CR. The set is explicit in taints.IsProtectedKey - the lifecycle and
 //     kubelet keys (node.kubernetes.io/not-ready, /unreachable, /unschedulable,
 //     /out-of-service, /memory-pressure, /disk-pressure, /pid-pressure,
-//     /network-unavailable) and the two cluster-autoscaler keys. A key that merely shares the
-//     node.kubernetes.io namespace, role=agent for instance, is not protected: the e2e pools
-//     declare exactly that and must be applied.
+//     /network-unavailable), the two cluster-autoscaler keys, and Cilium's
+//     node.cilium.io/agent-not-ready, which its agent stamps on a node that has just joined and
+//     removes when its datapath is programmed. A key that merely shares the node.kubernetes.io
+//     namespace, role=agent for instance, is not protected: the e2e pools declare exactly that and
+//     must be applied.
 //
 // It is idempotent: when the node already carries every declared taint nothing is patched.
 //

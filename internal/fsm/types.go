@@ -107,6 +107,29 @@ const (
 	MaxRetries             = 3
 	DefaultUncordonTimeout = 90 * time.Second
 
+	// DefaultReadinessGateTimeout bounds the readiness gate of the scale-up: the wait for the node
+	// object to be Ready and free of the CNI's bootstrap taint, counted from the moment the node
+	// object first appears (see setNodeSchedulableWithRetry). It is deliberately not the
+	// registration wait, which stays DefaultUncordonTimeout: a cold boot spends most of 90s
+	// registering the kubelet, and a gate sharing that budget times out on the machine it exists to
+	// protect - the slot is declared ready with the bootstrap taint still on the node, the pool's
+	// pods still cannot land, and the autoscaler buys a second machine. That is the symptom the
+	// gate was added for, plus 90s of a hook held open and an operator-visible failure per boot.
+	//
+	// 4 minutes is the shape of a Cilium bootstrap on the pool this controller runs on: the agent
+	// pod is scheduled once the node is Ready, pulls its image, and programs the datapath. The gate
+	// is a deadline, not a poll of a known duration: on a timeout the node is uncordoned, a Warning
+	// is recorded on the slot, and the transition completes, so a longer value only delays the
+	// signal that the CNI is really broken.
+	DefaultReadinessGateTimeout = 4 * time.Minute
+
+	// MaxUncordonRetryInterval is the ceiling of the exponential backoff the uncordon / readiness
+	// loop sleeps between passes (see setNodeSchedulableWithRetry). It is a named constant because
+	// progress.SettleGracePeriod is derived from it: the grace has to outlast every deadline that
+	// loop can consume, plus one sleep at this ceiling, or the watchdog writes over a progress its
+	// owner is about to record.
+	MaxUncordonRetryInterval = 10 * time.Second
+
 	// StuckTransitionThreshold is how long a transitional state (startingup,
 	// shuttingdown) may last before CheckStuckState forces a cleanup. The event recorded
 	// for that cleanup quotes it, so it is a named constant rather than a literal.
@@ -149,6 +172,16 @@ type NodeStateMachine struct {
 
 	// Configuration
 	uncordonTimeout time.Duration
+
+	// readinessGateTimeout bounds the readiness gate of the scale-up, counted from the moment the
+	// node object first appears (see setNodeSchedulableWithRetry and DefaultReadinessGateTimeout).
+	readinessGateTimeout time.Duration
+
+	// readinessTaintKeys are the taint keys the readiness gate waits for the node to be free of, on
+	// top of the Ready condition. They come from the slot's Group (spec.nodeReadinessTaints): the
+	// key belongs to the CNI of the cluster and is not verifiable from this repository, so an empty
+	// list gates on Ready alone.
+	readinessTaintKeys []string
 }
 
 // BackoffStrategy implements smart backoff for state transitions
@@ -182,6 +215,11 @@ type CoordinationManager interface {
 	CheckLock(ctx context.Context, node *infrav1alpha1.Node) (*OperationLock, bool)
 	IsLockExpired(lock *OperationLock) bool
 	ForceReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error
+	// RenewLock re-stamps the timestamp of the live lock this manager owns, so an operation that
+	// runs longer than the lock's timeout keeps the slot it already holds (see the implementation
+	// for the exact rules). It acquires nothing and takes nothing over; it reports whether a stamp
+	// was written.
+	RenewLock(ctx context.Context, node *infrav1alpha1.Node) (bool, error)
 }
 
 // OperationLock represents a coordination lock on a node

@@ -640,7 +640,8 @@ func TestHooksIntegration(t *testing.T) {
 	fakeClient := CreateFakeClient(scheme, node)
 
 	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-	nm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+	nm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	t.Run("complete startup flow with hooks", func(t *testing.T) {
 		// Start the node - should trigger before and enter hooks
@@ -758,6 +759,7 @@ func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *
 	mockCoord := NewMockCoordinationManager()
 	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	ctx := context.TODO()
 	event := &fsm.Event{
