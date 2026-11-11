@@ -19,6 +19,7 @@ package claim
 import (
 	"context"
 	"sort"
+	"time"
 
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -159,7 +160,7 @@ func PendingOfGroup(claims []infrav2alpha1.NodeClaim, group string) []infrav2alp
 
 	for i := range claims {
 		c := &claims[i]
-		if c.Spec.Request.Group != group || c.Status.Phase != infrav2alpha1.NodeClaimPending ||
+		if c.Spec.Request.Group != group || !phase.IsPending(c.Status.Phase) ||
 			!c.DeletionTimestamp.IsZero() {
 			continue
 		}
@@ -196,20 +197,42 @@ func OfSlotNamed(claims []infrav2alpha1.NodeClaim, slot *infrav2alpha1.Node) []i
 }
 
 // ScaleDownStreakExhausted reports that a slot has used the scale-down attempts its digest carries,
-// i.e. that the model stops firing the shutdown of a machine that will not go off. The bound is the
-// same claim.MaxConsecutiveAttempts the boot attempts are bounded by, and it is read off the record
-// of the last claim, which the claim controller keeps in step with the attempts it spent:
-// the v1alpha1 ShutdownAttempts condition on the long-lived slot, and its two reset sites, are gone
-// (docs/design/nodeclaim.md §4).
-func ScaleDownStreakExhausted(slot *infrav2alpha1.Node) bool {
+// i.e. that the model stops firing the shutdown of a machine that will not go off, and returns how
+// long is left of the reset grace. The bound is the same claim.MaxConsecutiveAttempts the boot
+// attempts are bounded by, and it is read off the record of the last claim, which the claim
+// controller keeps in step with the attempts it spent: the v1alpha1 ShutdownAttempts condition on the
+// long-lived slot, and its two reset sites, are gone (docs/design/nodeclaim.md §4).
+//
+// This is the case with no claim left to carry the count: the machine was left up by an episode that
+// has already been collected. The digest is the record, so the streak and its clock are read from it,
+// and the grace is what makes the pause bounded here too.
+func ScaleDownStreakExhausted(slot *infrav2alpha1.Node) (bool, time.Duration) {
 	digest := slot.Status.LastClaim
-	if digest == nil || digest.Attempt < MaxConsecutiveAttempts {
-		return false
+	if digest == nil || digest.ShutdownAttempts < MaxConsecutiveAttempts {
+		return false, 0
 	}
 
 	if digest.Call != infrav2alpha1.ClaimCallDeleteNodes && digest.Call != infrav2alpha1.ClaimCallDecreaseTargetSize {
-		return false
+		return false, 0
 	}
 
-	return phase.IsTerminal(digest.Phase)
+	if !phase.IsTerminal(digest.Phase) {
+		return false, 0
+	}
+
+	last := time.Time{}
+	if digest.LastShutdownAttemptAt != nil {
+		last = digest.LastShutdownAttemptAt.Time
+	}
+
+	if last.IsZero() {
+		last = time.Now()
+	}
+
+	left := ShutdownAttemptResetGrace - time.Since(last)
+	if left <= 0 {
+		return false, 0
+	}
+
+	return true, left
 }

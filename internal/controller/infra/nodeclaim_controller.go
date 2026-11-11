@@ -34,14 +34,11 @@ import (
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
-// ClaimFinalizer is the finalizer the claim controller puts on a claim the moment its phase becomes
-// booting. It is what makes "a boot that has started is never cancelled" true: deleting a booting or
-// ready claim is not an abandonment of the machine, it is the scale-down request, and the finalizer
-// runs the object to completed / failed once the machine is off (docs/design/nodeclaim.md §3).
-//
-// A pending claim carries no finalizer, so canceling a pending claim is a plain delete: nothing is in
-// flight, the object goes, and the unit comes off the target size on that write.
-const ClaimFinalizer = "infra.homecluster.dev/nodeclaim-finalizer"
+// ClaimFinalizer is the finalizer the claim model puts on a claim the moment its phase becomes
+// booting. It is the claim.Finalizer constant, spelled here so the controller that removes it on a
+// landed scale-down names the same string the recorder writes; see internal/claim/recorder.go for
+// the rules and docs/design/nodeclaim.md §3.
+const ClaimFinalizer = claim.Finalizer
 
 // NodeClaimReconciler owns the lifecycle of a NodeClaim: the attempt seed, one live claim per slot,
 // the deadline, the attempt bound, the finalizer of a scale-down, the digest the slot keeps, and the
@@ -83,12 +80,17 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	slot, err := r.slotOf(ctx, nodeClaim)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// The slot is gone, and so is the machine this claim asked for.
-			if _, err := r.recorder().MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonSlotDeleted); err != nil {
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{}, nil
+			// The slot is gone. The machine it named is going with it (the claim's ownerReference
+			// makes the slot's deletion the claim's deletion), so the claim has nothing left to
+			// run: the finalizer comes off and the GC finishes the object. Leaving it on is a claim
+			// stuck in Terminating forever, never retried, with a machine running behind it - and
+			// it is reachable through the documented rollout, which deletes the Node CRs
+			// (docs/design/nodeclaim.md §9), and through garbage collection of a namespace.
+			//
+			// No digest is stamped: the record lives on the slot, and the slot is not there. The
+			// phase move is best-effort for the same reason - it is the story an operator reads when
+			// the claim survives the finalizer removal, not a step the model depends on.
+			return r.releaseDeletedSlot(ctx, nodeClaim)
 		}
 
 		logger.Error(err, "Failed to read the slot of the claim", "claim", nodeClaim.Name)
@@ -112,8 +114,16 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// One live claim per slot. The webhook refuses a second one at admission; this is the same rule
 	// enforced where the API cannot see it (two providers racing, a claim applied by hand, a webhook
 	// that was down). The extra claim fails itself, and the error names the slot.
-	if err := r.refuseExtraLiveClaims(ctx, nodeClaim); err != nil {
+	handled, err := r.refuseExtraLiveClaims(ctx, nodeClaim)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if handled {
+		// This claim is the extra one, and failing it is the whole pass: the object is terminal now,
+		// its TTL collects it, and the copy this pass read is out of date - the pass that writes a
+		// finalizer from it would write one on a dead claim.
+		return ctrl.Result{RequeueAfter: idleResync}, nil
 	}
 
 	// The finalizer arrives with the boot: from the moment the phase is booting, deleting this claim
@@ -129,9 +139,57 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return r.reconcileLive(ctx, nodeClaim, slot)
 }
 
-// reconcileLive enforces the two bounds that end an attempt without a machine - the deadline and the
-// streak of attempts - keeps the slot's digest in step, and asks to be looked at again at the
-// deadline.
+// releaseDeletedSlot ends a claim whose slot (Node CR) is gone: the reason is recorded, and the
+// finalizer comes off, so the ownerReference's garbage collection can finish the object. The
+// SlotDeleted digest is deliberately not stamped - the record lives on the slot, and the slot does
+// not exist - so the claim object itself is the record, and `kubectl get nodeclaim` finds it while
+// its TTL keeps it.
+func (r *NodeClaimReconciler) releaseDeletedSlot(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if phase.IsLive(nodeClaim.Status.Phase) {
+		if _, err := r.recorder().MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonSlotDeleted); err != nil {
+			if client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
+	if !claim.HasFinalizer(nodeClaim) {
+		return ctrl.Result{}, nil
+	}
+
+	// Re-Get: the recorder's move bumped the resourceVersion, and a finalizer removal that lands on
+	// a caller's stale copy is a conflict on the pass that has nothing else left to do.
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if !controllerutil.ContainsFinalizer(fresh, ClaimFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	controllerutil.RemoveFinalizer(fresh, ClaimFinalizer)
+
+	if err := r.Update(ctx, fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	logger.Info("Released the finalizer of a claim whose slot is gone",
+		"claim", nodeClaim.Name, "slot", claim.SlotNameOf(nodeClaim))
+
+	return ctrl.Result{}, nil
+}
+
+// reconcileLive enforces the two bounds that end an attempt without a machine - the boot deadline
+// and the streak of attempts - owns the machine that vanished under a ready claim, keeps the slot's
+// digest in step, and asks to be looked at again at the deadline.
+//
+// Both bounds are bounds on the boot window, and they stop applying at ready: the deadline is the
+// budget for buying a machine, and the attempt bound is the bound on how many machines a slot may be
+// asked to buy in a row, so a claim that has its machine is not destroyed by a budget it already
+// spent, and is not failed by the number it landed on.
 //
 // The deadline is the whole replacement for the v1alpha1 progress watchdog: settle/re-arm/uncordon
 // existed to heal a long-lived slot left pointing at a machine that is not there, and a claim that
@@ -141,7 +199,7 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 	logger := log.FromContext(ctx)
 	recorder := r.recorder()
 
-	if phase.IsLive(nodeClaim.Status.Phase) && claim.IsOverdue(nodeClaim, time.Now()) {
+	if phase.InBootWindow(nodeClaim.Status.Phase) && claim.IsOverdue(nodeClaim, time.Now()) {
 		moved, err := recorder.MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonDeadlineExceeded)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -168,7 +226,7 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 	// The attempt bound, read off the claim: a slot whose streak of attempts is spent buys no further
 	// machine until an attempt lands (SeedAttempt restarts the streak at 1 after one does). This
 	// replaces fsm.StartupAttemptLimit, the ClaimRearmed condition on the slot and its refusal site.
-	if phase.IsLive(nodeClaim.Status.Phase) && nodeClaim.Status.Attempt > claim.MaxConsecutiveAttempts {
+	if phase.InBootWindow(nodeClaim.Status.Phase) && nodeClaim.Status.Attempt > claim.MaxConsecutiveAttempts {
 		moved, err := recorder.MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonAttemptLimitExceeded)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -189,6 +247,27 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 		return r.collect(ctx, nodeClaim, slot)
 	}
 
+	// A ready claim whose machine has vanished has no owner in the input law: the report it derives
+	// is booting, law 1 needs the shutdown state to fire a boot and law 3 needs the machine observed
+	// up to fire a shutdown, and the boot deadline closed on the write that made the claim ready. The
+	// claim controller owns the case, bounded by an observation (see watchMachine).
+	lost, requeue, err := r.watchMachine(ctx, nodeClaim, slot)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if lost {
+		// Re-Get, so the collection below digests the episode that just ended and not the claim as
+		// this pass found it, and hand the terminal claim to the collector: the digest, the finish
+		// time and the TTL are its job, and one pass that records an end is one pass that records it
+		// everywhere.
+		if err := r.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+
+		return r.collect(ctx, nodeClaim, slot)
+	}
+
 	if err := StampDigest(ctx, r.Client, slot, nodeClaim); err != nil {
 		logger.V(1).Info("Failed to stamp the slot's digest of the claim", "claim", nodeClaim.Name, "error", err.Error())
 	}
@@ -198,7 +277,79 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 		res = requeueAt(res, nodeClaim.Spec.DeadlineAt.Time)
 	}
 
+	if requeue != nil {
+		res = requeueAt(res, time.Now().Add(*requeue))
+	}
+
 	return res, nil
+}
+
+// watchMachine owns the machine that disappears under a claim that already reached ready.
+//
+// Nothing else does. phase.Derive reports booting for "ready claim, machine off" and the state
+// machine starts in startingup, where law 1's StartNode is not reachable and law 3's ShutdownNode
+// needs the machine observed up: a ready claim whose machine was deleted in a Hetzner console, by a
+// `kubectl delete node` of a deprovisioned server, or by a pool that was taken away, sits live
+// forever, counted as capacity the autoscaler is paying for, with the reason ClaimReasonMachineGone
+// named in the API and written by nobody.
+//
+// The bound is an observation, not a pass: the first pass that sees the machine off stamps
+// MachineObservedOff, a loss that heals leaves the claim ready and clears the condition, and only a
+// loss that outlasts one boot window (claim.MachineGoneGrace) ends the attempt. The move is the
+// whole cleanup: a terminal claim is not a want, so the input law powers anything that is running
+// off, the slot becomes free, and the next request of the slot is attempt N+1.
+func (r *NodeClaimReconciler) watchMachine(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim, slot *infrav2alpha1.Node) (bool, *time.Duration, error) {
+	logger := log.FromContext(ctx)
+
+	if nodeClaim.Status.Phase != infrav2alpha1.NodeClaimReady {
+		return false, nil, nil
+	}
+
+	key := client.ObjectKeyFromObject(nodeClaim)
+
+	if slot.Status.PowerState == infrav2alpha1.PowerStateOn {
+		if _, err := r.recorder().ClearMachineLoss(ctx, key); err != nil && client.IgnoreNotFound(err) != nil {
+			return false, nil, err
+		}
+
+		return false, nil, nil
+	}
+
+	first, _, err := r.recorder().RecordMachineLoss(ctx, key)
+	if err != nil && client.IgnoreNotFound(err) != nil {
+		return false, nil, err
+	}
+
+	if first.IsZero() {
+		// The condition write did not land, or the claim is gone: the next pass re-reads the
+		// observation, and a loss that is real is old by then.
+		return false, nil, nil
+	}
+
+	grace := claim.MachineGoneGrace()
+
+	if age := time.Since(first); age < grace {
+		left := grace - age
+
+		logger.V(1).Info("The machine of a ready claim is observed off; the loss is being watched",
+			"claim", nodeClaim.Name, "slot", slot.Name, "observedSince", first.String(), "bound", grace.String())
+
+		return false, &left, nil
+	}
+
+	moved, err := r.recorder().MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonMachineGone)
+	if err != nil {
+		return false, nil, err
+	}
+
+	r.eventf(nodeClaim, "ClaimMachineGone",
+		"the machine of slot %s has been observed off for %s, longer than one boot window %s: claim %s is recorded failed, the slot is free, and the next claim of the slot is attempt %d",
+		slot.Name, time.Since(first).Round(time.Second).String(), grace.String(), nodeClaim.Name, nodeClaim.Status.Attempt+1)
+
+	logger.Info("The machine of a ready claim is gone",
+		"claim", nodeClaim.Name, "slot", slot.Name, "observedSince", first.String(), "grace", grace.String())
+
+	return moved, nil, nil
 }
 
 // reconcileDeletion runs the finalizer of a claim a scale-down named.
@@ -214,44 +365,65 @@ func (r *NodeClaimReconciler) reconcileDeletion(ctx context.Context, nodeClaim *
 
 	if slot.Status.PowerState == infrav2alpha1.PowerStateOn {
 		// The machine is up. The slot reconciler owns powering it off; this pass keeps the finalizer,
-		// counts the attempt for the bound, and comes back. The count runs for a live claim too:
-		// a scale-down that named a ready claim spends its shutdown attempts on that claim, which is
-		// what the bound of internal/claim.MaxConsecutiveAttempts bounds (the v1alpha1
-		// ShutdownAttempts condition on the slot, and its two reset sites, are gone with §4).
-		bumped, err := BumpScaleDownAttempt(ctx, r.Client, slot, nodeClaim)
+		// counts the attempt for the bound, and comes back. The count is the claim's
+		// status.shutdownAttempts, a streak of its own: the boot attempts of the episode
+		// (status.attempt) are the record of the machines the request bought, and a shutdown that
+		// will not land does not spend them (docs/design/nodeclaim.md §4).
+		bumped, reset, err := BumpScaleDownAttempt(ctx, r.Client, slot, nodeClaim)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
-		if bumped && nodeClaim.Status.Attempt == claim.MaxConsecutiveAttempts {
+		if bumped && nodeClaim.Status.ShutdownAttempts == claim.MaxConsecutiveAttempts {
 			r.eventf(nodeClaim, "ShutdownAttemptLimitReached",
-				"scale-down of slot %s has spent %d of %d attempts and the machine is still observed up: the controller stops firing the shutdown and records it here, because a shutdown Job that exits 0 without the machine going off is the pool's script, not the controller",
-				slot.Name, claim.MaxConsecutiveAttempts, claim.MaxConsecutiveAttempts)
+				"scale-down of slot %s has spent %d of %d shutdown attempts and the machine is still observed up: the controller stops firing the shutdown for %s, because a shutdown Job that exits 0 without the machine going off is the pool's script, not the controller",
+				slot.Name, claim.MaxConsecutiveAttempts, claim.MaxConsecutiveAttempts, claim.ShutdownAttemptResetGrace.String())
+		}
+
+		if reset {
+			r.eventf(nodeClaim, "ShutdownAttemptStreakReset",
+				"the scale-down of slot %s spent its %d shutdown attempts and the reset grace of %s has passed: the machine is still observed up, so the controller fires the shutdown again - a pool whose script has been fixed is picked up without a hand edit",
+				slot.Name, claim.MaxConsecutiveAttempts, claim.ShutdownAttemptResetGrace.String())
 		}
 
 		logger.V(1).Info("Claim is being deleted and the machine is still up; keeping the finalizer",
-			"claim", nodeClaim.Name, "slot", slot.Name, "phase", string(nodeClaim.Status.Phase))
+			"claim", nodeClaim.Name, "slot", slot.Name, "phase", string(nodeClaim.Status.Phase),
+			"shutdownAttempts", nodeClaim.Status.ShutdownAttempts)
 
 		return ctrl.Result{RequeueAfter: shutdownPollResync}, nil
 	}
 
 	// The machine is off. The scale-down landed: a live claim ends completed, and the digest the slot
-	// keeps says which request it was.
+	// keeps says which request it was. The streak ends with the object that carries it, which is the
+	// reset the v1alpha1 shutdown counter needed a site for and does not exist here.
 	if phase.IsLive(nodeClaim.Status.Phase) {
 		if _, err := recorder.MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimCompleted, reasonForDeletion(nodeClaim)); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	if err := StampDigest(ctx, r.Client, slot, nodeClaim); err != nil {
+	// Re-Get: the recorder's move above wrote the status subresource, and a digest, or a finalizer
+	// removal, built on the copy this pass started with is a guaranteed conflict on the first pass of
+	// every scale-down - and a digest built on the stale copy is the story of the claim as it was
+	// before the scale-down landed, phase and reason both. The removal is the last thing the claim
+	// controller has to do, so the write that lands is the one the GC finishes on.
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if err := StampDigest(ctx, r.Client, slot, fresh); err != nil {
 		logger.V(1).Info("Failed to stamp the slot's digest of the deleted claim", "claim", nodeClaim.Name, "error", err.Error())
 	}
 
-	if controllerutil.ContainsFinalizer(nodeClaim, ClaimFinalizer) {
-		controllerutil.RemoveFinalizer(nodeClaim, ClaimFinalizer)
-		if err := r.Update(ctx, nodeClaim); err != nil && !errors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
+	if !controllerutil.ContainsFinalizer(fresh, ClaimFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	controllerutil.RemoveFinalizer(fresh, ClaimFinalizer)
+
+	if err := r.Update(ctx, fresh); err != nil && !errors.IsNotFound(err) {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	return ctrl.Result{}, nil
@@ -267,14 +439,14 @@ const shutdownPollResync = 15 * time.Second
 // claim of a slot is the one the slot answers for; every older live claim on the same slot is failed
 // with reason Superseded, and the error names the slot, because "two claims want one machine" is an
 // operator-visible bug and not a supported state (docs/design/nodeclaim.md §8).
-func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error {
+func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) (bool, error) {
 	if !phase.IsLive(nodeClaim.Status.Phase) {
-		return nil
+		return false, nil
 	}
 
 	claims, err := claim.ListOfSlot(ctx, r.Client, nodeClaim.Namespace, claim.SlotNameOf(nodeClaim))
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	extras := make([]*infrav2alpha1.NodeClaim, 0, len(claims))
@@ -285,9 +457,9 @@ func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeCla
 			continue
 		}
 
-		// The newest live claim owns the slot; ties break on the name, so the rule is deterministic.
-		if existing.CreationTimestamp.After(nodeClaim.CreationTimestamp.Time) ||
-			(existing.CreationTimestamp.Equal(&nodeClaim.CreationTimestamp) && existing.Name < nodeClaim.Name) {
+		// The newest live claim owns the slot; ties break on the name, so the rule is deterministic
+		// and matches claim.LiveOfSlot's choice of the slot's claim.
+		if isNewerClaim(existing, nodeClaim) {
 			extras = append(extras, nodeClaim)
 
 			break
@@ -296,17 +468,27 @@ func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeCla
 		extras = append(extras, existing)
 	}
 
+	if len(extras) == 0 {
+		return false, nil
+	}
+
+	owner := claim.LiveOfSlot(claims)
+	ownerName := ""
+	if owner != nil {
+		ownerName = owner.Name
+	}
+
 	for _, extra := range extras {
 		if extra.Name == nodeClaim.Name {
 			r.eventf(nodeClaim, "SlotAlreadyClaimed",
 				"slot %s already carries the live claim %s: one live claim per slot, this claim is failed as superseded",
-				claim.SlotNameOf(nodeClaim), extra.Name)
+				claim.SlotNameOf(nodeClaim), ownerName)
 
 			if _, err := r.recorder().MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonSuperseded); err != nil {
-				return err
+				return false, err
 			}
 
-			return nil
+			return true, nil
 		}
 
 		r.eventf(extra, "SlotAlreadyClaimed",
@@ -314,32 +496,74 @@ func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeCla
 			claim.SlotNameOf(extra), nodeClaim.Name)
 
 		if _, err := r.recorder().Move(ctx, client.ObjectKeyFromObject(extra), infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonSuperseded); err != nil {
-			return err
+			return false, err
 		}
 	}
 
-	return nil
+	return false, nil
 }
 
-// ensureFinalizer puts the finalizer on a claim whose boot has started, and only then: the whole
-// point of the finalizer is that a delete of a committed boot is not an abandonment, and a pending
-// claim must stay cheap to cancel (docs/design/nodeclaim.md §3).
-func (r *NodeClaimReconciler) ensureFinalizer(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error {
-	if !controllerutil.ContainsFinalizer(nodeClaim, ClaimFinalizer) {
-		if nodeClaim.Status.Phase == infrav2alpha1.NodeClaimPending {
-			return nil
-		}
-
-		if !phase.IsLive(nodeClaim.Status.Phase) {
-			return nil
-		}
-
-		controllerutil.AddFinalizer(nodeClaim, ClaimFinalizer)
-
-		if err := r.Update(ctx, nodeClaim); err != nil {
-			return err
-		}
+// isNewerClaim is the ordering the model uses everywhere: creation timestamp, with the name breaking
+// a tie so a slot has one newest claim by one formula (claim.LiveOfSlot, StampDigest's digest rule,
+// and this refusal of an extra live claim all ask the same question the same way).
+func isNewerClaim(a, b *infrav2alpha1.NodeClaim) bool {
+	if a.Name == b.Name {
+		return false
 	}
+
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.After(b.CreationTimestamp.Time)
+	}
+
+	return a.Name < b.Name
+}
+
+// ensureFinalizer is the belt of the scale-down finalizer. The writer is the recorder: the
+// pending -> booting move stamps it on the same write that records the phase, so a DeleteNodes in
+// the pass boundary cannot delete a committed boot with no shutdown behind it (M5, and
+// docs/design/nodeclaim.md §3). This pass covers what that writer cannot see: a claim whose phase
+// was landed on by a hand write, or by a move whose metadata write the API server refused.
+func (r *NodeClaimReconciler) ensureFinalizer(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error {
+	if claim.HasFinalizer(nodeClaim) {
+		return nil
+	}
+
+	// Re-Get: the writers that ran before this pass's metadata write (the attempt seed, the
+	// supersede, a move) all bump the resourceVersion, and a finalizer added on a caller's stale
+	// copy is a conflict on a path that has to succeed for the scale-down to be seen at all. The
+	// phase question is asked of the object the cluster has, so a claim the recorder just failed is
+	// never stamped a finalizer.
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+
+	if phase.IsPending(fresh.Status.Phase) || !phase.IsLive(fresh.Status.Phase) {
+		return nil
+	}
+
+	if !fresh.DeletionTimestamp.IsZero() {
+		// The API server refuses a finalizer on an object that is already being deleted, and a claim
+		// that is being deleted has its scale-down running from the finalizer it does have.
+		return nil
+	}
+
+	if controllerutil.ContainsFinalizer(fresh, ClaimFinalizer) {
+		nodeClaim.Finalizers = append([]string(nil), fresh.Finalizers...)
+		nodeClaim.ResourceVersion = fresh.ResourceVersion
+
+		return nil
+	}
+
+	controllerutil.AddFinalizer(fresh, ClaimFinalizer)
+
+	if err := r.Update(ctx, fresh); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+
+	// Keep the caller's copy in step with the write, so a later write of the same pass lands.
+	nodeClaim.Finalizers = append([]string(nil), fresh.Finalizers...)
+	nodeClaim.ResourceVersion = fresh.ResourceVersion
 
 	return nil
 }
@@ -355,8 +579,20 @@ func (r *NodeClaimReconciler) collect(ctx context.Context, nodeClaim *infrav2alp
 	}
 
 	if nodeClaim.Status.FinishedAt == nil {
-		if _, err := r.recorder().MoveOf(ctx, nodeClaim, nodeClaim.Status.Phase, nodeClaim.Status.Reason); err != nil {
+		moved, err := r.recorder().MoveOf(ctx, nodeClaim, nodeClaim.Status.Phase, nodeClaim.Status.Reason)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+
+		if !moved {
+			// The claim already carries the phase it is being moved to, so the recorder's move is a
+			// no-op and writes no clock. A terminal claim with no finishedAt has no instant for its
+			// TTL to start from, and would live forever: stamp the time the collection measures, so a
+			// phase landed on by a writer that stamped no time (a hand write, an apply of a status)
+			// is collected like one the recorder wrote.
+			if _, err := r.recorder().StampFinishedAt(ctx, client.ObjectKeyFromObject(nodeClaim)); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
 		}
 
 		return ctrl.Result{RequeueAfter: idleResync}, nil

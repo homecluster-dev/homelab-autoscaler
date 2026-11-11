@@ -687,10 +687,18 @@ func claimsOfSlot(claims []infrav2alpha1.NodeClaim, slotName string) []infrav2al
 // path with DeleteNodes, not with this one.
 //
 // The floor (spec.minSize) is judged against the target size this request can produce: the current
-// size minus the pending claims it is able to cancel, capped to what exists. A request that can cancel
-// nothing is a no-op success, because cluster-autoscaler calls this entry point precisely when its
-// view of the target size is stale, and a FailedPrecondition it retries forever never corrects that
-// view.
+// size minus the pending claims it is able to cancel, capped to what exists.
+//
+// What the request cannot carry out is not answered with success. The response of the RPC carries no
+// size, so a success is the provider asserting "the size you asked for is in force", and the
+// autoscaler's next move is built on that: it stops asking, and its pending pods sit on a group that
+// is one unit bigger than it believes, while the slot the same autoscaler wants to scale into answers
+// IncreaseSize with FailedPrecondition, no free node slot, for as long as the committed boot takes -
+// up to one boot deadline (12m40s), plus the TTL of the claim that carried it. A group that is
+// already at the requested size is a no-op success; a group whose every live claim is past the
+// cancelable phase is answered with codes.Unavailable, the retryable code: the state is transient by
+// construction (the boot deadline closes every boot, and DeleteNodes closes every ready machine), and
+// the autoscaler's own retry is what picks the decrease up when it becomes possible.
 func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.NodeGroupDecreaseTargetSizeRequest) (*pb.NodeGroupDecreaseTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDecreaseTargetSize called", "nodeGroup", req.Id, "delta", req.Delta)
@@ -720,13 +728,6 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 	currentSize := targetSizeOf(claims)
 	cancellable := claim.PendingOfGroup(claims, req.Id)
 
-	if len(cancellable) == 0 {
-		logger.Info("Nothing to cancel, the target size of the group cannot be decreased by this request",
-			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize, "resultingSize", currentSize)
-
-		return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
-	}
-
 	// Cancelling one pending claim is one unit off the target size, so carrying out the delta means
 	// cancelling -delta of them, and a request that asks for more than exist cancels all of them: the
 	// provider reports success for what it actually did, and cluster-autoscaler reads the new target
@@ -747,6 +748,25 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"decreasing node group %s by %d would take it below its minSize %d (current target size %d, %d claim(s) can be cancelled)",
 			req.Id, req.Delta, minSize, currentSize, toCancel)
+	}
+
+	if len(cancellable) == 0 {
+		if currentSize == 0 {
+			logger.Info("Nothing to cancel, and the group is already at the size the request asks for",
+				"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize)
+
+			return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
+		}
+
+		booting, ready := countPhase(claims, infrav2alpha1.NodeClaimBooting), countPhase(claims, infrav2alpha1.NodeClaimReady)
+
+		logger.Info("Nothing cancellable right now: every live claim of the group is past the pending phase",
+			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize,
+			"bootingClaims", booting, "readyClaims", ready)
+
+		return nil, status.Errorf(codes.Unavailable,
+			"node group %s cannot be decreased by %d right now: its %d live claim(s) are past the cancelable pending phase (%d booting, %d ready) and every one of them is committed - a boot is reversed by its own deadline, a ready machine by DeleteNodes; the request is worth retrying, and the autoscaler's next loop is what picks it up",
+			req.Id, req.Delta, currentSize, booting, ready)
 	}
 
 	cancelled := make([]string, 0, toCancel)

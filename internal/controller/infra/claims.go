@@ -67,11 +67,25 @@ func (w *transitionClaimWriter) MoveClaim(ctx context.Context, nodeClaim *infrav
 // why did it end" after the claim has been collected (docs/design/nodeclaim.md §8).
 //
 // It writes only when the record differs, so a resync of a slot whose last claim has not moved
-// writes nothing. It never stamps a summary of a claim that is not the newest of its slot: the
-// digest is the story of the last episode, and a late write from a claim that has been superseded
-// would rewrite it.
+// writes nothing. It never stamps a summary of a claim that is not the newest of its slot: the digest
+// is the story of the last episode, and a late write from a claim that has been superseded, or from
+// an episode whose collection is landing after the next request was already made, would rewrite it
+// with the older story. The ordering check is claim.LiveOfSlot's rule (newest creation timestamp,
+// ties broken on the name) over every claim of the slot, live or not.
 func StampDigest(ctx context.Context, c client.Client, slot *infrav2alpha1.Node, nodeClaim *infrav2alpha1.NodeClaim) error {
 	if nodeClaim == nil {
+		return nil
+	}
+
+	newest, err := newestClaimOfSlot(ctx, c, slot.Namespace, slot.Name)
+	if err != nil {
+		return err
+	}
+
+	if newest != nil && isNewerClaim(newest, nodeClaim) {
+		// Some other claim of this slot is newer than the one being stamped: its episode is the
+		// story the digest tells, and the pass that writes that one is the writer. A claim that is
+		// itself the newest one is the writer, and stamps.
 		return nil
 	}
 
@@ -93,16 +107,50 @@ func StampDigest(ctx context.Context, c client.Client, slot *infrav2alpha1.Node,
 	})
 }
 
-// BumpScaleDownAttempt counts one more shutdown attempt on the scale-down claim of a slot whose
-// machine the provider still observes up, and stamps the streak onto the slot's digest. The streak
-// is what claim.ScaleDownStreakExhausted bounds, and the count lives on the claim that asked for
-// the scale-down, so it ends when the claim ends.
-func BumpScaleDownAttempt(ctx context.Context, c client.Client, slot *infrav2alpha1.Node, nodeClaim *infrav2alpha1.NodeClaim) (bool, error) {
-	if nodeClaim == nil {
-		return false, nil
+// newestClaimOfSlot returns the newest claim of a slot, by the ordering the model uses everywhere
+// (isNewerClaim: creation timestamp, ties broken on the name so the rule is deterministic). nil when the
+// slot has no claims at all, which is the case of a claim being deleted that no longer has siblings.
+func newestClaimOfSlot(ctx context.Context, c client.Client, namespace, slotName string) (*infrav2alpha1.NodeClaim, error) {
+	items, err := claim.ListOfSlot(ctx, c, namespace, slotName)
+	if err != nil {
+		return nil, err
 	}
 
-	var bumped bool
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	newest := &items[0]
+	for i := range items[1:] {
+		candidate := &items[i+1]
+		if isNewerClaim(candidate, newest) {
+			newest = candidate
+		}
+	}
+
+	return newest, nil
+}
+
+// BumpScaleDownAttempt counts one more shutdown attempt on the scale-down claim of a slot whose
+// machine the provider still observes up, and stamps the streak onto the slot's digest. The streak is
+// what claim.ScaleDownStreakSpent bounds, and the count lives on the claim that asked for the
+// scale-down, so it ends when the claim ends.
+//
+// The count is status.shutdownAttempts, a counter of its own, and never status.attempt: status.attempt
+// is the number of machines this slot has been asked to buy, it is the seed of the next claim's
+// attempt, and a shutdown that will not land must not spend the boot budget of the episode that is
+// draining (docs/design/nodeclaim.md §4).
+//
+// It returns whether the count moved, and whether the move was a reset: a streak that is spent with
+// its grace past starts from 1 again, so a pool whose shutdown script has been fixed is picked up by
+// a later pass. The event that names the reset is the caller's, because the caller is the one that
+// knows the machine is still up.
+func BumpScaleDownAttempt(ctx context.Context, c client.Client, slot *infrav2alpha1.Node, nodeClaim *infrav2alpha1.NodeClaim) (bool, bool, error) {
+	if nodeClaim == nil {
+		return false, false, nil
+	}
+
+	var bumped, reset bool
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &infrav2alpha1.NodeClaim{}
@@ -110,28 +158,41 @@ func BumpScaleDownAttempt(ctx context.Context, c client.Client, slot *infrav2alp
 			return err
 		}
 
-		if fresh.Status.Attempt >= claim.MaxConsecutiveAttempts {
+		if spent, _ := claim.ScaleDownStreakSpent(fresh); spent {
+			// Inside the reset grace of a spent streak: there is nothing to count, and the refusal
+			// (internal/controller/infra/lifecycle.go) is the record.
 			return nil
 		}
 
-		fresh.Status.Attempt++
+		if fresh.Status.ShutdownAttempts >= claim.MaxConsecutiveAttempts {
+			reset = true
+			fresh.Status.ShutdownAttempts = 0
+		}
+
+		fresh.Status.ShutdownAttempts++
+
+		now := metav1.NewTime(time.Now())
+		fresh.Status.LastShutdownAttemptAt = &now
+
 		bumped = true
 
 		return c.Status().Update(ctx, fresh)
 	})
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	if !bumped {
-		return false, nil
+		return false, false, nil
 	}
 
+	// Re-Get, so the caller's copy carries the count that landed and the digest stamped from it
+	// names the attempt this pass bought.
 	if err := c.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim); err != nil {
-		return true, err
+		return true, reset, err
 	}
 
-	return true, StampDigest(ctx, c, slot, nodeClaim)
+	return true, reset, StampDigest(ctx, c, slot, nodeClaim)
 }
 
 // sameDigest compares two digests on the fields an operator reads, so a resync writes nothing.
@@ -143,12 +204,14 @@ func sameDigest(a, b *infrav2alpha1.LastClaimSummary) bool {
 	return a.Name == b.Name &&
 		a.Phase == b.Phase &&
 		a.Attempt == b.Attempt &&
+		a.ShutdownAttempts == b.ShutdownAttempts &&
 		a.Call == b.Call &&
 		a.Group == b.Group &&
 		a.Reason == b.Reason &&
 		sameTime(a.RequestedAt, b.RequestedAt) &&
 		sameTime(a.DeadlineAt, b.DeadlineAt) &&
-		sameTime(a.FinishedAt, b.FinishedAt)
+		sameTime(a.FinishedAt, b.FinishedAt) &&
+		sameTime(a.LastShutdownAttemptAt, b.LastShutdownAttemptAt)
 }
 
 // sameTime compares two optional timestamps, nil included.

@@ -62,11 +62,9 @@ type NodeReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// EventRecorder publishes Kubernetes Events on the Node CR for the scale up/down
-	// transitions the FSM runs and for the status.progress corrections the two rules of
-	// internal/progress make (the settlement of a progress that outlived its machine, and the
-	// observed power that outranks a recorded progress - see internal/progress).
-	// nil records nothing, which is what the unit tests use.
+	// EventRecorder publishes Kubernetes Events on the Node CR for the scale up/down transitions the
+	// FSM runs, and for the corrections the model records on a slot whose report and whose
+	// observation disagree. nil records nothing, which is what the unit tests use.
 	// Built once in cmd/main.go with mgr.GetEventRecorder, the new events API.
 	EventRecorder events.EventRecorder
 }
@@ -240,6 +238,13 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav2alpha1.Node{}).
+		// A NodeClaim is owned by the slot it asks for (the ownerReference internal/claim.New stamps),
+		// so every request, every phase move and every collection enqueues the slot. The input law reads
+		// the claim, so a pass must run when the claim changes: a claim created while the manager was
+		// down boots when it is created and not when something incidentally writes the Node, and a claim
+		// whose lifecycle Job finished during a restart gets the pass that re-fires its event (see
+		// recoverFinishedLifecycleJob).
+		Owns(&infrav2alpha1.NodeClaim{}).
 		Named("node").
 		Complete(r)
 }

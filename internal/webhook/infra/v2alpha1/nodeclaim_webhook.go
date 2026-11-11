@@ -108,7 +108,7 @@ func (v *NodeClaimCustomValidator) validate(ctx context.Context, nodeClaim *infr
 		return nil
 	}
 
-	if !phase.IsLive(nodeClaim.Status.Phase) && nodeClaim.Status.Phase != "" {
+	if !phase.IsLive(nodeClaim.Status.Phase) {
 		// A write that does not open a live claim (a status move to a terminal phase) is never the
 		// second claim on the slot.
 		return nil

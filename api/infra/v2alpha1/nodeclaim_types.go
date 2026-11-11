@@ -105,7 +105,19 @@ const (
 	// ClaimConditionMachineCommitted is True once the startup Job of the attempt exists, i.e. from
 	// pending -> booting on. It is the record that the attempt bought a machine, and that the claim
 	// is no longer cancelable.
+	//
+	// On a terminal move it is read off the edge the claim moved along, and it keeps its meaning:
+	// True for an attempt that ended from booting or ready, because a machine was committed and is
+	// the thing the input law powers off; False for an attempt that ended from pending, because
+	// nothing was ever bought. It is a record for an operator, never an instruction to a
+	// reconciler (claim.Recorder.stampTerminalConditions, docs/architecture/state.md).
 	ClaimConditionMachineCommitted = "MachineCommitted"
+	// ClaimConditionMachineObservedOff is True while the machine of a claim that reached ready is
+	// observed off. Its lastTransitionTime is the instant the loss was first recorded, and it is what
+	// the MachineGone bound is measured from: the observation has to outlast a whole boot window
+	// before the model calls a machine gone, because a reboot shows the same shape and is not one
+	// (docs/design/nodeclaim.md §4). Cleared when the machine comes back.
+	ClaimConditionMachineObservedOff = "MachineObservedOff"
 )
 
 // NodeClaimSpec defines the desired state of NodeClaim: one request for one machine.
@@ -188,8 +200,12 @@ type ClaimRequest struct {
 // NodeClaimStatus defines the observed state of NodeClaim.
 type NodeClaimStatus struct {
 	// Phase is the phase of the claim. See NodeClaimPhase for who writes each move.
+	//
+	// No status default: the status subresource strips `status` from a create, so a default here is
+	// only stamped by the first status write and buys nothing in the window the model cares about. A
+	// claim with no phase is read as pending by phase.IsLive / phase.IsPending, which is the single
+	// place the reading lives (docs/design/nodeclaim.md §3).
 	// +kubebuilder:validation:Enum=pending;booting;ready;failed;completed
-	// +kubebuilder:default=pending
 	// +optional
 	Phase NodeClaimPhase `json:"phase,omitempty"`
 
@@ -205,6 +221,26 @@ type NodeClaimStatus struct {
 	// StartupJobFailed, CancelledByDecreaseTargetSize, NodeDeleted.
 	// +optional
 	Reason string `json:"reason,omitempty"`
+
+	// ShutdownAttempts is how many times the scale-down that named this claim has fired the shutdown
+	// of a machine the provider still observes up. It is a counter of its own, separate from
+	// status.attempt: status.attempt counts machines the request bought (the boot bound of §4), and a
+	// scale-down that cannot land must not spend the boot attempts of the machine it is draining -
+	// that number is the record of the episode, and it seeds the next claim's attempt.
+	//
+	// The streak ends with the claim, and it resets: when the machine is observed off the claim ends
+	// completed, and when a reset grace passes with the machine still up the count goes back to 0 and
+	// the shutdown fires again, so a pool whose shutdown script has been fixed is picked up by the next
+	// pass (docs/design/nodeclaim.md §4, docs/architecture/state.md).
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ShutdownAttempts int32 `json:"shutdownAttempts,omitempty"`
+
+	// LastShutdownAttemptAt is when the last shutdown attempt of this claim was counted. It is the
+	// clock of the reset grace above, and the timestamp an operator reads for "the controller stopped
+	// firing this shutdown when".
+	// +optional
+	LastShutdownAttemptAt *metav1.Time `json:"lastShutdownAttemptAt,omitempty"`
 
 	// FinishedAt is when the claim reached a terminal phase. The TTL is measured from it, and it is
 	// one of the times the slot's digest carries.

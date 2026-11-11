@@ -69,22 +69,53 @@ const (
 )
 
 // AttemptBudget is the operator's budget for one attempt, measured from spec.requestedAt. It is
-// the sum of every deadline one attempt can consume, plus one sleep at the ceiling - the same
-// expression the 0.1.20 progress watchdog derived for the same reason, and the watchdog is gone
-// with this: the budget of a claim is what its deadline enforces.
+// the sum of every deadline one attempt can consume, plus one sleep at the ceiling: the deadline of
+// a claim is what enforces it, and it has to be longer than the attempt it bounds.
 //
-//	job monitor poll + registration wait + readiness gate + margin
-//	JobMonitorPollInterval (30s) + DefaultUncordonTimeout (90s)
-//	  + DefaultReadinessGateTimeout (4m) + MaxUncordonRetryInterval (10s) + 1m = 7m10s
+//	startup Job timeout + job monitor poll + registration wait + readiness gate + margin
+//	DefaultJobTimeout (5m) + JobMonitorPollInterval (30s) + DefaultUncordonTimeout (90s)
+//	  + DefaultReadinessGateTimeout (4m) + MaxUncordonRetryInterval (10s) + 1m = 12m40s
 //
-// The test in this package computes the number from the fsm constants, so growing a deadline
-// without growing the budget fails, and the constants are not copied.
+// The startup Job's own timeout is in the sum because the clock runs from `requestedAt`, i.e. from
+// before the Job exists: one attempt can spend the Job's whole 5m (JobTimeout), then the 90s it takes
+// the node to register, then the 4m of the readiness gate - about 9m50s of deadlines - and a budget
+// of 7m10s kills the claim in the middle of the machine it is still buying. The 0.1.20 progress
+// watchdog excluded the Job timeout for exactly this reason: its grace applied only to a Job that had
+// already finished (internal/progress/watchdog.go, deleted with this model), and a claim's deadline
+// has no such restriction to inherit.
+//
+// The test in this package computes the number from the fsm constants and pins the set they are, so
+// growing a deadline, or dropping one out of the sum, fails.
 func AttemptBudget() time.Duration {
-	return fsm.JobMonitorPollInterval +
+	return fsm.DefaultJobTimeout +
+		fsm.JobMonitorPollInterval +
 		fsm.DefaultUncordonTimeout +
 		fsm.DefaultReadinessGateTimeout +
 		fsm.MaxUncordonRetryInterval +
 		time.Minute
+}
+
+// BudgetConstants is the set AttemptBudget is built from, named: the test asserts the sum of exactly
+// these, so a constant that quietly leaves the budget leaves the set with it.
+func BudgetConstants() map[string]time.Duration {
+	return map[string]time.Duration{
+		"startup Job timeout":      fsm.DefaultJobTimeout,
+		"job monitor poll":         fsm.JobMonitorPollInterval,
+		"registration wait":        fsm.DefaultUncordonTimeout,
+		"readiness gate":           fsm.DefaultReadinessGateTimeout,
+		"uncordon retry ceiling":   fsm.MaxUncordonRetryInterval,
+		"one sleep at the ceiling": time.Minute,
+	}
+}
+
+// MachineGoneGrace is how long the observation "the machine of a ready claim is off" has to hold
+// before the claim is failed with MachineGone. It is one boot window (AttemptBudget), deliberately:
+// a reboot, a kubelet restarting after an upgrade, a machine a provider is slow to report, all show
+// the same shape for minutes, and a model that fails a serving claim on a single observation would
+// scale down a machine that is fine. A machine that stays off for longer than it takes to buy a new
+// one is gone, and the claim that asked for it is the object that says so.
+func MachineGoneGrace() time.Duration {
+	return AttemptBudget()
 }
 
 // DeadlineAt is spec.deadlineAt for a request made at requestedAt for a group with the given
@@ -114,6 +145,49 @@ func Budget(group *infrav2alpha1.Group) *metav1.Duration {
 	d := *group.Spec.MaxNodeProvisionTime
 
 	return &d
+}
+
+// ShutdownAttemptResetGrace is how long a spent scale-down streak keeps refusing the shutdown. Past
+// it, the count restarts and the shutdown fires again: a pool whose shutdown script was broken and
+// has been fixed is picked up by a later pass, without a hand edit, and the bound keeps its teeth
+// against a script that fails every time (30m is 3 attempts of a machine the provider keeps reporting
+// up, at the resync the refusal paces it at).
+//
+// The escape hatch for an operator who does not want to wait for the grace is documented in
+// docs/design/nodeclaim.md §4: zero the counter on the claim's status subresource, and the next pass
+// fires the shutdown.
+const ShutdownAttemptResetGrace = 30 * time.Minute
+
+// ScaleDownStreakSpent reports that a scale-down claim has used its shutdown attempts on a machine
+// the provider still observes up, and returns how long is left of the reset grace. Past the grace the
+// streak is not spent any more: the refusal was a bounded pause, not a sentence, and the machine is
+// asked to go off again (docs/design/nodeclaim.md §4, docs/architecture/state.md).
+//
+// The count is status.shutdownAttempts, and it is a counter of its own: status.attempt counts the
+// machines the request bought, and a shutdown that will not land must not spend the boot attempts of
+// the episode it is draining.
+func ScaleDownStreakSpent(c *infrav2alpha1.NodeClaim) (bool, time.Duration) {
+	if c == nil || c.Status.ShutdownAttempts < MaxConsecutiveAttempts {
+		return false, 0
+	}
+
+	last := time.Time{}
+	if c.Status.LastShutdownAttemptAt != nil {
+		last = c.Status.LastShutdownAttemptAt.Time
+	}
+
+	if last.IsZero() {
+		// A counter with no clock is a counter that started now: refusing for the whole grace on the
+		// strength of a writer that stamped no time is the wrong direction of safe.
+		last = time.Now()
+	}
+
+	left := ShutdownAttemptResetGrace - time.Since(last)
+	if left <= 0 {
+		return false, 0
+	}
+
+	return true, left
 }
 
 // SeedAttempt is the attempt number a new claim of a slot carries: the slot's last attempt + 1
@@ -203,14 +277,16 @@ func Digest(c *infrav2alpha1.NodeClaim) *infrav2alpha1.LastClaimSummary {
 	}
 
 	summary := &infrav2alpha1.LastClaimSummary{
-		Name:       c.Name,
-		Phase:      c.Status.Phase,
-		Attempt:    c.Status.Attempt,
-		Call:       c.Spec.Request.Call,
-		Group:      c.Spec.Request.Group,
-		Reason:     c.Status.Reason,
-		DeadlineAt: c.Spec.DeadlineAt,
-		FinishedAt: c.Status.FinishedAt,
+		Name:                  c.Name,
+		Phase:                 c.Status.Phase,
+		Attempt:               c.Status.Attempt,
+		ShutdownAttempts:      c.Status.ShutdownAttempts,
+		LastShutdownAttemptAt: c.Status.LastShutdownAttemptAt,
+		Call:                  c.Spec.Request.Call,
+		Group:                 c.Spec.Request.Group,
+		Reason:                c.Status.Reason,
+		DeadlineAt:            c.Spec.DeadlineAt,
+		FinishedAt:            c.Status.FinishedAt,
 	}
 
 	if !c.Spec.RequestedAt.IsZero() {

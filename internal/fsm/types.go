@@ -130,9 +130,9 @@ const (
 
 	// MaxUncordonRetryInterval is the ceiling of the exponential backoff the uncordon / readiness
 	// loop sleeps between passes (see setNodeSchedulableWithRetry). It is a named constant because
-	// progress.SettleGracePeriod is derived from it: the grace has to outlast every deadline that
-	// loop can consume, plus one sleep at this ceiling, or the watchdog writes over a progress its
-	// owner is about to record.
+	// claim.AttemptBudget is built from it: the budget of one attempt has to outlast every deadline
+	// that loop can consume, plus one sleep at this ceiling, or a claim is failed at the instant its
+	// own writer is about to record the machine it bought.
 	MaxUncordonRetryInterval = 10 * time.Second
 
 	// StuckTransitionThreshold is how long a transitional state (startingup,
@@ -142,10 +142,9 @@ const (
 
 	// JobMonitorPollInterval is how often the lifecycle Job monitor of a state machine reads
 	// its Job (see monitorJobCompletion), and so how long after a Job finishes the
-	// JobCompleted transition can be. It is a named constant because progress.SettleGracePeriod
-	// is measured against it: the watchdog that settles a slot with no machine and no Job has to
-	// wait out the polls of the writer it defers to, or it stomps a transition that is about to
-	// be recorded by its owner.
+	// JobCompleted transition can be. It is a named constant because claim.AttemptBudget is built
+	// from it: the deadline of a claim has to outlast the polls of the writer it defers to, or it
+	// fails a claim whose transition is about to be recorded by its owner.
 	JobMonitorPollInterval = 30 * time.Second
 )
 

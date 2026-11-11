@@ -764,7 +764,7 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 // machine can take work.
 //
 // It is the documented default of the readiness gate, and the value the chart's Group CRs get by
-// CRD default (api/infra/v1alpha1 GroupSpec.NodeReadinessTaints): the key belongs to the CNI of
+// CRD default (api/infra/v2alpha1 GroupSpec.NodeReadinessTaints): the key belongs to the CNI of
 // the cluster and is not verifiable from this repository, so the gate reads its list from the
 // Group and this constant is only the default in the schema. Cilium stamps the key from v1.9
 // onwards; the deployment this chart ships runs v1.16.x (Stable channel).
@@ -807,7 +807,7 @@ func nodeUsability(kubeNode *corev1.Node, keys []string) string {
 // schedulablePoll is the exponential backoff the uncordon / readiness loop sleeps with: 2s,
 // doubling, capped at MaxUncordonRetryInterval. It is a type so every branch of the loop has one
 // call (poll.wait()), and so the ceiling stays a single named number that
-// progress.SettleGracePeriod is measured against.
+// claim.AttemptBudget is measured from.
 type schedulablePoll struct {
 	interval time.Duration
 	max      time.Duration

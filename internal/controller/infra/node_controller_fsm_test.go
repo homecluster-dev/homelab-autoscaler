@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
@@ -379,31 +380,54 @@ func lifecycleJob(slot *infrav2alpha1.Node, jobPhase string) *batchv1.Job {
 // needs no reset heuristic on the long-lived slot (docs/design/nodeclaim.md §4, the removal of the
 // v1alpha1 ShutdownAttempts condition).
 func TestNodeReconciler_ScaleDownAttemptBound(t *testing.T) {
-	scaleDownDigest := func(attempt int32) *infrav2alpha1.LastClaimSummary {
+	// scaleDownDigest is the record of an episode that left a machine up: the scale-down call, the
+	// terminal phase, and the shutdown attempts it spent, with the clock the reset grace is measured
+	// from. The boot attempts (Attempt) are deliberately not the bound: a shutdown that will not
+	// land must not spend the record of the machines the request bought (M4).
+	scaleDownDigest := func(shutdownAttempts int32, lastAttempt time.Duration) *infrav2alpha1.LastClaimSummary {
+		stamp := metav1.NewTime(time.Now().Add(-lastAttempt))
+
 		return &infrav2alpha1.LastClaimSummary{
-			Name:    "claim-test-node",
-			Phase:   infrav2alpha1.NodeClaimCompleted,
-			Attempt: attempt,
-			Call:    infrav2alpha1.ClaimCallDeleteNodes,
-			Group:   "test-group",
+			Name:                  "claim-test-node",
+			Phase:                 infrav2alpha1.NodeClaimCompleted,
+			Attempt:               1,
+			ShutdownAttempts:      shutdownAttempts,
+			LastShutdownAttemptAt: &stamp,
+			Call:                  infrav2alpha1.ClaimCallDeleteNodes,
+			Group:                 "test-group",
 		}
 	}
 
-	t.Run("the attempts spent on this scale-down stop the retries", func(t *testing.T) {
+	t.Run("the shutdown attempts spent on this scale-down stop the retries", func(t *testing.T) {
 		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
-		node.Status.LastClaim = scaleDownDigest(3)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts, time.Minute)
 		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
 
 		result, err := reconcileTestSlot(t, reconciler)
 		require.NoError(t, err, "the refusal is not an error: the machine is up, the pool does not want it, and the record is on the claim")
 		assert.Equal(t, ctrl.Result{RequeueAfter: refusedResync}, result)
 
-		assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "no fifth shutdown Job for a script that keeps exiting 0")
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "no fourth shutdown Job for a script that keeps exiting 0")
+	})
+
+	t.Run("the bound spent on the boot attempts is not a shutdown bound", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		digest := scaleDownDigest(0, time.Minute)
+		digest.Attempt = 9
+		node.Status.LastClaim = digest
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1,
+			"the attempts a slot spent buying machines do not stop the shutdown of the machine it wants off")
 	})
 
 	t.Run("one attempt short of the bound fires", func(t *testing.T) {
 		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
-		node.Status.LastClaim = scaleDownDigest(2)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts-1, time.Minute)
 		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
 
 		_, err := reconcileTestSlot(t, reconciler)
@@ -412,9 +436,25 @@ func TestNodeReconciler_ScaleDownAttemptBound(t *testing.T) {
 		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1, "the bound is 3, so attempt 3 is fired")
 	})
 
+	t.Run("the grace of a spent streak passed, and the shutdown fires again", func(t *testing.T) {
+		// M4: the refusal is a bounded pause, not a sentence. A pool whose shutdown script has been
+		// fixed is picked up by a later pass, with no hand edit, and the bound keeps its teeth
+		// against a script that fails every time (it is re-spent, and re-paused).
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts, claim.ShutdownAttemptResetGrace+time.Minute)
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1,
+			"past claim.ShutdownAttemptResetGrace the streak is spent no longer, so the shutdown of the fixed script runs")
+	})
+
 	t.Run("a live claim is never refused: its own attempts are counted on it", func(t *testing.T) {
 		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
-		node.Status.LastClaim = scaleDownDigest(3)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts, time.Minute)
 
 		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
 			c.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
@@ -429,6 +469,35 @@ func TestNodeReconciler_ScaleDownAttemptBound(t *testing.T) {
 
 		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1,
 			"a scale-down that names a claim owns the machine, and its attempts are counted on that claim")
+	})
+
+	t.Run("a live claim that spent its own shutdown attempts is refused, for the grace at most", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+			c.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
+			c.Spec.Request.Nodes = []string{"test-node-k8s"}
+		})
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
+		markDeleted(t, reconciler.Client, nodeClaim)
+
+		// The streak the claim controller counts (reconcileDeletion -> BumpScaleDownAttempt), landed
+		// the way that writer lands it.
+		spent := &infrav2alpha1.NodeClaim{}
+		require.NoError(t, reconciler.Get(context.Background(), client.ObjectKeyFromObject(nodeClaim), spent))
+		spent.Status.ShutdownAttempts = claim.MaxConsecutiveAttempts
+		stamp := metav1.NewTime(time.Now())
+		spent.Status.LastShutdownAttemptAt = &stamp
+		require.NoError(t, reconciler.Client.Status().Update(context.Background(), spent))
+
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Equal(t, refusedResync, result.RequeueAfter,
+			"the refusal is paced: no later than the end of the reset grace, and the resync below it")
+
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client),
+			"a claim whose machine will not go off is not re-fired every 15s of its finalizer's poll")
 	})
 }
 

@@ -25,6 +25,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -200,6 +201,8 @@ var _ = Describe("NodeClaim lifecycle", func() {
 
 		Expect(readClaimObject(nodeClaim.Name).Status.Phase).To(Equal(infrav2alpha1.NodeClaimBooting),
 			"the pending -> booting write is the one that created the startup Job: an attempt is a machine bought")
+		Expect(readClaimObject(nodeClaim.Name).Finalizers).To(ContainElements(ClaimFinalizer),
+			"the finalizer lands on the same write as the booting phase (M5): there is no pass boundary in which a DeleteNodes deletes a committed boot with no shutdown behind it")
 		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseBooting),
 			"the slot reports the boot the claim asked for")
 	})
@@ -269,9 +272,11 @@ var _ = Describe("NodeClaim lifecycle", func() {
 
 	// "status.attempt seeds from Node.status.lastClaim.attempt and increments per new claim"
 	It("seeds the attempt of a claim from the slot's digest, and counts each new claim", func() {
+		// Each episode gets its own slot: a slot carries one live claim, and the spec is about the
+		// number the digest of a slot seeds, not about two requests wanting one machine (that pair
+		// has its own spec below).
 		name := slotName("attempt")
 		newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
-		ensureGroup()
 
 		// The slot has failed twice in a row. The digest is the only record of that: the claims
 		// that carried it are collected after their TTL.
@@ -287,11 +292,21 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		Expect(readClaimObject(first.Name).Status.Attempt).To(Equal(int32(3)),
 			"the third consecutive attempt of this slot, seeded from the digest the slot keeps")
 
-		// The next episode of the same slot is attempt 4, and the bound (3) is what fails it:
-		// a bound on attempts is a bound on the consecutive claims of a slot, and it lives on the
-		// request, not on the long-lived slot.
-		stampDigest(name, claim.Digest(readClaimObject(first.Name)))
-		second := createProviderClaim(readSlotObject(name))
+		// The next episode of the same slot is attempt 4, and the bound (3) is what fails it: a
+		// bound on attempts is a bound on the consecutive claims of a slot, and it lives on the
+		// request, not on the long-lived slot. The previous claim has to be out of the way for the
+		// slot to be free again - the provider claims a free slot, and one live claim per slot is
+		// enforced where the API cannot see it.
+		// The digest of the episode is what the next slot's first request reads, and the object that
+		// carried it is out of the way: one live claim per slot.
+		firstDigest := claim.Digest(readClaimObject(first.Name))
+		collectClaim(first.Name)
+
+		secondName := slotName("attempt-next")
+		newSlot(secondName, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		stampDigest(secondName, firstDigest)
+
+		second := createProviderClaim(readSlotObject(secondName))
 		reconcileClaim(second)
 
 		secondAfter := readClaimObject(second.Name)
@@ -303,10 +318,250 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		// An episode that landed restarts the streak: the reset rule reads the object that ends
 		// with the episode, which is why the v1alpha1 condition on the slot and its reset sites
 		// are gone.
-		stampDigest(name, &infrav2alpha1.LastClaimSummary{Name: "a-landed-claim", Phase: infrav2alpha1.NodeClaimReady, Attempt: 4, Call: infrav2alpha1.ClaimCallIncreaseSize})
-		third := createProviderClaim(readSlotObject(name))
+		thirdName := slotName("attempt-landed")
+		newSlot(thirdName, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		stampDigest(thirdName, &infrav2alpha1.LastClaimSummary{Name: "a-landed-claim", Phase: infrav2alpha1.NodeClaimReady, Attempt: 4, Call: infrav2alpha1.ClaimCallIncreaseSize})
+
+		third := createProviderClaim(readSlotObject(thirdName))
 		reconcileClaim(third)
 		Expect(readClaimObject(third.Name).Status.Attempt).To(Equal(int32(1)), "an attempt that bought a usable machine ends the streak")
+	})
+
+	// "a terminal claim is collected after its TTL, and the slot keeps the story"
+	It("collects a terminal claim after its TTL, and leaves the story on the slot", func() {
+		// §8's collection: a pool that scales twice a day writes claims forever, so the TTL is what
+		// keeps `kubectl get nodeclaim` a command an operator wants to run. The slot's digest is the
+		// record that survives the delete.
+		name := slotName("collect")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimFailed, func(c *infrav2alpha1.NodeClaim) {
+			ttl := int32(0)
+			c.Spec.TTLSecondsAfterFinished = &ttl
+		})
+
+		// The fixture landed the phase on the status subresource, so the claim carries no finishedAt.
+		// The first pass stamps the clock the TTL measures from - a terminal phase reached by a
+		// writer that stamped no time has to get one, or the object is never collected and the pool
+		// accumulates - and the collection runs on the pass after it.
+		reconcileClaim(nodeClaim)
+
+		stamped := readClaimObject(nodeClaim.Name)
+		Expect(stamped.Status.FinishedAt).NotTo(BeNil(), "a terminal claim with no clock is given one, so its TTL has a start")
+
+		reconcileClaim(stamped)
+
+		Eventually(func() bool {
+			return claimIsGone(stamped.Namespace, stamped.Name)
+		}, "30s", "200ms").Should(BeTrue(), "a terminal claim past its TTL is deleted")
+
+		digest := readSlotObject(name).Status.LastClaim
+		Expect(digest).NotTo(BeNil(), "the GC is safe because the digest of the episode survives it")
+		Expect(digest.Phase).To(Equal(infrav2alpha1.NodeClaimFailed))
+		Expect(digest.Name).To(Equal(stamped.Name))
+
+		// A claim whose TTL has not passed is kept, and the pass that will collect it is scheduled
+		// off status.finishedAt: the collection is timed, not polled.
+		later := slotName("collect-later")
+		newSlot(later, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		kept := newClaim(readSlotObject(later), infrav2alpha1.NodeClaimCompleted, func(c *infrav2alpha1.NodeClaim) {
+			ttl := int32(3600)
+			c.Spec.TTLSecondsAfterFinished = &ttl
+		})
+
+		result := reconcileClaim(kept)
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0), "the collection is scheduled, not polled")
+		Expect(result.RequeueAfter).To(BeNumerically("<=", time.Hour), "and it is scheduled for the TTL, not for a resync loop")
+		Expect(readClaimObject(kept.Name).Status.Phase).To(Equal(infrav2alpha1.NodeClaimCompleted),
+			"a terminal claim inside its TTL is still readable, which is the point of the TTL")
+	})
+
+	// "a scale-down whose shutdown never lands is counted, bounded, and paused"
+	It("keeps a scale-down that never lands, bounded by its own shutdown attempts", func() {
+		// M4. A shutdown Job that exits 0 without the machine going off is the pool's script, not the
+		// controller's bug. The finalizer cannot release while the machine is up, so the loop is
+		// permanent unless the attempts are counted, bounded, and the bound is a pause with an end.
+		// The bound is status.shutdownAttempts - a counter of its own, because the boot attempts of
+		// the episode are the record of the machines the request bought.
+		name := slotName("stuck-shutdown")
+		slot := newSlot(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+			c.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
+			c.Spec.Request.Nodes = []string{name + "-k8s"}
+		})
+
+		k8sNode(name, true)
+		markForScaleDown(nodeClaim)
+
+		// The first slot pass fires the shutdown: the machine is up and a marked claim is not a want.
+		reconcileSlot(readSlotObject(name))
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(HaveLen(1), "the shutdown the pool's script runs")
+
+		// The finalizer polls the observation. The machine never goes off, so every pass counts one
+		// more shutdown attempt and keeps the finalizer.
+		for pass := 1; pass <= int(claim.MaxConsecutiveAttempts)+2; pass++ {
+			result := reconcileClaim(readClaimObject(nodeClaim.Name))
+			Expect(result.RequeueAfter).To(Equal(shutdownPollResync), "pass %d polls the observation", pass)
+		}
+
+		stuck := readClaimObject(nodeClaim.Name)
+		Expect(stuck.Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady),
+			"a scale-down that has not landed does not end the claim: the machine is still up")
+		Expect(stuck.Finalizers).To(ContainElements(ClaimFinalizer),
+			"the request to power the machine off is kept: a scale-down is reversed, never forgotten")
+		Expect(stuck.Status.ShutdownAttempts).To(Equal(claim.MaxConsecutiveAttempts),
+			"the bound is spent on the shutdown counter, and the refusal is the record")
+		Expect(stuck.Status.LastShutdownAttemptAt).NotTo(BeNil(),
+			"the streak carries the clock its reset grace is measured from")
+		Expect(stuck.Status.Attempt).To(BeNumerically("<", claim.MaxConsecutiveAttempts),
+			"a shutdown that will not land does not spend the boot attempts of the episode (M4)")
+
+		// Past the bound the model stops firing a shutdown that will not land: the slot reconciler
+		// runs the law again, finds the streak spent, and buys no fifth Job.
+		before := len(jobsOfSlot(name, fsm.PhaseShutdown))
+
+		result := reconcileSlot(readSlotObject(name))
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0), "the pause is a requeue, not a silent stop")
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(HaveLen(before),
+			"no fourth shutdown Job for a script that keeps exiting 0")
+
+		// The observation flipping to off is what ends the loop: the scale-down landed, the claim ends
+		// completed, the finalizer comes off, and the object - with the streak it counted - goes away.
+		// The slot's digest is the record that survives it.
+		powerOff(name)
+
+		reconcileClaim(readClaimObject(nodeClaim.Name))
+
+		Eventually(func() bool {
+			return claimIsGone(nodeClaim.Namespace, nodeClaim.Name)
+		}, "30s", "200ms").Should(BeTrue(),
+			"a landed scale-down releases the finalizer, and the marked object is deleted on that write")
+
+		digest := readSlotObject(name).Status.LastClaim
+		Expect(digest).NotTo(BeNil(), "the episode is the slot's story after the claim is gone")
+		Expect(digest.Phase).To(Equal(infrav2alpha1.NodeClaimCompleted))
+		Expect(digest.Reason).To(Equal(infrav2alpha1.ClaimReasonNodeDeleted))
+		Expect(digest.ShutdownAttempts).To(Equal(claim.MaxConsecutiveAttempts),
+			"the attempts the stuck shutdown spent are on the record, and the streak ends with the object")
+	})
+
+	// "a slot deleted while its claim holds the finalizer takes the claim with it"
+	It("releases a claim whose slot is deleted under its finalizer", func() {
+		// B3. The documented rollout deletes the Node CRs (§9), and garbage collection of a namespace
+		// does the same. A claim that holds the finalizer blocks its own deletion with the slot gone:
+		// leaving it there is a claim stuck in Terminating forever, never retried, with the machine it
+		// asked for running behind it. The claim controller has nothing left to run - the record lives
+		// on a slot that does not exist - so the finalizer comes off, and GC finishes the object.
+		name := slotName("slot-deleted")
+		newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		nodeClaim := createProviderClaim(readSlotObject(name))
+		setClaimPhase(nodeClaim, infrav2alpha1.NodeClaimBooting, "")
+
+		// The claim is marked (the scale-down that named it, or the ownerReference's garbage
+		// collection when the slot goes; envtest runs no garbage collector, so the mark is written
+		// here) and the slot is deleted: the pair the rollout produces.
+		markForScaleDown(nodeClaim)
+
+		deleted := readSlotObject(name)
+		Expect(k8sClient.Delete(ctx, deleted)).To(Succeed())
+
+		for pass := 1; pass <= 6; pass++ {
+			current, found := readClaimIfThere(nodeClaim.Namespace, nodeClaim.Name)
+			if !found {
+				break
+			}
+
+			reconcileClaim(current)
+
+			after, still := readClaimIfThere(nodeClaim.Namespace, nodeClaim.Name)
+			if still {
+				Expect(after.Finalizers).NotTo(ContainElements(ClaimFinalizer),
+					"pass %d removes the finalizer: nothing is left that could satisfy it", pass)
+				Expect(after.Status.Reason).To(Equal(infrav2alpha1.ClaimReasonSlotDeleted))
+			}
+		}
+
+		Eventually(func() bool {
+			return claimIsGone(nodeClaim.Namespace, nodeClaim.Name)
+		}, "30s", "200ms").Should(BeTrue(),
+			"a marked object whose finalizer was released is deleted, and the claim is not stuck in Terminating")
+	})
+
+	// "one live claim per slot, enforced by the controller and not only by admission"
+	It("fails the extra live claim of a slot and keeps the newest one", func() {
+		// The webhook refuses a second live claim at admission; this is the same rule where the API
+		// cannot see it - two providers racing, a claim applied by hand, a provider that listed a
+		// stale inventory. The newest live claim owns the slot, and every older one is failed with
+		// reason Superseded, naming the slot and the claim that owns it.
+		name := slotName("two-claims")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+
+		older := newClaimNamed(slot, name+"-claim-a", infrav2alpha1.NodeClaimBooting, nil)
+		time.Sleep(1100 * time.Millisecond) // a second of creation-timestamp resolution, so "newest" is decidable
+		newClaimNamed(slot, name+"-claim-b", infrav2alpha1.NodeClaimBooting, nil)
+
+		reconcileClaim(older)
+
+		superseded := readClaimObject(older.Name)
+		Expect(superseded.Status.Phase).To(Equal(infrav2alpha1.NodeClaimFailed),
+			"two live claims want one machine, and that is an operator-visible bug, not a supported state")
+		Expect(superseded.Status.Reason).To(Equal(infrav2alpha1.ClaimReasonSuperseded))
+		Expect(superseded.Status.FinishedAt).NotTo(BeNil(), "the extra claim is terminal, and its TTL starts now")
+
+		kept := readClaimObject(name + "-claim-b")
+		Expect(kept.Status.Phase).To(Equal(infrav2alpha1.NodeClaimBooting),
+			"the newest live claim is the one the slot answers for")
+
+		// The slot's digest is the newest episode's story, not the late write of the claim that was
+		// just failed as superseded (StampDigest's ordering rule).
+		reconcileClaim(kept)
+		reconcileClaim(readClaimObject(older.Name))
+		Expect(readSlotObject(name).Status.LastClaim.Name).NotTo(Equal(older.Name),
+			"a superseded claim's collection does not rewrite the digest with the older episode")
+	})
+
+	// "a created claim with no phase is live: the window before the first status write"
+	It("counts a created claim with no phase as the live claim of its slot", func() {
+		// M1. The status subresource strips `status` from a create, and the CRD declares no phase
+		// default (a default on a subresource field is only stamped by the first status write), so a
+		// brand-new claim carries no phase at all. phase.IsLive reads that window as pending, and
+		// every reader that decides whether a machine is wanted asks IsLive: TargetSize, IsFree,
+		// ClaimedSlots, the webhook, and these two reconcilers.
+		name := slotName("phase-empty")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		nodeClaim := newClaim(slot, "", nil)
+
+		fresh := readClaimObject(nodeClaim.Name)
+		Expect(fresh.Status.Phase).To(BeEmpty(), "the create carried no status: the controller's first write has not landed")
+
+		// The claim controller treats it as a live claim in the boot window: it seeds the attempt,
+		// the deadline and the bound apply to it, and its digest is stamped.
+		reconcileClaim(fresh)
+
+		seeded := readClaimObject(nodeClaim.Name)
+		Expect(seeded.Status.Attempt).To(Equal(int32(1)),
+			"a phaseless claim is a request the controller seeds, not an object it ignores")
+		Expect(readSlotObject(name).Status.LastClaim.Name).To(Equal(nodeClaim.Name),
+			"the slot's digest is stamped by the pass that seeded the brand-new request")
+
+		// A second live claim on the slot enters the same rule, and the phaseless claim is in the
+		// set the rule reads: an empty phase is live, so the older of the pair - the one with no
+		// phase - is the extra, named and failed by the code that names the slot.
+		time.Sleep(1100 * time.Millisecond) // a second of creation-timestamp resolution, so "newest" is decidable
+		extra := newClaimNamed(slot, name+"-claim-extra", infrav2alpha1.NodeClaimPending, nil)
+
+		reconcileClaim(extra)
+		reconcileClaim(readClaimObject(nodeClaim.Name))
+
+		Expect(readClaimObject(extra.Name).Status.Phase).To(Equal(infrav2alpha1.NodeClaimPending),
+			"the newest live claim is the one the slot answers for")
+		Expect(readClaimObject(nodeClaim.Name).Status.Reason).To(Equal(infrav2alpha1.ClaimReasonSuperseded),
+			"the phaseless claim was in the live set, and lost the ordering: an empty phase is live")
+
+		// The claim the slot answers for boots: law 1 asks the live question, and a request the API
+		// server accepted wants a machine immediately.
+		reconcileSlot(readSlotObject(name))
+		Expect(jobsOfSlot(name, fsm.PhaseStartup)).To(HaveLen(1),
+			"a live claim the API server accepted boots on the pass that reads it: the phase of the claim is not a record a pass has to be handed")
 	})
 
 	// "the derived Node.status.phase never causes an action on its own"
@@ -356,6 +611,107 @@ var _ = Describe("NodeClaim lifecycle", func() {
 
 		reconcileObservation(serving + "-k8s")
 		Expect(readSlotObject(serving).Status.Phase).To(Equal(infrav2alpha1.NodePhaseReady))
+	})
+
+	// "the boot deadline of a ready claim is closed: the machine it bought is not destroyed"
+	It("leaves a ready claim alone when its boot deadline has passed", func() {
+		// B1. The deadline is the budget of the boot window, measured from spec.requestedAt. Every
+		// healthy machine in the pool is requested more than 12m10s before it serves its first pod,
+		// so a deadline that applies to a ready claim is a controller that destroys capacity on a
+		// timer: the machine is force-shut-down, cordoned, and the pool buys it again.
+		name := slotName("ready-overdue")
+		slot := newSlot(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+			overdue := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+			c.Spec.DeadlineAt = &overdue
+		})
+
+		k8sNode(name, true)
+
+		reconcileClaim(nodeClaim)
+
+		ready := readClaimObject(nodeClaim.Name)
+		Expect(ready.Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady),
+			"the deadline bounds the boot: a claim that reached ready owns a machine, and the boot budget says nothing about it")
+		Expect(ready.Status.Reason).To(BeEmpty(), "no DeadlineExceeded on a healthy machine")
+
+		reconcileSlot(readSlotObject(name))
+		reconcileClaim(readClaimObject(nodeClaim.Name))
+
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(BeEmpty(), "no shutdown Job: the machine is wanted")
+		Expect(readK8sNode(name+"-k8s").Spec.Unschedulable).To(BeFalse(), "the serving node is not cordoned")
+		Expect(readClaimObject(nodeClaim.Name).Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady))
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseReady),
+			"the slot keeps reporting the capacity it has")
+	})
+
+	// "a ready claim whose machine is observed off past a boot window is failed: MachineGone"
+	It("fails a ready claim whose machine has been observed off past the grace", func() {
+		// M2. phase.Derive reports booting for a ready claim with the machine off, law 1 needs the
+		// shutdown state to fire a boot and law 3 needs the machine observed up to fire a shutdown:
+		// the case has no owner, and ClaimReasonMachineGone is declared in the API and written by
+		// nobody. The claim controller owns it, bounded by an observation, so a reboot (which shows
+		// the same shape for minutes) is not an attempt that ends.
+		name := slotName("machine-gone")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimReady, nil)
+
+		// The first pass that sees the machine off records the loss and ends nothing.
+		reconcileClaim(nodeClaim)
+
+		watched := readClaimObject(nodeClaim.Name)
+		Expect(watched.Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady),
+			"a machine that is off for one pass is a machine that may be rebooting")
+		observed, seen := claim.MachineLossObservedSince(watched)
+		Expect(seen).To(BeTrue(), "the loss is recorded on the object, so the bound survives a manager restart")
+		Expect(observed).To(BeTemporally("~", time.Now(), time.Minute), "the first pass starts the clock it will outlive")
+
+		// The loss is old: the observation has outlasted a whole boot window.
+		stampMachineLossAge(nodeClaim.Name, claim.MachineGoneGrace()+time.Minute)
+
+		reconcileClaim(readClaimObject(nodeClaim.Name))
+
+		gone := readClaimObject(nodeClaim.Name)
+		Expect(gone.Status.Phase).To(Equal(infrav2alpha1.NodeClaimFailed),
+			"a machine that stays off longer than it takes to buy one is gone")
+		Expect(gone.Status.Reason).To(Equal(infrav2alpha1.ClaimReasonMachineGone))
+		Expect(gone.Status.FinishedAt).NotTo(BeNil(), "a terminal claim carries the time the TTL measures from")
+		Expect(readSlotObject(name).Status.LastClaim.Reason).To(Equal(infrav2alpha1.ClaimReasonMachineGone),
+			"the slot keeps the story of why it is free")
+
+		// A terminal claim is not a want: the slot is free, and the next request of the slot is a
+		// new attempt. The report is the slot pass's output, and the machine is off, so the slot
+		// lands at off and buys nothing.
+		reconcileSlot(readSlotObject(name))
+		Expect(jobsOfSlot(name, fsm.PhaseStartup)).To(BeEmpty(),
+			"a slot whose claim ended is free: nothing boots from a record, and nothing boots for a machine the pool has stopped wanting")
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(BeEmpty(),
+			"the machine is observed off: there is nothing left to power off")
+	})
+
+	// "a lifecycle Job that finished with nobody watching is picked up by the next pass"
+	It("lands a claim whose startup Job finished before the reconciler looked at it", func() {
+		// M3. The Job monitor is a goroutine of the process that ran the transition. A manager that
+		// restarts in that window loses the goroutine and keeps the objects: a booting claim whose
+		// startup Job completed during the restart has no event left to fire, sits at booting until
+		// its deadline fails it, and the machine that booted fine is force-shut-down. The Job is the
+		// fact, so the reconcile reads it.
+		name := slotName("job-recovered")
+		slot := newSlot(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimBooting, nil)
+		k8sNode(name, true)
+
+		job := createLifecycleJob(slot, fsm.PhaseStartup)
+		completeJob(job)
+
+		reconcileSlot(readSlotObject(name))
+
+		landed := readClaimObject(nodeClaim.Name)
+		Expect(landed.Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady),
+			"the finished startup Job of a booting claim is the evidence the readiness gate answers for")
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseReady),
+			"and the slot's report is derived from the claim the recovery moved")
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(BeEmpty(), "a recovered boot is not punished with a shutdown")
 	})
 })
 
@@ -607,4 +963,176 @@ func jobsOfSlot(slotName string, phases ...string) []batchv1.Job {
 	}
 
 	return matches
+}
+
+// ---------------------------------------------------------------------------
+// envtest helpers: the shapes a spec seeds that the API server will not stamp.
+// ---------------------------------------------------------------------------
+
+// newClaimNamed registers a live claim of a slot under a name the spec chooses, so two claims of one
+// slot can be created in a known order (the "newest wins" rule of one-live-claim-per-slot is about
+// creation timestamps, and a name is how a spec says which is which).
+func newClaimNamed(slot *infrav2alpha1.Node, name string, claimPhase infrav2alpha1.NodeClaimPhase, mutate func(*infrav2alpha1.NodeClaim)) *infrav2alpha1.NodeClaim {
+	nodeClaim := &infrav2alpha1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: slot.Namespace,
+			Labels: map[string]string{
+				claimLabelSlot:  slot.Name,
+				claimLabelGroup: readSlotObject(slot.Name).Labels["group"],
+			},
+		},
+		Spec: infrav2alpha1.NodeClaimSpec{
+			SlotRef:     corev1ObjectRef(slot),
+			RequestedBy: "cluster-autoscaler",
+			Request: infrav2alpha1.ClaimRequest{
+				Call:  infrav2alpha1.ClaimCallIncreaseSize,
+				Delta: 1,
+				Group: readSlotObject(slot.Name).Labels["group"],
+			},
+		},
+	}
+
+	if mutate != nil {
+		mutate(nodeClaim)
+	}
+
+	Expect(k8sClient.Create(ctx, nodeClaim)).To(Succeed())
+
+	if claimPhase != "" {
+		setClaimPhase(nodeClaim, claimPhase, "")
+	}
+
+	return nodeClaim
+}
+
+// addFinalizer stamps the scale-down finalizer the way the recorder's pending -> booting write does,
+// for a spec that lands the phase on the status subresource by hand and needs the metadata half of
+// the write present.
+func addFinalizer(name string) {
+	fresh := readClaimObject(name)
+	fresh.Finalizers = append(fresh.Finalizers, ClaimFinalizer)
+	Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+}
+
+// markForScaleDown is NodeGroupDeleteNodes' write on a claim that carries the finalizer: the delete
+// lands the deletionTimestamp, and the object stays for the claim controller to finish. A delete
+// without the finalizer would make the object disappear, and the spec would assert a shape the model
+// never reaches.
+func markForScaleDown(nodeClaim *infrav2alpha1.NodeClaim) {
+	GinkgoHelper()
+
+	addFinalizer(nodeClaim.Name)
+	Expect(k8sClient.Delete(ctx, readClaimObject(nodeClaim.Name))).To(Succeed())
+
+	fresh := readClaimObject(nodeClaim.Name)
+	Expect(fresh.DeletionTimestamp).NotTo(BeNil(), "a scale-down names the machine by marking its claim")
+}
+
+// readClaimIfThere reads a claim, and reports "gone" as not-found without failing the spec: the
+// collection and the garbage-collection paths delete the object, and a spec that polls for the end
+// has to be able to look.
+func readClaimIfThere(namespace, name string) (*infrav2alpha1.NodeClaim, bool) {
+	nodeClaim := &infrav2alpha1.NodeClaim{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, nodeClaim); err != nil {
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the only read failure a spec tolerates on a claim is that it is gone")
+
+		return nil, false
+	}
+
+	return nodeClaim, true
+}
+
+// collectClaim takes a claim out of the way of the next episode of its slot. A pending claim carries
+// no finalizer, so the delete is the cancellation the model prescribes: the object goes, and the slot
+// is free to be claimed again.
+func collectClaim(name string) {
+	GinkgoHelper()
+
+	nodeClaim := readClaimObject(name)
+	Expect(k8sClient.Delete(ctx, nodeClaim)).To(Succeed())
+
+	Eventually(func() bool {
+		return claimIsGone(nodeClaim.Namespace, nodeClaim.Name)
+	}, "30s", "200ms").Should(BeTrue(), "a claim with no finalizer is deleted by the delete")
+}
+
+// claimIsGone is the collection assertion: the object is not there any more.
+func claimIsGone(namespace, name string) bool {
+	_, found := readClaimIfThere(namespace, name)
+
+	return !found
+}
+
+// stampMachineLossAge records the machine-loss condition of a claim with a lastTransitionTime in the
+// past: the shape a claim carries when the loss was first observed long ago. The bound is measured
+// off the object, not off a controller's memory, so a manager restart does not restart the clock,
+// and a spec that wants an old observation writes it the way the writer does.
+func stampMachineLossAge(name string, age time.Duration) {
+	fresh := readClaimObject(name)
+
+	condition := metav1.Condition{
+		Type:               infrav2alpha1.ClaimConditionMachineObservedOff,
+		Status:             metav1.ConditionTrue,
+		Reason:             infrav2alpha1.ClaimReasonMachineGone,
+		Message:            "the spec observed the machine off, and it has been off for the whole grace",
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-age)),
+	}
+
+	replaced := false
+
+	for i := range fresh.Status.Conditions {
+		if fresh.Status.Conditions[i].Type == condition.Type {
+			fresh.Status.Conditions[i] = condition
+			replaced = true
+
+			break
+		}
+	}
+
+	if !replaced {
+		fresh.Status.Conditions = append(fresh.Status.Conditions, condition)
+	}
+
+	Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+}
+
+// completeJob stamps a lifecycle Job succeeded, the way the cluster does when the pod the operator's
+// script runs exits 0. It is the fact the in-process Job monitor reads, and the fact a reconcile
+// re-reads after a restart.
+func completeJob(job *batchv1.Job) {
+	GinkgoHelper()
+
+	fresh := &batchv1.Job{}
+	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(job), fresh)).To(Succeed())
+
+	now := metav1.NewTime(time.Now())
+
+	fresh.Status.StartTime = &now
+	fresh.Status.Succeeded = 1
+	fresh.Status.CompletionTime = &now
+	fresh.Status.Conditions = []batchv1.JobCondition{
+		{
+			Type:               batchv1.JobSuccessCriteriaMet,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+		},
+		{
+			Type:               batchv1.JobComplete,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+		},
+	}
+	Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+}
+
+// powerOff lands the observation of a machine that went off: the provider's power-off, the kubelet
+// stopping its heartbeat, and the observation path writing the slot. The spec's shutdown script is a
+// container envtest will not run, so this is how a spec says "the machine is off now".
+func powerOff(slotName string) {
+	GinkgoHelper()
+
+	fresh := readSlotObject(slotName)
+	fresh.Status.PowerState = infrav2alpha1.PowerStateOff
+	Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
 }

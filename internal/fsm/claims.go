@@ -172,7 +172,7 @@ func (nm *NodeStateMachine) commitAttempt(reason string) {
 		return
 	}
 
-	if nm.claim.Status.Phase != infrav2alpha1.NodeClaimPending {
+	if !phase.IsPending(nm.claim.Status.Phase) {
 		return
 	}
 

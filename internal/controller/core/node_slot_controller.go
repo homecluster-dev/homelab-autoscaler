@@ -167,14 +167,19 @@ func needsStatusSeed(node *infrav2alpha1.Node) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 //
-// What has to be seeded is decided by the spec (spec.desiredPowerState), so the watch uses
-// GenerationChangedPredicate: it lets create events and spec changes through, and ignores
-// updates that only touch fields written by the other reconcilers. A status write bumps the
-// resourceVersion, never the generation, so status-only updates from
-// KubernetesNodeReconciler and the FSM do not re-trigger this reconciler.
+// What has to be seeded is decided by the spec, so the watch uses GenerationChangedPredicate: it
+// lets create events and spec changes through, and ignores updates that only touch fields written by
+// the other reconcilers. In v2alpha1 the spec of a slot carries no runtime intent at all
+// (spec.desiredPowerState is gone with the claim model, docs/design/nodeclaim.md §2), so "the spec
+// changed" is the only question this predicate answers, and it is the right one: a status write bumps
+// the resourceVersion, never the generation, so status-only updates from KubernetesNodeReconciler and
+// the FSM do not re-trigger this reconciler.
 func (r *NodeSlotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav2alpha1.Node{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// A claim is owned by its slot, so the claims of a slot are watched through the slot: a claim
+		// that appears, moves, and is collected never enqueues this reconciler, which owns a report and
+		// not a machine.
 		Named("core-node-slot").
 		Complete(r)
 }

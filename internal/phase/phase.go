@@ -58,8 +58,9 @@ const (
 // It carries no field read from Node.status.phase, and no field read from a record of "what the
 // FSM last did": those are the outputs of this package, never its inputs.
 type Input struct {
-	// Claim is the live NodeClaim of the slot, or nil. A claim in a terminal phase (failed,
-	// completed) is not live and is reported as nil by LiveClaim: a terminal claim is not
+	// Claim is the claim of the slot as its caller read it - the newest live claim of the slot,
+	// including one a scale-down has marked for deletion - or nil. Filtering by phase is LiveClaim's
+	// job, so a caller that hands in a terminal claim is answered as nil: a terminal claim is not
 	// capacity, and it stops being capacity the moment it is recorded.
 	Claim *infrav2alpha1.NodeClaim
 
@@ -81,8 +82,15 @@ type Input struct {
 	ShutdownJobInFlight bool
 }
 
-// LiveClaim returns the claim of the input when it is live (pending, booting, ready and not
-// deleted), and nil otherwise.
+// LiveClaim returns the claim of the input when its phase is live - pending, counting the empty
+// phase of a claim the controller has not written yet, booting, ready - and nil for a terminal claim
+// and for no claim at all.
+//
+// A claim a scale-down has marked IS returned, and that is the point: the mark is not the phase
+// question. The marked claim owns its slot, its boot is committed, and its finalizer is the request
+// that reverses it, which is what the report row "a live claim, marked, observed up -> draining"
+// needs. MarkedForScaleDown below is this question conjoined with the deletion timestamp, and
+// WantsMachine (internal/claim) is the stronger question a boot must not answer to a marked claim.
 func (in Input) LiveClaim() *infrav2alpha1.NodeClaim {
 	if in.Claim == nil {
 		return nil
@@ -97,18 +105,41 @@ func (in Input) LiveClaim() *infrav2alpha1.NodeClaim {
 
 // IsLive reports whether a claim phase means "a machine is wanted": pending, booting and ready are
 // live; failed and completed are terminal, and are not capacity.
+//
+// An empty phase is live, and is read as pending. The status subresource strips `status` from a
+// create, so a claim that has just been created has no phase at all until the claim controller's
+// first write lands: a brand-new request is capacity from the instant it exists, and TargetSize,
+// IsFree, ClaimedSlots and the webhook all have to say so, or a second IncreaseSize claims the same
+// slot. `+kubebuilder:default=pending` on the status does not fix this - a default on a subresource
+// field is only stamped by the first status write - so the reading lives here, where
+// claim.Recorder.Move already defaults an empty phase to pending.
 func IsLive(phase infrav2alpha1.NodeClaimPhase) bool {
 	switch phase {
-	case infrav2alpha1.NodeClaimPending, infrav2alpha1.NodeClaimBooting, infrav2alpha1.NodeClaimReady:
+	case "", infrav2alpha1.NodeClaimPending, infrav2alpha1.NodeClaimBooting, infrav2alpha1.NodeClaimReady:
 		return true
 	default:
 		return false
 	}
 }
 
-// IsTerminal reports whether a claim phase is an end (failed, completed).
+// IsTerminal reports whether a claim phase is an end (failed, completed). A claim with no phase yet
+// is not an end: it is a request the API server has accepted and the controller has not moved.
 func IsTerminal(phase infrav2alpha1.NodeClaimPhase) bool {
 	return !IsLive(phase)
+}
+
+// IsPending reports whether a claim is in the cancelable phase, counting the phase a created claim
+// carries before the first status write (empty) as pending, for the same reason IsLive does.
+func IsPending(phase infrav2alpha1.NodeClaimPhase) bool {
+	return phase == "" || phase == infrav2alpha1.NodeClaimPending
+}
+
+// InBootWindow reports whether a claim is in the phase range `spec.deadlineAt` bounds: the machine
+// is being bought, and has not been bought. A claim that reached `ready` owns a machine, and the
+// boot budget says nothing about it, so the deadline, and the attempt bound that rides on it, stop
+// applying there (docs/design/nodeclaim.md §4).
+func InBootWindow(phase infrav2alpha1.NodeClaimPhase) bool {
+	return IsPending(phase) || phase == infrav2alpha1.NodeClaimBooting
 }
 
 // ObservedOn reports whether the observation says the machine is up.
@@ -170,7 +201,7 @@ func Derive(in Input) infrav2alpha1.NodePhase {
 	if !in.ObservedOn() {
 		// A live claim with the machine off is booted. A claim that was already ready has lost its
 		// machine, and its slot is being bought again: report booting, not ready.
-		if claim.Status.Phase == infrav2alpha1.NodeClaimPending && !in.StartupJobInFlight {
+		if IsPending(claim.Status.Phase) && !in.StartupJobInFlight {
 			return infrav2alpha1.NodePhasePending
 		}
 

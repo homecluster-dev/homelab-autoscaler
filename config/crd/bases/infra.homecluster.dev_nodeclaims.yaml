@@ -272,10 +272,21 @@ spec:
                   one of the times the slot's digest carries.
                 format: date-time
                 type: string
+              lastShutdownAttemptAt:
+                description: |-
+                  LastShutdownAttemptAt is when the last shutdown attempt of this claim was counted. It is the
+                  clock of the reset grace above, and the timestamp an operator reads for "the controller stopped
+                  firing this shutdown when".
+                format: date-time
+                type: string
               phase:
-                default: pending
-                description: Phase is the phase of the claim. See NodeClaimPhase for
-                  who writes each move.
+                description: |-
+                  Phase is the phase of the claim. See NodeClaimPhase for who writes each move.
+
+                  No status default: the status subresource strips `status` from a create, so a default here is
+                  only stamped by the first status write and buys nothing in the window the model cares about. A
+                  claim with no phase is read as pending by phase.IsLive / phase.IsPending, which is the single
+                  place the reading lives (docs/design/nodeclaim.md §3).
                 enum:
                 - pending
                 - booting
@@ -288,6 +299,21 @@ spec:
                   Reason is the one-line outcome, for `kubectl get nodeclaim`: DeadlineExceeded,
                   StartupJobFailed, CancelledByDecreaseTargetSize, NodeDeleted.
                 type: string
+              shutdownAttempts:
+                description: |-
+                  ShutdownAttempts is how many times the scale-down that named this claim has fired the shutdown
+                  of a machine the provider still observes up. It is a counter of its own, separate from
+                  status.attempt: status.attempt counts machines the request bought (the boot bound of §4), and a
+                  scale-down that cannot land must not spend the boot attempts of the machine it is draining -
+                  that number is the record of the episode, and it seeds the next claim's attempt.
+
+                  The streak ends with the claim, and it resets: when the machine is observed off the claim ends
+                  completed, and when a reset grace passes with the machine still up the count goes back to 0 and
+                  the shutdown fires again, so a pool whose shutdown script has been fixed is picked up by the next
+                  pass (docs/design/nodeclaim.md §4, docs/architecture/state.md).
+                format: int32
+                minimum: 0
+                type: integer
             type: object
         required:
         - spec

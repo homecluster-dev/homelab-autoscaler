@@ -111,6 +111,101 @@ func (r *NodeReconciler) lifecycleJobsInFlight(ctx context.Context, node *infrav
 	return startup, shutdown
 }
 
+// recoverFinishedLifecycleJob fires the lifecycle event for a Job of this slot that has finished,
+// and reports whether it did.
+//
+// The monitor of a lifecycle Job is a goroutine of the process that ran the transition: it holds the
+// coordination lock, reads the Job, and fires JobCompleted / JobFailed. A manager that restarts in
+// that window loses the goroutine and keeps the objects, and nothing re-attaches - a booting claim
+// whose startup Job completed during the restart has no event left to fire, sits at booting until its
+// boot deadline fails it, and the machine that booted successfully is then force-shut-down. Same for
+// a shutdown Job that completed: the scale-down's finalizer never releases.
+//
+// The Job is the fact, so the reconcile reads it. The pass only acts on a finished Job whose
+// lifecycle phase matches the state the input law derived (a startup Job for a slot the law puts in
+// startingup, a shutdown Job for one in shuttingdown), and never while the coordination lock is held
+// and unexpired: a lock that is alive means an in-process monitor owns this operation, and stealing
+// its event is the race the lock exists to close. A lock left behind by the restart expires by
+// itself (fsm.DefaultLockTimeout, cleaned at the top of the pass), so the recovery runs within one
+// lock timeout of the restart, and the claim's deadline is far longer than that.
+func (r *NodeReconciler) recoverFinishedLifecycleJob(ctx context.Context, node *infrav2alpha1.Node, stateMachine *fsm.NodeStateMachine, state string) (bool, error) {
+	var wantPhase string
+
+	switch state {
+	case phase.StateStartingUp:
+		wantPhase = fsm.PhaseStartup
+	case phase.StateShuttingDown:
+		wantPhase = fsm.PhaseShutdown
+	default:
+		// ready and shutdown are stable states: nothing is waiting on a Job, and a finished Job of a
+		// bygone operation is not evidence about this one.
+		return false, nil
+	}
+
+	if lock, held := r.checkOperationLock(ctx, node); held && !r.isLockExpired(lock) {
+		// An operation owns this slot in this process. Its own monitor fires its event.
+		return false, nil
+	}
+
+	job := r.finishedLifecycleJob(ctx, node, wantPhase)
+	if job == nil {
+		return false, nil
+	}
+
+	logger := log.FromContext(ctx)
+
+	if job.Status.Succeeded > 0 {
+		logger.Info("Re-firing the completion of a lifecycle Job that finished with nobody watching",
+			"node", node.Name, "job", job.Name, "phase", wantPhase)
+
+		return true, stateMachine.JobCompleted(job)
+	}
+
+	logger.Info("Re-firing the failure of a lifecycle Job that finished with nobody watching",
+		"node", node.Name, "job", job.Name, "phase", wantPhase)
+
+	return true, stateMachine.JobFailed()
+}
+
+// finishedLifecycleJob returns the newest finished lifecycle Job of a slot in the given phase
+// (fsm.PhaseStartup / fsm.PhaseShutdown), and nil when no such Job has a terminal status. A Job the
+// cluster has not stamped a terminal status on is in flight, and is the monitor's business.
+func (r *NodeReconciler) finishedLifecycleJob(ctx context.Context, node *infrav2alpha1.Node, wantPhase string) *batchv1.Job {
+	jobList := &batchv1.JobList{}
+	selector := labels.SelectorFromSet(labels.Set{fsm.LabelNodeCR: node.Name})
+
+	if err := r.List(ctx, jobList, &client.ListOptions{Namespace: node.Namespace, LabelSelector: selector}); err != nil {
+		log.FromContext(ctx).V(1).Info("Failed to list the lifecycle Jobs of the slot",
+			"node", node.Name, "error", err.Error())
+
+		return nil
+	}
+
+	var newest *batchv1.Job
+
+	for i := range jobList.Items {
+		job := &jobList.Items[i]
+
+		if job.Labels[fsm.LabelPhase] != wantPhase {
+			continue
+		}
+
+		if !job.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		if job.Status.Succeeded == 0 && job.Status.Failed == 0 {
+			continue
+		}
+
+		if newest == nil || job.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = job
+		}
+	}
+
+	return newest
+}
+
 // handleStateTransitionsWithFSM fires the lifecycle transition the input law asks for. The law, in
 // the order it is applied (docs/design/nodeclaim.md §6):
 //
@@ -199,7 +294,15 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(
 
 	// Law 2, and every transitional state: ready with a live claim and a usable node is capacity
 	// serving pods; startingup is driven by the Job monitor of the machine that started it;
-	// shuttingdown is driven by its own Job. Nothing fires here.
+	// shuttingdown is driven by its own Job. Nothing fires here - except for the Job that finished
+	// while the manager was not looking (recoverFinishedLifecycleJob), which is the same evidence
+	// read off the same object.
+	if handled, err := r.recoverFinishedLifecycleJob(ctx, node, stateMachine, state); err != nil {
+		return ctrl.Result{}, err
+	} else if handled {
+		return ctrl.Result{}, nil
+	}
+
 	stateMachine.CheckStuckState()
 
 	if fsm.IsTransitionalState(state) {
@@ -210,23 +313,34 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(
 }
 
 // scaleDownStreakRefusal reports that the model has stopped retrying the shutdown of a machine that
-// will not go off, and the requeue that paces it. The bound is the streak the claim digest carries
-// (claim.MaxConsecutiveAttempts), counted on the scale-down claim of the slot and stamped onto the
-// slot by the claim controller: it replaces the v1alpha1 ShutdownAttempts condition on the long-lived
-// slot, with its two reset sites (docs/design/nodeclaim.md §4).
+// will not go off, and the requeue that paces it. The bound is the streak of shutdown attempts
+// (claim.MaxConsecutiveAttempts) counted on the scale-down claim of the slot - status.shutdownAttempts,
+// a counter of its own, not the boot attempts of the episode - and stamped onto the slot's digest, so
+// it survives the claim's collection. It replaces the v1alpha1 ShutdownAttempts condition on the
+// long-lived slot, with its two reset sites (docs/design/nodeclaim.md §4).
+//
+// The refusal is a bounded pause, not a sentence: past claim.ShutdownAttemptResetGrace the streak is
+// spent no longer and the shutdown fires again, so a pool whose shutdown script has been fixed is
+// picked up without a hand edit, and the requeue below is paced to the grace so the resync is what
+// notices. The record is the ShutdownAttemptLimitReached warning on the claim.
 //
 // The refusal is not an error: the slot is up, the pool does not want it, and the pool's shutdown
-// script is what fails. The record is the Warning the claim controller stamps when the streak
-// reaches the bound, and a fixed script is picked up by the next pass, no hand intervention.
+// script is what fails. An operator who wants the next attempt now, and not at the grace, has the
+// documented escape hatch of §4: zero status.shutdownAttempts on the claim, and the next pass fires.
 func (r *NodeReconciler) scaleDownStreakRefusal(ctx context.Context, node *infrav2alpha1.Node, live *infrav2alpha1.NodeClaim) (bool, ctrl.Result) {
 	// A scale-down that names a claim spends its attempts on that claim, and the claim controller
 	// counts them (BumpScaleDownAttempt); the bound applies here, so a shutdown script that exits 0
-	// without powering the machine off is not re-fired every resync.
+	// without powering the machine off is not re-fired every resync. With no claim left to carry the
+	// count, the slot's digest is the record of the episode that left the machine up.
+	spent, left := false, time.Duration(0)
+
 	if live != nil {
-		if live.Status.Attempt < claim.MaxConsecutiveAttempts || live.DeletionTimestamp.IsZero() {
-			return false, ctrl.Result{}
-		}
-	} else if !claim.ScaleDownStreakExhausted(node) {
+		spent, left = claim.ScaleDownStreakSpent(live)
+	} else {
+		spent, left = claim.ScaleDownStreakExhausted(node)
+	}
+
+	if !spent {
 		return false, ctrl.Result{}
 	}
 
@@ -236,20 +350,28 @@ func (r *NodeReconciler) scaleDownStreakRefusal(ctx context.Context, node *infra
 	attempts, claimName, reason := int32(0), "", ""
 
 	if live != nil {
-		attempts, claimName, reason = live.Status.Attempt, live.Name, live.Status.Reason
+		attempts, claimName, reason = live.Status.ShutdownAttempts, live.Name, live.Status.Reason
 	} else if node.Status.LastClaim != nil {
-		attempts, claimName, reason = node.Status.LastClaim.Attempt, node.Status.LastClaim.Name, node.Status.LastClaim.Reason
+		attempts, claimName, reason = node.Status.LastClaim.ShutdownAttempts, node.Status.LastClaim.Name, node.Status.LastClaim.Reason
 	}
 
 	log.FromContext(ctx).Info("Not firing the shutdown: this slot has used its scale-down attempts",
 		"node", node.Name,
 		"attempts", attempts,
 		"limit", claim.MaxConsecutiveAttempts,
+		"resetIn", left.String(),
 		"claim", claimName,
 		"reason", reason,
 		"state", "the machine stays up, the slot keeps its report, and the record is on the claim")
 
-	return true, ctrl.Result{RequeueAfter: refusedResync}
+	// Come back no later than the end of the reset grace, so the pause ends on a pass and not on a
+	// resync that happens to land after it.
+	requeue := refusedResync
+	if left > 0 && left < requeue {
+		requeue = left
+	}
+
+	return true, ctrl.Result{RequeueAfter: requeue}
 }
 
 // claimNameOf / phaseNameOf are the log renderings of a claim that may be nil.

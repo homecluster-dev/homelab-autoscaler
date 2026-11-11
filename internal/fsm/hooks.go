@@ -38,12 +38,16 @@ import (
 // status.phase inside the FSM. That ordering is the invariant the lifecycle rests on: a
 // transition refused by the lock never reaches a writer, so status.phase keeps the stable
 // value it had (ready for a scale-down that lost to a scale-up, shutdown for a scale-up that
-// lost to a scale-down). A progress left in startingup/shuttingdown is not cosmetic: it is
-// excluded from the provider's target size, validateStateTransition gates every transition of
-// the slot out, and nothing in a reconcile heals it - the stuck-transition cleanup the docs
-// used to promise runs on the machine's own backoff record, which a reconciler builds fresh on
-// every pass, so ForceCleanup is never reached from there. The progress of a transitional slot
-// is moved by the operation that put it there, from its own job monitor, and by no one else.
+// lost to a scale-down). A slot left transitional is not cosmetic: the live claim of the slot is
+// the provider's unit of capacity, and an operation in flight is the lifecycle Job this transition
+// created - which is why the transition that refuses has to refuse before it creates, and what it
+// leaves behind is a slot with a Job of the operation that owns the lock, and nothing else. Under
+// v1alpha1 the same shape was a `status.progress` the slot reconciler gated every transition of
+// out (`validateStateTransition`, gone with docs/design/nodeclaim.md §6); under the claim model
+// the state is derived from (claim, observation, Jobs), so a refusal that writes nothing also
+// claims nothing. The transitional slot is moved on by the operation that put it there, from its
+// own job monitor, and - if that monitor died with a manager restart - by the reconcile that reads
+// the Job object (internal/controller/infra/lifecycle.go).
 // That is why a refusal has to happen before a writer, not after it. See
 // cancelLockedTransition and docs/architecture/state.md.
 
@@ -123,9 +127,10 @@ func (nm *NodeStateMachine) cancelLockedTransition(logger logr.Logger, e *fsm.Ev
 // It exists for the one path that holds a slot open longer than the lock's own timeout: the
 // scale-up transition into ready runs setNodeSchedulableWithRetry, which can spend 90s waiting for
 // the node object to register and then 4 minutes on the readiness gate - more than
-// DefaultLockTimeout. A lock that ages out mid-wait is not a lock: the next acquisition takes it
-// over, validateStateTransition cleans it up, and the progress watchdog's lock gate stops
-// protecting the slot while its own grace is measured against the very loop that is running. The
+// DefaultLockTimeout. A lock that ages out mid-wait is not a lock: the next acquisition takes the
+// slot, and a scale-down can then start its Job and its cordon on the machine this loop is still
+// waiting for - the readiness gate and the registration wait together are longer than the lock's
+// own timeout, which is exactly the window the renewal covers. The
 // caller that owns the slot therefore renews it on every pass of that loop, and nothing else does:
 // renewal never acquires, never touches a lock owned by another component, and never resurrects an
 // expired one (see DefaultCoordinationManager.RenewLock).

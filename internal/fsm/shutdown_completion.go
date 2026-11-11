@@ -63,7 +63,8 @@ package fsm
 // supplies, and the autoscaler's gRPC provider is the other side of this repository (it answers
 // cluster-autoscaler about node groups; it does not own a machine's power state). The observation
 // that is reachable is the one the reconcilers already write, so the hook's completion write is
-// conditional on it, exactly as the two rules of internal/progress are:
+// conditional on it, for the same reason the input law of the claim model reads the observation and
+// never a record:
 //
 //   - machineObservedUp reads the slot's last observed status.powerState and the Ready condition of
 //     its corev1.Node. On a completed shutdown Job, that pair says the machine is up;
@@ -88,25 +89,26 @@ package fsm
 //     which is the shape with no better evidence available;
 //   - the retry the refusal releases is bounded. A pool whose shutdown script exits 0 without the
 //     power-off landing cycles Job, refused completion, correction, ShutdownNode, Job, and every pass
-//     of it re-cordons a node that is serving pods: the shutdown-attempt counter the FSM owns
-//     (ShutdownAttemptLimit, internal/fsm/shutdown_attempts.go) stops it at 3 attempts with one
-//     Warning naming the limit, and progress.ReconcileObservedPower paces the loop with an
-//     exponentially growing requeue. Pre-fix this failure was static (a frozen slot); bounded, it is a
+//     of it re-cordons a node that is serving pods: the scale-down streak the claim carries
+//     (status.shutdownAttempts, bounded by claim.MaxConsecutiveAttempts, counted by
+//     BumpScaleDownAttempt in internal/controller/infra/claims.go) stops it at 3 attempts with one
+//     Warning naming the limit, and the refusal of internal/controller/infra/lifecycle.go paces the
+//     loop - for claim.ShutdownAttemptResetGrace at most, after which a fixed script is picked up. Pre-fix this failure was static (a frozen slot); bounded, it is a
 //     bounded number of shutdown Jobs, one Warning, and a slot an operator can read;
 //   - what the hook still cannot do is wait. It runs inside the completion of an operation whose
 //     monitor has already returned, so the precedence is enforced a second time, and with a horizon
-//     that a hook does not have, by progress.ReconcileObservedPower
-//     (internal/progress/observed_power.go): it applies the same rule once the slot's lifecycle Job
-//     has aged out of SettleGracePeriod. That is the backstop, and the split is the one the watchdog
-//     docs draw: this guard keeps a provable lie out of the completion write, the reconciler's rule
-//     corrects a lie that rested.
+//     that a hook does not have, by the observation path and the input law
+//     (internal/phase, internal/controller/core/node_controller.go): an observed on outranks a
+//     recorded off by construction, because the observation is the input and no record is. That is the
+//     backstop, and the split is the one the watchdog docs used to draw: this guard keeps a provable
+//     lie out of the completion write, the observation corrects a lie that rested.
 //
 // The trade accepted with the completion-time bound, stated because it is a real one: a provider whose
 // power-off is asynchronous and lands *after* the script exits presents a heartbeat older than the
 // completion, so the guard calls the machine "shut down" - no. It calls it "up", refuses the
 // completion, and the machine goes off moments later: the cost is one retry (one attempt of the
 // bound), not a lie in the record, because the slot is left at ready with a machine the observation
-// says is up, and progress.ReconcileObservedPower settles the pair once the node object stops
+// says is up, and the observation path settles the pair once the node object stops
 // reporting Ready. The opposite direction - a machine that is up recorded off - is the failure that
 // freezes a slot, and everything in this file is biased towards refusing on a doubt.
 
@@ -174,10 +176,10 @@ const ReasonShutdownNotObserved = "ShutdownNotObserved"
 //
 // From ready, with the claim off - the claim a completed shutdown always carries - the node
 // controller's shutdown branch is reachable again and the next pass runs ShutdownNode, with its
-// coordination lock, its cordon and its Job. That retry is bounded (fsm.ShutdownAttemptLimit: the
-// attempts of one slot are counted by enterShuttingDown, and ShutdownNode refuses past the bound with
-// one Warning), and progress.ReconcileObservedPower backs the precedence up with the horizon a hook
-// does not have.
+// coordination lock, its cordon and its Job. That retry is bounded (the scale-down streak of the
+// claim, status.shutdownAttempts, bounded by claim.MaxConsecutiveAttempts and refused by
+// internal/controller/infra/lifecycle.go for claim.ShutdownAttemptResetGrace at most), and the
+// observation path backs the precedence up with the horizon a hook does not have.
 func (nm *NodeStateMachine) refuseUnobservedShutdown(ctx context.Context, job *batchv1.Job) bool {
 	if !nm.machineObservedUp(ctx, job) {
 		return false
@@ -203,7 +205,7 @@ func (nm *NodeStateMachine) refuseUnobservedShutdown(ctx context.Context, job *b
 // client in this path - the power operation is the lifecycle Job the operator supplies, and the
 // autoscaler's gRPC provider answers cluster-autoscaler about node groups, it does not own a
 // machine's power state - so the hook's verification is conditional on the reconciler's observation,
-// and progress.ReconcileObservedPower is the backstop that applies the same precedence once the
+// and the observation path is the backstop that applies the same precedence once the
 // observation has had time to settle.
 //
 // A read that fails is not evidence: the completion is recorded as it always was. A slot with no
@@ -251,7 +253,7 @@ func (nm *NodeStateMachine) machineObservedUp(ctx context.Context, job *batchv1.
 // lands *after* the script exits. The script has returned, the Job has completed, and the kubelet's
 // last heartbeat is older than that completion only if the machine died after the Job finished - so
 // the machine is reported "still up" and the completion is refused once. That costs one retry (and one
-// attempt of the shutdown bound), and progress.ReconcileObservedPower is the backstop for a pair that
+// attempt of the scale-down bound), and the observation path is the backstop for a pair that
 // rests: by the time the Job's grace has aged out, the machine is off, its node object is gone or
 // NotReady, and there is nothing left to correct. The asymmetry is deliberate - a false "up" costs a
 // bounded retry, a false "off" is the frozen slot this file exists to keep out of the record.
@@ -283,9 +285,8 @@ func shutdownObservationBound(node *infrav2alpha1.Node, job *batchv1.Job) (time.
 // (lastShutdownTime). On a node whose clock is skewed the comparison shifts by the skew - a machine
 // running minutes behind can have its "up" read as "was off", and one minutes ahead can have a corpse
 // read as "up". This repository cannot read the kubelet's clock, and the two directions are not equally
-// expensive: the false "off" costs a bounded retry (the shutdown attempt bound, plus
-// progress.ReconcileObservedPower's grace, which measures the same window on the manager's clock and
-// the Job's), and the false "up" is what the guard exists to refuse. A cluster with real skew between
+// expensive: the false "off" costs a bounded retry (the scale-down attempt bound, plus
+// the resync the observation path runs, which measures the same window on the manager's clock), and the false "up" is what the guard exists to refuse. A cluster with real skew between
 // its nodes and its control plane should be fixed at the source (the kubelet's own clock discipline),
 // not worked around here.
 func kubeletIsLive(kubeNode *corev1.Node, observedAfter time.Time) bool {

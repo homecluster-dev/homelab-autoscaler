@@ -308,9 +308,24 @@ type LastClaimSummary struct {
 	Phase NodeClaimPhase `json:"phase,omitempty"`
 
 	// Attempt is the attempt number the claim carried (1..N for the slot). Seeding the next
-	// claim reads it; see the reset rule in internal/controller/infra/nodeclaim_controller.go.
+	// claim reads it; see the reset rule in internal/claim.SeedAttempt.
 	// +optional
 	Attempt int32 `json:"attempt,omitempty"`
+
+	// ShutdownAttempts is the scale-down attempts the claim had spent when the episode ended. It is
+	// the record the slot reconciler reads to decide whether to keep firing a shutdown on a machine
+	// that stays up when no claim of the slot is left to carry the count (see
+	// claim.ScaleDownStreakSpent), and it is a counter of its own: the boot attempts of the episode are
+	// in Attempt, and a shutdown that will not land must not spend them.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ShutdownAttempts int32 `json:"shutdownAttempts,omitempty"`
+
+	// LastShutdownAttemptAt is when the last of those attempts was counted. The streak reset's grace is
+	// measured from it, so a slot whose pool script has been fixed is not sentenced by the attempts of
+	// the episodes that ended (docs/design/nodeclaim.md §4).
+	// +optional
+	LastShutdownAttemptAt *metav1.Time `json:"lastShutdownAttemptAt,omitempty"`
 
 	// Call is the gRPC entry point that created the claim (IncreaseSize, DecreaseTargetSize,
 	// DeleteNodes) - the attribution of the request that owned this slot.
