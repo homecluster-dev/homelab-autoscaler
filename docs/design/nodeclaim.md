@@ -198,7 +198,7 @@ spec:
     call: IncreaseSize
     delta: 1
     group: remote-workers
-  deadlineAt: "2026-03-04T09:45:25Z"   # 7m10s budget, see §4
+  deadlineAt: "2026-03-04T09:50:25Z"   # 12m10s budget, see §4
 status:
   phase: booting
   attempt: 2
@@ -215,9 +215,17 @@ behind it, and is recorded on the slot, not on the claim (§6).
 | --- | --- | --- | --- | --- |
 | `pending` | Claim exists, no lifecycle Job has been created. The only cancelable phase. | `booting`, `completed`, `failed` | claim controller | Nothing yet. The slot is capacity and is counted. `StartNode` runs on the next pass: coordination lock, startup Job, power-on. |
 | `booting` | The startup Job exists; the power-on has been asked for. Committed. | `ready`, `failed` | The Job monitor of the machine that started it (`monitorJobCompletion` → `JobCompleted` / `JobFailed` / `JobTimeout`) | The machine is booting. The readiness gate holds the claim at `booting` until the node is Ready and free of the pool's readiness taints. |
-| `ready` | The machine is up, joined, and can take the pool's work. | `completed`, `failed` | observation reconciler (the machine arrives), the provider (a scale-down lands on it), the deadline watchdog (the machine is gone) | The slot serves pods. A scale-down names it in `DeleteNodes`, which moves it to `completed` and powers the machine off. |
-| `failed` | The attempt did not produce a usable machine, and never will. Terminal. | — | claim controller (Job failed, attempt limit, deadline, machine vanished) | Not capacity. The machine is force-shut-down so an overdue boot cannot join and start serving. The next claim on the slot is attempt N+1. |
+| `ready` | The machine is up, joined, and can take the pool's work. | `completed`, `failed` | the readiness gate of the startup transition (`afterJobCompleted`, the only writer of the move), the provider (a scale-down lands on it), the claim controller's machine-loss bound (§4) | The slot serves pods. A scale-down names it in `DeleteNodes`, which moves it to `completed` and powers the machine off. |
+| `failed` | The attempt did not produce a usable machine, and never will. Terminal. | — | the lifecycle transition (Job failed / timed out, readiness-gate timeout), the claim controller (deadline, attempt limit, machine gone, `Superseded` for a second live claim on the slot) | Not capacity. The machine is force-shut-down so an overdue boot cannot join and start serving. The next claim on the slot is attempt N+1. |
 | `completed` | The claim ended with the machine it asked for available. Terminal. | — | provider (`DecreaseTargetSize`, `DeleteNodes`), claim controller (a hand-deleted machine, a manual claim) | Not capacity. The machine is off, or is being drained and powered off. |
+
+A claim created by the provider carries **no phase at all**: the status subresource strips
+`status` from a create, and a default on a subresource field is only stamped by the first status
+write, so `+kubebuilder:default=pending` buys nothing in that window. The window is read as
+`pending` by the one predicate every reader asks (`phase.IsLive`, `phase.IsPending`), so a
+brand-new request is capacity from its create: `TargetSize` counts it, `IsFree` refuses the slot
+to a second `IncreaseSize`, and `DecreaseTargetSize` can cancel it. A claim whose phase is read
+as "not live" in that window is a slot two requests can claim.
 
 **`pending` is cancelable and `booting` is committed.** A boot that has started is never
 cancelled: the startup Job, the coordination lock, the cordon, the node object and the machine are
@@ -229,10 +237,14 @@ and no lock). Under this model:
 
 - Canceling a `pending` claim is deleting it. Nothing is in flight, the controller drops it, the
   unit comes off the target size on the same write.
-- Canceling a `booting` claim is not possible. The claim controller's finalizer is on the object
-  the moment the phase becomes `booting`, so a delete is not an abandonment: it runs to
-  `ready` or `failed`, and the machine is powered off by the shutdown path. A boot is reversed,
-  never interrupted.
+- Canceling a `booting` claim is not possible. The finalizer lands on the **same write** that
+  records the `booting` phase (`claim.Recorder.closeBootWindow`), not on a later pass of the claim
+  controller, so there is no window in which a `DeleteNodes` deletes a committed boot with no
+  shutdown behind it. A delete is therefore not an abandonment: the claim runs to `ready` or
+  `failed`, and the machine is powered off by the shutdown path. A boot is reversed, never
+  interrupted. The claim controller's own `ensureFinalizer` is the belt for a phase a hand write
+  landed, and it never stamps a finalizer on a claim that is terminal, pending, or already being
+  deleted.
 
 The `pending → booting` edge is also the attempt boundary: incrementing `status.attempt` is part
 of the same write that creates the startup Job, so an attempt is a machine bought and nothing
@@ -246,16 +258,28 @@ A claim is born with a budget. The budget is the operator's, measured from
 `spec.requestedAt`:
 
 ```
-budget = job monitor poll + registration wait + readiness gate + margin
-       = JobMonitorPollInterval (30s) + DefaultUncordonTimeout (90s)
+budget = startup Job timeout + job monitor poll + registration wait + readiness gate + margin
+       = DefaultJobTimeout (5m) + JobMonitorPollInterval (30s) + DefaultUncordonTimeout (90s)
          + DefaultReadinessGateTimeout (4m) + MaxUncordonRetryInterval (10s) + 1m
-       = 7m10s
+       = 12m10s
 ```
 
-That is `progress.SettleGracePeriod` (`internal/progress/watchdog.go`), the same expression, for
-the same reason: it is the sum of every deadline one attempt can consume, plus one sleep at the
-ceiling. A test computes it from the four constants, so growing a deadline without growing the
-budget fails.
+It is the same *kind* of expression the 0.1.20 progress watchdog derived for the same reason —
+the sum of every deadline one attempt can consume, plus one sleep at the ceiling — and the
+watchdog is gone with this model: the budget of a claim is what its deadline enforces. The
+startup Job's own timeout is in the sum, because the clock runs from `spec.requestedAt`, i.e.
+from **before the Job exists**. One attempt can spend the Job's whole 5m (the Job's timeout is
+`DefaultJobTimeout`, and `JobTimeout` is a reachable event), then the 90s it takes the node to
+register, then the 4m of the readiness gate: about 9m50s of deadlines in series. A budget of
+7m10s — the first sketch of this section, and the number the watchdog's grace used, which was
+safe there because the grace applied only to a Job that had **already finished**
+(`internal/progress/watchdog.go`, deleted) — fails a claim in the middle of the machine it is
+still buying, and the machine that boots an instant later is force-shut-down as overdue.
+
+A test computes the number from the fsm constants, and asserts the **set** the sum is built from
+by name (`claim.BudgetConstants`), so growing a deadline without growing the budget fails, and so
+does quietly dropping a member of the set: the assertion that a budget minus one constant is not
+the budget is the one that catches the 7m10s arithmetic.
 
 It is **floored by `Group.spec.maxNodeProvisionTime`**:
 
@@ -272,13 +296,58 @@ waiting for it, and the autoscaler's answer to a group that stopped growing is a
 `maxNodeProvisionTime` is copied onto the claim when it is created, so a claim says what budget
 was in force, and a pool that changes the number does not rewrite history.
 
-**Overdue means `failed`, and `failed` means force shutdown.** When the deadline passes with the
-claim at `pending` or `booting`, the claim controller records `failed` with
+**Overdue means `failed`, and `failed` means force shutdown — for a claim in the boot window.**
+When the deadline passes with the claim at `pending` (including the empty phase of a claim whose
+first status write has not landed) or `booting`, the claim controller records `failed` with
 `reason: DeadlineExceeded` and runs the shutdown path on the machine: cordon, shutdown Job, power
 off. The force shutdown is the point of the deadline — a boot that has overrun is a machine that
 may boot into a cluster that no longer wants it and starts serving pods on capacity the
 autoscaler has already given up on. The machine goes off, the slot becomes free, the next claim is
 attempt N+1.
+
+The deadline bounds the **boot**, not the machine's life. `phase.InBootWindow` is the range the
+deadline, and the attempt bound that rides on it, apply to, and the `booting → ready` write
+clears `spec.deadlineAt` (`claim.Recorder.closeBootWindow`): a claim that reached `ready` owns a
+machine, every healthy machine in a homelab pool is requested more than 12 minutes before it
+serves its first pod, and a CRD whose deadline field still names an instant in its past is a
+healthy unit that every later reader — the controller, the digest, `kubectl get nodeclaim` — reads
+as an overdue attempt. Destroying capacity on a timer is the bug this sentence closes.
+
+### The two bounds that outlive the boot window
+
+**A ready claim whose machine is gone.** `ready` with the machine observed off is the one shape
+the input law has no transition for: the report it derives is `booting`, law 1's `StartNode` is
+not reachable from `startingup`, law 3 needs the machine observed up, and the boot deadline
+closed on the write that made the claim ready. A machine deleted in a Hetzner console, a
+deprovisioned server, or a `kubectl delete node` leaves a live claim, a slot reported `booting`,
+and a unit the autoscaler pays for, with `reason: MachineGone` declared in the API and written by
+nobody. The claim controller owns the case, bounded by an **observation** and not by a pass
+(`NodeClaimReconciler.watchMachine`): the first pass that sees the machine off stamps
+`MachineObservedOff` on the claim, a machine that comes back clears it and the claim stays
+`ready`, and an observation that outlasts `claim.MachineGoneGrace` — one boot window, the same
+horizon as the deadline, deliberately: a reboot is not an attempt that ends — records
+`failed` / `MachineGone`. The clock is on the object, so a manager restart does not restart it.
+
+**A scale-down whose shutdown never lands.** The shutdown Job is a script, and it can exit 0 with
+the machine observed up (the pool's wrapper swallows the power-off). The claim's finalizer cannot
+release, so the poll is permanent unless the attempts are counted and bounded. They are counted on
+`status.shutdownAttempts` — a counter of its own, never `status.attempt`, which is the record of
+the machines the request bought and the seed of the next claim's number. Past
+`claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that will not land, and
+the claim carries the `ShutdownAttemptLimitReached` warning.
+
+The refusal is a bounded pause: past `claim.ShutdownAttemptResetGrace` (30m) the streak is spent
+no longer, the count restarts, and the shutdown fires again, so a pool whose script has been fixed
+is picked up by a later pass with no hand edit, and the refusal's requeue is paced to the grace so
+the pause ends on a pass. The streak also resets when the observation flips — a machine observed
+off ends the claim `completed`, and the counter dies with the object that carried it, which is why
+there is no reset heuristic on the slot. The manual escape hatch, for an operator who wants the
+next attempt now, is one command because the count lives on the request:
+
+```bash
+kubectl patch nodeclaim <claim> -n homelab-autoscaler-system --subresource=status --type=merge \
+  -p '{"status":{"shutdownAttempts":0,"lastShutdownAttemptAt":null}}'
+```
 
 ### Attempts
 
@@ -290,7 +359,10 @@ Attempts are a property of the request, not of the slot:
   (§3), so it counts machines bought, not reconcile passes.
 - A bound on attempts is a bound on consecutive claims; there is no counter on the slot to
   accumulate, and no reset heuristic, because the object that carries the count dies with the
-  episode.
+  episode. The bound is enforced on a claim in the boot window: a claim that has its machine
+  (`ready`) is not failed by the number it landed on.
+- A scale-down's attempts are a **separate** count, `status.shutdownAttempts`, on the claim that
+  asked for the scale-down, with the same bound and a bounded pause (§4).
 
 | Today | Under NodeClaim |
 | --- | --- |
@@ -306,12 +378,36 @@ Attempts are a property of the request, not of the slot:
 | --- | --- | --- |
 | `NodeGroupTargetSize` | `targetSizeOf` counts a slot when `spec.desiredPowerState: on` **or** its progress is not one of `shuttingdown`/`shutdown`/`startingup` (`countsTowardsTargetSize`, `internal/grpcserver/server.go`) | The count of **live claims** for the group: `pending` + `booting` + `ready`. No progress values appear in the arithmetic. |
 | `NodeGroupIncreaseSize(delta)` | Validates `delta > 0`, refuses a request that crosses `maxSize` (the slot count), then claims the **first** free slot it finds and returns: one slot per call, whatever `delta` says (`internal/grpcserver/server.go`) | Creates `delta` claims on `delta` free slots (free = no live claim), each with the request attributed, `attempt` seeded, `deadlineAt` set. The `maxSize` check is `liveClaims + delta > slots`. |
-| `NodeGroupDecreaseTargetSize(delta)` | Cancels slots matching `isStartingUpSlot` (`on` + observed `off` + `progress: startingup`) by writing `spec.desiredPowerState: off`, oldest startup first, capped to what exists, floor judged on the achievable size | Cancels `|delta|` claims in phase **`pending`** — deletes them, no finalizer, the unit comes off the target size on that write. **Never a `booting` claim** (§3). The cancellation is typed and attributed: it says which call, which delta, which group. |
+| `NodeGroupDecreaseTargetSize(delta)` | Cancels slots matching `isStartingUpSlot` (`on` + observed `off` + `progress: startingup`) by writing `spec.desiredPowerState: off`, oldest startup first, capped to what exists, floor judged on the achievable size | Cancels `|delta|` claims in phase **`pending`** (including the empty phase of a claim whose first status write has not landed) — deletes them, no finalizer, the unit comes off the target size on that write. **Never a `booting` claim** (§3). A request that can cancel nothing is **not** answered with success (§5.1). The cancellation is typed and attributed: it says which call, which delta, which group. |
 | `NodeGroupDeleteNodes(nodes)` | Writes `spec.desiredPowerState: off` on each named slot, floor judged against `targetSizeOf` | Records the request on each named slot's claim (`request.call: DeleteNodes`, `request.nodes`) and cancels it: a `pending` claim is deleted, a `booting`/`ready` claim is deleted through its finalizer, which runs the shutdown path (cordon, shutdown Job) and then releases. Draining stays cluster-autoscaler's — it evicts before calling `DeleteNodes`, and `ToBeDeletedByClusterAutoscaler` is observed and recorded by
 `internal/autoscaler/markers.go`. |
 | `NodeGroupNodes` | Instances are derived from the presence of a `corev1.Node` plus the spec: `creating` (claim, no node object), `running` (node object, claimed on), `deleting` (node object, claimed off); a slot with no node object and no claim is not reported | **Contract unchanged.** `creating` = a live claim in `pending`/`booting` with no `corev1.Node`; `running` = `ready`; `deleting` = a claim marked for scale-down. |
 | `NodeGroupTemplateNodeInfo` | Built from a live node or a placeholder fed by `spec.nodeCapacity` (`placeholderTemplateNode`, `applyTemplateCapacity`) | **Contract unchanged.** Template synthesis reads `Node.spec` only, which is what makes it correct in v2: the config object is a config object. |
 | `NodeGroupForNode`, `NodeGroups`, pricing, `GetOptions` | Unchanged | Unchanged. |
+
+### 5.1 The decrease that can cancel nothing
+
+`NodeGroupDecreaseTargetSize`'s response carries no size, so a success is the provider asserting
+"the size you asked for is in force". The entry point cancels `pending` claims only, and a group
+whose live claims are all `booting` or `ready` has nothing to cancel. Answering that with success
+is a lie with a long tail: cluster-autoscaler stops asking for the decrease, keeps paying for a
+unit it asked away, and its next `IncreaseSize` for the same slot is answered
+`FailedPrecondition … no free node slot` — a permanent-looking error for as long as the committed
+boot takes, up to one boot deadline (12m10s) plus the TTL of the claim that carried it.
+
+So the provider answers what it did:
+
+- a group with no live claim is already at the requested size: a no-op **success**;
+- a group whose every live claim is past the cancelable phase: **`codes.Unavailable`**, naming how
+  many claims are booting and how many are ready. The state is transient by construction — a boot
+  is reversed by its own deadline, a ready machine by `DeleteNodes` — and `Unavailable` is the
+  code cluster-autoscaler retries, so the decrease is carried out when it becomes possible;
+- a decrease that would take the group under `spec.minSize`: `codes.FailedPrecondition`, as before.
+  That one is not retryable, and it should not be: the floor is a declaration.
+
+`DecreaseTargetSize` is never the way to take a `ready` machine away. That path is
+`DeleteNodes`, which drains first (cluster-autoscaler evicts the pods, then calls), and the
+claim's finalizer is what makes the request non-forgettable (§3).
 
 **A `failed` or overdue claim is not counted.** The target size counts live claims, so the state
 "the autoscaler is paying for a machine that never arrived, forever" has no place to exist in.
@@ -352,13 +448,16 @@ Three consequences, each of which is a rule in `docs/architecture/state.md` toda
   tie-break between writers of one field: it is the only reading, and the field is a report. The
   four-rule authority order collapses to two writers with disjoint jobs — the claim controller
   moves claims, the observation reconciler moves reports.
-- **The progress watchdog's remaining job is exactly "the claim passed its deadline".** The
-  settle / re-arm / uncordon trio in `internal/progress/watchdog.go` exists to heal a long-lived
-  slot left pointing at a machine that is not there. A claim that produced nothing has a deadline,
-  and the deadline is the heal: `failed`, force shutdown, slot free, attempt N+1. The cordon
-  safety net (`CordonReconciled`) stays where the drain path leaves a cordoned node with no
-  machine behind it, and stays small: a cordoned node is invisible to cluster-autoscaler's
-  scale-down, so it is paid for forever.
+- **The progress watchdog's job is exactly "the claim passed its deadline".** The
+  settle / re-arm / uncordon trio in `internal/progress/watchdog.go` (deleted with this model)
+  existed to heal a long-lived slot left pointing at a machine that is not there. A claim that produced nothing has a deadline,
+  and the deadline is the heal: `failed`, force shutdown, slot free, attempt N+1. The cordon is
+  read, not reconciled from: a cordoned node is `phase.Unusable`, so a claim whose machine is
+  cordoned is never stamped `ready`, and the readiness gate's loop is the writer that uncordons
+  (`fsm.setNodeSchedulableWithRetry`, `abandonReadinessGate`). A cordoned node left standing is
+  invisible to cluster-autoscaler's scale-down, so it is paid for forever — which is why the
+  uncordon runs on the way out of a gate that timed out, and why a claim that is failed with a
+  cordoned node behind it is force-shut-down rather than left serving.
 - **`validateStateTransition`'s gate on transitional slots goes away.** Today no transition may
   start on a slot whose progress is `startingup`/`shuttingdown`, and a transitional progress may
   only be written by the operation that wrote it, because the field is both the FSM's state and
@@ -423,7 +522,8 @@ hang off it (create, monitor, deadline, force shutdown). The slot reconcilers
 the declared taints, the capacity-drift warning, the labels, the observation of the machine.
 Two controllers, one object each, is the point — but the seam is new and it is where the first
 bugs will live: the handover from "claim controller created a startup Job" to "observation
-reconciler saw the node" is the same window today's `SettleGracePeriod` exists to cover.
+reconciler saw the node" is the same window the 0.1.20 `SettleGracePeriod` existed to cover, now
+bounded by the claim's deadline instead of by a grace (§4).
 
 **One claim per slot is load-bearing.** It is what makes "a live claim exists" a synonym for
 "the machine is wanted", what keeps `TargetSize` a count of claims, and what keeps the model
@@ -549,7 +649,7 @@ replaced was the FSM's state and the report at once. The `kubectl get` column su
 be persisted at all, and the answer is the same precedent the design cites: keep what an operator
 reads in a crisis. §6 makes it derived and read by nobody, and a
 value that is computed from `(live claim, observation)` can be computed on read instead of written
-on every observation — no status write, no stale report, no `SettleGracePeriod` to protect it. It
+on every observation — no status write, no stale report, no watchdog grace to protect it. It
 cannot be a computed field, so the choices are: keep persisting it (cheap for the writer, and
 `kubectl get nodes.infra.homecluster.dev` keeps its `Progress` column), or drop the field and
 report the phase in the claim only (`kubectl get nodeclaim` becomes the one command). The
@@ -619,6 +719,58 @@ one detail settled by what the tests showed.
   provider's `TargetSize` excludes a marked claim (its unit comes off on the write that named it)
   while `ClaimedSlots` includes it (the slot is not free), and `NodeGroupDeleteNodes` is idempotent
   over an already-marked claim.
+- **The deadline bounds the boot, and the boot ends at `ready`.** The first sketch applied
+  `spec.deadlineAt` to any live claim, and `IsLive` includes `ready`, so every healthy machine was
+  destroyed 12m10s after its request: `failed/DeadlineExceeded`, a shutdown Job, a cordon. The
+  bound is `phase.InBootWindow` (`pending`, counting the empty phase, and `booting`), the
+  `booting → ready` write clears `spec.deadlineAt` so the CRD and the digest agree the attempt is
+  over, and the same window bounds the attempt check — a claim that landed on `ready` as attempt 4
+  is a success, not a fifth attempt.
+- **The budget is the set of deadlines an attempt can spend, in series.** `claim.AttemptBudget`
+  includes `fsm.DefaultJobTimeout`: the clock starts at `spec.requestedAt`, before the startup Job
+  exists, so an attempt can spend 5m of Job + 90s of registration + 4m of gate (≈9m50s) and a
+  7m10s budget kills it inside the machine it is buying. `claim.BudgetConstants` is the set, and
+  the test asserts the sum, the membership of each constant, and that no proper subset adds up to
+  the budget.
+- **A deleted slot releases its claim.** A claim whose `Node` is gone has nothing left to run: the
+  reason `SlotDeleted` is recorded, the finalizer comes off, and the ownerReference's garbage
+  collection finishes the object. Leaving the finalizer on is a claim stuck in `Terminating`
+  forever, never retried, with the machine still running — and it is reachable through the
+  documented rollout, which deletes the Node CRs (§9). No digest is stamped: the record lives on
+  the slot, and the slot does not exist, so the claim object is the record while its TTL keeps it.
+- **The digest is the newest episode's, and the collector never loses a claim.** `StampDigest`
+  stamps only the newest claim of the slot (the ordering rule `claim.LiveOfSlot` uses), so a late
+  write from a superseded episode cannot rewrite the story with the older one. A terminal claim
+  with no `status.finishedAt` gets one stamped (`Recorder.StampFinishedAt`), because a phase landed
+  on by a writer that stamped no time would otherwise never start its TTL and never be collected.
+- **`ready` with the machine off has an owner: the claim controller, bounded by an observation**
+  (§4). `ClaimReasonMachineGone` is written by `NodeClaimReconciler.watchMachine`, on
+  `claim.MachineGoneGrace` (one boot window), with the clock on the claim
+  (`MachineObservedOff`), so a reboot heals and a manager restart does not restart the bound.
+- **A restarted manager re-attaches to its Jobs.** The lifecycle Job monitor is a goroutine of the
+  process that ran the transition, and the coordination lock is its ownership marker. A restart
+  loses the goroutine and keeps the objects, leaving a booting claim whose Job completed with no
+  event left to fire — and it sits at `booting` until its deadline fails it, destroying a machine
+  that booted successfully. The slot reconciler therefore watches the claims of its slot
+  (`Owns(&NodeClaim{})`, so a claim created while the manager was down boots when it is created)
+  and reads the Job objects: a finished Job whose lifecycle phase matches the state the input law
+  derived, on a slot with no live lock, has its `JobCompleted` / `JobFailed` event re-fired.
+- **A scale-down counts its own attempts** on `status.shutdownAttempts`, with a bounded pause
+  (`claim.ShutdownAttemptResetGrace`) and a documented manual escape hatch (§4). Spending the
+  *boot* `status.attempt` on a shutdown that never lands is the bug the separate counter closes:
+  the boot attempts are the record of the machines the request bought, and the seed of the next
+  claim's number.
+- **The finalizer arrives with the boot.** `claim.Recorder.Move` stamps it on the same write that
+  records `booting`, and clears `spec.deadlineAt` on the write that records `ready`; both are
+  metadata/spec writes, applied **before** the status write, so a manager that dies between the
+  two leaves the boot committed with its deadline intact — the safe direction. `ensureFinalizer`
+  in the claim controller is the belt for a phase a hand write landed, re-Gets before it writes,
+  and refuses a finalizer on a pending, terminal, or already-deleted claim.
+- **`status.phase` has no CRD default, on purpose.** The status subresource strips `status` from a
+  create, so a default there is only stamped by the first status write, and the window it appears
+  to cover is the window the model has to survive: `phase.IsLive` reads an empty phase as pending,
+  and every reader that decides whether a machine is wanted asks `IsLive` (§3).
+- **The decrease that can cancel nothing says so** with `codes.Unavailable` (§5.1).
 - Two smaller settlements: `spec.maxNodeProvisionTime` is the claim's field for the number in force
   (§4 called it "the sibling field for reporting"), and one-live-claim-per-slot is enforced at
   admission as well as in the claim controller (`NodeClaimCustomValidator`), so the rule is refused

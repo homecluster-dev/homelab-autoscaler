@@ -46,7 +46,7 @@ test of the other.
 | `booting` | any | any | `booting` | `startingup` | nothing (the Job monitor owns it) |
 | `ready` | on | yes | `ready` | `ready` | nothing |
 | `ready` | on | no | `booting` | `startingup` | nothing (the readiness gate owns it) |
-| `ready` | off | — | `booting` | `startingup` | nothing (the machine vanished mid-boot; see below) |
+| `ready` | off | — | `booting` | `startingup` | nothing fires here; the claim controller ends the claim `failed` / `MachineGone` past one boot window ("A ready claim whose machine is gone") |
 | live, marked for deletion | on | — | `draining` | `ready` / `shuttingdown` | `ShutdownNode`, then the claim's finalizer releases |
 | live, marked for deletion | off | — | `off` | `shutdown` | the claim ends `completed`, the finalizer comes off |
 | `failed` / `completed` | on | — | `draining` | `ready` | `ShutdownNode` (a terminal claim is not a want) |
@@ -138,11 +138,20 @@ Two consequences worth stating plainly:
 (`claim.AttemptBudget` / `claim.DeadlineAt`):
 
 ```
-budget = JobMonitorPollInterval (30s) + DefaultUncordonTimeout (90s)
-       + DefaultReadinessGateTimeout (4m) + MaxUncordonRetryInterval (10s) + 1m
-       = 7m10s
+budget = DefaultJobTimeout (5m) + JobMonitorPollInterval (30s)
+       + DefaultUncordonTimeout (90s) + DefaultReadinessGateTimeout (4m)
+       + MaxUncordonRetryInterval (10s) + 1m
+       = 12m10s
 deadlineAt = requestedAt + max(budget, group.spec.maxNodeProvisionTime)
 ```
+
+The startup Job's own timeout is in the sum because the clock runs from `spec.requestedAt`, i.e.
+from before the Job exists: one attempt can spend the Job's whole 5m, then the 90s it takes the
+node to register, then the 4m of the readiness gate — about 9m50s of deadlines, in series. A
+budget of 7m10s (the first sketch of §4) fails the claim in the middle of the machine it is still
+buying, and the machine that boots an instant later is force-shut-down as overdue. The 0.1.20
+progress watchdog excluded the Job timeout for exactly this reason — its grace applied only to a
+Job that had already finished — and a claim's deadline has no such restriction to inherit.
 
 The floor is not decoration: cluster-autoscaler is told the group's number as its own scale-up
 termination deadline (`NodeGroupGetOptions` → `MaxNodeProvisionDuration`), so a claim that died
@@ -150,12 +159,16 @@ before that instant is a slot the autoscaler is still waiting for, and its answe
 `IncreaseSize`. The number in force is copied onto the claim (`spec.maxNodeProvisionTime`) so a
 pool that changes it does not rewrite history.
 
-**Overdue means `failed`, and `failed` means force shutdown.** The claim controller records
-`failed` with `reason: DeadlineExceeded`; the next pass of the slot reads "no live claim, machine
-observed on" and powers the machine off. This is the whole replacement for the v1alpha1 progress
-watchdog: the settle / re-arm / uncordon trio healed a long-lived slot left pointing at a machine
-that is not there, and a claim that produced nothing has a deadline that does the same thing with
-a record attached.
+**Overdue means `failed`, and `failed` means force shutdown — inside the boot window.** The claim
+controller records `failed` with `reason: DeadlineExceeded`; the next pass of the slot reads "no
+live claim, machine observed on" and powers the machine off. The bound applies to `pending` and
+`booting` (`phase.InBootWindow`), and the `booting → ready` write clears `spec.deadlineAt`: a
+claim that reached `ready` owns a machine, and a boot budget measured 12 minutes earlier is not a
+licence to destroy capacity that is serving. The same window bounds the attempt check; a claim
+that landed on `ready` with attempt 4 is a success, not a fifth attempt. This is the whole
+replacement for the v1alpha1 progress watchdog: the settle / re-arm / uncordon trio healed a
+long-lived slot left pointing at a machine that is not there, and a claim that produced nothing
+has a deadline that does the same thing with a record attached.
 
 Attempts live on the request, not on the slot:
 
@@ -165,15 +178,41 @@ Attempts live on the request, not on the slot:
 - it is incremented by the `pending → booting` write, so it counts machines bought;
 - `claim.MaxConsecutiveAttempts` (3) is the bound. Past it, the claim controller fails the claim
   with `reason: AttemptLimitExceeded` before a machine is bought.
-- a scale-down's attempts are counted on the claim that asked for the scale-down
-  (`BumpScaleDownAttempt`), and the slot reconciler stops firing a shutdown that will not land
-  once the claim has spent them.
+- a scale-down's attempts are counted on the claim that asked for the scale-down, on
+  `status.shutdownAttempts` (`BumpScaleDownAttempt`) — a counter of its own, so a shutdown script
+  that never lands does not spend the boot attempts of the episode it is draining. The slot
+  reconciler stops firing a shutdown that will not land once the streak is spent, and the streak
+  resets when the machine is observed off (the claim ends with the observation) or after
+  `claim.ShutdownAttemptResetGrace` (30m), which is what picks up a pool whose script has been
+  fixed. See "A shutdown Job that succeeded is not a machine that is off".
 
 The v1alpha1 machinery for the same two bounds — the `ClaimRearmed` and `ShutdownAttempts`
 conditions on the long-lived slot, `fsm.StartupAttemptLimit`, `fsm.ShutdownAttemptLimit`, and the
 reset heuristics each of them needed (the readiness gate of `afterJobCompleted`, and two more
 sites for the shutdown counter) — is gone. The object that carries the count dies with the
 episode, which is why there is nothing to reset.
+
+## A ready claim whose machine is gone
+
+`ready` with the machine observed off is the one row of the table that fires nothing:
+`phase.Derive` reports `booting` (law 1's `StartNode` is not reachable from `startingup`), law 3
+needs the machine observed up, and the boot deadline closed on the write that made the claim
+ready. A machine deleted in a provider console, a deprovisioned server, or a `kubectl delete node`
+therefore leaves a live claim, a slot reported `booting` forever, and a unit cluster-autoscaler is
+paying for.
+
+The claim controller owns the case, bounded by an observation, not by a pass
+(`NodeClaimReconciler.watchMachine`):
+
+- the first pass that sees the machine off stamps `MachineObservedOff=True` on the claim, and its
+  `lastTransitionTime` is the clock;
+- the machine coming back flips the condition off, and the claim stays `ready` — a reboot shows
+  the same shape for minutes, and is not an attempt that ends;
+- an observation that outlasts `claim.MachineGoneGrace` — one boot window, the same horizon as the
+  deadline — ends the claim `failed` with `reason: MachineGone`, and the input law makes the slot
+  free again.
+
+The bound lives on the object, so a manager restart does not restart the clock.
 
 ## The coordination lock is a belt
 
@@ -245,9 +284,25 @@ report follows the machine:
 
 - the shutdown Job completed and the machine is observed **up** → the slot keeps reporting
   `draining`, the scale-down claim keeps its finalizer, and the claim controller counts the
-  attempt. The bound is spent, the machine stays up, and the record is the
-  `ShutdownAttemptLimitReached` warning on the claim: a fixed script is picked up by the next
-  pass, and no hand intervention is needed.
+  attempt on `status.shutdownAttempts` — a counter of its own, because `status.attempt` is the
+  record of the machines the request bought and a shutdown that will not land must not spend it.
+  Past `claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that will not
+  land, the record is the `ShutdownAttemptLimitReached` warning on the claim, and the refusal
+  requeues.
+
+  The pause is bounded, not a sentence: past `claim.ShutdownAttemptResetGrace` (30m) the streak is
+  spent no longer, the count restarts, and the shutdown fires again. A pool whose shutdown script
+  has been fixed is therefore picked up by a later pass, with no hand intervention — **30 minutes
+  later**, not on the next one, and the next pass after the bound is paced to that deadline. The
+  escape hatch for an operator who will not wait for the grace is the one the claim model makes
+  possible, the counter living on the request:
+
+  ```bash
+  kubectl patch nodeclaim <claim> -n homelab-autoscaler-system --subresource=status --type=merge \
+    -p '{"status":{"shutdownAttempts":0,"lastShutdownAttemptAt":null}}'
+  ```
+
+  The next pass of the slot reconciler fires the shutdown again.
 - the machine is observed **off** → the scale-down claim ends `completed` (reason
   `NodeDeleted` / `CancelledByDecreaseTargetSize` / `DeletedByHand`, from the request that made
   it), the finalizer comes off, and the slot reports `off`.

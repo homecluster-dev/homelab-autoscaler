@@ -28,7 +28,7 @@ observes. One live claim per slot, enforced at admission and in the controller.
 | `request` | `ClaimRequest` | Yes | Structured attribution: which RPC asked for this machine, and with what arguments |
 | `requestedAt` | `metav1.Time` | No | When the request was made. The deadline budget is measured from it, so a replayed or hand-made claim gets the budget it would have had |
 | `requestedBy` | `string` | No | Free text, for an operator reading `kubectl get nodeclaim`: `cluster-autoscaler`, a human's name on a manual claim. Never parsed. Max 256 chars |
-| `deadlineAt` | `*metav1.Time` | No | The budget of this attempt: `requestedAt + max(7m10s, group.spec.maxNodeProvisionTime)`. Overdue means `failed`, and `failed` means the machine is force-shut-down |
+| `deadlineAt` | `*metav1.Time` | No | The budget of the **boot**: `requestedAt + max(12m10s, group.spec.maxNodeProvisionTime)` — the startup Job's own timeout, the Job monitor poll, the registration wait, the readiness gate and a margin. Overdue means `failed`, and `failed` means the machine is force-shut-down. It bounds `pending` and `booting` only, and the `booting → ready` write **clears it**: a claim that owns a machine is not destroyed by a budget it already spent |
 | `maxNodeProvisionTime` | `*metav1.Duration` | No | The group's `spec.maxNodeProvisionTime` as it was when the claim was created: a claim says what budget was in force, and a pool that changes the number does not rewrite history |
 | `ttlSecondsAfterFinished` | `*int32` | No | How long a terminal claim (`failed`, `completed`) survives `status.finishedAt` before the controller deletes it. Default `3600`. The slot keeps the digest, so collection is safe |
 
@@ -49,19 +49,21 @@ making a new claim.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `phase` | `NodeClaimPhase` | `pending`, `booting`, `ready`, `failed`, `completed`. Defaulted to `pending` by the CRD. The phase the operator's decisions derive from |
+| `phase` | `NodeClaimPhase` | `pending`, `booting`, `ready`, `failed`, `completed`. **No CRD default**: the status subresource strips `status` from a create, so a default on a subresource field is only stamped by the first status write. An empty phase is read as `pending` by `phase.IsLive` / `phase.IsPending` — the one place that reading lives — so a request is capacity from its create |
 | `attempt` | `int32` | `1..N` for the slot: seeded from `Node.status.lastClaim.attempt`, incremented by the `pending → booting` write, so it counts machines bought, not reconcile passes |
+| `shutdownAttempts` | `int32` | How many times the scale-down that named this claim fired the shutdown of a machine the provider still observes up. A counter of its own, separate from `attempt`: the boot attempts are the record of the machines the request bought, and a shutdown that will not land does not spend them. Past `claim.MaxConsecutiveAttempts` (3) the slot reconciler stops firing the shutdown, and the streak resets after `claim.ShutdownAttemptResetGrace` (30m) or with the claim |
+| `lastShutdownAttemptAt` | `*metav1.Time` | When the last of those attempts was counted: the clock of the reset grace, and the timestamp that answers "since when has the controller paused this shutdown" |
 | `reason` | `string` | The one-line outcome: `DeadlineExceeded`, `StartupJobFailed`, `StartupJobTimeout`, `ShutdownJobFailed`, `ShutdownJobTimeout`, `ReadinessGateTimeout`, `AttemptLimitExceeded`, `CancelledByDecreaseTargetSize`, `NodeDeleted`, `MachineGone`, `SlotDeleted`, `DeletedByHand`, `Superseded`, `StuckTransition` |
 | `finishedAt` | `*metav1.Time` | When the claim reached a terminal phase. The TTL is measured from it |
-| `conditions` | `[]metav1.Condition` | `MachineCommitted` (True from `booting` on: the attempt bought a machine, the claim is no longer cancelable) and `Ready` (True at `ready`) |
+| `conditions` | `[]metav1.Condition` | `MachineCommitted` (True from `booting` on: the attempt bought a machine, the claim is no longer cancelable; on a terminal move it is read off the phase the claim moved **from**, so a dead claim says whether there is a machine to clean up), `Ready` (True at `ready`), and `MachineObservedOff` (True while the machine of a ready claim is observed off; its `lastTransitionTime` is the clock of the `MachineGone` bound) |
 
 ### Phases, and who writes each move
 
 | Phase | Meaning | Legal next | Written by |
 |-------|---------|----------|-----------|
-| `pending` | Claimed, no lifecycle Job yet. **The only cancelable phase.** | `booting`, `ready`, `completed`, `failed` | created by the provider; live by the schema default |
+| `pending` | Claimed, no lifecycle Job yet. **The only cancelable phase.** | `booting`, `ready`, `completed`, `failed` | created by the provider, and live from the create: the claim carries no phase at all in that window, and an empty phase is read as `pending` |
 | `booting` | The startup Job exists and the power-on has been asked for. **Committed.** | `ready`, `completed`, `failed` | the `StartNode` transition of the slot, in the same write that created the startup Job and incremented `attempt` |
-| `ready` | The machine is up, joined, and free of the pool's readiness taints, so it can take the pool's work | `completed`, `failed` | the readiness gate at the end of the startup transition (`fsm.setNodeSchedulableWithRetry`) |
+| `ready` | The machine is up, joined, and free of the pool's readiness taints, so it can take the pool's work | `completed`, `failed` | the readiness gate at the end of the startup transition (`fsm.setNodeSchedulableWithRetry`) — the only writer of the move, and the write that closes the boot window by clearing `spec.deadlineAt` |
 | `failed` | The attempt produced no usable machine and never will. Terminal | — | the claim controller (deadline, attempt bound, superseded, slot gone) and the transition path (Job failed / timed out, readiness gate timed out, force cleanup) |
 | `completed` | The claim ended with the machine available. Terminal | — | the claim controller's finalizer path, once the machine is observed off |
 
@@ -76,7 +78,7 @@ Job, power off, and the claim ends `completed`.
 |-----|------------------------|
 | `NodeGroupTargetSize` | Returns the count of **live** claims: `pending` + `booting` + `ready`. A `failed`, `completed`, or scale-down-marked claim is not counted |
 | `NodeGroupIncreaseSize(delta)` | Creates `delta` claims on `delta` free slots (free = no live claim names it), each with `request.call: IncreaseSize`, the request's `delta`, the `group`, `requestedBy: cluster-autoscaler`, `requestedAt`, `deadlineAt`, and the group's `maxNodeProvisionTime`. `maxSize` is the slot count, checked as `liveClaims + delta > slots` |
-| `NodeGroupDecreaseTargetSize(delta)` | Deletes `\|delta\|` claims in phase **`pending`**, oldest first, capped to what can be cancelled. **Never a `booting` claim, never a `ready` one.** The floor is judged against the resulting size the request can produce; a request that can cancel nothing is a no-op success |
+| `NodeGroupDecreaseTargetSize(delta)` | Deletes `\|delta\|` claims in phase **`pending`**, oldest first, capped to what can be cancelled. **Never a `booting` claim, never a `ready` one.** The floor is judged against the resulting size the request can produce. A group already at the requested size is a no-op success; a group whose every live claim is past `pending` is answered with `codes.Unavailable` (retryable) naming how many boots and machines are committed, because success here is the autoscaler's cue to stop asking and to keep paying for a unit it asked away, while its next `IncreaseSize` for the same slot answers "no free node slot" for up to a boot deadline plus the claim's TTL |
 | `NodeGroupDeleteNodes(nodes)` | Records the request on the claim of each named slot (`request.call: DeleteNodes`, `request.nodes`) and cancels it: a `pending` claim is deleted, a `booting`/`ready` claim is deleted through its finalizer, which runs the shutdown. The drain stays cluster-autoscaler's |
 
 No RPC writes a field of a `Node` spec. `NodeGroupNodes` reports an instance per machine:

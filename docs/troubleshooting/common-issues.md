@@ -213,15 +213,29 @@ provider's power-off landed. The controller reads the machine, so the slot keeps
 kubectl describe nodeclaim claim-<node-name> -n homelab-autoscaler-system
 # Events: ShutdownAttemptLimitReached - the machine is still observed up after the bound (3)
 kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system \
-  -o jsonpath='{.status.lastClaim.attempt} {.status.lastClaim.reason} {.status.lastClaim.call}' ; echo
+  -o jsonpath='{.status.lastClaim.shutdownAttempts} {.status.lastClaim.reason} {.status.lastClaim.call}' ; echo
 kubectl logs -n homelab-autoscaler-system job/<shutdown-job>
 ```
+
+The attempts are `status.shutdownAttempts`, a counter of its own: `status.attempt` is the record of
+the machines the request bought, and a shutdown that never lands must not spend it.
 
 Past the bound the slot reconciler **stops firing the shutdown** — no fifth Job for a script that
 keeps exiting 0 — and the machine stays up, cordoned, unwanted, and paid for. That is deliberate:
 the fix is the script. Make `spec.shutdownPodSpec` call the provider's own power-off and exit
-non-zero when the machine is still on; the next pass picks the loop back up, and no hand on a status
-field is needed. A healthy scale-down pays no second Job either: the guard reads the kubelet's
+non-zero when the machine is still on.
+
+The pause is bounded, not a sentence: past `claim.ShutdownAttemptResetGrace` (30 minutes from
+`status.lastShutdownAttemptAt`) the streak is spent no longer, the count restarts, and the shutdown
+fires again — so a fixed script is picked up by a pass within 30 minutes, with no hand on a status
+field. Waiting 30 minutes is not the only option: the count lives on the request, and the claim is
+the object that reports it, so the escape hatch is one command, and the next pass of the slot
+reconciler fires.
+
+```bash
+kubectl patch nodeclaim claim-<node-name> -n homelab-autoscaler-system --subresource=status --type=merge \
+  -p '{"status":{"shutdownAttempts":0,"lastShutdownAttemptAt":null}}'
+``` A healthy scale-down pays no second Job either: the guard reads the kubelet's
 heartbeat against the Job's `status.completionTime`, because a node object stays `Ready` for
 `node-monitor-grace-period` (~40s) after a real power-off.
 
@@ -262,9 +276,14 @@ The causes, in the order to check them:
 - **`spec.startupPodSpec` is broken** (image pull, command, RBAC). The Job exists and fails, the
   claim moves to `failed` with `reason: StartupJobFailed`, and the machine is powered off.
   `kubectl logs -n homelab-autoscaler-system job/<startup-job>` is the answer.
-- **The deadline arrives.** `spec.deadlineAt` is the budget of the attempt; when it passes, the claim
-  is recorded `failed` with `reason: DeadlineExceeded` and the slot is freed for attempt N+1. A claim
-  cannot sit in `pending` past its deadline.
+- **The deadline arrives.** `spec.deadlineAt` is the budget of the **boot** (12m10s: the startup
+  Job's own timeout, the monitor poll, the registration wait, the readiness gate and a margin —
+  floored by the group's `spec.maxNodeProvisionTime`). When it passes with the claim at `pending`
+  or `booting`, the claim is recorded `failed` with `reason: DeadlineExceeded` and the slot is
+  freed for attempt N+1. A `ready` claim is past the boot window, and the `booting → ready` write
+  clears `spec.deadlineAt`: a healthy machine is never destroyed by a budget it already spent. A
+  claim that reaches `ready` with a deadline in its past (an old object, a hand write) is left
+  alone, and the deadline is cleared by the model, not by a timer.
 
 ```bash
 # The claim is overdue and the controller is healthy, and you want the machine now:
