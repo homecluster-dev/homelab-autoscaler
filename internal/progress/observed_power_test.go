@@ -302,10 +302,12 @@ func TestObservedPowerRefusesTheShapesAnOperationOwns(t *testing.T) {
 			rec := events.NewFakeRecorder(8)
 
 			node := observedSlot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
-			extra := []client.Object{liveNode()}
-			objects := append(extra, tc.prepare(t, node, nil)...)
+			prepared := tc.prepare(t, node, nil)
+			objects := make([]client.Object, 0, len(prepared)+2)
+			objects = append(objects, node, liveNode())
+			objects = append(objects, prepared...)
 
-			c := newClient(t, append([]client.Object{node}, objects...)...)
+			c := newClient(t, objects...)
 
 			before := readSlot(t, c)
 			outcome := reconcileObservedPower(t, c, readSlot(t, c), rec)
