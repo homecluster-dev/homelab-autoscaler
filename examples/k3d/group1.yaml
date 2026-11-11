@@ -11,3 +11,6 @@ spec:
   scaleDownUnreadyTime: 30s
   scaleDownUtilizationThreshold: "70"
   zeroOrMaxNodeScaling: false
+  # Keep one node of the group up: cluster-autoscaler never scales the group below
+  # this floor. Omit it (0) to let the group scale to nothing.
+  minSize: 1

@@ -54,6 +54,23 @@ spec:
                 type: boolean
               maxNodeProvisionTime:
                 type: string
+              minSize:
+                description: |-
+                  MinSize is the floor that cluster-autoscaler must not scale this group below. It is
+                  reported to cluster-autoscaler as the min size of the node group, so a pool that has
+                  to keep a machine up sets minSize: 1 and the autoscaler stops reclaiming that node
+                  (no keepalive pod pinning the slot is needed any more).
+
+                  0 is the default and the previous behaviour: the group may scale down to nothing.
+
+                  maxSize is not a field, it is derived from the number of Node CRs labelled with this
+                  group, so the invariant minSize <= maxSize cannot be expressed in the CRD. It is
+                  asserted at the gRPC boundary: a minSize larger than the number of slots is clamped
+                  to it when the group is reported, and scale operations that would cross the floor are
+                  refused.
+                format: int32
+                minimum: 0
+                type: integer
               scaleDownGpuUtilizationThreshold:
                 type: string
               scaleDownUnneededTime:
@@ -61,7 +78,6 @@ spec:
               scaleDownUnreadyTime:
                 type: string
               scaleDownUtilizationThreshold:
-                description: NodeSelector                     map[string]string `json:"nodeSelector"`
                 type: string
               zeroOrMaxNodeScaling:
                 type: boolean
