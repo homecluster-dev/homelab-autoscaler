@@ -179,8 +179,8 @@ func TestEnterShutdownDoesNotRecordAShutdownTheObservationContradicts(t *testing
 	updated := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-	assert.Equal(t, infrav2alpha1.NodePhaseReady, updated.Status.Phase,
-		"the shutdown is not recorded while the machine is observed up")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
+		"the shutdown is not recorded while the machine is observed up: the report says draining")
 	assert.Equal(t, infrav2alpha1.PowerStateOn, updated.Status.PowerState, "the observation is left to the observation controllers")
 	assert.Equal(t, StateReady, nm.GetCurrentState(), "the machine is moved to the state the observation says, so its own writer agrees")
 
@@ -224,7 +224,7 @@ func TestEnterShutdownRefusesAFastShutdownScript(t *testing.T) {
 		updated := &infrav2alpha1.Node{}
 		require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-		assert.Equal(t, infrav2alpha1.NodePhaseReady, updated.Status.Phase,
+		assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
 			"a heartbeat newer than the shutdown Job's completion is a kubelet alive after the script finished")
 		assert.Equal(t, StateReady, nm.GetCurrentState(), "the machine's own state moves with the write")
 		assert.Nil(t, shutdownCondition(updated), "no condition may claim a machine that is up is off")
@@ -267,15 +267,16 @@ func TestAfterJobCompletedDoesNotWriteTheShutdownTheEnterHookRefused(t *testing.
 
 	written := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), written))
-	require.Equal(t, infrav2alpha1.NodePhaseReady, written.Status.Phase)
+	require.Equal(t, infrav2alpha1.NodePhaseDraining, written.Status.Phase)
 
 	nm.afterJobCompleted(context.TODO(), event)
 
 	updated := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-	assert.Equal(t, infrav2alpha1.NodePhaseReady, updated.Status.Phase,
-		"the after_ hook writes the progress of its transition (shutdown), and the guard refuses it")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
+		"the after_ hook writes the report of the machine it is in, and the guard refuses the write of "+
+			"a machine the inputs say is up")
 	assert.Equal(t, written.ResourceVersion, updated.ResourceVersion,
 		"the refused completion is one status write, not two")
 	assert.Equal(t, StateReady, nm.GetCurrentState())
@@ -331,7 +332,8 @@ func assertCompletionRecorded(t *testing.T, nm *NodeStateMachine, rec *events.Fa
 	updated := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-	assert.Equal(t, infrav2alpha1.NodePhaseOff, updated.Status.Phase)
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
+		"the report is derived from the observation, which is still on in the window the guard answers for")
 	assert.Equal(t, StateShutdown, nm.GetCurrentState())
 	require.NotNil(t, shutdownCondition(updated), "the shutdown condition is stamped as it always was")
 

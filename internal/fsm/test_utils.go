@@ -28,6 +28,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 // MockCoordinationManager implements CoordinationManager for testing
@@ -396,4 +398,134 @@ func CreateTestKubernetesNode(name string, unschedulable bool) *corev1.Node {
 // progress.
 func (nm *NodeStateMachine) PrimeEnterState(state string) {
 	nm.fsm.SetState(state)
+}
+
+// TestClaim builds the live claim of a test slot. The claim is the input the state machine derives
+// its state from in v2alpha1, so a test of a transitional slot names a claim, not a progress string.
+// marked is the scale-down shape: a claim a DeleteNodes request has marked for deletion.
+func TestClaim(slotName, name string, claimPhase infrav2alpha1.NodeClaimPhase, marked bool) *infrav2alpha1.NodeClaim {
+	nodeClaim := &infrav2alpha1.NodeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: infrav2alpha1.GroupVersion.String(),
+			Kind:       "NodeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: config.NewNamespaceConfig().Get(),
+			Labels:    map[string]string{"infra.homecluster.dev/node": slotName, "group": "test-group"},
+			Finalizers: []string{
+				"infra.homecluster.dev/nodeclaim-finalizer",
+			},
+		},
+		Spec: infrav2alpha1.NodeClaimSpec{
+			SlotRef: corev1.ObjectReference{
+				APIVersion: infrav2alpha1.GroupVersion.String(),
+				Kind:       "Node",
+				Name:       slotName,
+			},
+			RequestedBy: "cluster-autoscaler",
+			Request: infrav2alpha1.ClaimRequest{
+				Call:  infrav2alpha1.ClaimCallIncreaseSize,
+				Delta: 1,
+				Group: "test-group",
+			},
+		},
+		Status: infrav2alpha1.NodeClaimStatus{
+			Phase:   claimPhase,
+			Attempt: 1,
+		},
+	}
+
+	if marked {
+		now := metav1.Now()
+		nodeClaim.DeletionTimestamp = &now
+	}
+
+	return nodeClaim
+}
+
+// InputOf is the FSM input of a shape under test: the claim, the observed power, the usability of
+// the node, and the lifecycle Jobs in flight.
+func InputOf(nodeClaim *infrav2alpha1.NodeClaim, powerState infrav2alpha1.PowerState, usable bool) phase.Input {
+	return phase.Input{
+		Claim:         nodeClaim,
+		ObservedPower: powerState,
+		NodeUsable:    usable,
+	}
+}
+
+// claimTestWriter is the fsm.ClaimWriter the hook tests move claims through. It writes the phase onto
+// the object the fake client holds, and enforces nothing: the phase table is internal/claim's own
+// test subject, and a hook test wants the evidence a transition produced, not the policy around it.
+type claimTestWriter struct {
+	client client.Client
+}
+
+func newClaimTestWriter(c client.Client) ClaimWriter {
+	return &claimTestWriter{client: c}
+}
+
+func (w *claimTestWriter) MoveClaim(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase, reason string) error {
+	if nodeClaim == nil {
+		return nil
+	}
+
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := w.client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		return err
+	}
+
+	fresh.Status.Phase = to
+	fresh.Status.Reason = reason
+
+	if err := w.client.Update(ctx, fresh); err != nil {
+		return err
+	}
+
+	nodeClaim.Status.Phase = to
+
+	return nil
+}
+
+// SlotInput is the input triple whose derivation puts a state machine in the state a slot's report
+// describes. A test that needs a transitional slot names the shape of the slot - the claim it carries
+// and the power its machine is observed at - and this helper turns that shape into the input; the
+// state is never written by the test.
+func SlotInput(node *infrav2alpha1.Node) phase.Input {
+	in := phase.Input{ObservedPower: node.Status.PowerState}
+
+	switch node.Status.Phase {
+	case infrav2alpha1.NodePhasePending:
+		in.Claim = TestClaim(node.Name, "claim-"+node.Name, infrav2alpha1.NodeClaimPending, false)
+		in.ObservedPower = infrav2alpha1.PowerStateOff
+	case infrav2alpha1.NodePhaseBooting:
+		in.Claim = TestClaim(node.Name, "claim-"+node.Name, infrav2alpha1.NodeClaimBooting, false)
+	case infrav2alpha1.NodePhaseReady:
+		in.ObservedPower = infrav2alpha1.PowerStateOn
+		in.NodeUsable = true
+
+		if in.Claim == nil {
+			in.Claim = TestClaim(node.Name, "claim-"+node.Name, infrav2alpha1.NodeClaimReady, false)
+		}
+	case infrav2alpha1.NodePhaseDraining:
+		in.ObservedPower = infrav2alpha1.PowerStateOn
+		in.ShutdownJobInFlight = true
+	case infrav2alpha1.NodePhaseOff:
+		in.ObservedPower = infrav2alpha1.PowerStateOff
+	}
+
+	if node.Status.PowerState == infrav2alpha1.PowerStateOn && in.ObservedPower == "" {
+		in.ObservedPower = infrav2alpha1.PowerStateOn
+	}
+
+	return in
+}
+
+// MachineForState builds a state machine for a test slot, seeded from the input its shape describes.
+// The v1alpha1 tests got their state from status.progress; the v2alpha1 tests get it from the claim
+// and the observation, through the same formula production code uses.
+func MachineForState(node *infrav2alpha1.Node, c client.Client, scheme *runtime.Scheme, coord CoordinationManager, opts ...Option) *NodeStateMachine {
+	in := SlotInput(node)
+
+	return NewNodeStateMachine(node, c, scheme, coord, append([]Option{WithInput(in)}, opts...)...)
 }

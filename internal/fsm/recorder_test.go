@@ -102,7 +102,7 @@ func newRecordingStateMachine(t *testing.T, node *infrav2alpha1.Node, mockCoord 
 	fakeClient := CreateFakeClient(scheme, append([]client.Object{node}, objects...)...)
 
 	rec := events.NewFakeRecorder(20)
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
+	nm := MachineForState(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
 	nm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -193,7 +193,7 @@ func TestNodeStateMachine_Events_ScaleUpFailure(t *testing.T) {
 	}
 
 	rec := events.NewFakeRecorder(20)
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
+	nm := MachineForState(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
 	nm.uncordonTimeout = 100 * time.Millisecond
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 

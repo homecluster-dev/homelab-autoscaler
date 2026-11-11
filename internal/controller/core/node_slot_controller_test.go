@@ -59,7 +59,7 @@ func slot(name string, desired infrav2alpha1.PowerState, powerState infrav2alpha
 		},
 		Status: infrav2alpha1.NodeStatus{
 			PowerState: powerState,
-			Progress:   progress,
+			Phase:      progress,
 		},
 	}
 }
@@ -139,28 +139,28 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 		{
 			name:     "slot that is desired to be on keeps its empty status",
 			node:     slot("slot-on", infrav2alpha1.PowerStateOn, "", ""),
-			expected: infrav2alpha1.NodeStatus{PowerState: "", Progress: ""},
+			expected: infrav2alpha1.NodeStatus{PowerState: "", Phase:      ""},
 		},
 		{
 			name:     "slot that is on keeps its real status",
 			node:     slot("slot-powered-on", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Progress: infrav2alpha1.NodePhaseReady},
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase:      infrav2alpha1.NodePhaseReady},
 		},
 		{
 			name:     "starting up slot is not touched",
 			node:     slot("slot-starting", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOff, Progress: infrav2alpha1.NodePhaseBooting},
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOff, Phase:      infrav2alpha1.NodePhaseBooting},
 		},
 		{
 			name:     "shutting down slot is not touched",
 			node:     slot("slot-stopping", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
-			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Progress: infrav2alpha1.NodePhaseDraining},
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase:      infrav2alpha1.NodePhaseDraining},
 		},
 		{
 			name:     "slot with a matching kubernetes node is left to the node controller",
 			node:     slot("omni-remote-3", infrav2alpha1.PowerStateOff, "", ""),
 			extra:    []client.Object{readyK8sNode},
-			expected: infrav2alpha1.NodeStatus{PowerState: "", Progress: ""},
+			expected: infrav2alpha1.NodeStatus{PowerState: "", Phase:      ""},
 		},
 	}
 
@@ -172,7 +172,7 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 			reconcileSlot(t, r, tc.node.Name)
 
 			node := getNodeCR(t, r, tc.node.Name)
-			assert.Equal(t, tc.expected, infrav2alpha1.NodeStatus{PowerState: node.Status.PowerState, Progress: node.Status.Phase})
+			assert.Equal(t, tc.expected, infrav2alpha1.NodeStatus{PowerState: node.Status.PowerState, Phase:      node.Status.Phase})
 		})
 	}
 }

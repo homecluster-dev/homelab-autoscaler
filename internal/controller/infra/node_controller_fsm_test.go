@@ -70,7 +70,7 @@ func createTestNode(powerState infrav2alpha1.PowerState, progress infrav2alpha1.
 		},
 		Status: infrav2alpha1.NodeStatus{
 			PowerState: powerState,
-			Progress:   progress,
+			Phase:      progress,
 		},
 	}
 }

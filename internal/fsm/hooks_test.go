@@ -36,6 +36,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 func TestBeforeStartNode(t *testing.T) {
@@ -162,9 +163,11 @@ func TestAfterJobCompleted(t *testing.T) {
 		// Create a Kubernetes node that is Ready but unschedulable (cordoned)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", true)
 
-		fakeClient := CreateFakeClient(scheme, node, kubeNode)
+		startingClaim := TestClaim("test-node", "claim-start", infrav2alpha1.NodeClaimBooting, false)
+		fakeClient := CreateFakeClient(scheme, node, kubeNode, startingClaim)
 
-		nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord,
+			WithClaim(startingClaim, newClaimTestWriter(fakeClient)))
 		ctx := context.TODO()
 
 		// Create a test job and add it to the fake client
@@ -195,7 +198,16 @@ func TestAfterJobCompleted(t *testing.T) {
 		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav2alpha1.NodePhase(StateReady), updatedNode.Status.Phase)
+		// The gate passed, so the claim moved booting -> ready. The slot's report is the derived
+		// value, and the observation this pass was built from says the machine is off: the report
+		// flips to ready when the node object is observed Ready (internal/controller/core), and
+		// nothing here reads the report to decide anything.
+		assert.Equal(t, infrav2alpha1.NodePhaseBooting, updatedNode.Status.Phase)
+
+		updatedClaim := &infrav2alpha1.NodeClaim{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(startingClaim), updatedClaim))
+		assert.Equal(t, infrav2alpha1.NodeClaimReady, updatedClaim.Status.Phase,
+			"the readiness gate's answer is the evidence for the claim's ready phase")
 
 		// Verify Kubernetes node was uncordoned
 		updatedKubeNode := &corev1.Node{}
@@ -240,7 +252,7 @@ func TestAfterJobCompleted(t *testing.T) {
 		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav2alpha1.NodePhase(StateShutdown), updatedNode.Status.Phase)
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, updatedNode.Status.Phase)
 	})
 }
 
@@ -371,7 +383,7 @@ func TestAfterJobFailed(t *testing.T) {
 		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav2alpha1.NodePhase(StateShutdown), updatedNode.Status.Phase)
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, updatedNode.Status.Phase)
 
 		// Verify failure condition was added
 		assert.Len(t, updatedNode.Status.Conditions, 1)
@@ -420,7 +432,7 @@ func TestAfterForceCleanup(t *testing.T) {
 		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav2alpha1.NodePhase(StateShutdown), updatedNode.Status.Phase)
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, updatedNode.Status.Phase)
 
 		// Verify cleanup condition was added
 		assert.Len(t, updatedNode.Status.Conditions, 1)
@@ -441,7 +453,9 @@ func TestEnterStartingUp(t *testing.T) {
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	// The slot is in the shape a scale-up starts from: a live claim in pending, and the machine off.
+	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord,
+		WithClaim(TestClaim("test-node", "claim-start", infrav2alpha1.NodeClaimPending, false), nil))
 	ctx := context.TODO()
 
 	// Create a mock FSM event
@@ -469,18 +483,14 @@ func TestEnterStartingUp(t *testing.T) {
 	updatedNode := &infrav2alpha1.Node{}
 	err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 	assert.NoError(t, err)
+	// The report is the derived value of the inputs of this transition: the transition moved the
+	// claim to booting, and a booting claim with the machine off is a slot in its boot window.
 	assert.Equal(t, infrav2alpha1.NodePhaseBooting, updatedNode.Status.Phase)
-	assert.NotNil(t, updatedNode.Status.LastStartupTime)
 
-	// Verify the progressing condition was added, and that the transition itself counted the startup
-	// attempt: the shutdown -> startingup transition is where a lifecycle Job and a powered-on machine
-	// hang off, so it is the one place the bound is paid (see internal/fsm/startup_attempts.go).
-	require.Len(t, updatedNode.Status.Conditions, 2, "the attempt record and the progressing record")
-
-	attempt := meta.FindStatusCondition(updatedNode.Status.Conditions, ConditionStartupAttempts)
-	require.NotNil(t, attempt, "the attempt is counted by the transition, not by the watchdog")
-	assert.Equal(t, ReasonStartupAttempt+"1", attempt.Reason)
-	assert.Equal(t, 1, StartupAttemptsOf(updatedNode))
+	// The progressing condition is the only record the transition leaves on the slot: the startup
+	// attempt is counted on the NodeClaim, not on the long-lived slot, so there is no condition to
+	// stamp and no reset heuristic to run (docs/design/nodeclaim.md §4).
+	require.Len(t, updatedNode.Status.Conditions, 1, "the progressing record alone")
 
 	condition := meta.FindStatusCondition(updatedNode.Status.Conditions, "StartupProgressing")
 	require.NotNil(t, condition)
@@ -497,7 +507,10 @@ func TestEnterShuttingDown(t *testing.T) {
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	// The shutdown transition runs on a machine that is observed up with its shutdown Job in flight:
+	// the shape the report reads draining from, and the shape the state machine is in.
+	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord,
+		WithInput(phase.Input{ObservedPower: infrav2alpha1.PowerStateOn, ShutdownJobInFlight: true}))
 	ctx := context.TODO()
 
 	// Create a mock FSM event
@@ -528,15 +541,10 @@ func TestEnterShuttingDown(t *testing.T) {
 	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updatedNode.Status.Phase)
 	assert.NotNil(t, updatedNode.Status.LastShutdownTime)
 
-	// Verify the progressing condition was added, and that the transition itself counted the shutdown
-	// attempt: the ready -> shuttingdown transition is where the coordination lock, the cordon and the
-	// shutdown lifecycle Job hang off, so it is the one place the bound is paid (see
-	// internal/fsm/shutdown_attempts.go).
-	require.Len(t, updatedNode.Status.Conditions, 2, "the attempt record and the progressing record")
-
-	attempt := meta.FindStatusCondition(updatedNode.Status.Conditions, ConditionShutdownAttempts)
-	require.NotNil(t, attempt, "the attempt is recorded where it begins, before its Job can be refused")
-	assert.Equal(t, ReasonShutdownAttempt+"1", attempt.Reason)
+	// The progressing condition is the only record the transition leaves on the slot: a scale-down is
+	// a claim (request.call: DeleteNodes), and its attempts are counted on the claim that asked for
+	// it and end when it ends.
+	require.Len(t, updatedNode.Status.Conditions, 1, "the progressing record alone")
 
 	progressing := meta.FindStatusCondition(updatedNode.Status.Conditions, "ShutdownProgressing")
 	require.NotNil(t, progressing)
@@ -553,7 +561,14 @@ func TestEnterReady(t *testing.T) {
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	// The slot enters ready with the machine observed up and its node usable: the shape the report
+	// derives ready from.
+	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord,
+		WithInput(phase.Input{
+			Claim:         TestClaim("test-node", "claim-ready", infrav2alpha1.NodeClaimReady, false),
+			ObservedPower: infrav2alpha1.PowerStateOn,
+			NodeUsable:    true,
+		}))
 	ctx := context.TODO()
 
 	// Set up backoff strategy to verify it gets cleared
@@ -604,7 +619,7 @@ func TestEnterShutdown(t *testing.T) {
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	nm := MachineForState(node, fakeClient, scheme, mockCoord)
 	ctx := context.TODO()
 
 	// Set up backoff strategy to verify it gets cleared
@@ -636,7 +651,10 @@ func TestEnterShutdown(t *testing.T) {
 	updatedNode := &infrav2alpha1.Node{}
 	err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 	assert.NoError(t, err)
-	assert.Equal(t, infrav2alpha1.NodePhaseOff, updatedNode.Status.Phase)
+	// The report is derived, and the observation of this slot says the machine is up: the slot
+	// reports draining, not off. The report flips to off when the observation controller sees the
+	// machine go NotReady, and nothing reads the report to decide an action.
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updatedNode.Status.Phase)
 
 	// Verify shutdown condition was added
 	assert.Len(t, updatedNode.Status.Conditions, 1)
@@ -774,7 +792,7 @@ func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *
 	fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 	mockCoord := NewMockCoordinationManager()
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	nm := MachineForState(node, fakeClient, scheme, mockCoord)
 	nm.uncordonTimeout = 100 * time.Millisecond
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -794,8 +812,11 @@ func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *
 
 	updated := &infrav2alpha1.Node{}
 	require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updated))
-	assert.Equal(t, infrav2alpha1.NodePhaseReady, updated.Status.Phase,
-		"the transition completes: a slot is never left transitional by a readiness gate that timed out")
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, updated.Status.Phase,
+		"the transition completes: a slot is never left transitional by a readiness gate that timed out. "+
+			"The report is the derived value: the gate's answer moved the claim to failed, and this "+
+			"slot's machine is observed off, so the slot is on its way out (a failed claim with the "+
+			"machine off is booted again by the next claim, attempt N+1)")
 
 	updatedKubeNode := &corev1.Node{}
 	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "test-node-k8s"}, updatedKubeNode))

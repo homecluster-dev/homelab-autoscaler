@@ -44,12 +44,11 @@ func slotCR() *infrav2alpha1.Node {
 	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "worker-1", Namespace: "homelab-autoscaler-system"},
 		Spec: infrav2alpha1.NodeSpec{
-			DesiredPowerState:  infrav2alpha1.PowerStateOn,
 			KubernetesNodeName: "worker-1",
 		},
 		Status: infrav2alpha1.NodeStatus{
 			PowerState: infrav2alpha1.PowerStateOn,
-			Progress:   infrav2alpha1.NodePhaseReady,
+			Phase:      infrav2alpha1.NodePhaseReady,
 		},
 	}
 }

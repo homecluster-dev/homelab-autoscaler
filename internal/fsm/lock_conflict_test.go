@@ -38,6 +38,7 @@ import (
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 // The tests in this file drive the collision the live trace showed: cluster-autoscaler asked
@@ -91,7 +92,9 @@ func newConflictTestEnv(t *testing.T, objects ...client.Object) *conflictTestEnv
 func (e *conflictTestEnv) machine(t *testing.T, node *infrav2alpha1.Node) *NodeStateMachine {
 	t.Helper()
 
-	nm := NewNodeStateMachine(node, e.fakeClient, e.scheme, e.coordMgr, WithEventRecorder(e.recorder))
+	// The state of the machine is the input the slot's shape describes (its claim and the observed
+	// power of its machine), never a record it reads back.
+	nm := MachineForState(node, e.fakeClient, e.scheme, e.coordMgr, WithEventRecorder(e.recorder))
 	nm.uncordonTimeout = 100 * time.Millisecond
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -260,8 +263,7 @@ func TestShutdownNodeCompletesAfterTheScaleUpReleasesTheLock(t *testing.T) {
 
 	stored = env.stored(t, node)
 	assert.Equal(t, infrav2alpha1.NodePhaseDraining, stored.Status.Phase,
-		"the retried shutdown runs, so the transitional progress it writes is driven by a real operation")
-	assert.Equal(t, infrav2alpha1.PowerStateOff, stored.Spec.DesiredPowerState)
+		"the retried shutdown runs, so the report it writes is driven by a real operation")
 
 	jobs := &batchv1.JobList{}
 	require.NoError(t, env.fakeClient.List(ctx, jobs))
@@ -277,8 +279,10 @@ func TestShutdownNodeCompletesAfterTheScaleUpReleasesTheLock(t *testing.T) {
 	require.NoError(t, retry.JobCompleted(&shutdownJob))
 
 	stored = env.stored(t, node)
-	assert.Equal(t, infrav2alpha1.NodePhaseOff, stored.Status.Phase, "the slot ends shut down")
-	assert.Equal(t, infrav2alpha1.PowerStateOff, stored.Spec.DesiredPowerState)
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, stored.Status.Phase,
+		"the shutdown Job completed, and the slot's machine is still observed up in this window: the "+
+			"report says draining, and flips to off when the observation controller sees the node go "+
+			"NotReady. Nothing reads the report to decide an action.")
 	_, locked = env.coordMgr.CheckLock(context.TODO(), stored)
 	assert.False(t, locked, "a completed shutdown releases its lock")
 
@@ -368,29 +372,37 @@ func TestJobTimeoutReleasesCoordinationLock(t *testing.T) {
 	assert.Len(t, recorded, 1, "%v", recorded)
 }
 
-// TestUpdateNodeProgressPersistsOnlyTheCurrentState pins the guard that keeps a state machine
-// from writing a progress it is not in. Inside the FSM the writers of status.phase are the
-// enter_ and after_ hooks, which looplab/fsm runs after applying the state change, so on every
-// legitimate path the two agree; a disagreement can only come from a machine that is stale -
-// the job monitor of an earlier reconcile, or one built from a Node read before a transition -
-// and that is precisely how a slot ends up in a transitional progress nothing is driving.
-// The guard only covers writes that go through it: the gRPC server and the core controllers
-// write status.phase too, and they are not state machines (see docs/architecture/state.md).
-func TestUpdateNodeProgressPersistsOnlyTheCurrentState(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseDraining)
-	node.Status.PowerState = infrav2alpha1.PowerStateOn
+// TestReportPhaseRefusesAStaleMachine pins the guard of the writer of the slot's report.
+//
+// v1alpha1's writer took the progress its caller believed it was writing and refused a value the
+// state machine was not in. v2alpha1 computes the value - phase.Derive over the input triple - so
+// there is nothing to pass, and the one disagreement the guard can still see is between a machine's
+// inputs and its state: the async job monitor of a transition that already finished, or a state
+// machine built from a Node read before a transition ran. That is precisely how a slot used to end up
+// in a transitional value nothing is driving, and the pass that owns the inputs writes the report.
+func TestReportPhaseRefusesAStaleMachine(t *testing.T) {
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 
 	env := newConflictTestEnv(t, node)
-	nm := env.machine(t, env.stored(t, node))
 
-	// a machine in shuttingdown cannot record ready: that write is not its transition to make
-	nm.updateNodeProgress(infrav2alpha1.NodePhaseReady)
+	// The inputs of a shutdown with its Job in flight: the state the inputs derive is shuttingdown,
+	// and the report they derive is draining.
+	in := phase.Input{ObservedPower: infrav2alpha1.PowerStateOn, ShutdownJobInFlight: true}
+	nm := NewNodeStateMachine(env.stored(t, node), env.fakeClient, env.scheme, env.coordMgr, WithInput(in))
+
+	// A machine primed into ready - the state of an earlier pass, the job monitor of a transition
+	// that already finished - is stale: its inputs derive shuttingdown, and the pass that owns the
+	// slot writes the report.
+	nm.PrimeEnterState(StateReady)
+	nm.reportPhase()
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, env.stored(t, node).Status.Phase,
+		"a stale machine does not write the report")
+
+	// The same machine, in the state its inputs derive, writes the derived value: draining - the
+	// machine is up and no live claim wants it.
+	nm.PrimeEnterState(phase.State(in))
+	nm.reportPhase()
 	assert.Equal(t, infrav2alpha1.NodePhaseDraining, env.stored(t, node).Status.Phase)
-
-	// the same machine, moved to the state a hook is entering, writes its own state
-	nm.PrimeEnterState(StateShutdown)
-	nm.updateNodeProgress(infrav2alpha1.NodePhaseOff)
-	assert.Equal(t, infrav2alpha1.NodePhaseOff, env.stored(t, node).Status.Phase)
 }
 
 // TestShutdownJobCreationFailureRollsTheSlotBackOutOfShuttingDown covers the other half of the
@@ -421,8 +433,10 @@ func TestShutdownJobCreationFailureRollsTheSlotBackOutOfShuttingDown(t *testing.
 
 	stored := &infrav2alpha1.Node{}
 	require.NoError(t, fake.Get(context.TODO(), client.ObjectKeyFromObject(node), stored))
-	assert.Equal(t, infrav2alpha1.NodePhaseReady, stored.Status.Phase,
-		"a shutdown whose job could not be created leaves the slot ready, not shuttingdown")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, stored.Status.Phase,
+		"a shutdown whose job could not be created leaves the slot in the shape the observation says: "+
+			"the machine is up, no claim wants it, so the report is draining and the next pass asks for "+
+			"the shutdown again")
 	assert.Equal(t, StateReady, nm.GetCurrentState())
 	assert.False(t, mockCoord.HasLock("test-node"), "the lock of a failed operation is released")
 
@@ -589,7 +603,11 @@ func TestStartNodeSurvivesAPlainWriteConflictOnTheLock(t *testing.T) {
 	racy := &slotWriteRace{Client: env.fakeClient, conflicts: 1}
 	coord := NewCoordinationManager(racy, NodeControllerOwner)
 
-	nm := NewNodeStateMachine(env.stored(t, node), racy, env.scheme, coord, WithEventRecorder(env.recorder))
+	claim := TestClaim("test-node", "claim-start", infrav2alpha1.NodeClaimPending, false)
+
+	nm := NewNodeStateMachine(env.stored(t, node), racy, env.scheme, coord,
+		WithEventRecorder(env.recorder),
+		WithInput(phase.Input{Claim: claim, ObservedPower: infrav2alpha1.PowerStateOff}))
 	nm.uncordonTimeout = 100 * time.Millisecond
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 

@@ -61,7 +61,7 @@ func nodeCR(name string, desired infrav2alpha1.PowerState, status infrav2alpha1.
 		},
 		Status: infrav2alpha1.NodeStatus{
 			PowerState: status,
-			Progress:   progress,
+			Phase:      progress,
 		},
 	}
 }

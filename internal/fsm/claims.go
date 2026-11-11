@@ -215,3 +215,17 @@ func (nm *NodeStateMachine) completeScaleDownClaim(reason string) {
 
 	nm.moveClaim(infrav2alpha1.NodeClaimCompleted, reason)
 }
+
+// releaseJobInputs drops the lifecycle-Job flags of the input when the operation that owned them is
+// over: a Job that failed, timed out, or was force-cleaned no longer has anything in flight, and the
+// report and the state the same pass derives must describe the slot the rollback landed on, not the
+// transition that died.
+func (nm *NodeStateMachine) releaseJobInputs(e *fsm.Event) {
+	if e != nil && e.Src == StateShuttingDown {
+		nm.input.ShutdownJobInFlight = false
+
+		return
+	}
+
+	nm.input.StartupJobInFlight = false
+}

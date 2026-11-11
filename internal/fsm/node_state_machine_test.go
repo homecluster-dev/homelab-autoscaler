@@ -40,64 +40,148 @@ import (
 	"github.com/stretchr/testify/require"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
-func TestNewNodeStateMachine(t *testing.T) {
+// inputLawCases is the phase state table of the NodeClaim model, as a test: every row is
+// (live claim, observed power, node usability, Jobs in flight) in, and the derived report and the
+// derived state machine state out. It is the table the PR and docs/architecture/state.md carry, and
+// the same rows are driven end to end in internal/controller/infra's input-law test.
+//
+// The four laws of docs/design/nodeclaim.md §6 are rows 1, 2, 3 and 4 (boot / ready / shut down /
+// force shut down); the rest are the shapes between them.
+func TestFSMInputLaw(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
+	const slot = "test-node"
+
+	pending := TestClaim(slot, "claim-pending", infrav2alpha1.NodeClaimPending, false)
+	booting := TestClaim(slot, "claim-booting", infrav2alpha1.NodeClaimBooting, false)
+	ready := TestClaim(slot, "claim-ready", infrav2alpha1.NodeClaimReady, false)
+	failed := TestClaim(slot, "claim-failed", infrav2alpha1.NodeClaimFailed, false)
+	marked := TestClaim(slot, "claim-marked", infrav2alpha1.NodeClaimReady, true)
+
+	off := infrav2alpha1.PowerStateOff
+	on := infrav2alpha1.PowerStateOn
+
 	tests := []struct {
 		name          string
-		nodeProgress  infrav2alpha1.NodePhase
+		in            phase.Input
+		expectedPhase infrav2alpha1.NodePhase
 		expectedState string
 	}{
 		{
-			name:          "shutdown node creates FSM in shutdown state",
-			nodeProgress:  infrav2alpha1.NodePhaseOff,
+			name:          "law 1: a live claim with the machine off boots it",
+			in:            phase.Input{Claim: pending, ObservedPower: off},
+			expectedPhase: infrav2alpha1.NodePhasePending,
 			expectedState: StateShutdown,
 		},
 		{
-			name:          "starting up node creates FSM in startingup state",
-			nodeProgress:  infrav2alpha1.NodePhaseBooting,
-			expectedState: StateStartingUp,
-		},
-		{
-			name:          "ready node creates FSM in ready state",
-			nodeProgress:  infrav2alpha1.NodePhaseReady,
+			name:          "law 2: live claim, machine on, node usable is ready",
+			in:            phase.Input{Claim: ready, ObservedPower: on, NodeUsable: true},
+			expectedPhase: infrav2alpha1.NodePhaseReady,
 			expectedState: StateReady,
 		},
 		{
-			name:          "shutting down node creates FSM in shuttingdown state",
-			nodeProgress:  infrav2alpha1.NodePhaseDraining,
+			name:          "law 3: no live claim, machine on, shuts it down",
+			in:            phase.Input{ObservedPower: on, NodeUsable: true},
+			expectedPhase: infrav2alpha1.NodePhaseDraining,
+			expectedState: StateReady,
+		},
+		{
+			name:          "law 4: a failed claim with the machine on force-shuts it down",
+			in:            phase.Input{Claim: failed, ObservedPower: on, NodeUsable: true},
+			expectedPhase: infrav2alpha1.NodePhaseDraining,
+			expectedState: StateReady,
+		},
+		{
+			name:          "a free slot: no claim, machine off",
+			in:            phase.Input{ObservedPower: off},
+			expectedPhase: infrav2alpha1.NodePhaseOff,
+			expectedState: StateShutdown,
+		},
+		{
+			name:          "a startup Job in flight for a pending claim is a boot, not a cancel target",
+			in:            phase.Input{Claim: pending, ObservedPower: off, StartupJobInFlight: true},
+			expectedPhase: infrav2alpha1.NodePhaseBooting,
+			expectedState: StateStartingUp,
+		},
+		{
+			name:          "a booting claim with the machine off is starting up",
+			in:            phase.Input{Claim: booting, ObservedPower: off},
+			expectedPhase: infrav2alpha1.NodePhaseBooting,
+			expectedState: StateStartingUp,
+		},
+		{
+			name:          "a ready claim whose node cannot take the pool's work is not ready",
+			in:            phase.Input{Claim: ready, ObservedPower: on, NodeUsable: false},
+			expectedPhase: infrav2alpha1.NodePhaseBooting,
+			expectedState: StateStartingUp,
+		},
+		{
+			name:          "a machine that vanished under a live claim is booted again",
+			in:            phase.Input{Claim: ready, ObservedPower: off},
+			expectedPhase: infrav2alpha1.NodePhaseBooting,
+			expectedState: StateStartingUp,
+		},
+		{
+			name:          "a claim marked for scale-down, machine on, with its shutdown Job running",
+			in:            phase.Input{Claim: marked, ObservedPower: on, NodeUsable: true, ShutdownJobInFlight: true},
+			expectedPhase: infrav2alpha1.NodePhaseDraining,
 			expectedState: StateShuttingDown,
 		},
 		{
-			name:          "empty progress defaults to shutdown state",
-			nodeProgress:  "",
+			name:          "a claim marked for scale-down, machine on, no Job yet: ShutdownNode is the event",
+			in:            phase.Input{Claim: marked, ObservedPower: on, NodeUsable: true},
+			expectedPhase: infrav2alpha1.NodePhaseDraining,
+			expectedState: StateReady,
+		},
+		{
+			name:          "a claim marked for scale-down, machine off: the slot is free again",
+			in:            phase.Input{Claim: marked, ObservedPower: off},
+			expectedPhase: infrav2alpha1.NodePhaseOff,
 			expectedState: StateShutdown,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, tt.nodeProgress)
-			mockCoord := NewMockCoordinationManager()
+			assert.Equal(t, tt.expectedPhase, phase.Derive(tt.in), "the report the model records")
+			assert.Equal(t, tt.expectedState, phase.State(tt.in), "the state the machine starts in")
+
+			// The same derivation through a built machine, so the looplab wiring is covered and not
+			// only the formula.
+			node := CreateTestNode(slot, config.NewNamespaceConfig().Get(), tt.in.ObservedPower, "")
 			fakeClient := CreateFakeClient(scheme, node)
+			machine := NewNodeStateMachine(node, fakeClient, scheme, NewMockCoordinationManager(), WithInput(tt.in))
 
-			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
-			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
-
-			assert.NotNil(t, fsm)
-			assert.Equal(t, tt.expectedState, fsm.GetCurrentState())
-			assert.Equal(t, node, fsm.node)
-			assert.Equal(t, fakeClient, fsm.client)
-			assert.Equal(t, scheme, fsm.scheme)
-			assert.Equal(t, mockCoord, fsm.coordinationManager)
-			assert.Equal(t, DefaultJobTimeout, fsm.jobTimeout)
+			assert.Equal(t, tt.expectedState, machine.GetCurrentState())
 		})
 	}
+}
+
+func TestNewNodeStateMachine(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+	mockCoord := NewMockCoordinationManager()
+	fakeClient := CreateFakeClient(scheme, node)
+
+	fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+	fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
+
+	assert.NotNil(t, fsm)
+	assert.Equal(t, StateShutdown, fsm.GetCurrentState())
+	assert.Equal(t, node, fsm.node)
+	assert.Equal(t, fakeClient, fsm.client)
+	assert.Equal(t, scheme, fsm.scheme)
+	assert.Equal(t, mockCoord, fsm.coordinationManager)
+	assert.Equal(t, DefaultJobTimeout, fsm.jobTimeout)
 }
 
 func TestNodeStateMachine_CanTransition(t *testing.T) {
@@ -105,108 +189,109 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
+	// Each case names the claim and the observation that put the machine in the state the event is
+	// asked for: the state is derived, so a test cannot write it.
+	const slot = "test-node"
+
 	tests := []struct {
 		name          string
-		currentState  infrav2alpha1.NodePhase
+		in            phase.Input
 		event         string
 		canTransition bool
 	}{
-		// Valid transitions
 		{
-			name:          "can start node from shutdown",
-			currentState:  infrav2alpha1.NodePhaseOff,
+			name:          "can start node from a pending claim with the machine off",
+			in:            phase.Input{Claim: TestClaim(slot, "c1", infrav2alpha1.NodeClaimPending, false), ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventStartNode,
 			canTransition: true,
 		},
 		{
-			name:          "can shutdown node from ready",
-			currentState:  infrav2alpha1.NodePhaseReady,
+			name:          "can shutdown node from an unwanted machine",
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOn, NodeUsable: true},
 			event:         EventShutdownNode,
 			canTransition: true,
 		},
 		{
 			name:          "can complete job from starting up",
-			currentState:  infrav2alpha1.NodePhaseBooting,
+			in:            phase.Input{Claim: TestClaim(slot, "c2", infrav2alpha1.NodeClaimBooting, false), ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventJobCompleted,
 			canTransition: true,
 		},
 		{
 			name:          "can complete job from shutting down",
-			currentState:  infrav2alpha1.NodePhaseDraining,
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOn, ShutdownJobInFlight: true},
 			event:         EventJobCompleted,
 			canTransition: true,
 		},
 		{
 			name:          "can fail job from starting up",
-			currentState:  infrav2alpha1.NodePhaseBooting,
+			in:            phase.Input{Claim: TestClaim(slot, "c3", infrav2alpha1.NodeClaimBooting, false), ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventJobFailed,
 			canTransition: true,
 		},
 		{
 			name:          "can fail job from shutting down",
-			currentState:  infrav2alpha1.NodePhaseDraining,
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOn, ShutdownJobInFlight: true},
 			event:         EventJobFailed,
 			canTransition: true,
 		},
 		{
 			name:          "can timeout from starting up",
-			currentState:  infrav2alpha1.NodePhaseBooting,
+			in:            phase.Input{Claim: TestClaim(slot, "c4", infrav2alpha1.NodeClaimBooting, false), ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventJobTimeout,
 			canTransition: true,
 		},
 		{
 			name:          "can timeout from shutting down",
-			currentState:  infrav2alpha1.NodePhaseDraining,
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOn, ShutdownJobInFlight: true},
 			event:         EventJobTimeout,
 			canTransition: true,
 		},
 		{
 			name:          "can force cleanup from starting up",
-			currentState:  infrav2alpha1.NodePhaseBooting,
+			in:            phase.Input{Claim: TestClaim(slot, "c5", infrav2alpha1.NodeClaimBooting, false), ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventForceCleanup,
 			canTransition: true,
 		},
 		{
 			name:          "can force cleanup from shutting down",
-			currentState:  infrav2alpha1.NodePhaseDraining,
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOn, ShutdownJobInFlight: true},
 			event:         EventForceCleanup,
 			canTransition: true,
 		},
-
-		// Invalid transitions
 		{
-			name:          "cannot start node from ready",
-			currentState:  infrav2alpha1.NodePhaseReady,
+			name:          "cannot start node from a ready claim on a usable node",
+			in:            phase.Input{Claim: TestClaim(slot, "c6", infrav2alpha1.NodeClaimReady, false), ObservedPower: infrav2alpha1.PowerStateOn, NodeUsable: true},
 			event:         EventStartNode,
 			canTransition: false,
 		},
 		{
-			name:          "cannot shutdown node from shutdown",
-			currentState:  infrav2alpha1.NodePhaseOff,
+			name:          "cannot shutdown node from a free slot",
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventShutdownNode,
 			canTransition: false,
 		},
 		{
 			name:          "cannot complete job from ready",
-			currentState:  infrav2alpha1.NodePhaseReady,
+			in:            phase.Input{Claim: TestClaim(slot, "c7", infrav2alpha1.NodeClaimReady, false), ObservedPower: infrav2alpha1.PowerStateOn, NodeUsable: true},
 			event:         EventJobCompleted,
 			canTransition: false,
 		},
 		{
 			name:          "cannot complete job from shutdown",
-			currentState:  infrav2alpha1.NodePhaseOff,
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventJobCompleted,
 			canTransition: false,
 		},
 		{
 			name:          "cannot force cleanup from ready",
-			currentState:  infrav2alpha1.NodePhaseReady,
+			in:            phase.Input{Claim: TestClaim(slot, "c8", infrav2alpha1.NodeClaimReady, false), ObservedPower: infrav2alpha1.PowerStateOn, NodeUsable: true},
 			event:         EventForceCleanup,
 			canTransition: false,
 		},
 		{
 			name:          "cannot force cleanup from shutdown",
-			currentState:  infrav2alpha1.NodePhaseOff,
+			in:            phase.Input{ObservedPower: infrav2alpha1.PowerStateOff},
 			event:         EventForceCleanup,
 			canTransition: false,
 		},
@@ -214,15 +299,14 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, tt.currentState)
+			node := CreateTestNode(slot, config.NewNamespaceConfig().Get(), tt.in.ObservedPower, "")
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
-			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
-			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
+			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, WithInput(tt.in))
 
-			assert.Equal(t, tt.canTransition, fsm.CanTransition(tt.event))
+			assert.Equal(t, tt.canTransition, fsm.CanTransition(tt.event),
+				"event %s from the state %q derives", tt.event, fsm.GetCurrentState())
 		})
 	}
 }
@@ -237,7 +321,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -282,7 +366,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -305,7 +389,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -332,7 +416,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -382,7 +466,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node) // No Kubernetes node
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -405,7 +489,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -435,7 +519,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -462,7 +546,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -557,7 +641,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
-			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+			fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
@@ -688,7 +772,7 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		err := fakeClient.Create(context.TODO(), job)
 		require.NoError(t, err)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 		fsm.jobTimeout = 2 * time.Second                  // Short timeout for testing
@@ -726,7 +810,7 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		err := fakeClient.Create(context.TODO(), job)
 		require.NoError(t, err)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 		fsm.jobTimeout = 2 * time.Second                  // Short timeout for testing
@@ -764,7 +848,7 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 		err := fakeClient.Create(context.TODO(), job)
 		require.NoError(t, err)
 
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 		fsm.jobTimeout = 100 * time.Millisecond           // Very short timeout for testing
@@ -920,7 +1004,7 @@ func TestNodeStateMachine_StartNodeWithCleanup(t *testing.T) {
 		oldShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", config.NewNamespaceConfig().Get(), "shutdown", "test-node-k8s")
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -957,7 +1041,7 @@ func TestNodeStateMachine_ShutdownNodeWithCleanup(t *testing.T) {
 		oldShutdownJob := CreateTestJobWithNodeLabel("test-node-shutdown-old", config.NewNamespaceConfig().Get(), "shutdown", "test-node-k8s")
 
 		fakeClient := CreateFakeClient(scheme, node, oldStartupJob, oldShutdownJob)
-		fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+		fsm := MachineForState(node, fakeClient, scheme, mockCoord)
 		fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 		fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 

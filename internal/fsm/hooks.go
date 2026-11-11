@@ -250,7 +250,10 @@ func (nm *NodeStateMachine) afterJobTimeout(ctx context.Context, e *fsm.Event) {
 
 	// The operation is over and it did not produce what it asked for, so the claim that asked for
 	// it ends. This is the v1alpha1 rollback of a timed-out lifecycle Job into a stable progress,
-	// with the end of the attempt recorded on the object that carried the request.
+	// with the end of the attempt recorded on the object that carried the request. The Job of this
+	// operation is finished, so the input stops naming one: the report and the state the same pass
+	// derives are the stable shape the rollback landed on.
+	nm.releaseJobInputs(e)
 	nm.moveClaim(infrav2alpha1.NodeClaimFailed, jobFailureReason(e, true))
 	nm.reportPhase()
 }
@@ -271,6 +274,7 @@ func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {
 	// not work, and the claim says so (reason StartupJobFailed / ShutdownJobFailed). The bound on
 	// the streak of attempts is enforced by the claim controller against the digest the slot keeps,
 	// so the v1alpha1 condition on the slot and its refusal site are gone (§4).
+	nm.releaseJobInputs(e)
 	nm.moveClaim(infrav2alpha1.NodeClaimFailed, jobFailureReason(e, false))
 
 	// Record the slot's derived report against the new claim phase and the observation.
@@ -309,6 +313,7 @@ func (nm *NodeStateMachine) afterForceCleanup(ctx context.Context, e *fsm.Event)
 
 	// A transition that got stuck and was force-cleaned produced no usable machine either, so the
 	// claim of the episode ends.
+	nm.releaseJobInputs(e)
 	nm.moveClaim(infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonStuckTransition)
 	nm.reportPhase()
 
@@ -336,9 +341,12 @@ func (nm *NodeStateMachine) enterStartingUp(ctx context.Context, e *fsm.Event) {
 		maxRetries:      MaxRetries,
 	}
 
-	// Record the report of the slot. The claim is still pending at this point: the startup Job is
-	// what moves it to booting (StartNode -> commitAttempt), so the slot reports pending until a
-	// machine has actually been bought.
+	// The pending -> booting edge: this transition is the startup operation beginning, so the claim
+	// moves here, and the write is what the report of the same pass is derived from. The startup Job
+	// is created by the caller a few lines later; if that creation fails, StartNode fires the
+	// JobFailed rollback and afterJobFailed moves the claim to failed - a committed boot that never
+	// got its Job is a failed attempt, not a claim left in pending with a Job nothing owns.
+	nm.moveClaim(infrav2alpha1.NodeClaimBooting, "")
 	nm.reportPhase()
 
 	// The startup attempt is counted on the claim, not on the slot: status.attempt is seeded from

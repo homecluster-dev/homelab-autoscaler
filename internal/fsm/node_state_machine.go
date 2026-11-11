@@ -65,6 +65,13 @@ func NewNodeStateMachine(
 		opt(nm)
 	}
 
+	// A caller that passes no input gets the observation alone: the power the cluster reports for the
+	// machine, and no live claim. That is the shape of a slot with no claim, and it is what the
+	// historical callers of this constructor - built from a Node read from the cache - mean.
+	if nm.input.ObservedPower == "" {
+		nm.input.ObservedPower = nm.node.Status.PowerState
+	}
+
 	// Initialize the FSM with the state the input law derives: (live claim phase, observed power,
 	// node usability). The v1alpha1 machine seeded itself from status.progress, i.e. from a record
 	// of what it last did, and every rule about which writers outrank which is a consequence of
@@ -155,6 +162,11 @@ func (nm *NodeStateMachine) StartNode() error {
 	nm.currentJob = job.Name
 	nm.jobStartTime = time.Now()
 
+	// The lifecycle Job of this operation exists: the input records it, and the report the same
+	// pass derives is a boot, not a pending claim.
+	nm.input.ShutdownJobInFlight = false
+	nm.input.StartupJobInFlight = true
+
 	// The pending -> booting edge of the claim, on the same path that created the startup Job: an
 	// attempt is a machine bought, not a reconcile pass, and from here the boot is committed -
 	// nothing cancels it (docs/design/nodeclaim.md §3).
@@ -230,6 +242,13 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 
 	nm.currentJob = job.Name
 	nm.jobStartTime = time.Now()
+
+	// The shutdown Job of this operation exists: the input records it, so the report the same pass
+	// derives is draining - the machine is up and the pool wants it no longer - and the state the
+	// machine derives is shuttingdown, where JobCompleted is reachable.
+	nm.input.StartupJobInFlight = false
+	nm.input.ShutdownJobInFlight = true
+	nm.reportPhase()
 
 	// Start async job monitoring
 	go nm.monitorJobCompletion(job.Name)
