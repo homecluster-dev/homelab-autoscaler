@@ -100,9 +100,41 @@ func TestNodeGroupNodes(t *testing.T) {
 		expected map[string]pb.InstanceStatus_InstanceState
 	}{
 		{
-			name: "powered off slots are not instances",
+			// A slot with no machine and no node object is spare capacity, not an instance.
+			// Reporting it is what made the autoscaler provision extra machines.
+			name: "off slot without a kubernetes node is skipped",
 			objects: []client.Object{
 				nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+			},
+			expected: map[string]pb.InstanceStatus_InstanceState{},
+		},
+		{
+			// The machine is off but the kubelet node object is still there (NotReady), so the
+			// slot is an instance that is going away. Cluster-autoscaler matches the node to it
+			// by spec.providerID, so it must not look like an unregistered node.
+			name: "off slot with a kubernetes node is deleting",
+			objects: []client.Object{
+				nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				k8sNode("slot-1", "homelab://slot-1"),
+			},
+			expected: map[string]pb.InstanceStatus_InstanceState{
+				"homelab://slot-1": pb.InstanceStatus_instanceDeleting,
+			},
+		},
+		{
+			name: "off slot with a kubernetes node without providerID falls back to the node CR identity",
+			objects: []client.Object{
+				nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				k8sNode("slot-1", ""),
+			},
+			expected: map[string]pb.InstanceStatus_InstanceState{
+				"homelab://slot-1": pb.InstanceStatus_instanceDeleting,
+			},
+		},
+		{
+			name: "off slot whose kubernetes node name is empty is skipped",
+			objects: []client.Object{
+				slotWithoutKubernetesNodeName("slot-1", infrav1alpha1.PowerStateOff),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{},
 		},
@@ -145,10 +177,13 @@ func TestNodeGroupNodes(t *testing.T) {
 			},
 		},
 		{
-			name: "mixed pool reports only existing and provisioning capacity",
+			name: "mixed pool reports every slot with a machine and skips spare capacity",
 			objects: []client.Object{
-				// fresh, never provisioned slot of a 15 slot pool
+				// fresh, never provisioned slot of a 15 slot pool, no machine and no node object
+				nodeCR("slot-seeded", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				// scaled down slot, the machine is off and the node object is left over
 				nodeCR("slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				k8sNode("slot-off", "homelab://slot-off"),
 				// slot requested by IncreaseSize, machine not joined yet
 				nodeCR("slot-new", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
 				// running slot without a cloud-controller-manager
@@ -156,6 +191,7 @@ func TestNodeGroupNodes(t *testing.T) {
 				k8sNode("omni-remote-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
+				"homelab://slot-off":      pb.InstanceStatus_instanceDeleting,
 				"homelab://slot-new":      pb.InstanceStatus_instanceCreating,
 				"homelab://omni-remote-1": pb.InstanceStatus_instanceRunning,
 			},
@@ -222,6 +258,70 @@ func TestNodeGroupNodesIgnoresEmptyKubernetesNodeName(t *testing.T) {
 		assert.Equal(t, "homelab://slot-1", resp.Instances[0].Id)
 		assert.Equal(t, pb.InstanceStatus_instanceCreating, resp.Instances[0].Status.InstanceState)
 	}
+}
+
+// TestNodeGroupNodesInstancePerMachine covers the contract the autoscaler relies on: one
+// instance per slot that has a machine, and the state of that instance follows the desired power
+// state. Cluster-autoscaler keys Kubernetes nodes to instances by spec.providerID, so the row
+// that matters is the shut down slot - its node object is still there and must map to an
+// instance, marked deleting, while a never provisioned slot must stay invisible.
+func TestNodeGroupNodesInstancePerMachine(t *testing.T) {
+	server := newServer(t,
+		nodeCR("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		k8sNode("slot-running", "homelab://slot-running"),
+		nodeCR("slot-creating", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+		nodeCR("slot-deleting", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		k8sNode("slot-deleting", "homelab://slot-deleting"),
+		nodeCR("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	resp, err := server.NodeGroupNodes(context.Background(), &pb.NodeGroupNodesRequest{Id: testGroup})
+	require.NoError(t, err)
+
+	got := make(map[string]pb.InstanceStatus_InstanceState, len(resp.Instances))
+	for _, instance := range resp.Instances {
+		require.NotEmpty(t, instance.Id, "instance id must never be empty")
+		require.NotNil(t, instance.Status)
+		require.NotNil(t, instance.Status.ErrorInfo, "error info must stay present and empty")
+		require.Empty(t, instance.Status.ErrorInfo.ErrorCode)
+		got[instance.Id] = instance.Status.InstanceState
+	}
+
+	assert.Equal(t, map[string]pb.InstanceStatus_InstanceState{
+		"homelab://slot-running":  pb.InstanceStatus_instanceRunning,
+		"homelab://slot-creating": pb.InstanceStatus_instanceCreating,
+		"homelab://slot-deleting": pb.InstanceStatus_instanceDeleting,
+	}, got, "a slot with no machine must not be reported")
+}
+
+// TestNodeGroupNodesStableIdentityAcrossShutdown covers the identity of a slot while it is
+// scaled down. The instance id is the providerID cluster-autoscaler matches the Kubernetes node
+// against, so the id must not change when the slot moves from running to deleting.
+func TestNodeGroupNodesStableIdentityAcrossShutdown(t *testing.T) {
+	server := newServer(t,
+		nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		k8sNode("slot-1", "homelab://slot-1"),
+	)
+
+	ctx := context.Background()
+
+	resp, err := server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
+	require.NoError(t, err)
+	require.Len(t, resp.Instances, 1)
+	assert.Equal(t, pb.InstanceStatus_instanceRunning, resp.Instances[0].Status.InstanceState)
+
+	// NodeGroupDeleteNodes sets the desired state to off; the machine powers off and the node
+	// object stays behind, NotReady.
+	slot := &infrav1alpha1.Node{}
+	require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: "slot-1", Namespace: "default"}, slot))
+	slot.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
+	require.NoError(t, server.Client.Update(ctx, slot))
+
+	resp, err = server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
+	require.NoError(t, err)
+	require.Len(t, resp.Instances, 1)
+	assert.Equal(t, pb.InstanceStatus_instanceDeleting, resp.Instances[0].Status.InstanceState)
+	assert.Equal(t, "homelab://slot-1", resp.Instances[0].Id, "instance id must not change when the slot is scaled down")
 }
 
 func TestNodeGroupTargetSizeIgnoresSeededSlots(t *testing.T) {
