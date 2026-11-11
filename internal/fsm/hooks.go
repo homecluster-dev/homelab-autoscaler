@@ -216,8 +216,13 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 		logger.Info("Successfully released coordination lock after job completion", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect new state
-	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
+	// Update node status to reflect new state. The progress of the state the machine is in is the
+	// value, not Progress(e.Dst): the completion of a shutdown Job whose machine the cluster still
+	// observes up moved the machine to ready (see refuseUnobservedShutdown, enterShutdown), and a
+	// completion that records the shutdown that observation refused is the lie this file exists to
+	// keep out of a slot. Every other transition leaves the machine in e.Dst, so the two spellings
+	// write the same value.
+	nm.updateNodeProgress(infrav1alpha1.Progress(nm.GetCurrentState()))
 
 	// Jobs are cleaned up automatically via TTL - no manual cleanup needed
 }
@@ -258,8 +263,9 @@ func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {
 		logger.Info("Successfully released coordination lock after job failure", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect failure and new state
-	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
+	// Update node status to reflect failure and new state. The machine's own state is the value, as
+	// in afterJobCompleted: a rollback writes the stable progress the machine moved into.
+	nm.updateNodeProgress(infrav1alpha1.Progress(nm.GetCurrentState()))
 
 	// Add failure condition
 	nm.addNodeCondition(metav1.Condition{
@@ -292,8 +298,9 @@ func (nm *NodeStateMachine) afterForceCleanup(ctx context.Context, e *fsm.Event)
 		logger.Info("Successfully force released coordination lock", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect cleanup
-	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
+	// Update node status to reflect cleanup. The machine's own state is the value, as in
+	// afterJobCompleted.
+	nm.updateNodeProgress(infrav1alpha1.Progress(nm.GetCurrentState()))
 
 	// Add cleanup condition
 	nm.addNodeCondition(metav1.Condition{
@@ -429,6 +436,34 @@ func (nm *NodeStateMachine) enterShutdown(ctx context.Context, e *fsm.Event) {
 
 	// Clear backoff strategy
 	nm.backoff = nil
+
+	// The completion of a shutdown Job is the one write of status.progress: shutdown this package
+	// cannot verify - its evidence is the exit code of a container the operator supplies (see the
+	// audit in shutdown_completion.go, and the live slot it closes). So the completion is conditional
+	// on the observation: a machine the cluster reports up (status.powerState on, and its corev1.Node
+	// Ready) is recorded at the progress the observation says, ready, and is not recorded shut down at
+	// all. From ready the claim that is already off reaches ShutdownNode again on the next pass; from
+	// shutdown nothing on this slot is reachable, which is the dead slot the record alone produced.
+	//
+	// A startup that died on the way (JobFailed / JobTimeout / ForceCleanup into shutdown) is not
+	// gated: those land on the stable off/shutdown pair by design, and the observation controllers
+	// write the machine they find - the rule that keeps that pair from resting is
+	// progress.ReconcileObservedPower, which applies the same precedence on the far side of its grace.
+	if e != nil && e.Event == EventJobCompleted && nm.refuseUnobservedShutdown(ctx) {
+		logger.Info("Not recording the shutdown completion: the machine is observed up",
+			"node", nm.node.Name,
+			"job", jobNameFromArgs(e),
+			"kubernetesNode", kubernetesNodeTarget(nm.node),
+			"powerstate", string(nm.node.Status.PowerState),
+			"recorded", string(infrav1alpha1.ProgressReady),
+			"why", "the shutdown Job exited 0 and the provider's observation says the machine is up: "+
+				"recording shutdown would strand the slot in a state the FSM cannot act on")
+
+		nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonShutdownNotObserved, ActionPowerOff,
+			shutdownNotObservedNote(nm, jobNameFromArgs(e)))
+
+		return
+	}
 
 	// Update node status
 	nm.updateNodeProgress(infrav1alpha1.ProgressShutdown)

@@ -65,8 +65,10 @@ type NodeReconciler struct {
 	Scheme *runtime.Scheme
 
 	// EventRecorder publishes Kubernetes Events on the Node CR for the scale up/down
-	// transitions the FSM runs and for the progress settlements the watchdog makes (see
-	// internal/progress). nil records nothing, which is what the unit tests use.
+	// transitions the FSM runs and for the status.progress corrections the two rules of
+	// internal/progress make (the settlement of a progress that outlived its machine, and the
+	// observed power that outranks a recorded progress - see internal/progress).
+	// nil records nothing, which is what the unit tests use.
 	// Built once in cmd/main.go with mgr.GetEventRecorder, the new events API.
 	EventRecorder events.EventRecorder
 }
@@ -160,17 +162,24 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return r.handleNodeDeletion(ctx, node, groupName, req.Name)
 	}
 
-	// Settle a status.progress that outlived the machine behind it, before any FSM branch can act
-	// on it. This runs first on purpose: the slot below is the live failure, a progress of ready
-	// (or a transitional one) with no corev1.Node and no lifecycle Job, and every branch that sees
-	// it wants to act on a machine that is not there. From ready the FSM fires a ShutdownNode and
-	// builds a shutdown Job for a server that was already deleted; a transitional progress is
-	// gated out of every transition by validateStateTransition, so it is simply frozen. Neither
-	// shape heals itself - see internal/progress for why not.
+	// Settle a status.progress that the cluster's observation contradicts, before any FSM branch can
+	// act on it, and settle a status.progress that outlived the machine behind it. Both rules run
+	// first on purpose: the slot below is the live failure, and every branch that reads a progress
+	// reads it as the FSM's state (fsm.getCurrentState).
 	//
-	// The wrapper returns the deadline the watchdog asked for when it declined to settle (a Job in
-	// flight, a Job that just finished inside the grace), which is folded into the result below so
-	// the settlement is scheduled and not left to the next resync.
+	//   - progress: shutdown on a slot whose machine is observed up is the shape a 40-minute stuck
+	//     scale-down lives in: ShutdownNode is unreachable from it, so correcting the progress to
+	//     ready is what lets the same pass fire the shutdown the claim asks for (see
+	//     internal/progress/observed_power.go);
+	//   - a progress of ready / startingup / shuttingdown with no corev1.Node and no lifecycle Job is
+	//     the shape a machine deleted out of band leaves behind: from ready the FSM fires a
+	//     ShutdownNode and builds a Job for a server that was already deleted, and a transitional
+	//     progress is gated out of every transition by validateStateTransition. Neither shape heals
+	//     itself - see internal/progress for why not.
+	//
+	// The wrapper returns the deadline the rules asked to be looked at again for (a Job in flight, a
+	// Job that just finished inside the grace), which is folded into the result below so the
+	// correction is scheduled and not left to the next resync.
 	watchdogRequeue := r.reconcileObservedProgress(ctx, node)
 
 	// Validate state before attempting transitions with smart backoff
@@ -188,25 +197,60 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	return shortenRequeue(result, watchdogRequeue), err
 }
 
-// reconcileObservedProgress settles a slot whose status.progress names a machine the cluster does
-// not have, re-arms a claimed slot whose machine never arrived, or uncordons a ready slot whose node
-// is cordoned with nothing running on it, and returns how long the watchdog wants to be looked at
-// again (0 = no deadline). See internal/progress for the rule, the grace period it is built on, and
-// the events it records.
+// reconcileObservedProgress applies the two status rules of internal/progress, in order, and
+// returns how long they want to be looked at again (0 = no deadline):
 //
-// A failure of the watchdog is never fatal to the pass: it means the reconciliation did not happen,
+//  1. progress.ReconcileObservedPower corrects a status.progress that the observed power of the
+//     slot contradicts - an on the machine reports, a shutdown the FSM recorded - and writes the
+//     caller's copy in place, so the FSM branch of this same pass can fire the ShutdownNode the
+//     corrected progress makes legal. See internal/progress/observed_power.go for the rule and for
+//     the live slot it closes.
+//  2. progress.Settle settles a slot whose status.progress names a machine the cluster does not
+//     have, re-arms a claimed slot whose machine never arrived, or uncordons a ready slot whose node
+//     is cordoned with nothing running on it. See internal/progress for the rule, the grace period
+//     it is built on, and the events it records.
+//
+// The two have distinct jobs and cannot both act on one slot: 1 requires a corev1.Node that reports
+// Ready, 2's settle and re-arm require a slot with no corev1.Node at all. They share the gates that
+// are not about the machine - the lifecycle Job grace and the coordination lock - so they cannot
+// disagree about whether an operation owns the slot.
+//
+// A failure of either rule is never fatal to the pass: it means the reconciliation did not happen,
 // and the next pass is the next attempt. Failing a reconcile because a slot that is already broken
 // could not be repaired would hide the reason it is broken.
 func (r *NodeReconciler) reconcileObservedProgress(ctx context.Context, node *infrav1alpha1.Node) time.Duration {
+	logger := log.FromContext(ctx)
+
+	correction, err := progress.ReconcileObservedPower(ctx, r.Client, node, r.EventRecorder, progress.SettleGracePeriod)
+	if err != nil {
+		logger.Error(err, "Failed to reconcile status.progress against the observed power state",
+			"node", node.Name, "progress", string(node.Status.Progress), "powerstate", string(node.Status.PowerState))
+	}
+
 	outcome, err := progress.Settle(ctx, r.Client, node, r.EventRecorder, progress.SettleGracePeriod)
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to reconcile status.progress against observed reality",
+		logger.Error(err, "Failed to reconcile status.progress against observed reality",
 			"node", node.Name, "progress", string(node.Status.Progress))
 
 		return progress.SettleGracePeriod
 	}
 
-	return outcome.RequeueAfter
+	return earliestRequeue(correction.RequeueAfter, outcome.RequeueAfter)
+}
+
+// earliestRequeue folds the deadlines the two status rules asked for into the one the caller
+// honours: the earliest of them, since acting on a slot at the later deadline leaves the correction
+// the earlier one asked for to the next resync. A rule that asked for nothing (0) is not a deadline.
+func earliestRequeue(a, b time.Duration) time.Duration {
+	if a <= 0 {
+		return b
+	}
+
+	if b <= 0 || a < b {
+		return a
+	}
+
+	return b
 }
 
 // readinessTaintKeys returns the taint keys the scale-up readiness gate of this slot's Group waits

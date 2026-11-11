@@ -63,6 +63,25 @@ limitations under the License.
 //
 // It records a Warning for each, and writes nothing else: the claim is the request, and this package
 // does not answer it, it only makes the slot able to answer it again.
+//
+// The package holds two rules, and they have distinct jobs. Read them as the two directions a slot
+// can lie in:
+//
+//   - Settle settles a *claim that produced nothing*: the progress names a machine (ready /
+//     startingup / shuttingdown) and the cluster has none - no corev1.Node, no lifecycle Job, no
+//     live lock. Its write is the stable off / shutdown pair.
+//   - ReconcileObservedPower (see observed_power.go) corrects a *machine that outlived its recorded
+//     state*: the progress says there is no machine (shutdown / shuttingdown, the two values the
+//     FSM reads as StateShutdown) and the cluster has positively observed one up - status.powerState
+//     on, and the slot's corev1.Node reporting Ready, which is the same observation that wrote the
+//     on. Its write is the observed pair, progress: ready.
+//
+// They cannot both act on one slot, and that is structural, not a coordination: Settle's settle and
+// re-arm arms require a slot with no corev1.Node at all, and ReconcileObservedPower requires a
+// corev1.Node that reports Ready. The two rules share the gates that are not about the machine -
+// observe, the lifecycle Job grace (jobWindow) and the coordination lock - so they can never
+// disagree about whether an operation owns the slot, and both run in the node controller's FSM path,
+// above every branch that reads status.progress.
 package progress
 
 import (
@@ -244,6 +263,10 @@ type Outcome struct {
 	// Uncordoned is true when the cordon safety net cleared spec.unschedulable:
 	// Action == ActionUncordon.
 	Uncordoned bool
+
+	// Corrected is true when the observed power of the slot overruled its recorded progress and the
+	// progress was written: Action == ActionCorrectToReady (see observed_power.go).
+	Corrected bool
 
 	// Previous is the progress the slot carried before the write; empty when nothing was
 	// written.
@@ -475,6 +498,15 @@ type observations struct {
 	nodeCordoned bool
 	nodeMarked   bool
 
+	// nodeReady is the Ready condition of that node, and is the strong half of the evidence the
+	// observed-power rule acts on: NodeReady=True is what core.getNodeStatus maps onto
+	// status.powerState: on, so a slot whose node object reports Ready is a slot the cluster has
+	// positively observed as powered on. NotReady is deliberately not evidence of anything here -
+	// it is the weak observation core.applyObservedPowerState spells out (a machine that is booting,
+	// a machine that is going off, and a machine that is up with a dead kubelet all spell it) - so
+	// the rule that corrects a progress on the strength of an observed on only reads the Ready side.
+	nodeReady bool
+
 	// lockHeld says a live coordination lock names an operation that owns the slot; lockNote
 	// describes it for the log.
 	lockHeld bool
@@ -508,6 +540,7 @@ func observe(ctx context.Context, c client.Client, coord fsm.CoordinationManager
 		obs.nodePresent = true
 		obs.nodeCordoned = kubeNode.Spec.Unschedulable
 		obs.nodeMarked = hasAutoscalerMarker(kubeNode)
+		obs.nodeReady = isReady(kubeNode)
 	}
 
 	jobs, err := lifecycleJobs(ctx, c, slot)
@@ -621,28 +654,11 @@ func decide(slot *infrav1alpha1.Node, obs observations) decision {
 		return decision{reason: "a coordination lock names an operation that owns the slot"}
 	}
 
-	// The grace window is measured from the tightest deadline of the Jobs of the slot: the
-	// earliest one that is about to leave it.
-	var wait time.Duration
-
-	for i := range obs.jobs {
-		job := &obs.jobs[i]
-
-		completed, finished := finishedAt(job)
-		if !finished {
-			// Pending or running: the operation is alive and its monitor is the writer. Look
-			// again on the grace, so a monitor that died with its manager is still caught.
-			return decision{requeueAfter: obs.grace, reason: fmt.Sprintf("lifecycle Job %s is in flight", job.Name)}
-		}
-
-		remaining := obs.grace - obs.now.Sub(completed)
-		if remaining <= 0 {
-			continue
-		}
-
-		if wait == 0 || remaining < wait {
-			wait = remaining
-		}
+	inFlight, wait := jobWindow(obs)
+	if inFlight != "" {
+		// Pending or running: the operation is alive and its monitor is the writer. Look again on
+		// the grace, so a monitor that died with its manager is still caught.
+		return decision{requeueAfter: obs.grace, reason: fmt.Sprintf("lifecycle Job %s is in flight", inFlight)}
 	}
 
 	if wait > 0 {
@@ -742,6 +758,38 @@ func impliesMachine(progress infrav1alpha1.Progress) bool {
 	default:
 		return false
 	}
+}
+
+// jobWindow is the lifecycle-Job half of the gate the two rules of this package share. It reports
+// the name of a Job that is pending or running - an operation in flight, whose monitor is the
+// writer of the slot's progress - and the time left of the settle grace of the finished Job whose
+// grace expires soonest, the tightest deadline of the Jobs of the slot.
+//
+// It is one function because both rules have to defer to the same evidence: the rule that settles a
+// progress that outlived its machine (Settle) and the rule that corrects a progress that the
+// observed power contradicts (ReconcileObservedPower) must never disagree about whether an
+// operation owns the slot, and a grace period that one rule measures and the other does not is how
+// a controller writes over a transition its owner is about to record.
+func jobWindow(obs observations) (inFlight string, graceRemaining time.Duration) {
+	for i := range obs.jobs {
+		job := &obs.jobs[i]
+
+		completed, finished := finishedAt(job)
+		if !finished {
+			return job.Name, 0
+		}
+
+		remaining := obs.grace - obs.now.Sub(completed)
+		if remaining <= 0 {
+			continue
+		}
+
+		if graceRemaining == 0 || remaining < graceRemaining {
+			graceRemaining = remaining
+		}
+	}
+
+	return "", graceRemaining
 }
 
 // startupGrace measures the settle grace of a slot that has no lifecycle Job object to measure
@@ -975,6 +1023,21 @@ func uncordonNode(ctx context.Context, c client.Client, nodeName string) (bool, 
 	}
 
 	return true, nil
+}
+
+// isReady reports the Ready condition of a Kubernetes node: true only when the node says
+// NodeReady=True. It is the same reading core.KubernetesNodeReconciler.getNodeStatus uses to write
+// status.powerState: on, so the two rules observe the machine identically: a node that is not Ready
+// is not evidence that a machine is up, and a node object that is not Ready is not evidence that a
+// machine is gone either (see kubernetesNode).
+func isReady(kubeNode *corev1.Node) bool {
+	for _, cond := range kubeNode.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
 }
 
 // hasUnschedulableTaint reports whether the kubelet's cordon taint is on the node.

@@ -697,6 +697,19 @@ func (nm *NodeStateMachine) setOwnerReference(job *batchv1.Job) {
 // writers outside the FSM - the gRPC server and the core node controllers - and none of them
 // is a state machine this check can consult; see docs/architecture/state.md.
 //
+// What the guard cannot cover is the field it does not write. updateNodeProgress persists
+// status.progress and never status.powerState, so a progress written here is recorded against the
+// power state the last observation left behind, and the pair is only as true as that observation:
+// the completion of a shutdown Job writes shutdown while the machine it powered off keeps its
+// corev1.Node Ready for node-monitor-grace-period (~40s), and the observation controller writes the
+// off when it sees the node go NotReady. A pair {powerState: on, progress: shutdown} that outlives
+// that window is a machine that outlived its record, and it is the state of the live 40-minute stuck
+// slot: the FSM derives StateShutdown from the progress, so ShutdownNode - the operation the claim
+// wants - is unreachable. Two rules close it: the completion of a shutdown Job refuses to write the
+// pair at all when the machine is observed up (fsm.refuseUnobservedShutdown, in
+// internal/fsm/shutdown_completion.go), and progress.ReconcileObservedPower corrects a pair that
+// rested, on the far side of the settle grace. Both read the observation; neither invents one.
+//
 // The check is free on every legitimate path: looplab/fsm applies the state change before it
 // runs the enter_ and after_ callbacks, so the progress a hook passes is the state the machine
 // is in, and this writes exactly what it used to.

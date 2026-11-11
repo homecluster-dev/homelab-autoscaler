@@ -121,7 +121,31 @@ that check.
    (`updateNodeProgress` refuses the progress of any state the machine is not in). A slot with a
    lifecycle Job in flight, a live coordination lock, or a Kubernetes node behind it is owned by
    its operation, and nothing else writes it.
-2. **The progress watchdog reconciles a slot that nothing is driving** (`internal/progress`, run
+2. **Observed provider power outranks a recorded progress**
+   (`progress.ReconcileObservedPower`, `internal/progress/observed_power.go`, run by the node
+   controller at the top of every pass, above every branch that reads `status.progress`). The
+   invariant: **a slot must never rest with an observed power that contradicts its FSM state.** The
+   shape the rule exists for is the live one - `{spec.desiredPowerState: off, status.powerState: on,
+   status.progress: shutdown}`: the FSM derives `StateShutdown` from the progress, the only event
+   legal from there is `StartNode`, the claim is `off`, so the reconcile logs "Node is in desired
+   state or transitioning" and the machine - up, serving pods, paid for - stays there until an
+   operator patches `status.progress` by hand.
+   - The evidence is the pair the observation controllers publish: `status.powerState: on` **and**
+     the slot's `corev1.Node` reporting `Ready` (the reading `core.getNodeStatus` maps onto the `on`).
+     A slot with no node object, or a NotReady one, is not "observed up" - that is rule 3's ground.
+   - The progress must imply no machine: `shutdown`, `shuttingdown`, and the empty progress of a slot
+     that was never seeded, the three values `getCurrentState` reads as `StateShutdown`.
+   - The lifecycle-Job grace and the coordination-lock gate are the watchdog's, verbatim
+     (`jobWindow`): the completion of a shutdown Job records `shutdown` while the machine's node
+     object stays `Ready` for node-monitor-grace-period (~40s), and correcting in that window is the
+     duplicate shutdown Job rule 4 refuses to write for.
+   - The write is the observed progress, `ready`, one status update, the claim untouched. For
+     `spec.desiredPowerState: off` the machine is up and unwanted, so `ShutdownNode` is legal from
+     there and the **same pass fires it** - no grace is waited for, the claim is already off - with a
+     `MachineObservedUp` **Warning** naming the progress it replaced. For a claim of `on` the machine
+     is wanted, the progress was the only thing wrong, and the same correction is a **Normal**: no
+     Job, no power operation.
+3. **The progress watchdog reconciles a slot that nothing is driving** (`internal/progress`, run
    by the node controller at the top of every pass, before any FSM branch). One gate, three
    outcomes: the slot has no `corev1.Node`, no startup/shutdown Job in flight, no such Job finished
    in the last `SettleGracePeriod` (~7 minutes, see below), carries no live coordination lock, and
@@ -138,15 +162,25 @@ that check.
    - the slot has a node object, is at `ready`, is claimed on, is cordoned, and carries no
      cluster-autoscaler marker -> **uncordon** it, with a `CordonReconciled` Warning. That is the
      residue of the paths that land in `ready` without the uncordon hook (`JobTimeout`, `JobFailed`).
-3. **Observation updates the stable values.** `core.KubernetesNodeReconciler.applyObservedPowerState`
+4. **Observation updates the stable values.** `core.KubernetesNodeReconciler.applyObservedPowerState`
    corrects `powerState`/`progress` to what the node object reports, and
    `core.NodeSlotReconciler` seeds a slot that never had a machine. Neither writes a transitional
    value, and neither runs on a slot that has no node object at all - which is exactly the case
-   rule 2 exists for.
+   rule 3 exists for.
 
-The order is the design. Rule 1 is what can strand a slot; rule 2 exists because of rule 1, and
-because rules 3 cannot reach a slot with no node object; rule 3 is the writer that was never
-allowed to fix the transitional values, and still is not.
+The order is the design. Rule 1 is what can strand a slot; rule 2 exists because a record of what
+the FSM last did is not evidence about a machine, and a progress that outlives the machine it
+describes freezes a slot rule 1 cannot leave; rule 3 exists because of rule 1 and because rule 4
+cannot reach a slot with no node object; rule 4 is the writer that was never allowed to fix the
+transitional values, and still is not.
+
+**Rules 2 and 3 have distinct jobs, and they cannot both act on one slot.** The watchdog settles a
+*claim that produced nothing*: its progress names a machine (`ready`, `startingup`, `shuttingdown`)
+and the cluster has none - no `corev1.Node`, no lifecycle Job, no lock. Rule 2 corrects a *machine
+that outlived its recorded state*: its progress names no machine and the cluster has one it observes
+up. The first needs a slot with no node object, the second needs one that reports `Ready`: the two
+gates are disjoint by construction, and they share the Job-grace and lock gates so they can never
+disagree about whether an operation owns the slot.
 
 The two gates that are not obvious:
 
@@ -204,6 +238,49 @@ The two gates that are not obvious:
   the transition into `startingup`: the absence of a Job is not evidence that the operation is over,
   and a grace that only exists while the Job object does would open inside the hook that owns the
   progress.
+
+### A shutdown Job that succeeded is not a machine that is off
+
+`progress: shutdown` is written by the completion of a shutdown Job, and the Job's evidence is the
+exit code of a container the operator supplies (`spec.shutdownPodSpec`): a script that calls the
+provider's power API, SSHes to the machine, pulls a plug. A script that exits 0 on a path where the
+power-off did not land - the provider accepted the request for a server that keeps running, an error
+was swallowed, a graceful ACPI request came back up - records the slot as off while the machine is
+up. `updateNodeProgress` writes `status.progress` and never `status.powerState`, so the write leaves
+the pair `{powerState: on, progress: shutdown}` standing, and the pair is what the live 40-minute
+stuck slot rests on: the observation controller that owns a slot with a node object refuses to
+correct a progress from an observed `on` unless the claim is `on` (see
+`core.applyObservedPowerState`), and the FSM reads `StateShutdown` from the progress, so
+`ShutdownNode` - the operation the claim wants - is unreachable. The slot heals only by hand.
+
+Two guards, in the order the evidence arrives:
+
+- **The completion is conditional** (`fsm.refuseUnobservedShutdown`,
+  `internal/fsm/shutdown_completion.go`). `enterShutdown` on a `JobCompleted` transition records
+  `shutdown` only when the machine is not observed up: not observed up is no `corev1.Node`, a node
+  that is not `Ready`, a node that has no heartbeat recorded, or a Ready condition whose
+  `lastHeartbeatTime` is not more than `shutdownObservationFreshness` (60s) after
+  `status.lastShutdownTime`. The heartbeat is the whole discriminator, and it is what keeps a healthy
+  scale-down paying nothing: a `Ready` node is normal for node-monitor-grace-period (~40s) after its
+  kubelet dies, and the Job monitor polls every 30s, so refusing the completion on the condition
+  alone would fire a second shutdown Job on every scale-down. When the observation does contradict
+  the completion, the hook writes the observed progress (`ready`) - and moves its own machine to
+  `ready`, so `updateNodeProgress`'s guard and the `after_JobCompleted` hook of the same completion
+  agree with it - stamps no `Shutdown` condition, records a `ShutdownNotObserved` **Warning** naming
+  the Job, and leaves the slot in the one state the FSM can act on: the claim that is already off
+  reaches `ShutdownNode` on the next pass, and the shutdown is retried until it lands.
+- **What the hook cannot do is wait.** It runs inside a completion whose monitor has already
+  returned, with an observation that is at most a node-monitor-grace-period stale, so the precedence
+  is enforced a second time, with a horizon a hook does not have, by rule 2
+  (`progress.ReconcileObservedPower`): once the slot's lifecycle Job has aged out of
+  `SettleGracePeriod`, an observed on outranks the recorded progress. That is the backstop, and the
+  split is the watchdog's own: the hook keeps a provable lie out of the completion write, rule 2
+  corrects a lie that rested, and rule 3 settles the claim that produced nothing.
+
+A startup that died on the way into `shutdown` (`JobFailed`, `JobTimeout`, `ForceCleanup`) is not
+gated: those land on the stable `off`/`shutdown` pair by design, and a `ready` slot is what the
+readiness gate exists to stop the pool from declaring. What has to be true about that pair is that it
+does not rest, and rule 2 is what makes it true.
 
 ### Ready means the machine can take the pool's work
 
@@ -333,6 +410,11 @@ The FSM provides robust error recovery:
 - Automatic lock cleanup
 
 ### Slots With No Machine
+
+The mirror of this section is [A shutdown Job that succeeded is not a machine that is
+off](#a-shutdown-job-that-succeeded-is-not-a-machine-that-is-off): the bullets below are a progress
+that names a machine the cluster does not have, those are a machine the cluster has and a progress
+that denies it.
 - The progress watchdog settles a slot whose `status.progress` names a machine the cluster does not
   have, with a `ProgressReconciled` Warning naming the progress it replaced (see
   [The authority order for status.progress](#the-authority-order-for-statusprogress))

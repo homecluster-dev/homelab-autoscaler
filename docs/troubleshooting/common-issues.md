@@ -184,6 +184,55 @@ the observation controllers), a startup/shutdown Job in flight, a Job that finis
 a startup stamped inside the grace by `status.lastStartupTime` when the Job object is already gone
 (the TTL collected it), or a live coordination lock.
 
+### The Slot Says Shutdown But The Machine Is Up
+
+The mirror of the section above: there the progress named a machine the cluster did not have, here the
+progress **denies** a machine the cluster can see. Read the pair:
+
+```bash
+kubectl get node.infra.homecluster.dev <node-name> -o jsonpath='{.spec.powerState} {.status.powerState} {.status.progress}' ; echo
+kubectl get node <kubernetes-node-name> -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastHeartbeatTime}' ; echo
+kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
+```
+
+`{status.powerState: on, status.progress: shutdown}` on a slot with `spec.powerState: off` is a
+machine that outlived its record: a shutdown Job exited 0 and the provider's power-off did not land
+(the request was accepted for a server that kept running, the script swallowed the error, a graceful
+ACPI request came back up). The record is not cosmetic. The FSM derives its state from
+`status.progress`, so the slot is `shutdown`; the only event legal from there is `StartNode`, the
+claim is `off`, and `ShutdownNode` - the operation that would satisfy it - is unreachable. Before this
+rule the reconcile logged "Node is in desired state or transitioning" every pass and the machine ran
+for 40 minutes until `status.progress` was patched by hand.
+
+The controller now closes it in two places, and both say so on the slot:
+
+- the shutdown completion is **conditional** (`internal/fsm/shutdown_completion.go`): a completed
+  shutdown Job on a machine the cluster observes up is not recorded as `shutdown` at all. The slot is
+  recorded `ready`, which is the state the FSM can act on, and one `ShutdownNotObserved` **Warning**
+  names the Job that claimed the machine was off. The next reconcile runs the shutdown again, with its
+  Job, its lock and its cordon. The guard reads the kubelet's **heartbeat** and not the `Ready`
+  condition, so a healthy scale-down - whose node object stays `Ready` for
+  `node-monitor-grace-period`, ~40s, after the machine goes off - pays no second shutdown Job;
+- the precedence is enforced again in the reconcile (`progress.ReconcileObservedPower`): with
+  `status.powerState: on`, a `corev1.Node` reporting `Ready`, and a progress that implies no machine
+  (`shutdown`, `shuttingdown`, or empty), the observation outranks the record, the progress is
+  corrected to `ready`, and - for a claim of `off` - the **same pass** fires `ShutdownNode`. Nothing
+  waits for a grace period: the claim is already off and the machine is burning money. One
+  `MachineObservedUp` **Warning** names the progress it replaced; on a claimed-`on` slot the same
+  correction is a **Normal**, with no Job, because the machine is the one the pool asked for.
+
+```bash
+kubectl describe node.infra.homecluster.dev <node-name>
+# Events: ShutdownNotObserved | MachineObservedUp  (each names the progress / Job it is talking about)
+```
+
+Both rules share the lifecycle-Job and coordination-lock gates, so a shutdown that is genuinely in
+flight is left to its own operation. What they cannot fix is the pool's own shutdown script: if
+`spec.shutdownPodSpec` exits 0 without the provider's power-off landing, the slot loops - shutdown
+Job, machine still up, `ShutdownNotObserved`, retry - and the visible symptom moves from a frozen slot
+to a Warning per attempt. Make the script call the provider's own power-off and exit non-zero when the
+machine is still on.
+
 ### Who Cordoned My Node
 
 cluster-autoscaler marks the nodes it is about to remove with its own taints, and the operator side
