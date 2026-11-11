@@ -748,10 +748,73 @@ func TestNodeGroupIncreaseSizeFailsWithoutFreeSlot(t *testing.T) {
 	assert.Contains(t, err.Error(), "0 of 3 slots are free")
 }
 
-// landCreatedClaims lands the claims a handler just created on their pending phase. The phase is
-// declared with a +kubebuilder:default on the status in the CRD, so the API server stamps a
-// created claim live at once; the fake client applies no CRD defaults, so a fixture seeds the
-// phase the claim controller's first pass (and the schema default) produce.
+// TestCreatedClaimIsLiveBeforeTheFirstStatusWrite is the ordering M1 settles: the status
+// subresource strips `status` from a create, and `status.phase` carries no CRD default (a default
+// on a subresource field is only stamped by the first status write), so a claim the provider has
+// just created has no phase at all. In that window the provider must already see the request:
+// TargetSize counts it, its slot is not free, and DecreaseTargetSize can cancel it. If an empty
+// phase is read as "not live" - and IsTerminal said exactly that, before the reading moved into
+// phase.IsLive - a second IncreaseSize claims the same slot, two requests buy one machine, and the
+// autoscaler's arithmetic is short by the unit it is paying for.
+func TestCreatedClaimIsLiveBeforeTheFirstStatusWrite(t *testing.T) {
+	server := newServer(t, flatten(
+		[]client.Object{groupCR(testGroup, 0)},
+		idleSlot("slot-fresh"),
+		idleSlot("slot-idle"),
+	)...)
+
+	ctx := context.Background()
+
+	_, err := server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+	require.NoError(t, err)
+
+	created := claimsOf(t, server)
+	require.Len(t, created, 1)
+	require.Empty(t, created[0].Status.Phase, "the create carried no status: the phase the controller lands has not landed yet")
+
+	size, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), size.TargetSize, "a request the API server accepted is capacity from its create")
+
+	nodes, err := server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Len(t, nodes.Instances, 1, "the slot a phaseless claim names is reported, not invisible")
+
+	// The same slot is not claimed a second time: one live claim per slot is what makes "a live
+	// claim exists" a synonym for "the machine is wanted".
+	_, err = server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+	require.NoError(t, err, "the second request takes the other free slot; the first slot is not offered twice")
+
+	claims := claimsOf(t, server)
+	require.Len(t, claims, 2)
+	slots := map[string]bool{}
+	for _, nodeClaim := range claims {
+		assert.False(t, slots[nodeClaim.Spec.SlotRef.Name], "slot %s is claimed twice", nodeClaim.Spec.SlotRef.Name)
+		slots[nodeClaim.Spec.SlotRef.Name] = true
+	}
+
+	// A claim with no phase is in the cancelable phase, so the decrease that asks for the unit back
+	// cancels the request the controller has not moved yet.
+	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
+	require.NoError(t, err, "both claims are pending, one of them by the empty phase, and both are cancelable")
+
+	after, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), after.TargetSize, "the units came off on the deletes that made them")
+	assert.Empty(t, claimsOf(t, server), "a phaseless claim is a pending claim, and a pending claim is deleted by a decrease")
+}
+
+// landCreatedClaims lands the claims a handler just created on their pending phase, for the tests
+// that need the claim controller's first write to have happened (a move out of pending, a digest
+// seeded from the phase).
+//
+// It is not needed for the provider's arithmetic. `status.phase` carries no CRD default - a default
+// on a status field is not stamped on create, because the status subresource strips `status` from
+// the create - and a claim with no phase is read as pending by phase.IsLive / phase.IsPending, which
+// is the single place that reading lives. A brand-new request is capacity from the instant the API
+// server accepts it: TargetSize counts it, its slot is not free, and DecreaseTargetSize can cancel
+// it. TestProviderSeesACreatedClaimLive pins that ordering; a fixture that seeds pending here is
+// stating the phase the controller's first pass lands, not making the claim live.
 func landCreatedClaims(t *testing.T, server *HomeClusterProviderServer) {
 	t.Helper()
 
@@ -788,12 +851,11 @@ func TestNodeGroupIncreaseSizeRefusesNonPositiveDelta(t *testing.T) {
 // reporting is the size the request actually produced.
 //
 // "No silent lying" is the property under test. The response of the RPC carries no size
-// (NodeGroupDecreaseTargetSizeResponse is intentionally empty), and cluster-autoscaler reads the
-// group's size back from NodeGroupTargetSize, so the provider has to leave the two in agreement:
-// a request for -3 that can cancel 2 units takes 2 units away and reports success for exactly
-// that, and a request that can cancel nothing takes nothing away and is answered as the no-op it
-// is, because a FailedPrecondition the autoscaler retries forever never corrects its own stale
-// view of the target size.
+// (NodeGroupDecreaseTargetSizeResponse is intentionally empty), so success is the provider
+// asserting "the size you asked for is in force", and cluster-autoscaler reads the group's size
+// back from NodeGroupTargetSize. A request for -3 that can cancel 2 units takes 2 units away and
+// reports success for exactly that; a request that can cancel nothing is answered with a code that
+// says so (TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsRetryable).
 func TestNodeGroupDecreaseTargetSizeCancelsOnlyPendingClaims(t *testing.T) {
 	server := newServer(t, flatten(
 		pendingSlot("slot-pending-1"),
@@ -826,10 +888,19 @@ func TestNodeGroupDecreaseTargetSizeCancelsOnlyPendingClaims(t *testing.T) {
 		"the achievable resulting size is what the provider reports: the two cancelled units are off the number, the committed boot is not")
 }
 
-// TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsANoOpSuccess: a group whose every live
-// claim is committed cannot be decreased by this entry point, and the autoscaler is not stuck
-// retrying a request the provider can never carry out.
-func TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsANoOpSuccess(t *testing.T) {
+// TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsRetryable is M6, the messaging half of the
+// cancelation contract. A group whose every live claim is past the pending phase cannot be
+// decreased by this entry point: a booting claim is committed and a ready machine runs work, so
+// the request has nothing to cancel.
+//
+// Answering that with success is a lie the autoscaler acts on. It stops asking for the decrease,
+// and it keeps paying for a unit it asked away - and for the same slot its next IncreaseSize is
+// answered "no free node slot" (FailedPrecondition), a permanent-looking error that lasts as long
+// as the committed boot takes: up to one boot deadline, plus the TTL of the claim that carried it.
+// The state is transient by construction (the boot deadline closes a boot, DeleteNodes closes a
+// ready machine), so the code is codes.Unavailable: retryable, and naming what is committed and by
+// what.
+func TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsRetryable(t *testing.T) {
 	server := newServer(t, flatten(
 		bootingSlot("slot-booting"),
 		runningSlot(t, "slot-ready"),
@@ -843,7 +914,13 @@ func TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsANoOpSuccess(t *testing
 	ctx := context.Background()
 
 	_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
-	require.NoError(t, err)
+	require.Error(t, err, "a decrease that cancelled nothing does not report success")
+
+	st, ok := grpcstatus.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.Unavailable, st.Code(), "the state is transient: a boot ends at its deadline, a ready machine ends at DeleteNodes")
+	assert.Contains(t, st.Message(), "booting")
+	assert.Contains(t, st.Message(), "ready")
 
 	phases := claimPhases(t, server)
 	assert.Len(t, phases, 3, "nothing was cancelled, so no claim disappeared")
@@ -853,6 +930,29 @@ func TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsANoOpSuccess(t *testing
 	after, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), after.TargetSize, "the size the provider reports is unchanged, because the request changed nothing")
+}
+
+// TestNodeGroupDecreaseTargetSizeAtZeroIsANoOpSuccess: a group with no live claim is already at
+// every size the request can ask for. That is not a failure to carry out the request, it is the
+// request satisfied, and the autoscaler is told so with a success it can act on.
+func TestNodeGroupDecreaseTargetSizeAtZeroIsANoOpSuccess(t *testing.T) {
+	server := newServer(t, flatten(
+		idleSlot("slot-free-1"),
+		idleSlot("slot-free-2"),
+		[]client.Object{
+			nodeCR("slot-done", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+			claimCR("slot-done", infrav2alpha1.NodeClaimCompleted, nil),
+		},
+	)...)
+
+	ctx := context.Background()
+
+	_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
+	require.NoError(t, err, "the requested size is already in force: the answer is success, not a retry")
+
+	after, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), after.TargetSize)
 }
 
 // TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize: the floor is judged against the target

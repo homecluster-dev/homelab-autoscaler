@@ -18,6 +18,7 @@ package claim
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -83,35 +84,86 @@ func deleteNodes(names ...string) infrav2alpha1.ClaimRequest {
 }
 
 // TestAttemptBudgetIsTheSumOfTheDeadlines pins §4 of the design: the budget of one attempt is the
-// sum of every deadline an attempt can consume, plus one sleep at the ceiling. The expected value
-// is computed from the fsm's own constants, so growing a deadline without growing the budget fails,
-// and the numbers are not copied into the test.
+// sum of every deadline an attempt can consume, plus one sleep at the ceiling. The expected value is
+// computed from the fsm's own constants, so growing a deadline without growing the budget fails.
+//
+// The set is what the test asserts, not just the total. The budget is measured from
+// spec.requestedAt, i.e. from before the startup Job exists, so one attempt can spend the Job's own
+// timeout, then the registration wait, then the readiness gate, in series: a sum that quietly drops
+// one of the constants is a claim killed in the middle of the machine it is still buying, and an
+// assertion that only compares the budget against the *smallest* member (a poll interval) cannot see
+// that. So the set is asserted three ways: the sum of the named set equals the budget, no proper
+// subset of it does, and the budget outlasts the serial chain of the deadlines it bounds.
 func TestAttemptBudgetIsTheSumOfTheDeadlines(t *testing.T) {
-	fromTheConstants := fsm.JobMonitorPollInterval +
-		fsm.DefaultUncordonTimeout +
-		fsm.DefaultReadinessGateTimeout +
-		fsm.MaxUncordonRetryInterval +
-		time.Minute
+	constants := BudgetConstants()
 
-	assert.Equal(t, fromTheConstants, AttemptBudget(),
-		"the budget is job monitor poll + registration wait + readiness gate + margin")
+	names := make([]string, 0, len(constants))
+	for name := range constants {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 
-	// The design names the number the four constants add up to (docs/design/nodeclaim.md §4:
-	// 30s + 90s + 4m + 10s + 1m = 7m10s). Changing a deadline is a deliberate act, and this
+	// The set the budget is built from, spelled out. A constant leaving the budget has to leave this
+	// list too, and the sum assertion below is what catches it.
+	assert.Equal(t, []string{
+		"job monitor poll",
+		"one sleep at the ceiling",
+		"readiness gate",
+		"registration wait",
+		"startup Job timeout",
+		"uncordon retry ceiling",
+	}, names, "the set of constants the budget is built from")
+
+	assert.Equal(t, map[string]time.Duration{
+		"startup Job timeout":      fsm.DefaultJobTimeout,
+		"job monitor poll":         fsm.JobMonitorPollInterval,
+		"registration wait":        fsm.DefaultUncordonTimeout,
+		"readiness gate":           fsm.DefaultReadinessGateTimeout,
+		"uncordon retry ceiling":   fsm.MaxUncordonRetryInterval,
+		"one sleep at the ceiling": time.Minute,
+	}, constants, "each member of the set is the fsm constant of §4, not a copy of a number")
+
+	total := time.Duration(0)
+	for _, name := range names {
+		total += constants[name]
+	}
+
+	assert.Equal(t, total, AttemptBudget(),
+		"the budget is the sum of the named set: startup Job timeout + job monitor poll + registration wait + readiness gate + margin")
+
+	// No proper subset of the set adds up to the budget: dropping one member, in particular the
+	// startup Job's own timeout, moves the total and fails here.
+	for _, name := range names {
+		assert.NotEqual(t, AttemptBudget(), total-constants[name],
+			"the budget is built from %s too: without it a claim is killed at the boundary of a deadline it is still inside", name)
+	}
+
+	// The design names the number the set adds up to (docs/design/nodeclaim.md §4:
+	// 5m + 30s + 90s + 4m + 10s + 1m = 12m10s). Changing a deadline is a deliberate act, and this
 	// assertion is the one that says so in the release notes.
-	assert.Equal(t, 7*time.Minute+10*time.Second, AttemptBudget(),
-		"the budget the design states is 7m10s")
+	assert.Equal(t, 12*time.Minute+10*time.Second, AttemptBudget(),
+		"the budget the design states is 12m10s")
 
-	// The budget is the sum of the deadlines, so it is longer than each of them: an attempt that
-	// spends one whole deadline still has room to be reported, not killed at its own boundary.
-	for name, deadline := range map[string]time.Duration{
-		"job monitor poll":       fsm.JobMonitorPollInterval,
-		"registration wait":      fsm.DefaultUncordonTimeout,
-		"readiness gate":         fsm.DefaultReadinessGateTimeout,
-		"uncordon retry ceiling": fsm.MaxUncordonRetryInterval,
-	} {
+	// The budget is longer than each deadline it covers, and longer than the chain they form in
+	// series: a Job that burns its whole 5m, a node that takes the whole 90s to register, and a gate
+	// that runs its whole 4m is 9m50s of attempt, and a 7m10s budget failed the claim inside it.
+	// That is the arithmetic the 0.1.20 watchdog's grace got by only applying to a Job that had
+	// already finished, and a claim's deadline has no such restriction to inherit.
+	serial := fsm.DefaultJobTimeout + fsm.DefaultUncordonTimeout + fsm.DefaultReadinessGateTimeout
+	assert.Greater(t, AttemptBudget(), serial,
+		"the budget must outlast a Job that spends its whole timeout and then the registration wait and then the gate (%s)", serial)
+
+	for name, deadline := range constants {
 		assert.Greater(t, AttemptBudget(), deadline, "the budget must outlast the %s it covers", name)
 	}
+}
+
+// TestMachineGoneGraceIsABootWindow is M2's bound: the observation that a ready claim's machine is
+// off has to outlast a whole boot window before the model calls the machine gone, so a reboot is not
+// an attempt that ends, and a machine that is really gone is not counted as capacity forever.
+func TestMachineGoneGraceIsABootWindow(t *testing.T) {
+	assert.Equal(t, AttemptBudget(), MachineGoneGrace(),
+		"the grace is one boot window: the same horizon the deadline of the attempt is measured by")
 }
 
 // TestDeadlineAtIsTheBudgetFlooredByTheGroupNumber is the floor rule of §4:
@@ -160,8 +212,8 @@ func TestDeadlineAtIsTheBudgetFlooredByTheGroupNumber(t *testing.T) {
 		},
 		{
 			name:       "a longer group number extends the deadline to the autoscaler's own horizon",
-			groupMax:   &metav1.Duration{Duration: 10 * time.Minute},
-			wantOffset: 10 * time.Minute,
+			groupMax:   &metav1.Duration{Duration: 20 * time.Minute},
+			wantOffset: 20 * time.Minute,
 		},
 		{
 			name:       "a pool that never gives up",
@@ -233,7 +285,7 @@ func TestIsOverdueIsTheClockOfTheDeadline(t *testing.T) {
 // TestBudgetIsTheNumberInForceForReporting: the group's spec.maxNodeProvisionTime is copied onto
 // the claim, so a pool that changes the number does not rewrite the history of a claim (§4).
 func TestBudgetIsTheNumberInForceForReporting(t *testing.T) {
-	long := 10 * time.Minute
+	long := 20 * time.Minute
 
 	tests := []struct {
 		name  string
@@ -398,7 +450,10 @@ func TestSeedAttemptIsTheStreakOfOneEpisode(t *testing.T) {
 // from a stale cache must not bake in a number the controller cannot correct.
 func TestNewIsTheRequestTheScalarCouldNot(t *testing.T) {
 	scheme := scheme(t)
-	long := 10 * time.Minute
+
+	// A group number longer than the operator's budget (12m10s, §4): the floor is what the deadline
+	// lands on, so the fixture has to be above it to test the floor.
+	long := 20 * time.Minute
 
 	tests := []struct {
 		name        string

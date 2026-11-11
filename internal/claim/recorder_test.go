@@ -19,6 +19,7 @@ package claim
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -279,9 +280,17 @@ func TestRecorderMoveIsTheTableEnforced(t *testing.T) {
 				assert.False(t, got.Status.FinishedAt.Time.Before(nodeClaim.CreationTimestamp.Time))
 			}
 
-			assert.Equal(t, phase.IsLive(tt.to) && tt.to != infrav2alpha1.NodeClaimPending,
+			// MachineCommitted is the answer to "did this attempt ever buy a machine". On a live
+			// move the phase that answers it is the one it moved to; on a terminal move it is the
+			// one it moved *from*: a claim that ends from booting or ready leaves a real machine
+			// behind for the input law to power off, a claim that ends from pending leaves
+			// nothing. Recording the destination of a terminal move here would call both "no
+			// machine", which is the difference an operator is asking about.
+			committed := tt.to == infrav2alpha1.NodeClaimBooting || tt.to == infrav2alpha1.NodeClaimReady ||
+				tt.from == infrav2alpha1.NodeClaimBooting || tt.from == infrav2alpha1.NodeClaimReady
+			assert.Equal(t, committed,
 				conditionStatus(t, got, infrav2alpha1.ClaimConditionMachineCommitted) == metav1.ConditionTrue,
-				"the attempt bought a machine from booting on")
+				"the attempt bought a machine from booting on, and an end does not un-buy it")
 			assert.Equal(t, tt.to == infrav2alpha1.NodeClaimReady,
 				conditionStatus(t, got, infrav2alpha1.ClaimConditionReady) == metav1.ConditionTrue,
 				"the claim asserts its machine is usable only at ready")
@@ -423,7 +432,8 @@ func TestRecorderIsIdempotentOverAnAlreadyMarkedClaim(t *testing.T) {
 	assert.Equal(t, infrav2alpha1.ClaimReasonNodeDeleted, landed.Status.Reason)
 	require.NotNil(t, landed.Status.FinishedAt)
 	assert.Equal(t, metav1.ConditionFalse, conditionStatus(t, landed, infrav2alpha1.ClaimConditionReady))
-	assert.Equal(t, metav1.ConditionFalse, conditionStatus(t, landed, infrav2alpha1.ClaimConditionMachineCommitted))
+	assert.Equal(t, metav1.ConditionTrue, conditionStatus(t, landed, infrav2alpha1.ClaimConditionMachineCommitted),
+		"the scale-down ended a ready claim: there is a machine, and it is what the shutdown was for")
 
 	// Every later pass of the same scale-down: the request is already recorded, and re-deleting it
 	// is not a cancellation.
@@ -580,7 +590,11 @@ func TestARequestReadsBackWhatItAskedFor(t *testing.T) {
 	assert.Equal(t, fixGroup, got.Labels[LabelGroup], "the group label")
 	assert.Equal(t, fixSlot, got.Labels[LabelSlot], "the slot label")
 	assert.NotEmpty(t, got.Spec.RequestedAt)
-	require.NotNil(t, got.Spec.DeadlineAt)
+	// B1: the boot window closed at ready, and the recorder cleared spec.deadlineAt on that write.
+	// A healthy machine's claim that carries a deadline in its past is a claim every later reader -
+	// the controller, the digest, `kubectl get nodeclaim` - reads as an overdue attempt.
+	assert.Nil(t, got.Spec.DeadlineAt, "the deadline is the budget of the boot, and the boot is over")
+	assert.True(t, HasFinalizer(got), "the finalizer arrived with the boot, on the booting write (M5)")
 
 	// The record of the attempt: the number the slot's history produced, and the phase the
 	// lifecycle path reported.
@@ -594,6 +608,154 @@ func TestARequestReadsBackWhatItAskedFor(t *testing.T) {
 	assert.Equal(t, fixGroup, digest.Group)
 	assert.Equal(t, int32(1), digest.Attempt)
 	assert.Equal(t, infrav2alpha1.NodeClaimReady, digest.Phase)
+	assert.Nil(t, digest.DeadlineAt, "the digest and the CRD agree: the attempt is over, and it has no deadline")
+}
+
+// TestRecorderBootingMoveStampsTheFinalizer is M5: the finalizer of a scale-down arrives on the same
+// write that records the pending -> booting move. A finalizer stamped by the claim controller on a
+// later pass leaves a window in which a DeleteNodes deletes a committed boot with no shutdown behind
+// it - the object is gone, the startup Job and the machine are not, and nothing owns them (§3: "a
+// boot that has started is never cancelled" is only true if the object that says so cannot be deleted
+// while the boot runs).
+func TestRecorderBootingMoveStampsTheFinalizer(t *testing.T) {
+	nodeClaim := recordedClaim(infrav2alpha1.NodeClaimPending, 1)
+	require.Empty(t, nodeClaim.Finalizers, "a pending claim is cheap to cancel: it carries no finalizer")
+
+	recorder, cl := recorderWith(t, nodeClaim)
+	ctx := context.Background()
+	key := client.ObjectKeyFromObject(nodeClaim)
+
+	moved, err := recorder.Move(ctx, key, infrav2alpha1.NodeClaimBooting, "")
+	require.NoError(t, err)
+	require.True(t, moved)
+
+	got := getClaim(t, cl, nodeClaim)
+	assert.Equal(t, infrav2alpha1.NodeClaimBooting, got.Status.Phase)
+	assert.True(t, HasFinalizer(got), "the phase and the finalizer land on one write, so there is no pass boundary to delete into")
+
+	// The finalizer of a pending claim's cancelation is not stamped: deleting a pending claim stays a
+	// plain delete, which is the whole cancelation path of DecreaseTargetSize.
+	pending := recordedClaim(infrav2alpha1.NodeClaimPending, 1)
+	pending.Name = "stays-cancelable"
+	recorder2, cl2 := recorderWith(t, pending)
+
+	moved, err = recorder2.Move(ctx, client.ObjectKeyFromObject(pending), infrav2alpha1.NodeClaimCompleted,
+		infrav2alpha1.ClaimReasonCancelledByDecreaseTargetSize)
+	require.NoError(t, err)
+	require.True(t, moved)
+	assert.False(t, HasFinalizer(getClaim(t, cl2, pending)),
+		"a move that never entered the boot window stamps no finalizer")
+}
+
+// TestRecorderReadyMoveClosesTheBootWindow is B1 in the writer: reaching ready ends the boot budget,
+// and the deadline is cleared so the object says what the model means. The move is idempotent
+// afterwards: the second pass writes nothing, because the deadline it would clear is already gone.
+func TestRecorderReadyMoveClosesTheBootWindow(t *testing.T) {
+	nodeClaim := recordedClaim(infrav2alpha1.NodeClaimBooting, 1)
+	deadline := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+	nodeClaim.Spec.DeadlineAt = &deadline
+
+	recorder, cl := recorderWith(t, nodeClaim)
+	ctx := context.Background()
+	key := client.ObjectKeyFromObject(nodeClaim)
+
+	moved, err := recorder.Move(ctx, key, infrav2alpha1.NodeClaimReady, "")
+	require.NoError(t, err)
+	require.True(t, moved)
+
+	got := getClaim(t, cl, nodeClaim)
+	assert.Equal(t, infrav2alpha1.NodeClaimReady, got.Status.Phase)
+	assert.Nil(t, got.Spec.DeadlineAt, "the boot window is closed: the deadline of the attempt is finished")
+	assert.False(t, IsOverdue(got, time.Now()), "a ready claim with an old deadline is not overdue: IsOverdue reads the field, and the field is gone")
+
+	before := getClaim(t, cl, nodeClaim)
+	moved, err = recorder.Move(ctx, key, infrav2alpha1.NodeClaimReady, "")
+	require.NoError(t, err)
+	assert.False(t, moved, "the ready move is idempotent once its window is closed")
+	assert.Equal(t, before.ResourceVersion, getClaim(t, cl, nodeClaim).ResourceVersion,
+		"an idempotent move touches neither the spec nor the status")
+}
+
+// TestScaleDownStreakSpentIsTheShutdownCounterOfItsOwn is M4: the bound on shutdown attempts lives on
+// status.shutdownAttempts, the boot attempts are untouched by it, and a spent streak is a bounded
+// pause - past claim.ShutdownAttemptResetGrace the shutdown fires again, so a pool whose script has
+// been fixed is picked up without a hand edit.
+func TestScaleDownStreakSpentIsTheShutdownCounterOfItsOwn(t *testing.T) {
+	at := func(d time.Duration) *metav1.Time {
+		now := metav1.NewTime(time.Now().Add(d))
+
+		return &now
+	}
+
+	tests := []struct {
+		name      string
+		claim     *infrav2alpha1.NodeClaim
+		wantSpent bool
+		wantReset bool
+	}{
+		{
+			name:      "no attempts spent",
+			claim:     &infrav2alpha1.NodeClaim{Status: infrav2alpha1.NodeClaimStatus{Phase: infrav2alpha1.NodeClaimReady}},
+			wantSpent: false,
+		},
+		{
+			name: "one attempt short of the bound",
+			claim: &infrav2alpha1.NodeClaim{Status: infrav2alpha1.NodeClaimStatus{
+				Phase: infrav2alpha1.NodeClaimReady, ShutdownAttempts: MaxConsecutiveAttempts - 1,
+				LastShutdownAttemptAt: at(0),
+			}},
+			wantSpent: false,
+		},
+		{
+			name: "the bound spent, inside the grace: the refusal is in force",
+			claim: &infrav2alpha1.NodeClaim{Status: infrav2alpha1.NodeClaimStatus{
+				Phase: infrav2alpha1.NodeClaimReady, ShutdownAttempts: MaxConsecutiveAttempts,
+				LastShutdownAttemptAt: at(0),
+			}},
+			wantSpent: true,
+		},
+		{
+			name: "the bound spent, its grace past: a fixed script is picked up",
+			claim: &infrav2alpha1.NodeClaim{Status: infrav2alpha1.NodeClaimStatus{
+				Phase: infrav2alpha1.NodeClaimReady, ShutdownAttempts: MaxConsecutiveAttempts,
+				LastShutdownAttemptAt: at(-(ShutdownAttemptResetGrace + time.Minute)),
+			}},
+			wantSpent: false,
+			wantReset: true,
+		},
+		{
+			name: "a spent streak with no clock is a streak that started now",
+			claim: &infrav2alpha1.NodeClaim{Status: infrav2alpha1.NodeClaimStatus{
+				Phase: infrav2alpha1.NodeClaimReady, ShutdownAttempts: MaxConsecutiveAttempts,
+			}},
+			wantSpent: true,
+		},
+		{
+			name: "the boot attempts of the episode are not the shutdown bound",
+			claim: &infrav2alpha1.NodeClaim{Status: infrav2alpha1.NodeClaimStatus{
+				Phase: infrav2alpha1.NodeClaimReady, Attempt: 9, ShutdownAttempts: 0,
+			}},
+			wantSpent: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spent, left := ScaleDownStreakSpent(tt.claim)
+			assert.Equal(t, tt.wantSpent, spent)
+
+			if tt.wantSpent {
+				assert.Greater(t, left, time.Duration(0), "the refusal reports the grace it is pausing for")
+				assert.LessOrEqual(t, left, ShutdownAttemptResetGrace)
+			} else {
+				assert.Zero(t, left, "a streak that is not spent has no grace to wait out")
+			}
+		})
+	}
+
+	nilSpent, nilLeft := ScaleDownStreakSpent(nil)
+	assert.False(t, nilSpent, "no claim spends no attempts")
+	assert.Zero(t, nilLeft)
 }
 
 // TestGetIsNilForACollectedClaim: every caller of Get is a path that has to survive the TTL.

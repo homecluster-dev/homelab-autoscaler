@@ -281,9 +281,12 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				requireClaimsFor(created, "gpu-node-2", "gpu-group", int32(1))
 
-				// The phase of a created claim is the schema's default and the claim
-				// controller's first write; the mock client applies neither, so the fixture
-				// lands it and the provider's arithmetic is read back on a live claim.
+				// A created claim carries no phase until the claim controller's first write:
+				// the status subresource strips `status` from a create, and the CRD declares
+				// no default there. The provider reads that empty phase as pending
+				// (phase.IsLive), so the claim is live and counted from its create - the
+				// fixture lands the controller's write here to assert the arithmetic on the
+				// phase the episode runs at, not to make the claim count.
 				created.Status.Phase = infrav2alpha1.NodeClaimPending
 				Expect(mockClient.Update(testCtx, created)).To(Succeed())
 
@@ -428,8 +431,9 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 	Describe("NodeGroupDecreaseTargetSize endpoint", func() {
 		Context("when group has running nodes", func() {
-			It("should decrease target size by shutting down nodes", func() {
-				// Setup test data with shutting down scenario
+			It("refuses a decrease of a group whose live claims are all committed, retryably", func() {
+				// The scenario's machine is a ready claim: the machine is running work, and
+				// this entry point cancels pending claims only (docs/design/nodeclaim.md §5).
 				mockClient, err := loader.CreateMockClientWithScenario("shutting-down")
 				Expect(err).NotTo(HaveOccurred())
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
@@ -439,11 +443,24 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 					Id:    "cpu-group",
 					Delta: -1,
 				}
-				resp, err := server.NodeGroupDecreaseTargetSize(testCtx, req)
+				_, err = server.NodeGroupDecreaseTargetSize(testCtx, req)
 
-				// Verify response
+				// M6: the provider does not answer a request it did not carry out with success.
+				// Success is the autoscaler's cue to stop asking, and it is then left paying for a
+				// unit it asked away while IncreaseSize for the same slot answers "no free node
+				// slot" - for up to a boot deadline plus the claim's TTL. The state is transient
+				// (DeleteNodes closes a ready machine), so the code is the retryable one.
+				Expect(err).To(HaveOccurred())
+
+				st, ok := status.FromError(err)
+				Expect(ok).To(BeTrue())
+				Expect(st.Code()).To(Equal(codes.Unavailable))
+				Expect(st.Message()).To(ContainSubstring("ready"))
+
+				size, err := server.NodeGroupTargetSize(testCtx, &pb.NodeGroupTargetSizeRequest{Id: "cpu-group"})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(resp).NotTo(BeNil())
+				Expect(size.TargetSize).To(BeNumerically(">", 0),
+					"nothing was cancelled, so the size the autoscaler reads back is the size it asked against")
 			})
 		})
 

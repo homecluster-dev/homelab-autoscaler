@@ -34,6 +34,7 @@ import (
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 	"github.com/homecluster-dev/homelab-autoscaler/test/utils"
 )
@@ -659,8 +660,26 @@ spec:
 
 				return fresh.Spec.DeadlineAt.Time.Equal(want)
 			}, 30*time.Second, checkInterval).Should(BeTrue(),
-				"The deadline is the budget of one attempt (job monitor poll + registration wait +\n"+
-					"readiness gate + margin), floored by the group's number")
+				"The deadline is the budget of one attempt (startup Job timeout + job monitor poll +\n"+
+					"registration wait + readiness gate + margin), floored by the group's number")
+
+			By("Verifying the budget outlasts the deadlines one attempt can spend in series")
+			// B2. The deadline runs from spec.requestedAt, i.e. from before the startup Job exists,
+			// so one attempt can spend the Job's own timeout, then the registration wait, then the
+			// readiness gate - about 9m50s of deadlines. A budget that omits the Job's timeout
+			// (7m10s, the first sketch of §4) fails a claim in the middle of the machine it is still
+			// buying, and the machine that boots an instant later is force-shut-down as overdue.
+			Eventually(func() bool {
+				fresh, err := newestClaimOfSlot(shutdownNodeName)
+				if err != nil || fresh == nil || fresh.Spec.DeadlineAt == nil {
+					return false
+				}
+
+				budget := fresh.Spec.DeadlineAt.Time.Sub(fresh.Spec.RequestedAt.Time)
+
+				return budget >= claimSerialDeadlines()
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"The claim's budget is at least the Job timeout + the registration wait + the readiness gate")
 
 			By("Verifying the claim copies the group's number in force")
 			// spec.maxNodeProvisionTime is the number the pool declared when the claim was created:
@@ -942,6 +961,49 @@ spec:
 			}, 15*time.Second, checkInterval).Should(Equal(infrav2alpha1.NodePhaseReady),
 				"The relaxed scale-down settings keep the machine the claim bought in service")
 
+			By("Verifying a boot deadline in the past leaves a ready claim alone")
+			// B1, on a live cluster. The deadline is the budget of the boot window (12m10s), and a
+			// machine that serves the pool for an hour is past it by any measure. A controller that
+			// applies the deadline to a ready claim destroys working capacity on a timer: the claim
+			// lands failed/DeadlineExceeded, a shutdown Job runs, the node is cordoned, and the pod
+			// on it is evicted. The write below manufactures the shape every healthy machine reaches
+			// - a ready claim with a deadline in its past - and the window is long enough to outlive
+			// the whole budget, so the failure is visible, not a race with a 15s poll.
+			serving, err := newestClaimOfSlot(shutdownNodeName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(serving).NotTo(BeNil())
+
+			Expect(stampClaimDeadline(serving.Name, time.Now().Add(-3*time.Hour))).To(Succeed(),
+				"The deadline of a served claim can be pushed into the past by anything that writes the object")
+
+			Consistently(func() string {
+				claim, err := newestClaimOfSlot(shutdownNodeName)
+				if err != nil || claim == nil {
+					return "claim-gone"
+				}
+
+				if string(claim.Status.Phase) != string(infrav2alpha1.NodeClaimReady) {
+					return "claim-" + string(claim.Status.Phase) + "-" + claim.Status.Reason
+				}
+
+				if slotPhase(shutdownNodeName) != infrav2alpha1.NodePhaseReady {
+					return "slot-" + string(slotPhase(shutdownNodeName))
+				}
+
+				if jobs, err := shutdownJobsOfSlot(shutdownNodeName); err != nil {
+					return "jobs-unreadable"
+				} else if jobs > 0 {
+					return "shutdown-job"
+				}
+
+				if !nodeSchedulable(shutdownNodeName) {
+					return "cordoned"
+				}
+
+				return "ready"
+			}, 3*time.Minute, checkInterval).Should(Equal("ready"),
+				"A ready claim past its boot deadline stays ready: the machine, its node object, and the pod on it are left alone")
+
 			By("Verifying deployment pod is scheduled on the correct node")
 			Eventually(func() string {
 				out, _ := utils.Run(kubectl("get", "pods",
@@ -1097,6 +1159,51 @@ func liveClaimOfSlot(slotName string) (*infrav2alpha1.NodeClaim, error) {
 // newestClaimOfSlot returns the newest claim of a slot in any phase, live or terminal: the episode
 // the slot answers for, and the object the suite follows from pending to its end. It returns nil,
 // nil for a slot that has never been claimed.
+// claimSerialDeadlines is the chain of deadlines one attempt can consume in series: the startup
+// Job's own timeout, then the registration wait, then the readiness gate. The claim's budget is
+// measured from spec.requestedAt, before the Job exists, so it has to outlast all three (B2).
+func claimSerialDeadlines() time.Duration {
+	return fsm.DefaultJobTimeout + fsm.DefaultUncordonTimeout + fsm.DefaultReadinessGateTimeout
+}
+
+// stampClaimDeadline writes spec.deadlineAt of a claim: the shape every healthy machine's claim
+// reaches when its boot budget has run out, manufactured on the live object so a controller that
+// reads the deadline as a lifetime is caught in one poll, not in 12 minutes of waiting.
+func stampClaimDeadline(name string, at time.Time) error {
+	stamp := fmt.Sprintf(`{"spec":{"deadlineAt":%q}}`, at.UTC().Format(time.RFC3339))
+	_, err := utils.Run(kubectl("patch", "nodeclaim", name, "-n", namespace,
+		"--type", "merge", "-p", stamp))
+
+	return err
+}
+
+// shutdownJobsOfSlot counts the shutdown Jobs of a slot: the force shutdown a terminal claim puts
+// the machine through, and the thing that must not exist behind a claim that is serving.
+func shutdownJobsOfSlot(slotName string) (int, error) {
+	out, err := utils.Run(kubectl("get", "jobs", "-n", namespace,
+		"-l", fmt.Sprintf("%s=%s,%s=%s", fsm.LabelNodeCR, slotName, fsm.LabelPhase, fsm.PhaseShutdown),
+		"-o", "jsonpath={.items[*].metadata.name}"))
+	if err != nil {
+		return 0, err
+	}
+
+	names := strings.Fields(string(out))
+
+	return len(names), nil
+}
+
+// nodeSchedulable reports whether the Kubernetes node of a slot is still schedulable: a cordon is
+// the first write of a shutdown, so a serving machine that is cordoned is the symptom, visible
+// seconds before the power-off lands.
+func nodeSchedulable(slotName string) bool {
+	out, err := utils.Run(kubectl("get", "node", slotName, "-o", "jsonpath={.spec.unschedulable}"))
+	if err != nil {
+		return true
+	}
+
+	return strings.TrimSpace(string(out)) != "true"
+}
+
 func newestClaimOfSlot(slotName string) (*infrav2alpha1.NodeClaim, error) {
 	claims, err := readClaims(slotName)
 	if err != nil {

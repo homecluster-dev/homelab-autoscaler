@@ -58,6 +58,10 @@ func TestDeriveIsThePhaseStateTable(t *testing.T) {
 		{"no claim, no observation yet", Input{}, infrav2alpha1.NodePhaseOff},
 		{"no claim, machine observed up is unwanted, not idle", Input{ObservedPower: infrav2alpha1.PowerStateOn}, infrav2alpha1.NodePhaseDraining},
 		{"pending claim, machine off", Input{Claim: claim(infrav2alpha1.NodeClaimPending, false), ObservedPower: infrav2alpha1.PowerStateOff}, infrav2alpha1.NodePhasePending},
+		// M1: the status subresource strips `status` from a create, and status.phase carries no CRD
+		// default, so a brand-new claim has no phase. It is the live claim of its slot, in the
+		// pending shape, from its create.
+		{"claim with no phase is live and pending", Input{Claim: claim("", false), ObservedPower: infrav2alpha1.PowerStateOff}, infrav2alpha1.NodePhasePending},
 		{"pending claim with a startup Job is booting", Input{Claim: claim(infrav2alpha1.NodeClaimPending, false), ObservedPower: infrav2alpha1.PowerStateOff, StartupJobInFlight: true}, infrav2alpha1.NodePhaseBooting},
 		{"pending claim, machine already up", Input{Claim: claim(infrav2alpha1.NodeClaimPending, false), ObservedPower: infrav2alpha1.PowerStateOn}, infrav2alpha1.NodePhaseBooting},
 		{"booting claim", Input{Claim: claim(infrav2alpha1.NodeClaimBooting, false), ObservedPower: infrav2alpha1.PowerStateOff, StartupJobInFlight: true}, infrav2alpha1.NodePhaseBooting},
@@ -163,4 +167,59 @@ func TestUnusableIsTheReadinessGate(t *testing.T) {
 	cordoned := ready()
 	cordoned.Spec.Unschedulable = true
 	assert.Contains(t, Unusable(cordoned, keys), "cordoned")
+}
+
+// TestIsLiveIsTheWantsMachineReading is the law's predicate, asserted on the phase set: the three
+// live phases are capacity, the two terminal ones are not, and the empty phase a created claim
+// carries before the first status write is pending (M1). A reader that calls an empty phase terminal
+// - and IsTerminal said exactly that, before the reading moved here - makes a brand-new request
+// invisible to TargetSize, IsFree, ClaimedSlots and the webhook, so a second IncreaseSize can claim
+// the same slot and two requests buy one machine.
+func TestIsLiveIsTheWantsMachineReading(t *testing.T) {
+	tests := []struct {
+		phase       infrav2alpha1.NodeClaimPhase
+		wantLive    bool
+		wantPending bool
+		wantWindow  bool
+	}{
+		{phase: "", wantLive: true, wantPending: true, wantWindow: true},
+		{phase: infrav2alpha1.NodeClaimPending, wantLive: true, wantPending: true, wantWindow: true},
+		{phase: infrav2alpha1.NodeClaimBooting, wantLive: true, wantPending: false, wantWindow: true},
+		{phase: infrav2alpha1.NodeClaimReady, wantLive: true, wantPending: false, wantWindow: false},
+		{phase: infrav2alpha1.NodeClaimFailed, wantLive: false, wantPending: false, wantWindow: false},
+		{phase: infrav2alpha1.NodeClaimCompleted, wantLive: false, wantPending: false, wantWindow: false},
+	}
+
+	for _, tt := range tests {
+		name := string(tt.phase)
+		if name == "" {
+			name = "(no phase yet)"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tt.wantLive, IsLive(tt.phase), "IsLive is the machine-is-wanted reading")
+			assert.Equal(t, !tt.wantLive, IsTerminal(tt.phase), "IsTerminal is its complement, not a third answer")
+			assert.Equal(t, tt.wantPending, IsPending(tt.phase), "IsPending is the cancelable reading")
+			assert.Equal(t, tt.wantWindow, InBootWindow(tt.phase),
+				"InBootWindow is the range spec.deadlineAt and the attempt bound apply to: ready ends it (B1)")
+		})
+	}
+}
+
+// TestLiveClaimReturnsAMarkedClaim keeps the comment on Input.LiveClaim honest: the mark a
+// scale-down leaves is not the phase question. The marked claim owns its slot, and MarkedForScaleDown
+// is this predicate conjoined with the deletion timestamp; WantsMachine (internal/claim) is the
+// stronger question a boot must not answer to it.
+func TestLiveClaimReturnsAMarkedClaim(t *testing.T) {
+	marked := claim(infrav2alpha1.NodeClaimReady, true)
+
+	in := Input{Claim: marked, ObservedPower: infrav2alpha1.PowerStateOn, NodeUsable: true}
+
+	assert.NotNil(t, in.LiveClaim(), "a claim a scale-down marked is still the claim of the slot")
+	assert.True(t, in.MarkedForScaleDown(), "and it is the request that reverses the machine")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, Derive(in), "the slot reports the drain it is in")
+
+	assert.Nil(t, Input{Claim: claim(infrav2alpha1.NodeClaimFailed, false)}.LiveClaim(),
+		"a terminal claim is not capacity, and stops being capacity the moment it is recorded")
+	assert.Nil(t, Input{Claim: nil}.LiveClaim(), "no claim, no live claim")
 }
