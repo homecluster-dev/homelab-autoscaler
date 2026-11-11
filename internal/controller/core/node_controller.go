@@ -145,14 +145,24 @@ func expectedProgress(powerState infrav1alpha1.PowerState) (infrav1alpha1.Progre
 //
 // The two observations are not equally trustworthy, so they are not gated the same way.
 //
-// An observed on (the node reports NodeReady=True) is positive evidence that the machine
-// is up, and the progress correction runs whether or not the power state changed. That is
-// the live bug: a slot that was shut down and started again through a path this
-// controller did not observe (desiredPowerState flipped back to on, machine booted) keeps
-// status.powerState: on while status.progress stays "shutdown". That stale progress is
-// not cosmetic: NodeGroupTargetSize excludes slots whose progress is
-// shutdown/shuttingdown, so a group with one Ready node reports targetSize 0 and
-// cluster-autoscaler refuses to scale.
+// An observed on (the node reports NodeReady=True) on a slot that is desired on is
+// positive evidence that the machine is up, and the progress correction runs whether or
+// not the power state changed. That is the live bug: a slot that was shut down and
+// started again through a path this controller did not observe (desiredPowerState flipped
+// back to on, machine booted) keeps status.powerState: on while status.progress stays
+// "shutdown". That stale progress is not cosmetic: NodeGroupTargetSize excludes slots
+// whose progress is shutdown/shuttingdown, so a group with one Ready node reports
+// targetSize 0 and cluster-autoscaler refuses to scale.
+//
+// spec.desiredPowerState is part of that gate because the mirror of the same bug is
+// reachable on the way down: fsm.hooks.enterShutdown writes progress=shutdown when the
+// shutdown Job submits the power-off, while the corev1.Node stays NodeReady=True for the
+// node-monitor-grace-period (~40s). A Node event in that window observes
+// {desired: off, status.powerState: on, progress: shutdown}, which is an "on"
+// observation with no power state change, and correcting it to ready makes the FSM derive
+// StateReady, so internal/controller/infra fires a second ShutdownNode and a duplicate
+// shutdown Job. A shutdown always carries desiredPowerState: off, the boot window and the
+// live bug both carry on, so requiring on makes both directions unambiguous.
 //
 // An observed off (the node does not report NodeReady=True) is not evidence that the
 // machine is off, so the shutdown correction only runs on an actual power state change,
@@ -190,7 +200,11 @@ func applyObservedPowerState(node *infrav1alpha1.Node, powerState infrav1alpha1.
 		return changed
 	}
 
-	if powerState == infrav1alpha1.PowerStateOn || powerStateChanged {
+	// Both directions have to be unambiguous: an observed on only proves the machine is up
+	// for a slot that is meant to be up, and an observed off is only a change when the
+	// recorded power state says otherwise. See the doc comment for the two windows.
+	if (node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn && powerState == infrav1alpha1.PowerStateOn) ||
+		powerStateChanged {
 		if node.Status.Progress != desiredProgress {
 			node.Status.Progress = desiredProgress
 			changed = true

@@ -169,6 +169,33 @@ func TestK8sNodeReconcilerCorrectsProgressToShutdownWhenTheMachineTurnsOff(t *te
 	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress, "a real power state change corrects the progress")
 }
 
+// TestK8sNodeReconcilerLeavesShutdownWindowAlone is the mirror of the boot-window test and
+// the reason the observed-on correction is gated on spec.desiredPowerState too:
+// fsm.hooks.enterShutdown writes progress=shutdown when the shutdown Job submits the
+// power-off, and the corev1.Node keeps NodeReady=True for the node-monitor-grace-period
+// (~40s). A Node event in that window observes {desired: off, status.powerState: on,
+// progress: shutdown} with no power state change. Correcting that to ready makes the FSM,
+// which reads its state from progress, derive StateReady, and the infra NodeController
+// then fires a second ShutdownNode for a machine that is already being powered off: a
+// duplicate shutdown Job.
+func TestK8sNodeReconcilerLeavesShutdownWindowAlone(t *testing.T) {
+	r := newK8sNodeReconciler(t,
+		slot("omni-remote-6", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown),
+		managedNode("omni-remote-6", true),
+	)
+
+	before := slotFrom(t, r.Client, "omni-remote-6")
+	reconcileK8sNode(t, r, "omni-remote-6")
+	reconcileK8sNode(t, r, "omni-remote-6")
+
+	node := slotFrom(t, r.Client, "omni-remote-6")
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress, "a shutdown that is already recorded must not be flipped back to ready")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, node.Status.PowerState, "the machine is still observed up during the grace period")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Spec.DesiredPowerState, "spec must not be touched")
+	assert.Equal(t, before.Status, node.Status)
+	assert.Equal(t, before.ResourceVersion, node.ResourceVersion, "nothing to record during the shutdown window, so no status write")
+}
+
 // TestK8sNodeReconcilerLeavesTransitionalProgressAlone: startingup and shuttingdown are
 // owned by the state machine, which is the only one that knows a power operation is in
 // flight. The reconciler corrects the power state, never those values.
@@ -313,6 +340,7 @@ func TestExpectedProgress(t *testing.T) {
 func TestApplyObservedPowerState(t *testing.T) {
 	tests := []struct {
 		name         string
+		desired      infrav1alpha1.PowerState
 		powerState   infrav1alpha1.PowerState
 		observed     infrav1alpha1.PowerState
 		progress     infrav1alpha1.Progress
@@ -320,27 +348,43 @@ func TestApplyObservedPowerState(t *testing.T) {
 		wantPower    infrav1alpha1.PowerState
 		wantProgress infrav1alpha1.Progress
 	}{
-		{"power state change derives progress", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
-		{"progress corrected without a power state change", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
-		{"observed on fills in an empty progress", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, "", true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
-		{"power state change to off corrects ready to shutdown", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown},
-		{"boot window: not ready node, slot already recorded off, keeps ready", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady},
-		{"boot window: unrecorded progress of a slot that is already off is left alone", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, "", false, infrav1alpha1.PowerStateOff, ""},
-		{"startingup is owned by the state machine", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
-		{"shuttingdown is owned by the state machine", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown, false, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown},
-		{"startingup survives a power state change", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
-		{"already consistent", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, false, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
+		{"power state change derives progress", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
+		{"progress corrected without a power state change", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
+		{"observed on fills in an empty progress", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, "", true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
+		{"power state change to off corrects ready to shutdown", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown},
+		{"boot window: not ready node, slot already recorded off, keeps ready", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady},
+		{"boot window: unrecorded progress of a slot that is already off is left alone", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, "", false, infrav1alpha1.PowerStateOff, ""},
+		{
+			// The mirror of the live bug, gated by spec.desiredPowerState: enterShutdown has
+			// already recorded progress=shutdown when the shutdown Job submitted the power-off,
+			// and the corev1.Node stays Ready for the node-monitor-grace-period. Flipping that
+			// to ready makes the FSM derive StateReady and the infra controller fires a second
+			// ShutdownNode, i.e. a duplicate shutdown Job.
+			name:         "shutdown window: ready node of a slot that is desired off keeps shutdown",
+			desired:      infrav1alpha1.PowerStateOff,
+			powerState:   infrav1alpha1.PowerStateOn,
+			observed:     infrav1alpha1.PowerStateOn,
+			progress:     infrav1alpha1.ProgressShutdown,
+			wantChange:   false,
+			wantPower:    infrav1alpha1.PowerStateOn,
+			wantProgress: infrav1alpha1.ProgressShutdown,
+		},
+		{"startingup is owned by the state machine", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
+		{"shuttingdown is owned by the state machine", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown, false, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown},
+		{"startingup survives a power state change", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
+		{"already consistent", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, false, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			node := slot("n", infrav1alpha1.PowerStateOn, tc.powerState, tc.progress)
+			node := slot("n", tc.desired, tc.powerState, tc.progress)
 
 			changed := applyObservedPowerState(node, tc.observed)
 
 			assert.Equal(t, tc.wantChange, changed)
 			assert.Equal(t, tc.wantPower, node.Status.PowerState)
 			assert.Equal(t, tc.wantProgress, node.Status.Progress)
+			assert.Equal(t, tc.desired, node.Spec.DesiredPowerState, "the request must never touch spec.desiredPowerState")
 		})
 	}
 }
