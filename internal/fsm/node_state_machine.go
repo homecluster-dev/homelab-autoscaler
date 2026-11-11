@@ -87,13 +87,6 @@ func NewNodeStateMachine(
 	return nm
 }
 
-// getCurrentState is the state the input law puts this machine in. It reads the input triple, and
-// the only field of Node.status it consults is status.powerState, the observation. It never reads
-// a record of a previous transition.
-func (nm *NodeStateMachine) getCurrentState() string {
-	return phase.State(nm.input)
-}
-
 // GetCurrentState returns the current FSM state
 func (nm *NodeStateMachine) GetCurrentState() string {
 	return nm.fsm.Current()
@@ -416,11 +409,11 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 
 // lifecycleObjectMeta builds the ObjectMeta shared by the startup and shutdown Jobs,
 // so the two builders (and their pod templates) cannot drift apart.
-func (nm *NodeStateMachine) lifecycleObjectMeta(name string, phase string) metav1.ObjectMeta {
+func (nm *NodeStateMachine) lifecycleObjectMeta(name string, jobPhase string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{
 		Name:        name,
 		Namespace:   nm.node.Namespace,
-		Labels:      nm.lifecycleLabels(phase),
+		Labels:      nm.lifecycleLabels(jobPhase),
 		Annotations: nm.lifecycleAnnotations(),
 	}
 }
@@ -434,13 +427,13 @@ func (nm *NodeStateMachine) lifecycleObjectMeta(name string, phase string) metav
 // (or any other Argo tracking label) here: these Jobs are created by the controller,
 // they are not Argo-managed children, and a tracking label would make Argo claim them
 // and prune them for not existing in Git.
-func (nm *NodeStateMachine) lifecycleLabels(phase string) map[string]string {
+func (nm *NodeStateMachine) lifecycleLabels(jobPhase string) map[string]string {
 	return map[string]string{
 		// Keys relied upon by cleanupPendingJobs, the gRPC server and the tests.
 		LabelApp:        LifecycleAppName,
 		LabelGroup:      nm.node.Labels[LabelGroup],
 		LabelNodeLegacy: nm.node.Spec.KubernetesNodeName,
-		LabelType:       phase,
+		LabelType:       jobPhase,
 
 		// Standard labels, so the operator's Jobs are identifiable by convention.
 		LabelK8sName:      LifecycleAppName,
@@ -450,7 +443,7 @@ func (nm *NodeStateMachine) lifecycleLabels(phase string) map[string]string {
 		// Explicit provenance: the Node CR a human / Argo CD sees is nm.node.Name,
 		// which can differ from spec.kubernetesNodeName carried by LabelNodeLegacy.
 		LabelNodeCR: nm.node.Name,
-		LabelPhase:  phase,
+		LabelPhase:  jobPhase,
 	}
 }
 

@@ -157,7 +157,7 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 			}
 		}
 
-		r.eventf(nodeClaim, corev1.EventTypeWarning, "ClaimDeadlineExceeded",
+		r.eventf(nodeClaim, "ClaimDeadlineExceeded",
 			"claim %s of slot %s is overdue (deadline %s, phase %s): recorded failed, the machine is force-shut-down and the next claim of the slot is attempt %d",
 			nodeClaim.Name, slot.Name, nodeClaim.Spec.DeadlineAt, nodeClaim.Status.Phase, nodeClaim.Status.Attempt+1)
 
@@ -180,7 +180,7 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 			}
 		}
 
-		r.eventf(nodeClaim, corev1.EventTypeWarning, "ClaimAttemptLimitExceeded",
+		r.eventf(nodeClaim, "ClaimAttemptLimitExceeded",
 			"claim %s of slot %s is attempt %d of %d: the slot has used its consecutive attempts, no machine is bought for it, and the record lives on this claim",
 			nodeClaim.Name, slot.Name, nodeClaim.Status.Attempt, claim.MaxConsecutiveAttempts)
 	}
@@ -224,7 +224,7 @@ func (r *NodeClaimReconciler) reconcileDeletion(ctx context.Context, nodeClaim *
 		}
 
 		if bumped && nodeClaim.Status.Attempt == claim.MaxConsecutiveAttempts {
-			r.eventf(nodeClaim, corev1.EventTypeWarning, "ShutdownAttemptLimitReached",
+			r.eventf(nodeClaim, "ShutdownAttemptLimitReached",
 				"scale-down of slot %s has spent %d of %d attempts and the machine is still observed up: the controller stops firing the shutdown and records it here, because a shutdown Job that exits 0 without the machine going off is the pool's script, not the controller",
 				slot.Name, claim.MaxConsecutiveAttempts, claim.MaxConsecutiveAttempts)
 		}
@@ -277,7 +277,7 @@ func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeCla
 		return err
 	}
 
-	var extras []*infrav2alpha1.NodeClaim
+	extras := make([]*infrav2alpha1.NodeClaim, 0, len(claims))
 
 	for i := range claims {
 		existing := &claims[i]
@@ -298,7 +298,7 @@ func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeCla
 
 	for _, extra := range extras {
 		if extra.Name == nodeClaim.Name {
-			r.eventf(nodeClaim, corev1.EventTypeWarning, "SlotAlreadyClaimed",
+			r.eventf(nodeClaim, "SlotAlreadyClaimed",
 				"slot %s already carries the live claim %s: one live claim per slot, this claim is failed as superseded",
 				claim.SlotNameOf(nodeClaim), extra.Name)
 
@@ -309,7 +309,7 @@ func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeCla
 			return nil
 		}
 
-		r.eventf(extra, corev1.EventTypeWarning, "SlotAlreadyClaimed",
+		r.eventf(extra, "SlotAlreadyClaimed",
 			"slot %s already carries the live claim %s: one live claim per slot, this claim is failed as superseded",
 			claim.SlotNameOf(extra), nodeClaim.Name)
 
@@ -367,7 +367,7 @@ func (r *NodeClaimReconciler) collect(ctx context.Context, nodeClaim *infrav2alp
 		ttl = time.Duration(*nodeClaim.Spec.TTLSecondsAfterFinished) * time.Second
 	}
 
-	expiry := nodeClaim.Status.FinishedAt.Time.Add(ttl)
+	expiry := nodeClaim.Status.FinishedAt.Add(ttl)
 	if now := time.Now(); now.Before(expiry) {
 		return ctrl.Result{RequeueAfter: expiry.Sub(now)}, nil
 	}
@@ -418,12 +418,14 @@ func (r *NodeClaimReconciler) recorder() *claim.Recorder {
 }
 
 // eventf publishes an Event on the claim, and is a no-op without a recorder.
-func (r *NodeClaimReconciler) eventf(nodeClaim *infrav2alpha1.NodeClaim, eventType, reason, format string, args ...interface{}) {
+func (r *NodeClaimReconciler) eventf(nodeClaim *infrav2alpha1.NodeClaim, reason, format string, args ...interface{}) {
 	if r.EventRecorder == nil || nodeClaim == nil {
 		return
 	}
 
-	r.EventRecorder.Eventf(nodeClaim, nil, eventType, reason, "nodeclaim", format, args...)
+	// Every record the claim controller publishes is a Warning: each one is an attempt that
+	// ended without a usable machine, which is what an operator has to be told to go look.
+	r.EventRecorder.Eventf(nodeClaim, nil, corev1.EventTypeWarning, reason, "nodeclaim", format, args...)
 }
 
 // SetupWithManager sets up the controller with the Manager.

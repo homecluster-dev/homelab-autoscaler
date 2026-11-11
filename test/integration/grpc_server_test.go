@@ -270,7 +270,8 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				for i := range claims.Items {
 					candidate := &claims.Items[i]
-					if candidate.Spec.SlotRef.Name == "gpu-node-2" && candidate.Spec.Request.Call == infrav2alpha1.ClaimCallIncreaseSize &&
+					if candidate.Spec.SlotRef.Name == "gpu-node-2" &&
+						candidate.Spec.Request.Call == infrav2alpha1.ClaimCallIncreaseSize &&
 						candidate.Status.Phase == "" {
 						created = candidate
 
@@ -288,11 +289,13 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				after, err := server.NodeGroupTargetSize(testCtx, &pb.NodeGroupTargetSizeRequest{Id: "gpu-group"})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(after.TargetSize).To(Equal(int32(2)), "the count of live claims is the target size, and the created claim is one")
+				Expect(after.TargetSize).To(Equal(int32(2)),
+					"the count of live claims is the target size, and the created claim is one")
 
 				// No field of the slot carries the request: the spec is Git-owned configuration.
 				node := &infrav2alpha1.Node{}
-				Expect(mockClient.Get(testCtx, client.ObjectKey{Name: "gpu-node-2", Namespace: namespace.Get()}, node)).To(Succeed())
+				gpuKey := client.ObjectKey{Name: "gpu-node-2", Namespace: namespace.Get()}
+				Expect(mockClient.Get(testCtx, gpuKey, node)).To(Succeed())
 				Expect(node.Spec.KubernetesNodeName).To(Equal("gpu-node-2"), "the handler wrote no field of the slot")
 			})
 		})
@@ -386,7 +389,8 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				// The slot itself is untouched: DeleteNodes records and cancels a claim, it does
 				// not write a slot.
 				node := &infrav2alpha1.Node{}
-				Expect(mockClient.Get(testCtx, client.ObjectKey{Name: "test-node-1", Namespace: namespace.Get()}, node)).To(Succeed())
+				nodeKey := client.ObjectKey{Name: "test-node-1", Namespace: namespace.Get()}
+				Expect(mockClient.Get(testCtx, nodeKey, node)).To(Succeed())
 				Expect(node.Spec.KubernetesNodeName).To(Equal("test-node-1"))
 			})
 		})

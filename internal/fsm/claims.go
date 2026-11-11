@@ -112,12 +112,6 @@ func stampDerivedPhase(node *infrav2alpha1.Node, derived infrav2alpha1.NodePhase
 	return true
 }
 
-// claimOf returns the live claim this machine moves, and nil when the transition has no claim to
-// report on (the shutdown of a machine the pool no longer wants).
-func (nm *NodeStateMachine) claimOf() *infrav2alpha1.NodeClaim {
-	return nm.claim
-}
-
 // moveClaim records a phase move of the claim this transition is the evidence for, and keeps the
 // machine's own input in step with it, so the report written after the move is derived from the
 // claim's new phase.

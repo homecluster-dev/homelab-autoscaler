@@ -149,17 +149,17 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 		{
 			name:     "slot that is on keeps its real status",
 			node:     slot("slot-powered-on", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase:      infrav2alpha1.NodePhaseReady},
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase: infrav2alpha1.NodePhaseReady},
 		},
 		{
 			name:     "starting up slot is not touched",
 			node:     slot("slot-starting", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOff, Phase:      infrav2alpha1.NodePhaseBooting},
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOff, Phase: infrav2alpha1.NodePhaseBooting},
 		},
 		{
 			name:     "shutting down slot is not touched",
 			node:     slot("slot-stopping", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
-			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase:      infrav2alpha1.NodePhaseDraining},
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase: infrav2alpha1.NodePhaseDraining},
 		},
 		{
 			name:     "slot with a matching kubernetes node is left to the node controller",
@@ -177,7 +177,7 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 			reconcileSlot(t, r, tc.node.Name)
 
 			node := getNodeCR(t, r, tc.node.Name)
-			assert.Equal(t, tc.expected, infrav2alpha1.NodeStatus{PowerState: node.Status.PowerState, Phase:      node.Status.Phase})
+			assert.Equal(t, tc.expected, infrav2alpha1.NodeStatus{PowerState: node.Status.PowerState, Phase: node.Status.Phase})
 		})
 	}
 }

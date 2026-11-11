@@ -173,7 +173,7 @@ func New(slot *infrav2alpha1.Node, group *infrav2alpha1.Group, req infrav2alpha1
 			RequestedAt:             metav1.NewTime(requestedAt),
 			RequestedBy:             requestedBy,
 			Request:                 req,
-			DeadlineAt:              deadlineAt(requestedAt, groupMaxOf(req, group)),
+			DeadlineAt:              deadlineAt(requestedAt, Budget(group)),
 			MaxNodeProvisionTime:    Budget(group),
 			TTLSecondsAfterFinished: &ttl,
 		},
@@ -192,18 +192,6 @@ func deadlineAt(requestedAt time.Time, groupMax *metav1.Duration) *metav1.Time {
 	out := metav1.NewTime(DeadlineAt(requestedAt, groupMax))
 
 	return &out
-}
-
-// groupMaxOf returns the group's spec.maxNodeProvisionTime. The group is looked up by the caller
-// that needs it for arithmetic; a claim whose group cannot be read keeps the operator budget alone,
-// which is the shorter of the two and the one the design floors with the group's value when it has
-// one.
-func groupMaxOf(req infrav2alpha1.ClaimRequest, group *infrav2alpha1.Group) *metav1.Duration {
-	if group == nil {
-		return nil
-	}
-
-	return Budget(group)
 }
 
 // Digest is the one-line record of a claim, copied onto Node.status.lastClaim so that

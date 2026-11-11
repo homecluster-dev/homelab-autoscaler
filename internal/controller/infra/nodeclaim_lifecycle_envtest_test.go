@@ -60,7 +60,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 	// ensureGroup creates the Group the slots label. The Node reconciler refuses a slot whose
 	// Group it cannot read, so every spec needs it, and it carries the readiness taint key the
 	// pool's CNI stamps: the gate for phase ready is the node being free of it.
-	ensureGroup := func() *infrav2alpha1.Group {
+	ensureGroup := func() {
 		groupCR := &infrav2alpha1.Group{
 			ObjectMeta: metav1.ObjectMeta{Name: group, Namespace: NamespaceConfig.Get()},
 			Spec: infrav2alpha1.GroupSpec{
@@ -74,8 +74,6 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		}
 
 		createIgnoreExists(groupCR)
-
-		return groupCR
 	}
 
 	// newSlot registers a slot: the Group, the label, and the observation/report the spec starts
@@ -144,7 +142,9 @@ var _ = Describe("NodeClaim lifecycle", func() {
 	// k8sNode registers the Kubernetes node of a slot: the machine, as the kubelet presents it.
 	// The label is what the observation path matches on, so a spec that asserts the derived
 	// report needs it: the machine is found by the label, not by a name convention.
-	k8sNode := func(slotName string, ready bool, unschedulable bool, taints []corev1.Taint) *corev1.Node {
+	// k8sNode registers the machine of a slot as the kubelet presents it. A fixture never cordons:
+	// the cordon is a transition's, so the assertion "the shutdown cordoned it" means something.
+	k8sNode := func(slotName string, ready bool) {
 		name := slotName + "-k8s"
 
 		node := &corev1.Node{
@@ -152,7 +152,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 				Name:   name,
 				Labels: map[string]string{"infra.homecluster.dev/node": slotName},
 			},
-			Spec: corev1.NodeSpec{Unschedulable: unschedulable, Taints: taints},
+			Spec: corev1.NodeSpec{},
 			Status: corev1.NodeStatus{
 				Conditions: []corev1.NodeCondition{{
 					Type:   corev1.NodeReady,
@@ -166,8 +166,6 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		}
 
 		Expect(k8sClient.Create(ctx, node)).To(Succeed())
-
-		return node
 	}
 
 	// "a slot with no live claim and the machine off is idle"
@@ -211,7 +209,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		name := slotName("ready")
 		slot := newSlot(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimBooting, nil)
-		k8sNode(name, true, false, nil)
+		k8sNode(name, true)
 		job := createLifecycleJob(slot, fsm.PhaseStartup)
 
 		// The state the input law puts the machine in, before the gate answers: the claim is
@@ -233,7 +231,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		// And the pass that follows the gate takes no further action on a ready unit.
 		result := reconcileSlot(readSlotObject(name))
 		Expect(result.RequeueAfter).To(Equal(idleResync))
-		Expect(len(jobsOfSlot(name))).To(Equal(1), "the startup Job in flight is the only lifecycle Job")
+		Expect(jobsOfSlot(name)).To(HaveLen(1), "the startup Job in flight is the only lifecycle Job")
 	})
 
 	// "spec.deadlineAt in the past on a booting claim -> failed, and the machine is force-shut down"
@@ -245,7 +243,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 			c.Spec.DeadlineAt = &overdue
 		})
 
-		k8sNode(name, true, false, nil)
+		k8sNode(name, true)
 		createLifecycleJob(slot, fsm.PhaseStartup)
 
 		reconcileClaim(nodeClaim)
@@ -320,7 +318,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady)
 		// The machine is off, and the kubelet left its node object behind NotReady: that is the
 		// observation the report is recomputed from.
-		k8sNode(name, false, false, nil)
+		k8sNode(name, false)
 
 		reconcileSlot(slot)
 		Expect(jobsOfSlot(name)).To(BeEmpty(), "a phase the slot reports is not a request: nothing is bought, nothing is powered off")
@@ -349,7 +347,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		serving := slotName("lie-draining")
 		servingSlot := newSlot(serving, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
 		newClaim(servingSlot, infrav2alpha1.NodeClaimReady, nil)
-		k8sNode(serving, true, false, nil)
+		k8sNode(serving, true)
 
 		result := reconcileSlot(readSlotObject(serving))
 		Expect(result.RequeueAfter).To(Equal(idleResync), "law 2: capacity serving pods is left alone")

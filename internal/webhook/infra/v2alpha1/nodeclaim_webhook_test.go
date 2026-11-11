@@ -85,7 +85,7 @@ func slotUnderTest(name string) *infrav2alpha1.Node {
 
 // newClaimValidator builds the validator over a fake cluster holding the objects the case
 // describes.
-func newClaimValidator(objects ...client.Object) (NodeClaimCustomValidator, *runtime.Scheme) {
+func newClaimValidator(objects ...client.Object) NodeClaimCustomValidator {
 	testScheme := runtime.NewScheme()
 	_ = infrav2alpha1.AddToScheme(testScheme)
 	_ = corev1.AddToScheme(testScheme)
@@ -96,13 +96,13 @@ func newClaimValidator(objects ...client.Object) (NodeClaimCustomValidator, *run
 		WithObjects(objects...).
 		Build()
 
-	return NodeClaimCustomValidator{Client: k8sClient}, testScheme
+	return NodeClaimCustomValidator{Client: k8sClient}
 }
 
 var _ = Describe("NodeClaim Webhook", func() {
 	Context("one live claim per slot, on create", func() {
 		It("admits the first live claim of a slot", func() {
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot))
+			validator := newClaimValidator(slotUnderTest(claimSlot))
 
 			warnings, err := validator.ValidateCreate(context.Background(), claimUnderTest("claim-a", claimSlot, nil))
 			Expect(err).NotTo(HaveOccurred())
@@ -114,7 +114,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 				c.Status.Phase = infrav2alpha1.NodeClaimBooting
 			})
 
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot), live)
+			validator := newClaimValidator(slotUnderTest(claimSlot), live)
 
 			_, err := validator.ValidateCreate(context.Background(), claimUnderTest("claim-b", claimSlot, func(c *infrav2alpha1.NodeClaim) {
 				c.Status.Phase = infrav2alpha1.NodeClaimPending
@@ -132,14 +132,14 @@ var _ = Describe("NodeClaim Webhook", func() {
 				c.Finalizers = append(c.Finalizers, "infra.homecluster.dev/nodeclaim-finalizer")
 			})
 
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot), draining)
+			validator := newClaimValidator(slotUnderTest(claimSlot), draining)
 
 			_, err := validator.ValidateCreate(context.Background(), claimUnderTest("claim-b", claimSlot, nil))
 			requireForbidden(err, claimSlot, "claim-a")
 		})
 
 		It("admits a claim on a slot whose last claim ended, because a terminal claim is not live", func() {
-			validator, _ := newClaimValidator(
+			validator := newClaimValidator(
 				slotUnderTest(claimSlot),
 				claimUnderTest("claim-old", claimSlot, func(c *infrav2alpha1.NodeClaim) {
 					c.Status.Phase = infrav2alpha1.NodeClaimFailed
@@ -160,7 +160,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 				c.Status.Phase = infrav2alpha1.NodeClaimPending
 			})
 
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot), live)
+			validator := newClaimValidator(slotUnderTest(claimSlot), live)
 
 			updated := live.DeepCopy()
 			updated.Status.Phase = infrav2alpha1.NodeClaimBooting
@@ -177,7 +177,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 				c.Status.Phase = infrav2alpha1.NodeClaimPending
 			})
 
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot), live, extra)
+			validator := newClaimValidator(slotUnderTest(claimSlot), live, extra)
 
 			updated := extra.DeepCopy()
 			updated.Status.Phase = infrav2alpha1.NodeClaimBooting
@@ -197,7 +197,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 				c.Status.Phase = infrav2alpha1.NodeClaimBooting
 			})
 
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot), live, older)
+			validator := newClaimValidator(slotUnderTest(claimSlot), live, older)
 
 			finished := older.DeepCopy()
 			finished.Status.Phase = infrav2alpha1.NodeClaimFailed
@@ -210,7 +210,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 
 	Context("the slot a claim asks for", func() {
 		It("refuses a claim with no slot named", func() {
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot))
+			validator := newClaimValidator(slotUnderTest(claimSlot))
 
 			_, err := validator.ValidateCreate(context.Background(), claimUnderTest("claim-a", "", nil))
 			Expect(err).To(HaveOccurred())
@@ -218,7 +218,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 		})
 
 		It("refuses a claim for a slot that does not exist, and names it", func() {
-			validator, _ := newClaimValidator()
+			validator := newClaimValidator()
 
 			_, err := validator.ValidateCreate(context.Background(), claimUnderTest("claim-a", "no-such-slot", nil))
 			Expect(err).To(HaveOccurred())
@@ -231,7 +231,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 				c.Status.Phase = infrav2alpha1.NodeClaimBooting
 			})
 
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot), live)
+			validator := newClaimValidator(slotUnderTest(claimSlot), live)
 
 			warnings, err := validator.ValidateDelete(context.Background(), live)
 			Expect(err).NotTo(HaveOccurred(), "canceling is deleting: admission is the wrong place to judge a scale-down")
@@ -240,7 +240,7 @@ var _ = Describe("NodeClaim Webhook", func() {
 
 		It("does not deny when the inventory cannot be read", func() {
 			// A webhook that denies because it could not list is a webhook that stops the pool.
-			validator, _ := newClaimValidator(slotUnderTest(claimSlot))
+			validator := newClaimValidator(slotUnderTest(claimSlot))
 
 			_, err := validator.ValidateCreate(context.Background(), claimUnderTest("claim-a", claimSlot, nil))
 			Expect(err).NotTo(HaveOccurred())

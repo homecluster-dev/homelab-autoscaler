@@ -27,7 +27,6 @@ import (
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 // transitionClaimWriter is the fsm.ClaimWriter the node state machine moves claims through: a thin
@@ -159,11 +158,6 @@ func sameTime(a, b *metav1.Time) bool {
 	}
 
 	return a.Time.Equal(b.Time)
-}
-
-// claimIsLive reports whether a claim names a machine that is wanted.
-func claimIsLive(nodeClaim *infrav2alpha1.NodeClaim) bool {
-	return nodeClaim != nil && phase.IsLive(nodeClaim.Status.Phase)
 }
 
 // requeueAt folds a deadline into a reconcile result: the earliest of what the caller already asked

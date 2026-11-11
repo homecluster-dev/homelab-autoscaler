@@ -256,21 +256,6 @@ func slotsOf(t *testing.T, server *HomeClusterProviderServer, names ...string) m
 	return got
 }
 
-// cancelClaim is the provider's own write: DeleteNodes marks a claim, and the finalizer the claim
-// controller stamped is what keeps a marked claim on its slot. The fake client sets the deletion
-// timestamp on a delete of an object that carries a finalizer, which is the shape the real
-// handler produces.
-func cancelClaim(t *testing.T, server *HomeClusterProviderServer, name string) {
-	t.Helper()
-
-	nodeClaim := &infrav2alpha1.NodeClaim{}
-	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: "claim-" + name, Namespace: testNamespace}, nodeClaim))
-
-	nodeClaim.Finalizers = append(nodeClaim.Finalizers, "infra.homecluster.dev/nodeclaim-finalizer")
-	require.NoError(t, server.Client.Update(context.Background(), nodeClaim))
-	require.NoError(t, server.Client.Delete(context.Background(), nodeClaim))
-}
-
 // TestNodeGroupNodes is the instance contract of §5 of the design, unchanged in its shape and
 // moved in its input: a slot is "wanted" when a live claim names it, not when a spec field says
 // so. The rows are the ones cluster-autoscaler's registration and scale-down loops depend on:
@@ -672,7 +657,7 @@ func TestNodeGroupIncreaseSizeCreatesClaimsWithTheAttributionFilledIn(t *testing
 		assert.Empty(t, nodeClaim.Spec.Request.Nodes, "IncreaseSize names no nodes")
 
 		require.NotNil(t, nodeClaim.Spec.DeadlineAt, "a claim is born with a budget")
-		budget := nodeClaim.Spec.DeadlineAt.Time.Sub(nodeClaim.Spec.RequestedAt.Time)
+		budget := nodeClaim.Spec.DeadlineAt.Sub(nodeClaim.Spec.RequestedAt.Time)
 		assert.Equal(t, 15*time.Minute, budget,
 			"the deadline is the operator's budget floored by the group's spec.maxNodeProvisionTime, which is the number cluster-autoscaler is told as its own termination deadline")
 		require.NotNil(t, nodeClaim.Spec.MaxNodeProvisionTime, "the claim records the budget that was in force when it was created")
