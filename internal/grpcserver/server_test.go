@@ -18,6 +18,7 @@ package grpcserver
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -571,7 +572,9 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 
 // TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize mirrors the same floor on the
 // decrease path: cancelling slots that are still starting must not take the group below
-// its minimum size.
+// its minimum size. The floor is judged against the target size that results from the
+// request (targetSizeOf + delta), and a request that cannot take any capacity away is a
+// no-op success, because cluster-autoscaler retries a refusal forever.
 func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 	startingUp := func(name string) *infrav1alpha1.Node {
 		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
@@ -579,36 +582,99 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 	running := func(name string) *infrav1alpha1.Node {
 		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 	}
+	// midShutdown is a slot being powered off: desired off, the machine still on, progress
+	// not yet a shutdown, so it still counts towards the target size.
+	midShutdown := func(name string) *infrav1alpha1.Node {
+		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	}
 
 	tests := []struct {
-		name    string
-		objects []client.Object
-		delta   int32
-		refuse  bool
+		name     string
+		objects  []client.Object
+		delta    int32
+		refuse   bool
+		wantShed []string // slots the request must cancel: desired off, progress shuttingdown
+		wantKeep []string // slots this request must not cancel
 	}{
 		{
-			name:    "one running node, minSize 1: cancelling a starting slot would drop the target size below the floor",
-			objects: []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2")},
-			delta:   -1,
-			refuse:  true,
+			// The reported bug: the floor has to be judged against the target size that
+			// results from the request. Cancelling the starting slot takes the target size
+			// from 2 to 1, which is the floor, not below it, and refusing that leaves
+			// cluster-autoscaler retrying the refusal forever with a target size it can
+			// never correct (the pre-fix arithmetic counted the running slots only, so it
+			// compared 1 + (-1) = 0 against the floor).
+			name:     "minSize 1, one running + one starting: delta -1 lands on the floor and is carried out",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1"},
 		},
 		{
-			name:    "minSize 1 with one running node and nothing to cancel",
-			objects: []client.Object{groupCR(testGroup, 1), running("slot-1")},
-			delta:   -1,
-			refuse:  true,
+			// Nothing to cancel means no capacity goes away, so there is nothing to refuse:
+			// a FailedPrecondition here is retried forever.
+			name:     "minSize 1 with one running node and nothing to cancel is a no-op success",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1")},
+			delta:    -1,
+			refuse:   false,
+			wantKeep: []string{"slot-1"},
 		},
 		{
-			name:    "minSize 1 with two running nodes keeps one",
-			objects: []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2"), startingUp("slot-3")},
-			delta:   -1,
-			refuse:  false,
+			name:     "minSize 2, two running + one starting: delta -2 genuinely crosses the floor",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
+			delta:    -2,
+			refuse:   true,
+			wantKeep: []string{"slot-1", "slot-2", "slot-3"},
 		},
 		{
-			name:    "no floor keeps the old behaviour",
-			objects: []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
-			delta:   -1,
-			refuse:  false,
+			name:     "minSize 2, two running + one starting: delta -1 lands on the floor",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-3"},
+			wantKeep: []string{"slot-1", "slot-2"},
+		},
+		{
+			// The floor is compared against targetSizeOf, the number NodeGroupTargetSize
+			// reports, not against a count of the running slots. A slot that is mid shutdown
+			// is still part of the target size, so cancelling the starting slot here lands on
+			// the floor; counting only the running slots would refuse it.
+			name:     "minSize 2, one running + one starting + one mid shutdown: delta -1 lands on the floor",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2"), midShutdown("slot-3")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1", "slot-3"},
+		},
+		{
+			// Cancelling one starting slot is one unit off the target size, so the delta is
+			// carried out on the slots that can be cancelled and the running machines, which
+			// this entry point does not own, stay up.
+			name:     "minSize 1 with two running nodes and one starting cancels the starting slot",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2"), startingUp("slot-3")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-3"},
+			wantKeep: []string{"slot-1", "slot-2"},
+		},
+		{
+			// A delta larger than the slots that can be cancelled cancels all of them and
+			// still succeeds: cluster-autoscaler reads the resulting target size back from
+			// NodeGroupTargetSize, it does not track the arithmetic itself.
+			name:     "no floor, delta larger than the starting slots cancels all of them",
+			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
+			delta:    -2,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1"},
+		},
+		{
+			name:     "no floor keeps the old behaviour",
+			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1"},
 		},
 	}
 
@@ -627,22 +693,35 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 				require.True(t, ok)
 				assert.Equal(t, codes.FailedPrecondition, st.Code())
 				assert.Contains(t, st.Message(), "minSize")
-
-				// the starting up slot was not cancelled
-				for _, obj := range tc.objects {
-					node, ok := obj.(*infrav1alpha1.Node)
-					if !ok || node.Status.Progress != infrav1alpha1.ProgressStartingUp {
-						continue
-					}
-					assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, node.Name)[node.Name])
-				}
-
-				return
+			} else {
+				require.NoError(t, err)
 			}
 
-			require.NoError(t, err)
+			all := append(append([]string{}, tc.wantShed...), tc.wantKeep...)
+			for _, name := range all {
+				if slices.Contains(tc.wantShed, name) {
+					desired, progress := slotState(t, server, name)
+					assert.Equal(t, infrav1alpha1.PowerStateOff, desired, "cancelled slot %s must be desired off", name)
+					assert.Equal(t, infrav1alpha1.ProgressShuttingDown, progress, "cancelled slot %s leaves the target size", name)
+
+					continue
+				}
+
+				_, progress := slotState(t, server, name)
+				assert.NotEqual(t, infrav1alpha1.ProgressShuttingDown, progress, "slot %s must not be cancelled", name)
+			}
 		})
 	}
+}
+
+// slotState reads the desired power state and the recorded progress of a slot.
+func slotState(t *testing.T, server *HomeClusterProviderServer, name string) (infrav1alpha1.PowerState, infrav1alpha1.Progress) {
+	t.Helper()
+
+	node := &infrav1alpha1.Node{}
+	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
+
+	return node.Spec.DesiredPowerState, node.Status.Progress
 }
 
 // TestNodeGroupIncreaseSizeRefusesBeyondMaxSize: maxSize is the number of slots committed
