@@ -24,10 +24,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
@@ -750,6 +753,9 @@ func TestScaleDownStreakSpentIsTheShutdownCounterOfItsOwn(t *testing.T) {
 			} else {
 				assert.Zero(t, left, "a streak that is not spent has no grace to wait out")
 			}
+
+			assert.Equal(t, tt.wantReset, ScaleDownStreakResetDue(tt.claim),
+				"the pass that fires a shutdown past the grace is the one that says the pause ended, and it is that pass's event")
 		})
 	}
 
@@ -810,16 +816,24 @@ func recordedClaim(claimPhase infrav2alpha1.NodeClaimPhase, attempt int32) *infr
 	}
 }
 
-// recorderWith is a Recorder over a fake client carrying the fixture's objects, with the status
-// subresource of the claim enabled: the Recorder writes status, exactly as the controllers do.
-func recorderWith(t *testing.T, objs ...client.Object) (*Recorder, client.WithWatch) {
+// recorderClient is the fake cluster of the recorder's tests: the fixture's objects, with the status
+// subresource of the claim and the slot enabled, because the Recorder writes status there and nothing
+// else. A test that intercepts one write wraps this client, and reads the result off it.
+func recorderClient(t *testing.T, objs ...client.Object) client.WithWatch {
 	t.Helper()
 
-	cl := fake.NewClientBuilder().
+	return fake.NewClientBuilder().
 		WithScheme(scheme(t)).
 		WithObjects(objs...).
 		WithStatusSubresource(&infrav2alpha1.NodeClaim{}, &infrav2alpha1.Node{}).
 		Build()
+}
+
+// recorderWith is a Recorder over that cluster.
+func recorderWith(t *testing.T, objs ...client.Object) (*Recorder, client.WithWatch) {
+	t.Helper()
+
+	cl := recorderClient(t, objs...)
 
 	return NewRecorder(cl), cl
 }
@@ -847,4 +861,139 @@ func conditionStatus(t *testing.T, nodeClaim *infrav2alpha1.NodeClaim, condition
 	}
 
 	return metav1.ConditionUnknown
+}
+
+// TestRecorderReadyMoveClearsTheDeadlineAfterTheStatusWrite is the order of the two writes of the
+// `booting -> ready` move, and the direction a crash between them leaves the claim in.
+//
+// The deadline is the only writer that fails an attempt whose startup Job is gone, and the claim
+// controller reads it inside the boot window only. Clearing it *before* the status write therefore
+// leaves the shape nothing heals: a manager that dies between the two hands back a `booting` claim
+// with no deadline, and once the Job's TTL removes the Job no path is left to end the attempt - the
+// claim lives, its slot is counted as capacity, and nothing is watching it. Writing the status first
+// leaves the other pair: a `ready` claim that still carries its deadline, a field every guard in the
+// model scopes to the boot window and therefore reads as inert, and an idempotent re-apply of the
+// move that clears it.
+func TestRecorderReadyMoveClearsTheDeadlineAfterTheStatusWrite(t *testing.T) {
+	ctx := context.Background()
+
+	bootingWithDeadline := func() *infrav2alpha1.NodeClaim {
+		nodeClaim := recordedClaim(infrav2alpha1.NodeClaimBooting, 1)
+
+		deadline := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+		nodeClaim.Spec.DeadlineAt = &deadline
+
+		return nodeClaim
+	}
+
+	conflict := func(obj client.Object) error {
+		return apierrors.NewConflict(
+			schema.GroupResource{Group: infrav2alpha1.GroupVersion.Group, Resource: "nodeclaims"},
+			obj.GetName(),
+			context.DeadlineExceeded)
+	}
+
+	t.Run("the status lands and the deadline clear is lost: the pair is healable", func(t *testing.T) {
+		nodeClaim := bootingWithDeadline()
+		key := client.ObjectKeyFromObject(nodeClaim)
+
+		// The metadata/spec write fails: the recorder is past its status write, and a manager that
+		// dies here leaves the shape below.
+		base := recorderClient(t, nodeClaim)
+		lost := interceptor.NewClient(base, interceptor.Funcs{
+			Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+				return conflict(obj)
+			},
+		})
+
+		moved, err := NewRecorder(lost).Move(ctx, key, infrav2alpha1.NodeClaimReady, "")
+		require.Error(t, err, "a lost write is reported, not swallowed")
+		assert.False(t, moved)
+
+		got := getClaim(t, base, nodeClaim)
+		assert.Equal(t, infrav2alpha1.NodeClaimReady, got.Status.Phase,
+			"the phase the transition produced is recorded first: the readiness gate's answer is not lost with the spec write")
+		assert.NotNil(t, got.Spec.DeadlineAt, "the deadline is the field that is still owed")
+		assert.True(t, IsOverdue(got, time.Now()), "and it is overdue, which is what makes the pair legible: the boot is over")
+		assert.False(t, phase.InBootWindow(got.Status.Phase) && IsOverdue(got, time.Now()),
+			"no guard of the model reads a deadline outside the boot window: the claim is not destroyed, and it is watched")
+
+		// The heal: the pass that re-lands the (idempotent) move is the one that closes the window.
+		_, err = NewRecorder(lost).Move(ctx, key, infrav2alpha1.NodeClaimReady, "")
+		require.Error(t, err, "the writer is still broken: the recorder never silently reports a clean move")
+
+		repaired := NewRecorder(base)
+		moved, err = repaired.Move(ctx, key, infrav2alpha1.NodeClaimReady, "")
+		require.NoError(t, err)
+		assert.True(t, moved, "the re-apply writes the half the lost write owed: it is the pass that closes the window")
+		assert.Nil(t, getClaim(t, base, nodeClaim).Spec.DeadlineAt,
+			"and the re-apply is the pass that clears the deadline the lost write owed")
+	})
+
+	t.Run("the status write is lost: the deadline stays on a booting claim", func(t *testing.T) {
+		nodeClaim := bootingWithDeadline()
+		key := client.ObjectKeyFromObject(nodeClaim)
+
+		base := recorderClient(t, nodeClaim)
+		lost := interceptor.NewClient(base, interceptor.Funcs{
+			SubResourceUpdate: func(_ context.Context, _ client.Client, _ string, obj client.Object, _ ...client.SubResourceUpdateOption) error {
+				return conflict(obj)
+			},
+		})
+
+		moved, err := NewRecorder(lost).Move(ctx, key, infrav2alpha1.NodeClaimReady, "")
+		require.Error(t, err)
+		assert.False(t, moved)
+
+		got := getClaim(t, base, nodeClaim)
+		assert.Equal(t, infrav2alpha1.NodeClaimBooting, got.Status.Phase, "the move did not land")
+		assert.NotNil(t, got.Spec.DeadlineAt,
+			"and the claim is not left booting without the deadline that ends it: the clear runs after the status write, never before it")
+		assert.True(t, phase.InBootWindow(got.Status.Phase) && IsOverdue(got, time.Now()),
+			"the deadline guard is armed on exactly this shape, and it is what fails the attempt")
+	})
+}
+
+// TestBootCommittedAtAndScaleDownRequestedAtAreTheBoundsARecoveryCorrelatesTo is the lower bound of
+// the two lifecycle recoveries (internal/controller/infra/lifecycle.go): a finished Job is evidence
+// about the operation of this claim, and the operation cannot predate the claim's own commit.
+func TestBootCommittedAtAndScaleDownRequestedAtAreTheBoundsARecoveryCorrelatesTo(t *testing.T) {
+	made := time.Now().Add(-10 * time.Minute)
+	committed := made.Add(90 * time.Second)
+	marked := made.Add(20 * time.Minute)
+
+	withCondition := func(status metav1.ConditionStatus, at time.Time) *infrav2alpha1.NodeClaim {
+		nodeClaim := recordedClaim(infrav2alpha1.NodeClaimBooting, 1)
+		nodeClaim.CreationTimestamp = metav1.NewTime(made)
+		nodeClaim.Status.Conditions = []metav1.Condition{{
+			Type:               infrav2alpha1.ClaimConditionMachineCommitted,
+			Status:             status,
+			Reason:             string(infrav2alpha1.NodeClaimBooting),
+			LastTransitionTime: metav1.NewTime(at),
+		}}
+
+		return nodeClaim
+	}
+
+	assert.Equal(t, committed, BootCommittedAt(withCondition(metav1.ConditionTrue, committed)),
+		"a claim that records its commit answers with the instant it committed")
+	unstamped := recordedClaim(infrav2alpha1.NodeClaimBooting, 1)
+	unstamped.CreationTimestamp = metav1.NewTime(made)
+
+	assert.Equal(t, made, BootCommittedAt(unstamped),
+		"a claim with no condition falls back to its creation, the oldest instant its boot can have started")
+	assert.Equal(t, made, BootCommittedAt(withCondition(metav1.ConditionFalse, committed)),
+		"a MachineCommitted that is False records no commit: the fallback is the claim's creation")
+	assert.True(t, BootCommittedAt(nil).IsZero(), "no claim, no bound: the caller does not refuse on an absence")
+
+	markedClaim := recordedClaim(infrav2alpha1.NodeClaimReady, 1)
+	deletion := metav1.NewTime(marked)
+	markedClaim.CreationTimestamp = metav1.NewTime(made)
+	markedClaim.DeletionTimestamp = &deletion
+
+	assert.Equal(t, marked, ScaleDownRequestedAt(markedClaim),
+		"the scale-down's clock is the deletionTimestamp the request landed, not the claim's creation")
+	assert.True(t, ScaleDownRequestedAt(recordedClaim(infrav2alpha1.NodeClaimReady, 1)).IsZero(),
+		"a claim no scale-down named owns no shutdown to recover")
+	assert.True(t, ScaleDownRequestedAt(nil).IsZero())
 }

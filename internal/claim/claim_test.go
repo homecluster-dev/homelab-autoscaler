@@ -146,7 +146,7 @@ func TestAttemptBudgetIsTheSumOfTheDeadlines(t *testing.T) {
 
 	// The budget is longer than each deadline it covers, and longer than the chain they form in
 	// series: a Job that burns its whole 5m, a node that takes the whole 90s to register, and a gate
-	// that runs its whole 4m is 9m50s of attempt, and a 7m10s budget failed the claim inside it.
+	// that runs its whole 4m is 10m30s of attempt, and a 7m10s budget failed the claim inside it.
 	// That is the arithmetic the 0.1.20 watchdog's grace got by only applying to a Job that had
 	// already finished, and a claim's deadline has no such restriction to inherit.
 	serial := fsm.DefaultJobTimeout + fsm.DefaultUncordonTimeout + fsm.DefaultReadinessGateTimeout

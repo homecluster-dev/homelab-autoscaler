@@ -213,7 +213,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		slot := newSlot(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimBooting, nil)
 		k8sNode(name, true)
-		job := createLifecycleJob(slot, fsm.PhaseStartup)
+		job := createStartupJobFixture(slot, name+"-startup-envtest")
 
 		// The state the input law puts the machine in, before the gate answers: the claim is
 		// booting, the machine is observed on and the node is usable, so the startup is in flight
@@ -247,7 +247,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		})
 
 		k8sNode(name, true)
-		createLifecycleJob(slot, fsm.PhaseStartup)
+		createStartupJobFixture(slot, name+"-startup-envtest")
 
 		reconcileClaim(nodeClaim)
 
@@ -376,12 +376,19 @@ var _ = Describe("NodeClaim lifecycle", func() {
 	})
 
 	// "a scale-down whose shutdown never lands is counted, bounded, and paused"
-	It("keeps a scale-down that never lands, bounded by its own shutdown attempts", func() {
+	It("keeps a scale-down that never lands, bounded by the shutdown Jobs it fired", func() {
 		// M4. A shutdown Job that exits 0 without the machine going off is the pool's script, not the
 		// controller's bug. The finalizer cannot release while the machine is up, so the loop is
 		// permanent unless the attempts are counted, bounded, and the bound is a pause with an end.
-		// The bound is status.shutdownAttempts - a counter of its own, because the boot attempts of
-		// the episode are the record of the machines the request bought.
+		//
+		// The bound is status.shutdownAttempts, and it counts shutdowns, not reconciles: the claim
+		// controller's finalizer poll runs every 15s, so a streak written on that path reaches 3 in 45s
+		// with zero lifecycle Jobs behind it, trips the bound after one real attempt, and starts the 30m
+		// pause early. The count is stamped where a shutdown is fired - the state machine's ShutdownNode,
+		// on the branch that created the shutdown Job - and the poll reads.
+		//
+		// The boot attempts of the episode are a separate counter (status.attempt), and a shutdown that
+		// will not land must not spend them.
 		name := slotName("stuck-shutdown")
 		slot := newSlot(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
 		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
@@ -392,15 +399,36 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		k8sNode(name, true)
 		markForScaleDown(nodeClaim)
 
-		// The first slot pass fires the shutdown: the machine is up and a marked claim is not a want.
-		reconcileSlot(readSlotObject(name))
-		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(HaveLen(1), "the shutdown the pool's script runs")
+		// One cycle is one attempt: the slot pass fires the shutdown, the script exits 0, the machine
+		// the provider observes is still up, and the completion is refused (fsm.refuseUnobservedShutdown)
+		// so the slot stays draining and the scale-down has not landed.
+		for attempt := 1; attempt <= int(claim.MaxConsecutiveAttempts); attempt++ {
+			reconcileSlot(readSlotObject(name))
 
-		// The finalizer polls the observation. The machine never goes off, so every pass counts one
-		// more shutdown attempt and keeps the finalizer.
-		for pass := 1; pass <= int(claim.MaxConsecutiveAttempts)+2; pass++ {
-			result := reconcileClaim(readClaimObject(nodeClaim.Name))
-			Expect(result.RequeueAfter).To(Equal(shutdownPollResync), "pass %d polls the observation", pass)
+			jobs := jobsOfSlot(name, fsm.PhaseShutdown)
+			Expect(jobs).To(HaveLen(attempt), "attempt %d is one shutdown Job: the machine is up and a marked claim is not a want", attempt)
+
+			Expect(readClaimObject(nodeClaim.Name).Status.ShutdownAttempts).To(Equal(int32(attempt)),
+				"the streak counts the shutdowns this scale-down fired, not the passes that looked at the machine")
+
+			fired := newestJobOf(jobs)
+			monitorLifecycleJob(readSlotObject(name), fired)
+
+			// The finalizer polls the observation. Three looks at a machine that stays up are three
+			// looks: the streak they leave behind is the streak of the Jobs that were fired.
+			for pass := 1; pass <= 3; pass++ {
+				result := reconcileClaim(readClaimObject(nodeClaim.Name))
+				Expect(result.RequeueAfter).To(Equal(shutdownPollResync), "pass %d polls the observation", pass)
+			}
+
+			Expect(readClaimObject(nodeClaim.Name).Status.ShutdownAttempts).To(Equal(int32(attempt)),
+				"the poll of the observation counts nothing: it is read-only, and an attempt is a shutdown Job")
+			Expect(readClaimObject(nodeClaim.Name).Status.Attempt).To(BeNumerically("<", claim.MaxConsecutiveAttempts),
+				"a shutdown that will not land does not spend the boot attempts of the episode (M4)")
+
+			// The shutdown Job is named per second (fsm.createShutdownJob), so the next attempt is a
+			// second later. A spec that fires two shutdowns in one second asks for a name collision.
+			waitForNextSecond()
 		}
 
 		stuck := readClaimObject(nodeClaim.Name)
@@ -412,15 +440,15 @@ var _ = Describe("NodeClaim lifecycle", func() {
 			"the bound is spent on the shutdown counter, and the refusal is the record")
 		Expect(stuck.Status.LastShutdownAttemptAt).NotTo(BeNil(),
 			"the streak carries the clock its reset grace is measured from")
-		Expect(stuck.Status.Attempt).To(BeNumerically("<", claim.MaxConsecutiveAttempts),
-			"a shutdown that will not land does not spend the boot attempts of the episode (M4)")
 
 		// Past the bound the model stops firing a shutdown that will not land: the slot reconciler
-		// runs the law again, finds the streak spent, and buys no fifth Job.
+		// runs the law again, finds the streak spent, and buys no fourth Job.
 		before := len(jobsOfSlot(name, fsm.PhaseShutdown))
 
 		result := reconcileSlot(readSlotObject(name))
 		Expect(result.RequeueAfter).To(BeNumerically(">", 0), "the pause is a requeue, not a silent stop")
+		Expect(result.RequeueAfter).To(BeNumerically("<=", claim.ShutdownAttemptResetGrace),
+			"and it is paced to the end of the reset grace, so the pause ends on a pass")
 		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(HaveLen(before),
 			"no fourth shutdown Job for a script that keeps exiting 0")
 
@@ -701,7 +729,7 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimBooting, nil)
 		k8sNode(name, true)
 
-		job := createLifecycleJob(slot, fsm.PhaseStartup)
+		job := createStartupJobFixture(slot, name+"-startup-envtest")
 		completeJob(job)
 
 		reconcileSlot(readSlotObject(name))
@@ -712,6 +740,89 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseReady),
 			"and the slot's report is derived from the claim the recovery moved")
 		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(BeEmpty(), "a recovered boot is not punished with a shutdown")
+	})
+
+	// "the recovery of a finished Job answers for the boot window, not for a machine that is serving"
+	It("leaves a ready claim alone when the only Job on its slot is the completed startup of its own boot", func() {
+		// M3, the correlated half. A ready claim whose machine is momentarily observed off derives
+		// `startingup` - the same report a real boot derives - and a recovery gated on the derived state
+		// alone re-fires the startup Job this claim's readiness gate consumed long ago. The gate then
+		// runs again on a machine that is already serving: 96s without a node object, ~4m30s with one
+		// that is NotReady, and the claim ends failed/ReadinessGateTimeout instead of the MachineGone the
+		// 12m10s observation bound is there to record. When the machine comes back, the slot sees "no
+		// live claim + on" and powers it off: the reboot churn the grace exists to close.
+		//
+		// The Job is the claim's own - created after the claim, so nothing but the boot-window gate
+		// refuses it - and that gate is the fix: the recovery answers for an attempt that is running.
+		name := slotName("ready-blip")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimReady, nil)
+
+		// The machine is off and its kubelet left its node object behind NotReady: the blip shape a
+		// reboot, a slow provider and a lost machine all show.
+		k8sNode(name, false)
+
+		job := createStartupJobFixture(slot, name+"-startup-envtest")
+		completeJob(job)
+
+		result := reconcileSlot(readSlotObject(name))
+
+		ready := readClaimObject(nodeClaim.Name)
+		Expect(ready.Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady),
+			"a consumed startup Job is not the evidence of a boot: the claim owns a machine, and the boot window is closed")
+		Expect(ready.Status.Reason).To(BeEmpty(),
+			"no ReadinessGateTimeout: the gate of the attempt that bought this machine ran once, and it passed")
+		Expect(ready.Status.FinishedAt).To(BeNil(), "the episode is not over: a machine that is off for a pass is rebooting")
+
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0),
+			"the blip is a transitional report, and the pass that looks again is scheduled")
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(BeEmpty(), "a momentary blip powers nothing off")
+		Expect(jobsOfSlot(name)).To(HaveLen(1), "the recovery creates nothing: the completed startup Job is the only Job on the slot")
+		Expect(readK8sNode(name+"-k8s").Spec.Unschedulable).To(BeFalse(), "the serving node is not cordoned by a recovery")
+
+		// The owner of the shape is the claim controller, bounded by an observation of the loss: the
+		// first pass records it and ends nothing, which is the sentence the machine-gone spec makes.
+		reconcileClaim(readClaimObject(nodeClaim.Name))
+
+		watched := readClaimObject(nodeClaim.Name)
+		Expect(watched.Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady), "the loss is being watched, not spent")
+		_, seen := claim.MachineLossObservedSince(watched)
+		Expect(seen).To(BeTrue(), "the bound that ends this claim is the observation, and it started on this pass")
+	})
+
+	// "the recovery reads the newest Job of the phase, not the newest finished one"
+	It("leaves a booting claim to the startup Job that is running, not to an older finished one", func() {
+		// M3, the in-flight half. A booting claim with a finished failed startup Job of an earlier
+		// attempt on the same slot is failed on the next pass by the older Job while its own Job is
+		// still running: the newest *finished* Job is not the operation, and firing its event steals the
+		// verdict of an attempt that has not been decided yet. The newest Job of the wanted phase is the
+		// operation; if it is unfinished, the monitor owns its event and this pass has nothing to say.
+		name := slotName("boot-in-flight")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimBooting, nil)
+		k8sNode(name, false)
+
+		// The record of the attempt before: finished, failed, and older than the boot running now.
+		older := createStartupJobFixture(slot, name+"-startup-older")
+		failJob(older)
+
+		waitForNextSecond()
+
+		// The attempt in flight: the newest startup Job of the slot, unfinished.
+		createStartupJobFixture(slot, name+"-startup-running")
+
+		reconcileSlot(readSlotObject(name))
+
+		booting := readClaimObject(nodeClaim.Name)
+		Expect(booting.Status.Phase).To(Equal(infrav2alpha1.NodeClaimBooting),
+			"the running Job is the operation, and an older finished one cannot end the attempt it is running")
+		Expect(booting.Status.Reason).To(BeEmpty(), "no StartupJobFailed from somebody else's attempt")
+		Expect(booting.Status.FinishedAt).To(BeNil(), "the attempt is still running, and its deadline is intact")
+
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(BeEmpty(), "a boot in flight is not shut down by a recovery")
+		Expect(jobsOfSlot(name, fsm.PhaseStartup)).To(HaveLen(2), "the pass creates no third Job: the boot it is watching is the one that exists")
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseBooting),
+			"the slot keeps reporting the boot its claim asked for")
 	})
 })
 
@@ -786,10 +897,16 @@ func createProviderClaim(slot *infrav2alpha1.Node) *infrav2alpha1.NodeClaim {
 
 // createLifecycleJob registers a running lifecycle Job of a slot, with the labels the reconciler
 // lists on. It is the fact that separates "a boot is in flight" from "a claim exists".
-func createLifecycleJob(slot *infrav2alpha1.Node, jobPhase string) *batchv1.Job {
+// createStartupJobFixture registers a running startup Job under a name the spec chooses, so a slot can
+// carry two Jobs of the phase - the finished record of an earlier attempt and the running Job of the
+// one in flight - and "the newest" is a question the spec can answer. The shutdown Jobs of the specs
+// are created by the controller: law 3 is what fires a shutdown.
+func createStartupJobFixture(slot *infrav2alpha1.Node, name string) *batchv1.Job {
+	jobPhase := fsm.PhaseStartup
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      slot.Name + "-" + jobPhase + "-envtest",
+			Name:      name,
 			Namespace: slot.Namespace,
 			Labels: map[string]string{
 				fsm.LabelNodeCR: slot.Name,
@@ -837,6 +954,63 @@ func reconcileClaim(nodeClaim *infrav2alpha1.NodeClaim) ctrl.Result {
 	Expect(err).NotTo(HaveOccurred())
 
 	return result
+}
+
+// newestJobOf is the Job a spec's next step acts on: a slot that carries several lifecycle Jobs of
+// one phase has one current operation, and it is the newest - the same rule the recovery of a
+// finished Job applies to a slot (internal/controller/infra/lifecycle.go).
+func newestJobOf(jobs []batchv1.Job) *batchv1.Job {
+	Expect(jobs).NotTo(BeEmpty(), "the spec has a Job of this phase to act on")
+
+	newest := &jobs[0]
+	for i := range jobs[1:] {
+		candidate := &jobs[i+1]
+		if candidate.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = candidate
+		}
+	}
+
+	return newest
+}
+
+// monitorLifecycleJob plays the Job monitor of a lifecycle Job that has finished. In production the
+// monitor is a goroutine of the pass that fired the operation: it holds the coordination lock, reads
+// the Job, and reports the completion - which is what releases the lock. envtest runs no Job
+// controller, so the spec is the goroutine. The state machine is built while the Job is still in
+// flight, because that is the state its event is reachable from, and the Job is stamped finished
+// before the event runs.
+func monitorLifecycleJob(slot *infrav2alpha1.Node, job *batchv1.Job) {
+	GinkgoHelper()
+
+	reconciler := &NodeReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+
+	live, err := reconciler.liveClaimOf(ctx, slot)
+	Expect(err).NotTo(HaveOccurred())
+
+	machine := startupGateMachine(reconciler, slot, live)
+	Expect(machine.GetCurrentState()).To(Equal(fsm.StateShuttingDown),
+		"the shutdown Job in flight is the state its completion is reachable from")
+
+	completeJob(job)
+
+	// The machine the script did not power off keeps heartbeating *after* the Job finished: that is
+	// the pair fsm.machineObservedUp reads to refuse the completion, and the bound it measures
+	// against is the Job's completion time (fsm.shutdownObservationBound). The second the Job
+	// completed is the same second as its completion time, so the heartbeat the spec stamps is one
+	// later - the kubelet's own cadence is 5s, and a spec that stamps both in one second asserts a
+	// machine that stopped heartbeating at the instant the script exited.
+	waitForNextSecond()
+	heartbeatK8sNode(slot.Name)
+
+	Expect(machine.JobCompleted(job)).To(Succeed())
+}
+
+// waitForNextSecond moves a spec past the resolution of the name the controller gives a lifecycle Job
+// (<slot>-shutdown-<unix second>): two shutdowns fired inside one second ask for one name, and the
+// second create fails on it. The Jobs the fixtures write by hand are named by the spec, so only the
+// Jobs the controller creates are affected.
+func waitForNextSecond() {
+	time.Sleep(1100 * time.Millisecond)
 }
 
 // reconcileObservation runs the observation path over the Kubernetes node of a slot: the writer of
@@ -894,7 +1068,7 @@ func startupGateMachine(reconciler *NodeReconciler, slot *infrav2alpha1.Node, li
 	return fsm.NewNodeStateMachine(fresh, k8sClient, scheme.Scheme, coord,
 		fsm.WithReadinessTaintKeys(readyTaintKeysOf(fresh)),
 		fsm.WithInput(input),
-		fsm.WithClaim(live, claimWriterFor(k8sClient)))
+		fsm.WithClaim(live, claimWriterFor(k8sClient, fresh)))
 }
 
 // readyTaintKeysOf is the gate the slot records for its Group: the keys the observation path reads
@@ -1121,6 +1295,65 @@ func completeJob(job *batchv1.Job) {
 			Type:               batchv1.JobComplete,
 			Status:             corev1.ConditionTrue,
 			LastTransitionTime: now,
+		},
+	}
+	Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+}
+
+// heartbeatK8sNode stamps the kubelet's last heartbeat on the node object of a slot, at "now", and
+// keeps the node Ready. It is the fact an observation of "the machine is up" is made of: the Ready
+// condition with a heartbeat newer than the instant the shutdown Job completed (see
+// monitorLifecycleJob, and fsm.shutdownObservationBound for the bound).
+func heartbeatK8sNode(slotName string) {
+	GinkgoHelper()
+
+	node := readK8sNode(slotName + "-k8s")
+	now := metav1.NewTime(time.Now())
+
+	found := false
+
+	for i := range node.Status.Conditions {
+		if node.Status.Conditions[i].Type != corev1.NodeReady {
+			continue
+		}
+
+		node.Status.Conditions[i].Status = corev1.ConditionTrue
+		node.Status.Conditions[i].LastHeartbeatTime = now
+		node.Status.Conditions[i].LastTransitionTime = now
+		found = true
+	}
+
+	Expect(found).To(BeTrue(), "the slot's node object carries its Ready condition")
+	Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+}
+
+// failJob stamps a lifecycle Job failed, the way the cluster does when the pod the operator's script
+// runs exhausts its retries. A finished Job of a bygone attempt is the record the recovery of a
+// running one must not mistake for evidence.
+func failJob(job *batchv1.Job) {
+	GinkgoHelper()
+
+	fresh := &batchv1.Job{}
+	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(job), fresh)).To(Succeed())
+
+	now := metav1.NewTime(time.Now())
+
+	fresh.Status.StartTime = &now
+	fresh.Status.Failed = 1
+	fresh.Status.Conditions = []batchv1.JobCondition{
+		{
+			Type:               batchv1.JobFailureTarget,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+			Reason:             "BackoffLimitExceeded",
+			Message:            "the spec's lifecycle script exited non-zero",
+		},
+		{
+			Type:               batchv1.JobFailed,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+			Reason:             "BackoffLimitExceeded",
+			Message:            "the spec's lifecycle script exited non-zero",
 		},
 	}
 	Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())

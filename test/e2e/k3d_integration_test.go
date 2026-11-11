@@ -666,7 +666,7 @@ spec:
 			By("Verifying the budget outlasts the deadlines one attempt can spend in series")
 			// B2. The deadline runs from spec.requestedAt, i.e. from before the startup Job exists,
 			// so one attempt can spend the Job's own timeout, then the registration wait, then the
-			// readiness gate - about 9m50s of deadlines. A budget that omits the Job's timeout
+			// readiness gate - about 10m30s of deadlines. A budget that omits the Job's timeout
 			// (7m10s, the first sketch of §4) fails a claim in the middle of the machine it is still
 			// buying, and the machine that boots an instant later is force-shut-down as overdue.
 			Eventually(func() bool {
