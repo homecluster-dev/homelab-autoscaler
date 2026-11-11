@@ -65,6 +65,20 @@ Implements Cluster Autoscaler CloudProvider interface:
 - `NodeGroupDeleteNodes()` - Scale down nodes
 - `NodeGroupDecreaseTargetSize()` - Target size reduction
 
+**Target size**
+
+The one definition of the target size of a group (`targetSizeOf`, reported by
+`NodeGroupTargetSize`) counts a slot when it is **claimed** - `spec.desiredPowerState: on`, its
+machine booting or running - and does not count a slot that is genuinely being torn down
+(`spec.desiredPowerState: off` with a progress of `shuttingdown`/`shutdown`).
+
+`spec.desiredPowerState` is the request and `status.progress` is what the machine is doing, and
+the autoscaler reads the request: `NodeGroupIncreaseSize` claims a slot with a spec write, and
+the FSM moves the progress seconds later, after the machine has taken minutes to boot. A target
+size read off the progress alone reports the slot the autoscaler just asked for as shut down, so
+it concludes the group never grew and calls `IncreaseSize` again in the same loop. Every
+minSize/maxSize check in the provider is judged against this same number.
+
 ## Data Flow
 
 1. **Group Creation**: User creates Group CRD → Group Controller → Updates status

@@ -54,6 +54,31 @@ annotations:
 - Prevents race conditions between controllers
 - 5-minute timeout for stuck operations
 
+### What a refused transition leaves behind
+
+A transition that loses the lock is a deferral, not a failure of the slot, and the rules below
+are what keep it from stranding one:
+
+- The acquisition happens in the `before_` hook, before the state change and before the
+  `enter_` hooks, which are the only writers of `status.progress`. A refused transition
+  therefore writes nothing: the slot keeps the stable progress it had (`ready` for a
+  scale-down that lost to a scale-up, `shutdown` the other way round). That matters because a
+  progress of `startingup`/`shuttingdown` is excluded from the provider's target size, and
+  `validateStateTransition` refuses to start a transition from a transitional progress, so a
+  slot left there is only freed by the stuck-transition cleanup after 15 minutes.
+- The lifecycle entry points (`StartNode`, `ShutdownNode`) trigger the event, and so take the
+  lock, before touching anything: cordoning the Kubernetes node, clearing the
+  `ToBeDeletedByClusterAutoscaler` taint and deleting the pending lifecycle Job all happen
+  only on a slot the operation owns.
+- The refusal is reported as a `LockConflictError` carrying the remaining lifetime of the
+  lock. The node controller requeues for that deadline, and the intent of the refused
+  operation is `spec.desiredPowerState` - written by cluster-autoscaler's `DeleteNodes` /
+  `DecreaseTargetSize` - so the transition is retried on the next pass, without a second
+  request from the autoscaler.
+- Every transition that ends an operation releases the lock, including `JobTimeout`: a lock
+  must not outlive the operation that wrote it, or the next operation on the slot is refused
+  by a lock nothing is running under.
+
 ## Async Operations
 
 Power operations use Kubernetes Jobs for async execution:
