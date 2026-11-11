@@ -588,9 +588,10 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 
 // TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize mirrors the same floor on the
 // decrease path: cancelling slots that are still starting must not take the group below
-// its minimum size. The floor is judged against the target size that results from the
-// request (targetSizeOf + delta), and a request that cannot take any capacity away is a
-// no-op success, because cluster-autoscaler retries a refusal forever.
+// its minimum size. The floor is judged against the target size the request can actually
+// produce (targetSizeOf minus the slots it is able to cancel), and a request that cannot
+// take any capacity away is a no-op success, because cluster-autoscaler retries a refusal
+// forever.
 func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 	startingUp := func(name string) *infrav1alpha1.Node {
 		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
@@ -636,11 +637,25 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			wantKeep: []string{"slot-1"},
 		},
 		{
-			name:     "minSize 2, two running + one starting: delta -2 genuinely crosses the floor",
+			// The only capacity this entry point owns is the starting slot, so a delta that is
+			// bigger than the slots it can cancel cannot cross the floor either: cancelling the
+			// one starting slot takes the target size from 3 to 2, which is the floor.
+			name:     "minSize 2, two running + one starting: delta -2 cancels the one starting slot and lands on the floor",
 			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
 			delta:    -2,
+			refuse:   false,
+			wantShed: []string{"slot-3"},
+			wantKeep: []string{"slot-1", "slot-2"},
+		},
+		{
+			// The case that genuinely crosses the floor: one running slot and one starting
+			// slot, so the only cancellation this request can carry out takes the target size
+			// from 2 to 1, below the floor. It is refused, nothing is cancelled.
+			name:     "minSize 2, one running + one starting: delta -2 crosses the floor and is refused",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2")},
+			delta:    -2,
 			refuse:   true,
-			wantKeep: []string{"slot-1", "slot-2", "slot-3"},
+			wantKeep: []string{"slot-1", "slot-2"},
 		},
 		{
 			name:     "minSize 2, two running + one starting: delta -1 lands on the floor",
@@ -661,6 +676,19 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			refuse:   false,
 			wantShed: []string{"slot-2"},
 			wantKeep: []string{"slot-1", "slot-3"},
+		},
+		{
+			// The floor has to be judged against the size the request can actually produce,
+			// not against the uncapped delta: the target size is 3 (one running + two starting),
+			// two slots can be cancelled, so the achievable result is 1, exactly the floor. The
+			// uncapped arithmetic compared 3 - 3 = 0 against the floor and refused it, the same
+			// class of unrecoverable FailedPrecondition as the case above, one level down.
+			name:     "minSize 1, one running + two starting: delta -3 cancels both starting slots and lands on the floor",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2"), startingUp("slot-3")},
+			delta:    -3,
+			refuse:   false,
+			wantShed: []string{"slot-2", "slot-3"},
+			wantKeep: []string{"slot-1"},
 		},
 		{
 			// Cancelling one starting slot is one unit off the target size, so the delta is

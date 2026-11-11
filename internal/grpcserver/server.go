@@ -582,10 +582,10 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 
 // NodeGroupDecreaseTargetSize decreases the target size of the node group by cancelling
 // the slots that are still starting. The floor of the group (spec.minSize) is judged
-// against the target size that results from the request, using the same targetSizeOf that
-// NodeGroupTargetSize reports, and a request that cannot take any capacity away is a
-// no-op success: cluster-autoscaler retries a FailedPrecondition forever and never
-// corrects its own view of the target size.
+// against the target size that this request can actually produce, using the same
+// targetSizeOf that NodeGroupTargetSize reports, and a request that cannot take any
+// capacity away is a no-op success: cluster-autoscaler retries a FailedPrecondition
+// forever and never corrects its own view of the target size.
 func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.NodeGroupDecreaseTargetSizeRequest) (*pb.NodeGroupDecreaseTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDecreaseTargetSize called", "nodeGroup", req.Id, "delta", req.Delta)
@@ -618,36 +618,50 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 	}
 
 	// The target size is the single definition from targetSizeOf, the number
-	// NodeGroupTargetSize reports, and the floor is judged against the size that results
-	// from this request (current target size + delta). cluster-autoscaler calls this entry
-	// point precisely when its view of the target size is stale, so a request that lands
-	// on the floor has to be accepted: the previous arithmetic compared the floor against
-	// the running slots only, dropping the ones that are starting, and refused the
-	// ordinary bookkeeping case (minSize 1, one running + one starting, delta -1 lands on
-	// the floor) with a FailedPrecondition the autoscaler retries forever.
+	// NodeGroupTargetSize reports. cluster-autoscaler calls this entry point precisely when
+	// its view of the target size is stale, so a request that lands on the floor has to be
+	// accepted. The arithmetic that decides the floor has been wrong twice: it first
+	// compared the floor against the running slots only, dropping the ones that are starting
+	// (minSize 1, one running + one starting, delta -1 lands on the floor, was refused), and
+	// then against the uncapped delta, so a request that can only reach the floor was
+	// refused as well (see the nodesToShutdown cap below).
 	currentSize := targetSizeOf(nodes)
-	resultingSize := currentSize + req.Delta // req.Delta is negative
-	if resultingSize < 0 {
-		resultingSize = 0
-	}
 
 	// Nothing to cancel means the request cannot take any capacity away: answer it as a
 	// no-op success rather than an error, so the autoscaler is not stuck retrying a
 	// request the provider can never carry out, and moves on to reconcile its view.
 	if len(startingUpNodes) == 0 {
 		logger.Info("Nothing to cancel, the target size of the group cannot be decreased by this request",
-			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize, "resultingSize", resultingSize)
+			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize, "resultingSize", currentSize)
 		return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 	}
 
 	minSize := s.groupMinSize(ctx, req.Id, int32(len(nodes)))
+
+	// How many slots this request will actually cancel. Cancelling one starting slot is one
+	// unit off the target size, so carrying out the delta means cancelling -delta of them,
+	// and a request that asks for more than exist cancels all of them: the provider reports
+	// success for what it actually did, and cluster-autoscaler reads the new target size back
+	// from NodeGroupTargetSize.
+	nodesToShutdown := -req.Delta
+	if available := int32(len(startingUpNodes)); nodesToShutdown > available {
+		nodesToShutdown = available
+	}
+
+	// The floor is judged against the size the request will produce, which is the current
+	// target size minus the slots it can cancel, not minus the delta it was asked for. With
+	// minSize 1, one running + two starting slots and delta -3 the achievable result is 1,
+	// exactly the floor: refusing that (the uncapped arithmetic produced 0) is the same class
+	// of unrecoverable FailedPrecondition as the case above, one level down.
+	resultingSize := currentSize - nodesToShutdown
 	if resultingSize < minSize {
 		logger.Info("Refusing to decrease the target size below the minSize of the group",
-			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize,
+			"nodeGroup", req.Id, "delta", req.Delta, "cancellable", int32(len(startingUpNodes)),
+			"nodesToShutdown", nodesToShutdown, "currentSize", currentSize,
 			"resultingSize", resultingSize, "minSize", minSize)
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"decreasing node group %s by %d would take it below its minSize %d (current target size %d)",
-			req.Id, req.Delta, minSize, currentSize)
+			"decreasing node group %s by %d would take it below its minSize %d (current target size %d, %d slot(s) can be cancelled)",
+			req.Id, req.Delta, minSize, currentSize, nodesToShutdown)
 	}
 
 	// Sort starting up nodes by last startup time (oldest first)
@@ -660,16 +674,6 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 		}
 		return startingUpNodes[i].Status.LastStartupTime.Before(startingUpNodes[j].Status.LastStartupTime)
 	})
-
-	// Calculate how many starting up slots to cancel. Cancelling one is exactly one unit
-	// off the target size, so carrying out the delta means cancelling -delta of them, and
-	// a request that asks for more than exist cancels all of them: the provider reports
-	// success for what it actually did, and cluster-autoscaler reads the new target size
-	// back from NodeGroupTargetSize.
-	nodesToShutdown := -req.Delta
-	if available := int32(len(startingUpNodes)); nodesToShutdown > available {
-		nodesToShutdown = available
-	}
 
 	// Shut down the required number of starting up nodes
 	for i := 0; i < int(nodesToShutdown) && i < len(startingUpNodes); i++ {
@@ -692,7 +696,10 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 		logger.Info("Successfully marked node for shutdown", "node", node.Name, "group", req.Id)
 	}
 
-	logger.Info("NodeGroupDecreaseTargetSize completed", "nodeGroup", req.Id, "currentSize", currentSize, "newSize", resultingSize, "delta", req.Delta, "nodesShutdown", nodesToShutdown)
+	// The size reported here is the target size after the cancellations that were actually
+	// carried out (the cap above), not the one the delta asked for.
+	logger.Info("NodeGroupDecreaseTargetSize completed", "nodeGroup", req.Id, "delta", req.Delta,
+		"nodesShutdown", nodesToShutdown, "currentSize", currentSize, "newSize", currentSize-nodesToShutdown)
 
 	return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 }
