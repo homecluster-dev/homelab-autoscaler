@@ -521,7 +521,12 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 	return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 }
 
-// NodeGroupNodes returns a list of all nodes that belong to this node group
+// NodeGroupNodes returns a list of all nodes that belong to this node group.
+//
+// The instances mirror the machines the provider has: a slot with a Kubernetes node object is
+// reported running when it is desired to be on and deleting when it is desired to be off, a slot
+// that is desired to be on but has not joined yet is reported as creating, and a slot that is
+// desired to be off without a machine behind it is not reported at all.
 func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.NodeGroupNodesRequest) (*pb.NodeGroupNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupNodes called", "nodeGroup", req.Id)
@@ -536,26 +541,48 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 		}
 	}
 
-	// Convert nodes to instances
+	// Convert nodes to instances.
+	//
+	// A slot has a machine behind it exactly when it has a Kubernetes Node object: the kubelet
+	// registers the node when the machine boots and the object stays behind, NotReady, while the
+	// machine is powered off. Cluster-autoscaler matches every Kubernetes Node to an instance by
+	// spec.providerID, so a slot with a node object must produce an instance (marked deleting
+	// when the machine is desired off) and a slot without one must not.
 	instances := make([]*pb.Instance, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
-		// A slot that is not desired to be on is capacity the provider could create,
-		// not an instance that exists. Reporting it as running inflates the current
-		// size of the group, which makes the autoscaler provision extra machines.
-		if node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOn {
+		desiredOn := node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn
+
+		// The Kubernetes node only exists once the machine has joined the cluster. Slots
+		// without spec.kubernetesNodeName have never been provisioned, so the lookup is
+		// skipped and they are treated as having no node.
+		kubernetesNode := &corev1.Node{}
+		hasKubernetesNode := false
+		if name := node.Spec.KubernetesNodeName; name != "" {
+			err = s.Client.Get(ctx, client.ObjectKey{Name: name}, kubernetesNode)
+			switch {
+			case err == nil:
+				hasKubernetesNode = true
+			case !errors.IsNotFound(err):
+				logger.Error(err, "Failed to get Kubernetes node", "node", name, "nodeCR", node.Name)
+			}
+		}
+
+		if !hasKubernetesNode && !desiredOn {
+			// A slot that is not desired to be on and has no machine is capacity the
+			// provider could create, not an instance that exists. Reporting it inflates
+			// the current size of the group, which makes the autoscaler provision extra
+			// machines.
 			continue
 		}
 
-		// The Kubernetes node only exists once the machine has joined the cluster.
-		// Until then the instance is still provisioning.
+		// A desired-on slot whose node has not joined yet is still provisioning; a desired-off
+		// slot whose node object is left over is a machine that is being powered off.
 		instanceState := pb.InstanceStatus_instanceCreating
-		kubernetesNode := &corev1.Node{}
-		if name := node.Spec.KubernetesNodeName; name != "" {
-			err = s.Client.Get(ctx, client.ObjectKey{Name: name}, kubernetesNode)
-			if err == nil {
+		if hasKubernetesNode {
+			if desiredOn {
 				instanceState = pb.InstanceStatus_instanceRunning
-			} else if !errors.IsNotFound(err) {
-				logger.Error(err, "Failed to get Kubernetes node", "node", name, "nodeCR", node.Name)
+			} else {
+				instanceState = pb.InstanceStatus_instanceDeleting
 			}
 		}
 
