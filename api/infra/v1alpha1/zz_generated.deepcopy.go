@@ -160,6 +160,11 @@ func (in *MinimalPodSpec) DeepCopyInto(out *MinimalPodSpec) {
 		*out = new(string)
 		**out = **in
 	}
+	if in.PriorityClassName != nil {
+		in, out := &in.PriorityClassName, &out.PriorityClassName
+		*out = new(string)
+		**out = **in
+	}
 	if in.TTLSecondsAfterFinished != nil {
 		in, out := &in.TTLSecondsAfterFinished, &out.TTLSecondsAfterFinished
 		*out = new(int32)

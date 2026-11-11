@@ -112,6 +112,12 @@ type MinimalPodSpec struct {
 	// Each volume mounts a Secret or ConfigMap
 	Volumes        []VolumeMountSpec `json:"volumes,omitempty"`
 	ServiceAccount *string           `json:"serviceAccount,omitempty"`
+	// PriorityClassName is assigned to the Pod created by the startup/shutdown Job.
+	// Use it to keep power-management Pods schedulable (and non-preemptible) under
+	// resource pressure, e.g. "system-cluster-critical". Empty means the cluster
+	// default (priority 0), which is today's behaviour.
+	// +optional
+	PriorityClassName *string `json:"priorityClassName,omitempty"`
 	// TTLSecondsAfterFinished limits the lifetime of the Job.
 	// Defaults to 600 seconds (10 minutes) if not specified.
 	// +optional
