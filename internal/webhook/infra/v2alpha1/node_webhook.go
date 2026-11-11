@@ -45,7 +45,7 @@ func SetupNodeWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/validate-infra-homecluster-dev-v1alpha1-node,mutating=false,failurePolicy=fail,sideEffects=None,groups=infra.homecluster.dev,resources=nodes,verbs=create;update,versions=v1alpha1,name=vnode-v1alpha1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-infra-homecluster-dev-v2alpha1-node,mutating=false,failurePolicy=fail,sideEffects=None,groups=infra.homecluster.dev,resources=nodes,verbs=create;update,versions=v2alpha1,name=vnode-v2alpha1.kb.io,admissionReviewVersions=v1
 
 // NodeCustomValidator struct is responsible for validating the Node resource
 // when it is created, updated, or deleted.
