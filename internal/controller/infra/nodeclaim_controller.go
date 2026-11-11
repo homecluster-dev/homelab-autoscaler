@@ -60,6 +60,12 @@ type NodeClaimReconciler struct {
 	// Recorder writes claim status. Set to claim.NewRecorder(r.Client) in SetupWithManager when
 	// nil, so tests can inject their own.
 	Recorder *claim.Recorder
+
+	// APIReader reads the slot of a claim straight from the API server, past the cache. The one path
+	// that needs it is the release of a finalizer on a slot that is gone: that write is
+	// irreversible, so the fact behind it is never a read that can lag (see slotIsGone). Set from
+	// mgr.GetAPIReader() in SetupWithManager when nil.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodeclaims,verbs=get;list;watch;create;update;patch;delete
@@ -87,9 +93,22 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			// it is reachable through the documented rollout, which deletes the Node CRs
 			// (docs/design/nodeclaim.md §9), and through garbage collection of a namespace.
 			//
+			// The read that says so is the cached one, and the write behind it cannot be undone: a
+			// cache that has not caught up with a slot that exists - a slot recreated by the rollout,
+			// a claim reconciled from a watch of its own create - would release the finalizer of a
+			// claim whose machine is still wanted. The fact is re-read from the API server before
+			// anything is given up (slotIsGone), and a pass that disagrees requeues.
+			//
 			// No digest is stamped: the record lives on the slot, and the slot is not there. The
 			// phase move is best-effort for the same reason - it is the story an operator reads when
 			// the claim survives the finalizer removal, not a step the model depends on.
+			if !r.slotIsGone(ctx, nodeClaim) {
+				logger.Info("The cache says the slot is gone and the API server says it is there; re-reading on the next pass",
+					"claim", nodeClaim.Name, "slot", claim.SlotNameOf(nodeClaim))
+
+				return ctrl.Result{RequeueAfter: slotReadDisagreementResync}, nil
+			}
+
 			return r.releaseDeletedSlot(ctx, nodeClaim)
 		}
 
@@ -139,11 +158,18 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return r.reconcileLive(ctx, nodeClaim, slot)
 }
 
-// releaseDeletedSlot ends a claim whose slot (Node CR) is gone: the reason is recorded, and the
-// finalizer comes off, so the ownerReference's garbage collection can finish the object. The
-// SlotDeleted digest is deliberately not stamped - the record lives on the slot, and the slot does
-// not exist - so the claim object itself is the record, and `kubectl get nodeclaim` finds it while
-// its TTL keeps it.
+// releaseDeletedSlot ends a claim whose slot (Node CR) is gone: the reason is recorded, the finalizer
+// comes off, and the claim's own TTL is kept from here (finishReleasedSlot). The SlotDeleted digest
+// is deliberately not stamped - the record lives on the slot, and the slot does not exist - so the
+// claim object is the record, for as long as its TTL keeps it: the collection path this controller
+// uses for every other terminal claim is reached through the slot, and the slot is gone.
+//
+// "For as long as its TTL keeps it" is exact, and the wording matters. A claim the scale-down already
+// marked is deleted by the API server on the write that removes its finalizer, and a claim an
+// ownerReference points at can be taken by the slot's garbage collection at the same instant: neither
+// survives to its TTL. An unmarked claim of a deleted slot - the rollout of §9, which deletes the
+// Node CRs and leaves the claims - is the one that reads as the record, and it is kept for
+// spec.ttlSecondsAfterFinished from the moment it was failed.
 func (r *NodeClaimReconciler) releaseDeletedSlot(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -156,7 +182,7 @@ func (r *NodeClaimReconciler) releaseDeletedSlot(ctx context.Context, nodeClaim 
 	}
 
 	if !claim.HasFinalizer(nodeClaim) {
-		return ctrl.Result{}, nil
+		return r.finishReleasedSlot(ctx, nodeClaim)
 	}
 
 	// Re-Get: the recorder's move bumped the resourceVersion, and a finalizer removal that lands on
@@ -167,7 +193,7 @@ func (r *NodeClaimReconciler) releaseDeletedSlot(ctx context.Context, nodeClaim 
 	}
 
 	if !controllerutil.ContainsFinalizer(fresh, ClaimFinalizer) {
-		return ctrl.Result{}, nil
+		return r.finishReleasedSlot(ctx, nodeClaim)
 	}
 
 	controllerutil.RemoveFinalizer(fresh, ClaimFinalizer)
@@ -179,8 +205,82 @@ func (r *NodeClaimReconciler) releaseDeletedSlot(ctx context.Context, nodeClaim 
 	logger.Info("Released the finalizer of a claim whose slot is gone",
 		"claim", nodeClaim.Name, "slot", claim.SlotNameOf(nodeClaim))
 
+	return r.finishReleasedSlot(ctx, nodeClaim)
+}
+
+// finishReleasedSlot keeps the TTL of a claim that outlived its slot. Every other collection path of
+// this controller is reached through the slot - it reads the slot, and stamps the digest the slot
+// keeps - so with the slot gone that path never runs again, and the only record of the episode is the
+// object itself (§8, §9).
+//
+// A claim the provider created names its slot by an ownerReference on the slot, so the slot's
+// deletion is its deletion and the garbage collector finishes it. A claim applied by hand - a
+// manifest, a provider that stamped no ownerReference - has no collector at all: nothing deletes it,
+// and its spec.ttlSecondsAfterFinished is a field nothing reads. The release path is the one pass
+// this controller runs for such an object, so the TTL is honoured here: deleted once it has passed,
+// and a requeue scheduled for the instant it passes when it has not.
+func (r *NodeClaimReconciler) finishReleasedSlot(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) (ctrl.Result, error) {
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		// The object is gone: the finalizer removal above finished a marked claim, and its owner's
+		// garbage collection finished an unmarked one. Nothing is left to schedule.
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if phase.IsLive(fresh.Status.Phase) {
+		// The move to failed did not land (a conflict, a write the API server refused). The next pass
+		// re-reads the slot's absence, lands it, and reaches the collection below.
+		return ctrl.Result{RequeueAfter: idleResync}, nil
+	}
+
+	if fresh.Status.FinishedAt == nil {
+		if _, err := r.recorder().StampFinishedAt(ctx, client.ObjectKeyFromObject(fresh)); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+
+		return ctrl.Result{RequeueAfter: idleResync}, nil
+	}
+
+	ttl := ttlOfClaim(fresh)
+
+	if expiry := fresh.Status.FinishedAt.Add(ttl); expiry.After(time.Now()) {
+		return ctrl.Result{RequeueAfter: time.Until(expiry)}, nil
+	}
+
+	if err := r.Delete(ctx, fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	log.FromContext(ctx).Info("Collected a terminal claim whose slot is gone", "claim", fresh.Name,
+		"slot", claim.SlotNameOf(fresh), "phase", string(fresh.Status.Phase), "ttl", ttl.String())
+
 	return ctrl.Result{}, nil
 }
+
+// slotIsGone asks the API server, past the cache, whether the slot of a claim is gone. The cached
+// read in slotOf is the one that drives every other decision of this controller, and it is the one
+// that can be behind: a slot the rollout deleted and recreated, a claim reconciled from a watch of
+// its own create. Releasing a finalizer cannot be undone, so the irreversible branch re-reads the
+// fact from the API server and gives up only when both readers agree the slot is not there.
+//
+// With no direct reader wired - a unit test whose client is the only client there is - the cached
+// read is not a lagging one, and the answer is the cached one.
+func (r *NodeClaimReconciler) slotIsGone(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) bool {
+	if r.APIReader == nil {
+		return true
+	}
+
+	slot := &infrav2alpha1.Node{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: nodeClaim.Namespace, Name: claim.SlotNameOf(nodeClaim)}, slot); err != nil {
+		return errors.IsNotFound(err)
+	}
+
+	return false
+}
+
+// slotReadDisagreementResync is how long a pass that cannot tell whether its slot is gone waits
+// before asking again: the cache catches up in seconds, and the question is only ever asked once.
+const slotReadDisagreementResync = 5 * time.Second
 
 // reconcileLive enforces the two bounds that end an attempt without a machine - the boot deadline
 // and the streak of attempts - owns the machine that vanished under a ready claim, keeps the slot's
@@ -359,36 +459,23 @@ func (r *NodeClaimReconciler) watchMachine(ctx context.Context, nodeClaim *infra
 // the rule is that a boot is reversed, never interrupted: the machine is powered off by the shutdown
 // path (the slot reconciler fires ShutdownNode for a claim marked for scale-down), and only once the
 // machine is observed off does the claim end and the finalizer come off.
+//
+// While the machine is still up this pass is read-only. The attempts of the scale-down are counted by
+// the path that fires them (internal/fsm ShutdownNode -> recordShutdownAttempt -> BumpScaleDownAttempt),
+// not here: this path polls the observation every shutdownPollResync, and a poll is not an attempt.
+// The bound it would spend on polls is the bound the slot reconciler applies, so the streak stays the
+// streak of shutdown Jobs - which is the number the 30m pause is measured against.
 func (r *NodeClaimReconciler) reconcileDeletion(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim, slot *infrav2alpha1.Node) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	recorder := r.recorder()
 
 	if slot.Status.PowerState == infrav2alpha1.PowerStateOn {
-		// The machine is up. The slot reconciler owns powering it off; this pass keeps the finalizer,
-		// counts the attempt for the bound, and comes back. The count is the claim's
-		// status.shutdownAttempts, a streak of its own: the boot attempts of the episode
-		// (status.attempt) are the record of the machines the request bought, and a shutdown that
-		// will not land does not spend them (docs/design/nodeclaim.md §4).
-		bumped, reset, err := BumpScaleDownAttempt(ctx, r.Client, slot, nodeClaim)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		if bumped && nodeClaim.Status.ShutdownAttempts == claim.MaxConsecutiveAttempts {
-			r.eventf(nodeClaim, "ShutdownAttemptLimitReached",
-				"scale-down of slot %s has spent %d of %d shutdown attempts and the machine is still observed up: the controller stops firing the shutdown for %s, because a shutdown Job that exits 0 without the machine going off is the pool's script, not the controller",
-				slot.Name, claim.MaxConsecutiveAttempts, claim.MaxConsecutiveAttempts, claim.ShutdownAttemptResetGrace.String())
-		}
-
-		if reset {
-			r.eventf(nodeClaim, "ShutdownAttemptStreakReset",
-				"the scale-down of slot %s spent its %d shutdown attempts and the reset grace of %s has passed: the machine is still observed up, so the controller fires the shutdown again - a pool whose script has been fixed is picked up without a hand edit",
-				slot.Name, claim.MaxConsecutiveAttempts, claim.ShutdownAttemptResetGrace.String())
-		}
-
+		// The machine is up. The slot reconciler owns powering it off and counting the shutdowns it
+		// fires; this pass keeps the finalizer, reads the streak for the log, and comes back.
 		logger.V(1).Info("Claim is being deleted and the machine is still up; keeping the finalizer",
 			"claim", nodeClaim.Name, "slot", slot.Name, "phase", string(nodeClaim.Status.Phase),
-			"shutdownAttempts", nodeClaim.Status.ShutdownAttempts)
+			"shutdownAttempts", nodeClaim.Status.ShutdownAttempts,
+			"shutdownsFired", "the shutdown Jobs this slot's scale-down created, counted where they fire")
 
 		return ctrl.Result{RequeueAfter: shutdownPollResync}, nil
 	}
@@ -598,10 +685,7 @@ func (r *NodeClaimReconciler) collect(ctx context.Context, nodeClaim *infrav2alp
 		return ctrl.Result{RequeueAfter: idleResync}, nil
 	}
 
-	ttl := time.Duration(claim.DefaultTTLSecondsAfterFinished) * time.Second
-	if nodeClaim.Spec.TTLSecondsAfterFinished != nil {
-		ttl = time.Duration(*nodeClaim.Spec.TTLSecondsAfterFinished) * time.Second
-	}
+	ttl := ttlOfClaim(nodeClaim)
 
 	expiry := nodeClaim.Status.FinishedAt.Add(ttl)
 	if now := time.Now(); now.Before(expiry) {
@@ -666,8 +750,28 @@ func (r *NodeClaimReconciler) eventf(nodeClaim *infrav2alpha1.NodeClaim, reason,
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = claim.NewRecorder(r.Client)
+	}
+
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav2alpha1.NodeClaim{}).
 		Named("nodeclaim").
 		Complete(r)
+}
+
+// ttlOfClaim is spec.ttlSecondsAfterFinished of a terminal claim, defaulted to
+// claim.DefaultTTLSecondsAfterFinished. Both collection paths read it here: the one that runs with a
+// slot (collect, which stamps the digest and deletes), and the one that runs when the slot is gone
+// (finishReleasedSlot, which has no digest to stamp and no garbage collector to finish the object).
+func ttlOfClaim(nodeClaim *infrav2alpha1.NodeClaim) time.Duration {
+	if nodeClaim.Spec.TTLSecondsAfterFinished != nil {
+		return time.Duration(*nodeClaim.Spec.TTLSecondsAfterFinished) * time.Second
+	}
+
+	return time.Duration(claim.DefaultTTLSecondsAfterFinished) * time.Second
 }

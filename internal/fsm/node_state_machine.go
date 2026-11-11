@@ -197,7 +197,9 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 
 	// A scale-down is a claim (request.call: DeleteNodes), and its attempts are counted on that
 	// claim and end when it ends: the v1alpha1 ShutdownAttempts condition on the long-lived slot,
-	// with its two reset sites, is gone (§4).
+	// with its two reset sites, is gone (§4). The count is stamped below, on the path that created
+	// the shutdown Job, because an attempt is a machine the pool was asked to power off and not a
+	// pass that looked at it.
 
 	// Trigger FSM event, taking the coordination lock. See StartNode for what a cancellation
 	// does and does not leave behind.
@@ -241,6 +243,13 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 	// machine derives is shuttingdown, where JobCompleted is reachable.
 	nm.input.StartupJobInFlight = false
 	nm.input.ShutdownJobInFlight = true
+
+	// One shutdown attempt is one Job: the streak the bound (claim.MaxConsecutiveAttempts) reads is
+	// counted here, on the claim that asked for the scale-down, and nowhere else. The finalizer's
+	// poll of the observation is read-only, so 45s of polling a machine that stays up is three looks
+	// and not three attempts.
+	nm.recordShutdownAttempt()
+
 	nm.reportPhase()
 
 	// Start async job monitoring

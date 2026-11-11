@@ -163,6 +163,31 @@ func (nm *NodeStateMachine) setInputPhase(to infrav2alpha1.NodeClaimPhase) {
 	}
 }
 
+// recordShutdownAttempt counts the shutdown this machine fired on the claim a scale-down named. It
+// runs on the path that created the shutdown Job (ShutdownNode, after the create), so the streak the
+// bound reads is a streak of attempts: three shutdown Jobs on a machine the provider keeps observing
+// up, and the pause that follows them.
+//
+// It never fails the transition, for the same reason moveClaim does not: the shutdown is running,
+// and a claim status write the API server refused costs the record of one attempt, not the machine.
+// A slot whose shutdown never lands is re-fired by the next pass and counted by the one that
+// creates the next Job, so the bound closes in either way; a streak that cannot be written is a
+// bound that is one attempt looser, which is the direction that does not destroy a machine.
+//
+// With no claim (the shutdown of a machine the pool stopped wanting, an episode whose claim is
+// already collected) there is nothing to count on: the slot's digest is the record, and
+// claim.ScaleDownStreakExhausted reads it.
+func (nm *NodeStateMachine) recordShutdownAttempt() {
+	if nm.claim == nil || nm.claimWriter == nil {
+		return
+	}
+
+	if err := nm.claimWriter.RecordShutdownAttempt(context.TODO(), nm.claim); err != nil {
+		log.Log.WithName("fsm").Error(err, "Failed to record the shutdown attempt on the claim; the scale-down bound is one attempt looser",
+			"node", nm.node.Name, "claim", nm.claim.Name)
+	}
+}
+
 // commitAttempt is the pending -> booting edge: the write that says this claim bought a machine.
 // It runs on the same path that created the startup Job (StartNode), so an attempt is a machine and
 // not a reconcile pass, and a claim that never got a Job keeps its number without spending a

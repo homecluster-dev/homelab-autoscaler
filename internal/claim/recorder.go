@@ -155,10 +155,18 @@ func (r *Recorder) Seed(ctx context.Context, key client.ObjectKey, slot *infrav2
 // stale copy, and it refuses a move the table refuses (see ErrIllegalMove).
 //
 // A move is one phase, and it can need two writes, because a claim carries two things that are not
-// status (see closeBootWindow): the finalizer of a committed boot, and `spec.deadlineAt`, the budget
-// of a boot that is still running. The metadata/spec write is applied first, so a manager that dies
-// between the two leaves the boot committed and the deadline intact - the safe direction, the one
-// where the claim controller lands the phase on its next pass.
+// status: the finalizer of a committed boot (see openBootWindow), and `spec.deadlineAt`, the budget
+// of a boot that is still running (see clearBootDeadline). The two halves are ordered in the
+// direction that heals, and they are not ordered the same way:
+//
+//   - the finalizer of the `-> booting` move is written *before* the status write, so a manager that
+//     dies between the two leaves the boot committed, with its deadline, and a claim controller whose
+//     next pass lands the phase;
+//   - the deadline of the `-> ready` move is cleared *after* the status write, so a manager that dies
+//     between the two leaves a ready claim that still carries a deadline the boot-window guard makes
+//     inert, and an idempotent re-apply of the move that clears it. The order the other way left a
+//     `booting` claim with no deadline, which nothing heals: the deadline is the only writer that
+//     fails an attempt whose Job is gone.
 func (r *Recorder) Move(ctx context.Context, key client.ObjectKey, to infrav2alpha1.NodeClaimPhase, reason string) (bool, error) {
 	moved := false
 
@@ -179,13 +187,24 @@ func (r *Recorder) Move(ctx context.Context, key client.ObjectKey, to infrav2alp
 
 		idempotent := from == to && (reason == "" || fresh.Status.Reason == reason)
 
-		restamped, err := r.closeBootWindow(ctx, fresh, to)
+		restamped, err := r.openBootWindow(ctx, fresh, to)
 		if err != nil {
 			return err
 		}
 
-		if idempotent && !restamped {
-			return nil
+		if idempotent {
+			// The phase is already what the caller asked for. The one thing such a move can still owe
+			// is the deadline of the boot window: a claim the pass before made ready with its deadline
+			// intact - the write that cleared it did not land - is closed here, and a move that owes
+			// nothing writes nothing (the recorder is called on every pass of a ready claim's slot).
+			closed, err := r.clearBootDeadline(ctx, fresh, to)
+			if err != nil {
+				return err
+			}
+
+			if !restamped && !closed {
+				return nil
+			}
 		}
 
 		fresh.Status.Phase = to
@@ -207,6 +226,17 @@ func (r *Recorder) Move(ctx context.Context, key client.ObjectKey, to infrav2alp
 
 		moved = true
 
+		// The deadline is cleared on the write *after* the status one, never before it. A manager that
+		// dies between the two leaves a `ready` claim that still carries its boot deadline, and that
+		// direction heals: the deadline guard is scoped to the boot window, so the field is inert on a
+		// ready claim, the claim controller keeps watching its machine, and the pass that re-lands the
+		// (idempotent) move clears it. The order the recorder used to write - deadline first - leaves
+		// the other shape: a `booting` claim with no deadline, which nothing heals once the startup
+		// Job's TTL has removed the Job and no path is left to fail the attempt.
+		if _, err := r.clearBootDeadline(ctx, fresh, to); err != nil {
+			return err
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -216,39 +246,52 @@ func (r *Recorder) Move(ctx context.Context, key client.ObjectKey, to infrav2alp
 	return moved, nil
 }
 
-// closeBootWindow writes the non-status half of two moves, and reports whether it wrote:
-//
-//   - `-> booting`: the finalizer arrives with the boot, on the same write that records the phase.
-//     A finalizer that lands on a later pass of the claim controller leaves a window in which a
-//     DeleteNodes deletes a committed boot with no shutdown behind it (docs/design/nodeclaim.md §3);
-//   - `-> ready`: `spec.deadlineAt` is cleared. The deadline is the budget of the boot window, not
-//     of the machine's life: a claim that reached ready owns a machine, and a CRD whose deadline
-//     field still names an instant in its past is a claim the digest, `kubectl get nodeclaim` and
-//     any writer that re-reads the deadline all read as an overdue attempt. Clearing it is what makes
-//     the object say what the model means: the attempt is over.
+// openBootWindow writes the metadata half of the `-> booting` move, and reports whether it wrote: the
+// scale-down finalizer arrives with the boot, on the write that records the phase. A finalizer that
+// lands on a later pass of the claim controller leaves a window in which a DeleteNodes deletes a
+// committed boot with no shutdown behind it (docs/design/nodeclaim.md §3), so this half runs *before*
+// the status write, and a manager that dies between the two leaves the boot committed and the
+// deadline intact - the safe direction, the one where the claim controller lands the phase on its
+// next pass.
 //
 // A finalizer is never added to an object the API server has already marked for deletion (it is
 // refused), and a claim being deleted has a shutdown running, so the finalizer question is moot there.
-func (r *Recorder) closeBootWindow(ctx context.Context, fresh *infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase) (bool, error) {
-	addFinalizer := to == infrav2alpha1.NodeClaimBooting &&
-		fresh.DeletionTimestamp.IsZero() &&
-		!controllerutil.ContainsFinalizer(fresh, Finalizer)
-	clearDeadline := to == infrav2alpha1.NodeClaimReady && fresh.Spec.DeadlineAt != nil
-
-	if !addFinalizer && !clearDeadline {
+func (r *Recorder) openBootWindow(ctx context.Context, fresh *infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase) (bool, error) {
+	if to != infrav2alpha1.NodeClaimBooting {
 		return false, nil
 	}
 
-	if addFinalizer {
-		controllerutil.AddFinalizer(fresh, Finalizer)
+	if !fresh.DeletionTimestamp.IsZero() || controllerutil.ContainsFinalizer(fresh, Finalizer) {
+		return false, nil
 	}
 
-	if clearDeadline {
-		fresh.Spec.DeadlineAt = nil
-	}
+	controllerutil.AddFinalizer(fresh, Finalizer)
 
 	if err := r.Client.Update(ctx, fresh); err != nil {
 		return false, fmt.Errorf("writing the metadata of claim %s for its move to %s: %w", fresh.Name, to, err)
+	}
+
+	return true, nil
+}
+
+// clearBootDeadline writes the spec half of the `-> ready` move, and reports whether it wrote:
+// `spec.deadlineAt` is cleared. The deadline is the budget of the boot window, not of the machine's
+// life: a claim that reached ready owns a machine, and a CRD whose deadline field still names an
+// instant in its past is a claim the digest, `kubectl get nodeclaim` and any writer that re-reads the
+// deadline all read as an overdue attempt. Clearing it is what makes the object say what the model
+// means: the attempt is over.
+//
+// It runs after the status write of the same move (see Move), and is idempotent: a claim that is
+// ready with no deadline writes nothing.
+func (r *Recorder) clearBootDeadline(ctx context.Context, fresh *infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase) (bool, error) {
+	if to != infrav2alpha1.NodeClaimReady || fresh.Spec.DeadlineAt == nil {
+		return false, nil
+	}
+
+	fresh.Spec.DeadlineAt = nil
+
+	if err := r.Client.Update(ctx, fresh); err != nil {
+		return false, fmt.Errorf("clearing the boot deadline of claim %s on its move to %s: %w", fresh.Name, to, err)
 	}
 
 	return true, nil

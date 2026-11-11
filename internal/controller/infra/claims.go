@@ -36,11 +36,16 @@ import (
 // exactly one enforcement point whatever the caller.
 type transitionClaimWriter struct {
 	recorder *claim.Recorder
+	client   client.Client
+
+	// slot is the slot this state machine is running on: the shutdown streak is counted on its
+	// claim and mirrored onto its digest, and the writer is built per pass with the slot in hand.
+	slot *infrav2alpha1.Node
 }
 
-// claimWriterFor builds the writer for a client.
-func claimWriterFor(c client.Client) *transitionClaimWriter {
-	return &transitionClaimWriter{recorder: claim.NewRecorder(c)}
+// claimWriterFor builds the writer for a client, bound to the slot the state machine runs on.
+func claimWriterFor(c client.Client, slot *infrav2alpha1.Node) *transitionClaimWriter {
+	return &transitionClaimWriter{recorder: claim.NewRecorder(c), client: c, slot: slot}
 }
 
 // MoveClaim applies one phase move of the claim. The in-memory copy the caller passes is updated
@@ -60,6 +65,19 @@ func (w *transitionClaimWriter) MoveClaim(ctx context.Context, nodeClaim *infrav
 	}
 
 	return nil
+}
+
+// RecordShutdownAttempt is the shutdown attempt of the scale-down this pass fired: the state machine
+// calls it on the path that created the shutdown Job, so the streak the bound reads is a streak of
+// shutdowns and not a streak of reconcile passes (see BumpScaleDownAttempt).
+func (w *transitionClaimWriter) RecordShutdownAttempt(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error {
+	if nodeClaim == nil {
+		return nil
+	}
+
+	_, _, err := BumpScaleDownAttempt(ctx, w.client, w.slot, nodeClaim)
+
+	return err
 }
 
 // StampDigest copies a claim's summary onto the slot's status.lastClaim, so that
@@ -136,6 +154,14 @@ func newestClaimOfSlot(ctx context.Context, c client.Client, namespace, slotName
 // what claim.ScaleDownStreakSpent bounds, and the count lives on the claim that asked for the
 // scale-down, so it ends when the claim ends.
 //
+// Its one caller is the shutdown-firing path: the state machine's ShutdownNode, on the branch that
+// created the shutdown Job (fsm.recordShutdownAttempt, reached through the claim writer in this
+// package). That is the site where an attempt exists. The claim controller's finalizer poll of the
+// observation (reconcileDeletion) reads the count and writes nothing: a streak counted per reconcile
+// is a streak of polling - at the 15s poll, three "attempts" are 45s of looking at a machine with one
+// Job behind it - and the bound then trips before it has bounded anything, starting the 30m pause
+// early.
+//
 // The count is status.shutdownAttempts, a counter of its own, and never status.attempt: status.attempt
 // is the number of machines this slot has been asked to buy, it is the seed of the next claim's
 // attempt, and a shutdown that will not land must not spend the boot budget of the episode that is
@@ -143,8 +169,9 @@ func newestClaimOfSlot(ctx context.Context, c client.Client, namespace, slotName
 //
 // It returns whether the count moved, and whether the move was a reset: a streak that is spent with
 // its grace past starts from 1 again, so a pool whose shutdown script has been fixed is picked up by
-// a later pass. The event that names the reset is the caller's, because the caller is the one that
-// knows the machine is still up.
+// a later pass. The records of the bound - the refusal and the end of the pause - are published by
+// the pass that applies them (scaleDownStreakRefusal), because that pass is the one that knows the
+// machine is still up.
 func BumpScaleDownAttempt(ctx context.Context, c client.Client, slot *infrav2alpha1.Node, nodeClaim *infrav2alpha1.NodeClaim) (bool, bool, error) {
 	if nodeClaim == nil {
 		return false, false, nil

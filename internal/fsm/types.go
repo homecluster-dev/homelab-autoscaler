@@ -250,6 +250,14 @@ type CoordinationManager interface {
 // state machine does not import the claim package and the table has one enforcement point.
 type ClaimWriter interface {
 	MoveClaim(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase, reason string) error
+
+	// RecordShutdownAttempt counts one shutdown attempt on the claim a scale-down named. It is a
+	// method of this interface and not a write the state machine makes, because the claim's status
+	// writer (and the bound the count feeds) lives behind it, and it is called where the shutdown is
+	// fired: the path that created the shutdown Job. A reconcile pass that only looked at the machine
+	// is not an attempt, and a streak counted per pass spends the bound on polling the observation
+	// (docs/design/nodeclaim.md §4).
+	RecordShutdownAttempt(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error
 }
 
 // OperationLock represents a coordination lock on a node

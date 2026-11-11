@@ -694,7 +694,7 @@ func claimsOfSlot(claims []infrav2alpha1.NodeClaim, slotName string) []infrav2al
 // autoscaler's next move is built on that: it stops asking, and its pending pods sit on a group that
 // is one unit bigger than it believes, while the slot the same autoscaler wants to scale into answers
 // IncreaseSize with FailedPrecondition, no free node slot, for as long as the committed boot takes -
-// up to one boot deadline (12m40s), plus the TTL of the claim that carried it. A group that is
+// up to one boot deadline (12m10s), plus the TTL of the claim that carried it. A group that is
 // already at the requested size is a no-op success; a group whose every live claim is past the
 // cancelable phase is answered with codes.Unavailable, the retryable code: the state is transient by
 // construction (the boot deadline closes every boot, and DeleteNodes closes every ready machine), and

@@ -73,6 +73,13 @@ type NodeReconciler struct {
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes/finalizers,verbs=update
 
+// The input law of this reconciler is the live claim of the slot, and the recovery of a finished
+// lifecycle Job is correlated to the claim that owns the operation (claim.BootCommittedAt,
+// claim.ScaleDownRequestedAt), so it lists and reads NodeClaims. The rule is not decoration: the
+// aggregated role picks the verbs up from the claim controller's markers today, and a deployment that
+// ships this controller's rules on their own would run a reconciler that cannot read its input.
+// +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodeclaims,verbs=get;list;watch
+
 // Needed to record why a slot was powered on/off on the Node CR, so that
 // `kubectl describe node.infra.homecluster.dev <name>` shows the lifecycle transitions.
 // The controller records through the new events API (k8s.io/client-go/tools/events), so the

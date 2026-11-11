@@ -74,11 +74,11 @@ const (
 //
 //	startup Job timeout + job monitor poll + registration wait + readiness gate + margin
 //	DefaultJobTimeout (5m) + JobMonitorPollInterval (30s) + DefaultUncordonTimeout (90s)
-//	  + DefaultReadinessGateTimeout (4m) + MaxUncordonRetryInterval (10s) + 1m = 12m40s
+//	  + DefaultReadinessGateTimeout (4m) + MaxUncordonRetryInterval (10s) + 1m = 12m10s
 //
 // The startup Job's own timeout is in the sum because the clock runs from `requestedAt`, i.e. from
 // before the Job exists: one attempt can spend the Job's whole 5m (JobTimeout), then the 90s it takes
-// the node to register, then the 4m of the readiness gate - about 9m50s of deadlines - and a budget
+// the node to register, then the 4m of the readiness gate - 10m30s of deadlines - and a budget
 // of 7m10s kills the claim in the middle of the machine it is still buying. The 0.1.20 progress
 // watchdog excluded the Job timeout for exactly this reason: its grace applied only to a Job that had
 // already finished (internal/progress/watchdog.go, deleted with this model), and a claim's deadline
@@ -188,6 +188,21 @@ func ScaleDownStreakSpent(c *infrav2alpha1.NodeClaim) (bool, time.Duration) {
 	}
 
 	return true, left
+}
+
+// ScaleDownStreakResetDue reports that a scale-down streak is spent and its reset grace has passed:
+// the pass that fires the shutdown again is the one the pause ends on, and the record of the pause
+// ending belongs to it (the count itself restarts with the Job that pass creates, at
+// BumpScaleDownAttempt). A counter with no clock is treated as started now, as in ScaleDownStreakSpent,
+// so a streak that stamped no time is never reported as already reset.
+func ScaleDownStreakResetDue(c *infrav2alpha1.NodeClaim) bool {
+	if c == nil || c.Status.ShutdownAttempts < MaxConsecutiveAttempts {
+		return false
+	}
+
+	spent, _ := ScaleDownStreakSpent(c)
+
+	return !spent
 }
 
 // SeedAttempt is the attempt number a new claim of a slot carries: the slot's last attempt + 1

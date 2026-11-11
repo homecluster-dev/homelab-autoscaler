@@ -487,6 +487,42 @@ func (w *claimTestWriter) MoveClaim(ctx context.Context, nodeClaim *infrav2alpha
 	return nil
 }
 
+// RecordShutdownAttempt counts the shutdown on the claim, the way the controller's writer does: the
+// hook tests assert the streak the bound reads, so the fake writes the same two fields the real
+// writer stamps, with the same reset rule.
+func (w *claimTestWriter) RecordShutdownAttempt(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error {
+	if nodeClaim == nil {
+		return nil
+	}
+
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := w.client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		return err
+	}
+
+	if fresh.Status.ShutdownAttempts >= maxConsecutiveAttemptsOfClaim {
+		fresh.Status.ShutdownAttempts = 0
+	}
+
+	fresh.Status.ShutdownAttempts++
+
+	now := metav1.Now()
+	fresh.Status.LastShutdownAttemptAt = &now
+
+	if err := w.client.Update(ctx, fresh); err != nil {
+		return err
+	}
+
+	nodeClaim.Status.ShutdownAttempts = fresh.Status.ShutdownAttempts
+
+	return nil
+}
+
+// maxConsecutiveAttemptsOfClaim mirrors claim.MaxConsecutiveAttempts. internal/fsm cannot import
+// internal/claim - the claim package measures the boot budget from these constants, and an edge the
+// other way is a cycle - so a test helper that applies the bound names the number it mirrors.
+const maxConsecutiveAttemptsOfClaim = int32(3)
+
 // SlotInput is the input triple whose derivation puts a state machine in the state a slot's report
 // describes. A test that needs a transitional slot names the shape of the slot - the claim it carries
 // and the power its machine is observed at - and this helper turns that shape into the input; the
