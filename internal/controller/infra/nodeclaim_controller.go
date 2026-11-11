@@ -142,8 +142,19 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 	recorder := r.recorder()
 
 	if phase.IsLive(nodeClaim.Status.Phase) && claim.IsOverdue(nodeClaim, time.Now()) {
-		if _, err := recorder.MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonDeadlineExceeded); err != nil {
+		moved, err := recorder.MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonDeadlineExceeded)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+
+		if moved {
+			// The move is the record this pass reports on: the digest the slot keeps, the terminal
+			// branch below and the events all read the claim's phase, reason and finish time, and a
+			// caller's copy written before the move names the attempt that just ended as the one
+			// still running.
+			if err := r.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
 		}
 
 		r.eventf(nodeClaim, corev1.EventTypeWarning, "ClaimDeadlineExceeded",
@@ -158,8 +169,15 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 	// machine until an attempt lands (SeedAttempt restarts the streak at 1 after one does). This
 	// replaces fsm.StartupAttemptLimit, the ClaimRearmed condition on the slot and its refusal site.
 	if phase.IsLive(nodeClaim.Status.Phase) && nodeClaim.Status.Attempt > claim.MaxConsecutiveAttempts {
-		if _, err := recorder.MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonAttemptLimitExceeded); err != nil {
+		moved, err := recorder.MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonAttemptLimitExceeded)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+
+		if moved {
+			if err := r.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
 		}
 
 		r.eventf(nodeClaim, corev1.EventTypeWarning, "ClaimAttemptLimitExceeded",
@@ -196,18 +214,19 @@ func (r *NodeClaimReconciler) reconcileDeletion(ctx context.Context, nodeClaim *
 
 	if slot.Status.PowerState == infrav2alpha1.PowerStateOn {
 		// The machine is up. The slot reconciler owns powering it off; this pass keeps the finalizer,
-		// counts the attempt for the bound, and comes back.
-		if phase.IsTerminal(nodeClaim.Status.Phase) {
-			bumped, err := BumpScaleDownAttempt(ctx, r.Client, slot, nodeClaim)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
+		// counts the attempt for the bound, and comes back. The count runs for a live claim too:
+		// a scale-down that named a ready claim spends its shutdown attempts on that claim, which is
+		// what the bound of internal/claim.MaxConsecutiveAttempts bounds (the v1alpha1
+		// ShutdownAttempts condition on the slot, and its two reset sites, are gone with §4).
+		bumped, err := BumpScaleDownAttempt(ctx, r.Client, slot, nodeClaim)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 
-			if bumped && nodeClaim.Status.Attempt == claim.MaxConsecutiveAttempts {
-				r.eventf(nodeClaim, corev1.EventTypeWarning, "ShutdownAttemptLimitReached",
-					"scale-down of slot %s has spent %d of %d attempts and the machine is still observed up: the controller stops firing the shutdown and records it here, because a shutdown Job that exits 0 without the machine going off is the pool's script, not the controller",
-					slot.Name, claim.MaxConsecutiveAttempts, claim.MaxConsecutiveAttempts)
-			}
+		if bumped && nodeClaim.Status.Attempt == claim.MaxConsecutiveAttempts {
+			r.eventf(nodeClaim, corev1.EventTypeWarning, "ShutdownAttemptLimitReached",
+				"scale-down of slot %s has spent %d of %d attempts and the machine is still observed up: the controller stops firing the shutdown and records it here, because a shutdown Job that exits 0 without the machine going off is the pool's script, not the controller",
+				slot.Name, claim.MaxConsecutiveAttempts, claim.MaxConsecutiveAttempts)
 		}
 
 		logger.V(1).Info("Claim is being deleted and the machine is still up; keeping the finalizer",

@@ -56,4 +56,3 @@ func (s *HomeClusterProviderServer) groupOf(ctx context.Context, groupName strin
 
 	return group
 }
-

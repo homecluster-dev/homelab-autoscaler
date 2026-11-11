@@ -228,35 +228,6 @@ func (r *NodeReconciler) readinessTaintKeys(ctx context.Context, node *infrav2al
 	return keys
 }
 
-// shortenRequeue moves a reconcile result forward to an earlier deadline the caller was asked to
-// honour, and never delays one: a requeue the FSM asked for, a transition that finished and wants
-// to run now, wins over the watchdog's deadline.
-//
-// A result that asks to requeue immediately is returned untouched, twice over: "now" is already
-// earlier than any grace, and controller-runtime refuses a Result that sets Requeue and
-// RequeueAfter together, so writing a deadline onto that result would fail the reconcile.
-func shortenRequeue(result ctrl.Result, requeueAfter time.Duration) ctrl.Result {
-	if requeueAfter <= 0 {
-		return result
-	}
-
-	//nolint:staticcheck // SA1019: Requeue is deprecated, and reading it is the point: a caller
-	// that asks to requeue now must not get a deadline stamped onto the result, because
-	// controller-runtime refuses a Result that sets both fields. No caller in this repository
-	// returns Requeue today, and the guard is what keeps that true if one does.
-	if result.Requeue {
-		return result
-	}
-
-	if result.RequeueAfter > 0 && result.RequeueAfter <= requeueAfter {
-		return result
-	}
-
-	result.RequeueAfter = requeueAfter
-
-	return result
-}
-
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Register field index for pods by node name

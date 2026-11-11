@@ -285,16 +285,22 @@ func ListOfSlot(ctx context.Context, c client.Client, namespace, slotName string
 	return list.Items, nil
 }
 
-// LiveOfSlot returns the live claim of a slot: pending, booting or ready, and not deleted. When
-// more than one is live the newest is the claim the slot answers for and the rest are extras the
-// claim controller fails (one live claim per slot is load-bearing: it is what makes "a live claim
-// exists" a synonym for "the machine is wanted").
+// LiveOfSlot returns the live claim of a slot: the newest claim whose phase is live (pending,
+// booting, ready). A claim a scale-down marked for deletion is returned too, and it is the claim of
+// the slot: the boot it started is committed, and deleting the claim is the request that reverses
+// it, so the object stays on the slot until the machine is observed off (docs/design/nodeclaim.md §3).
+//
+// "Live" is the phase question - does an episode of this slot still own the machine. WantsMachine,
+// below, is the stronger question the state machine asks before it boots anything. When more than
+// one claim of a slot is live the newest is the one the slot answers for, and the rest are extras
+// the claim controller fails: one live claim per slot is load-bearing, it is what makes "a live
+// claim exists" a synonym for "the machine is wanted".
 func LiveOfSlot(claims []infrav2alpha1.NodeClaim) *infrav2alpha1.NodeClaim {
 	var best *infrav2alpha1.NodeClaim
 
 	for i := range claims {
 		c := &claims[i]
-		if !phase.IsLive(c.Status.Phase) || !c.DeletionTimestamp.IsZero() {
+		if !phase.IsLive(c.Status.Phase) {
 			continue
 		}
 
@@ -304,4 +310,14 @@ func LiveOfSlot(claims []infrav2alpha1.NodeClaim) *infrav2alpha1.NodeClaim {
 	}
 
 	return best
+}
+
+// WantsMachine reports whether a claim wants a machine on its slot: it is live, and no scale-down
+// has named it. A claim marked for deletion is the record of the opposite - the machine is going
+// off, and the claim's finalizer is what keeps the request from being forgotten - so a pass that
+// would boot the slot must not read a marked claim as a want, and a pass that powers the slot off
+// must not lose sight of it. The pair is the difference between "the startup is committed" and
+// "the startup is the next thing to do" (docs/design/nodeclaim.md §3, §5).
+func WantsMachine(c *infrav2alpha1.NodeClaim) bool {
+	return c != nil && phase.IsLive(c.Status.Phase) && c.DeletionTimestamp.IsZero()
 }

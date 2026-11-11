@@ -614,6 +614,15 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 		slot := &slots[i]
 		live := claim.LiveOfSlot(claimsOfSlot(claims, slot.Name))
 
+		// A claim the request already marked is the state the request asked for: its finalizer is
+		// running the machine down. Re-deleting it is not a cancellation, it is a second write on
+		// an object that is on its way out, so the request is idempotent by construction.
+		if live != nil && !live.DeletionTimestamp.IsZero() {
+			logger.V(1).Info("The claim of the slot is already cancelled and draining", "claim", live.Name, "node", slot.Name)
+
+			continue
+		}
+
 		if live == nil {
 			// Nothing to cancel. A machine that is standing on this slot is powered off by the input
 			// law on the slot's next pass; a free slot is already off.
@@ -820,7 +829,7 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 		// The slot is wanted exactly when a live claim names it. A claim marked for scale-down is not
 		// a want: the machine is going away, which is the deleting state.
 		live := claim.LiveOfSlot(claimsOfSlot(claims, node.Name))
-		wanted := live != nil
+		wanted := claim.WantsMachine(live)
 
 		// The Kubernetes node only exists once the machine has joined the cluster. Slots
 		// without spec.kubernetesNodeName have never been provisioned, so the lookup is

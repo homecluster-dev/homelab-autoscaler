@@ -160,7 +160,11 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(
 	// Law 1: a live claim with the machine off boots it. The state machine's StartNode transition
 	// is the one that creates the startup Job, and it is reachable from shutdown, which is the
 	// state a slot in that shape derives to.
-	if live != nil && input.LiveClaim() != nil && !input.ObservedOn() && state == phase.StateShutdown {
+	//
+	// The want is the claim's, and a claim a scale-down marked is not a want: its machine is going
+	// off, and booting it again is the loop the claim's finalizer exists to close (law 3 owns that
+	// shape).
+	if claim.WantsMachine(live) && !input.ObservedOn() && state == phase.StateShutdown {
 		if err := stateMachine.StartNode(); err != nil {
 			if result, deferred := deferTransitionOnLockConflict(ctx, node, err); deferred {
 				return result, nil
@@ -215,16 +219,34 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(
 // script is what fails. The record is the Warning the claim controller stamps when the streak
 // reaches the bound, and a fixed script is picked up by the next pass, no hand intervention.
 func (r *NodeReconciler) scaleDownStreakRefusal(ctx context.Context, node *infrav2alpha1.Node, live *infrav2alpha1.NodeClaim) (bool, ctrl.Result) {
-	if live != nil || !claim.ScaleDownStreakExhausted(node) {
+	// A scale-down that names a claim spends its attempts on that claim, and the claim controller
+	// counts them (BumpScaleDownAttempt); the bound applies here, so a shutdown script that exits 0
+	// without powering the machine off is not re-fired every resync.
+	if live != nil {
+		if live.Status.Attempt < claim.MaxConsecutiveAttempts || live.DeletionTimestamp.IsZero() {
+			return false, ctrl.Result{}
+		}
+	} else if !claim.ScaleDownStreakExhausted(node) {
 		return false, ctrl.Result{}
+	}
+
+	// The record the refusal points an operator at: the claim, when the scale-down named one, and
+	// the slot's digest when it did not (the machine was left up by an episode that is already
+	// collected).
+	attempts, claimName, reason := int32(0), "", ""
+
+	if live != nil {
+		attempts, claimName, reason = live.Status.Attempt, live.Name, live.Status.Reason
+	} else if node.Status.LastClaim != nil {
+		attempts, claimName, reason = node.Status.LastClaim.Attempt, node.Status.LastClaim.Name, node.Status.LastClaim.Reason
 	}
 
 	log.FromContext(ctx).Info("Not firing the shutdown: this slot has used its scale-down attempts",
 		"node", node.Name,
-		"attempts", node.Status.LastClaim.Attempt,
+		"attempts", attempts,
 		"limit", claim.MaxConsecutiveAttempts,
-		"claim", node.Status.LastClaim.Name,
-		"reason", node.Status.LastClaim.Reason,
+		"claim", claimName,
+		"reason", reason,
 		"state", "the machine stays up, the slot keeps its report, and the record is on the claim")
 
 	return true, ctrl.Result{RequeueAfter: refusedResync}
