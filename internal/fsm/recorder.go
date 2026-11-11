@@ -197,7 +197,7 @@ func (nm *NodeStateMachine) lifecycleTarget() string {
 		group = nm.node.Labels["infra.homecluster.dev/group"]
 	}
 	if group == "" {
-		group = "unknown"
+		group = unknownField
 	}
 
 	if nm.node.Spec.KubernetesNodeName == "" {

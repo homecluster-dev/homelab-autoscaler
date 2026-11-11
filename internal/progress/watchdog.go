@@ -76,12 +76,41 @@ limitations under the License.
 //     on, and the slot's corev1.Node reporting Ready, which is the same observation that wrote the
 //     on. Its write is the observed pair, progress: ready.
 //
-// They cannot both act on one slot, and that is structural, not a coordination: Settle's settle and
-// re-arm arms require a slot with no corev1.Node at all, and ReconcileObservedPower requires a
-// corev1.Node that reports Ready. The two rules share the gates that are not about the machine -
-// observe, the lifecycle Job grace (jobWindow) and the coordination lock - so they can never
-// disagree about whether an operation owns the slot, and both run in the node controller's FSM path,
-// above every branch that reads status.progress.
+// They are disjoint on the two shapes they own, and that is structural, not a coordination: Settle's
+// settle and re-arm arms require a slot with no corev1.Node at all, and ReconcileObservedPower
+// requires a corev1.Node that reports Ready. The two rules share the gates that are not about the
+// machine - observe, the lifecycle Job grace (jobWindow, plus the stamp-measured fallback the Job
+// gate falls through to when no Job object is left: startupGrace for the watchdog, shutdownGrace for
+// this rule) and the coordination lock - so they can never disagree about whether an operation owns
+// the slot, and both run in the node controller's FSM path, above every branch that reads
+// status.progress.
+//
+// Disjoint is not exhaustive. There is a third shape neither rule acts on, and it is stated here
+// because a reader of "the two rules cover every pair" would assume it: {status.progress:
+// shuttingdown, a corev1.Node that is present and NotReady, no lifecycle Job, no live lock} - the
+// transitional progress of a shutdown whose operation died, on a machine whose node object is there
+// and reporting down. Settle refuses it: its gates require a slot with no node object at all, because
+// the status of a slot that has a node belongs to the observation controllers. ReconcileObservedPower
+// refuses it: NotReady is not positive evidence that a machine is up, so there is nothing for the
+// observation to outrank the progress with. And the observation controller that does own a slot with a
+// node object - core.applyObservedPowerState - writes the off and never touches a transitional
+// progress, which is the rule that keeps the boot window from being read as a shutdown.
+//
+// So nothing in this package moves that slot, and the pair is frozen in the same way the shapes this
+// package exists for are: validateStateTransition gates every transition of a transitional slot out,
+// and the stuck-transition cleanup is not reached from a reconcile (the reconciler builds a fresh
+// state machine per pass, so IsTransitionStuck is false on it). It is a known hole, deliberately not
+// closed here: settling it means reading "NotReady" as "the machine is off", and that reading is what
+// the observation controller refuses to make for the boot window. The operator's way out is what it
+// was before this package existed - a status.progress patch - and docs/architecture/state.md states
+// the shape next to the two rules that own the other two.
+//
+// The two rules also share the bound and the pace of the loop they can start: a correction to ready
+// is what makes ShutdownNode legal, and a pool whose shutdown script exits 0 without the power-off
+// landing loops (Job, refused completion, correction, shutdown, Job). The bound is the shutdown-attempt
+// counter the FSM owns (fsm.ShutdownAttemptLimit, internal/fsm/shutdown_attempts.go), and
+// ReconcileObservedPower sets the pace: a slot with refused completions is looked at again on an
+// exponentially growing deadline (observedPowerRetryBackoff). See observed_power.go.
 package progress
 
 import (
@@ -268,6 +297,14 @@ type Outcome struct {
 	// progress was written: Action == ActionCorrectToReady (see observed_power.go).
 	Corrected bool
 
+	// ShutdownAttempts is the shutdown-attempt count of the slot, read off the record the FSM owns
+	// (fsm.ShutdownAttemptsOf): the shutdowns whose completion the observation refused. Only the
+	// observed-power rule reports it, and only reads it: the counter is incremented where a shutdown
+	// attempt begins (fsm.enterShuttingDown) and cleared where one lands. It is the number the operator
+	// sees in the event, the number the bound (fsm.ShutdownAttemptLimit) is enforced on, and the number
+	// the exponential RequeueAfter below is computed from. This pass writes none of it.
+	ShutdownAttempts int
+
 	// Previous is the progress the slot carried before the write; empty when nothing was
 	// written.
 	Previous infrav1alpha1.Progress
@@ -280,7 +317,10 @@ type Outcome struct {
 
 	// RequeueAfter is how long the caller should wait before looking at this slot again: > 0
 	// when the slot was left alone because a lifecycle Job is in flight or is inside the grace
-	// of finishing, so the settlement is not forgotten, it is scheduled.
+	// of finishing, so the settlement is not forgotten, it is scheduled; and - for the observed-power
+	// rule - > 0 after it corrected a slot whose recent shutdown completions were refused, on the
+	// exponential backoff of that loop (observedPowerRetryBackoff), so a pool whose shutdown script
+	// never powers off slows down instead of firing a shutdown per pass.
 	RequeueAfter time.Duration
 
 	// Reason explains, for the log line, why nothing was settled.
@@ -353,8 +393,12 @@ func Settle(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, reco
 
 	obs, err := observe(ctx, c, coord, slot, grace)
 	if err != nil {
-		// The API server is unreachable, the slot is gone, ... Nothing was written, so the caller
-		// reports the error and the normal controller backoff brings the pass back.
+		// The API server is unreachable, the node object read failed, the Job List failed, ... Nothing
+		// is written and the caller reports the error, like it does for every other failure of the pass.
+		// That is the rule this package writes under: a settlement, a re-arm, an uncordon, and the
+		// observed-power correction are all decided from this one read, so a partially-failed
+		// observation - a machine this pass could not see, Jobs this pass could not list - is never
+		// evidence to write over a slot. The decide below is reached only with the whole evidence set.
 		return Outcome{}, err
 	}
 
@@ -520,14 +564,23 @@ type observations struct {
 	// it is incremented where an attempt begins and cleared where a boot passes the readiness gate.
 	startupAttempts int
 
+	// shutdownAttempts is how many shutdown attempts this slot has spent, read off the record the FSM
+	// owns (fsm.ShutdownAttemptsOf). Only the observed-power rule reads it: it counts the shutdowns
+	// whose completion this pool's script claimed and the observation refused, and it is what that
+	// rule's bound and its exponential backoff are measured in (observedPowerRetryBackoff, see
+	// observed_power.go). Like the startup count, this package never writes it.
+	shutdownAttempts int
+
 	// now and grace are the clock and the window the Job gates are measured against.
 	now   time.Time
 	grace time.Duration
 }
 
 // observe pays for the reads of one pass: the slot's node object, its lifecycle Jobs, its
-// coordination lock, and its startup-attempt record. The cheap in-memory gates live in decide, so this is
-// only ever called for a slot that is a candidate.
+// coordination lock, and its startup- and shutdown-attempt records. The cheap in-memory gates live in
+// decide, so this is only ever called for a slot that is a candidate. Every read is paid for once and
+// reported: an error means the observation is incomplete, and neither rule writes on an observation
+// it could not finish (see Settle and ReconcileObservedPower).
 func observe(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, grace time.Duration) (observations, error) {
 	obs := observations{now: time.Now(), grace: grace}
 
@@ -551,6 +604,7 @@ func observe(ctx context.Context, c client.Client, coord fsm.CoordinationManager
 	obs.jobs = jobs
 	obs.lockHeld, obs.lockNote = lockIsHeld(ctx, coord, slot)
 	obs.startupAttempts = fsm.StartupAttemptsOf(slot)
+	obs.shutdownAttempts = fsm.ShutdownAttemptsOf(slot)
 
 	return obs, nil
 }

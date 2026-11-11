@@ -210,10 +210,19 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 //     is cordoned with nothing running on it. See internal/progress for the rule, the grace period
 //     it is built on, and the events it records.
 //
-// The two have distinct jobs and cannot both act on one slot: 1 requires a corev1.Node that reports
-// Ready, 2's settle and re-arm require a slot with no corev1.Node at all. They share the gates that
-// are not about the machine - the lifecycle Job grace and the coordination lock - so they cannot
-// disagree about whether an operation owns the slot.
+// The two have distinct jobs, and on the two shapes they own they cannot both act on one slot: 1
+// requires a corev1.Node that reports Ready, 2's settle and re-arm require a slot with no corev1.Node
+// at all. "Cannot both act" is not "covers every pair": there is a third shape neither rule owns - a
+// progress of shuttingdown on a slot whose node object is present and NotReady, with no Job and no lock
+// - and it is stated, with why, in internal/progress's package doc and in docs/architecture/state.md.
+// They share the gates that are not about the machine - the lifecycle Job grace, the stamp-measured
+// fallback for a Job the TTL already collected, and the coordination lock - so they cannot disagree
+// about whether an operation owns the slot.
+//
+// The deadline returned is the earliest of the two rules asked for, and rule 1 asks for an
+// exponentially growing one for a slot whose shutdown completions keep being refused: the correction
+// releases a ShutdownNode, and a pool whose shutdown script never powers off must be paced, not run at
+// full resync speed (see progress.observedPowerRetryBackoff and fsm.ShutdownAttemptLimit).
 //
 // A failure of either rule is never fatal to the pass: it means the reconciliation did not happen,
 // and the next pass is the next attempt. Failing a reconcile because a slot that is already broken
@@ -232,7 +241,10 @@ func (r *NodeReconciler) reconcileObservedProgress(ctx context.Context, node *in
 		logger.Error(err, "Failed to reconcile status.progress against observed reality",
 			"node", node.Name, "progress", string(node.Status.Progress))
 
-		return progress.SettleGracePeriod
+		// A failed Settle is not a deadline it computed: it is this package's own fallback, so the slot
+		// is looked at again on the grace. The correction's deadline is folded in, because a rule that
+		// succeeded gets its say, and the earliest of the two is the one the caller honours.
+		return earliestRequeue(correction.RequeueAfter, progress.SettleGracePeriod)
 	}
 
 	return earliestRequeue(correction.RequeueAfter, outcome.RequeueAfter)
@@ -240,7 +252,10 @@ func (r *NodeReconciler) reconcileObservedProgress(ctx context.Context, node *in
 
 // earliestRequeue folds the deadlines the two status rules asked for into the one the caller
 // honours: the earliest of them, since acting on a slot at the later deadline leaves the correction
-// the earlier one asked for to the next resync. A rule that asked for nothing (0) is not a deadline.
+// the earlier one asked for to the next resync. A rule that asked for nothing (0) is not a deadline,
+// and a rule that failed asks for nothing - its Outcome is the zero value, so an error contributes no
+// deadline of its own, and only the rule that computed one gets a say. earliestRequeue never extends a
+// deadline: the value it returns is never later than a non-zero argument it was given.
 func earliestRequeue(a, b time.Duration) time.Duration {
 	if a <= 0 {
 		return b
@@ -378,6 +393,10 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 			if result, deferred := deferTransitionOnLockConflict(ctx, node, err); deferred {
 				return result, nil
 			}
+
+			if result, refused := deferShutdownAttemptLimit(ctx, node, err); refused {
+				return result, nil
+			}
 			// controller-runtime discards the Result when the error is non-nil, the requeue
 			// backoff is decided by the controller, so only the error is returned here.
 			return ctrl.Result{}, err
@@ -476,6 +495,41 @@ func deferStartupAttemptLimit(ctx context.Context, node *infrav1alpha1.Node, err
 // not a transient failure, the record on the slot is the signal, and the pass that comes back finds
 // the same count and writes nothing.
 const startupAttemptRefusalRequeue = 5 * time.Minute
+
+// deferShutdownAttemptLimit turns a shutdown the FSM refused because the slot has used the shutdown
+// attempts of its scale-down episode into a result, and reports whether it did. It is the mirror of
+// deferStartupAttemptLimit for the other bound this controller knows how to read, and the enforcement
+// lives in the FSM (fsm.NodeStateMachine.ShutdownNode) - the one place every path that fires a
+// shutdown passes, the autoscaler's scale-down, the shutdown an observed-power correction releases, and
+// the retry a refused shutdown completion leads back into.
+//
+// No error is returned, and the reasons are the same as deferStartupAttemptLimit's: the slot is at the
+// pair the correction wrote (status.progress ready, status.powerState on, spec.desiredPowerState off),
+// nothing a resync can do changes that, and handing a permanent, operator-shaped condition to
+// controller-runtime's rate limiter prints a failure per pass and buries the one record that matters,
+// the ShutdownAttemptLimitReached Warning on the slot. The idle resync is kept, because a pool whose
+// shutdown script has been fixed must be picked up without a human touching the slot.
+func deferShutdownAttemptLimit(ctx context.Context, node *infrav1alpha1.Node, err error) (ctrl.Result, bool) {
+	refusal := fsm.AsShutdownAttemptLimit(err)
+	if refusal == nil {
+		return ctrl.Result{}, false
+	}
+
+	log.FromContext(ctx).Info("Shutdown refused: the slot has used its shutdown attempts",
+		"node", node.Name,
+		"attempts", refusal.Attempts,
+		"limit", refusal.Limit,
+		"state", "left at the observed pair - progress ready, powerState on, claim off - on a machine that is up",
+		"recorded", "ShutdownAttemptLimitReached Warning on the slot")
+
+	return ctrl.Result{RequeueAfter: shutdownAttemptRefusalRequeue}, true
+}
+
+// shutdownAttemptRefusalRequeue is the idle resync of a slot that cannot be powered off: not a retry
+// (the bound has been reached, and the next firing of the same shutdown is exactly what the refusal is
+// refusing), and not a stop (a fixed spec.shutdownPodSpec, or a machine powered off out of band, is
+// picked up without an operator touching the slot).
+const shutdownAttemptRefusalRequeue = 5 * time.Minute
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {

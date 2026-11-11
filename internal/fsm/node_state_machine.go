@@ -223,6 +223,45 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 
 	logger.Info("Triggering ShutdownNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
 
+	// The shutdown-attempt bound, checked before the transition and therefore before the coordination
+	// lock, the pending-Job cleanup and the cordon: a slot that has used its shutdown attempts must not
+	// cordon a node and start another shutdown Job, and it must not touch the state of an operation that
+	// owns the slot on the way out.
+	//
+	// This is the check that closes the loop the shutdown-completion guard opens
+	// (internal/fsm/shutdown_completion.go). A shutdown Job that exits 0 on a machine the observation
+	// reports up is refused: the slot is recorded ready, the claim is off, and the next pass fires this
+	// transition again - one shutdown Job, one cordon of a node that is serving pods, and one power
+	// operation on a real machine, per pass, forever. Unbounded that is a regression against the pre-PR
+	// behaviour (the same broken script left a *frozen* slot and no Job); bounded, it is three attempts,
+	// an exponentially growing gap between them (progress.observedPowerRetryBackoff), one
+	// ShutdownAttemptLimitReached Warning, and a slot that rests at the pair the observation says -
+	// ready, on, claimed off - which is healable the moment the pool's script is fixed. See
+	// internal/fsm/shutdown_attempts.go for the counter, its reset rule, and the hole it leaves.
+	if attempts, exhausted := nm.ShutdownAttemptsSpent(); exhausted {
+		cause := shutdownAttemptRefusalCause(nm.node)
+
+		// The note is the deduplication: exactly one Warning per scale-down episode, and the record the
+		// refusal stamps is the one the count reads.
+		_, noted := nm.noteShutdownAttemptLimit(cause)
+		if noted {
+			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonShutdownAttemptLimitReached, ActionPowerOff,
+				shutdownAttemptLimitNote(nm.node, attempts, cause))
+		}
+
+		// Info, not Error: the controller has stopped hammering a machine it cannot power off, and the
+		// refusal is the bound working. The attempts are in the line, because the question an operator
+		// asks next is "how many times did it try".
+		logger.Info("Refusing to shut down a slot that has used its shutdown attempts",
+			"node", nm.node.Name,
+			"attempts", attempts,
+			"limit", ShutdownAttemptLimit,
+			"evidence", cause,
+			"warning", "recorded on the slot"+notedSuffix(noted))
+
+		return &ShutdownAttemptLimitError{Node: nm.node.Name, Attempts: attempts, Limit: ShutdownAttemptLimit}
+	}
+
 	// Trigger FSM event, taking the coordination lock. See StartNode for what a cancellation
 	// does and does not leave behind.
 	if err := nm.fsm.Event(ctx, EventShutdownNode); err != nil {

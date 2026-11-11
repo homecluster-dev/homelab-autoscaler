@@ -206,6 +206,13 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 			// long-lived and are reused across claim episodes, so a count that is never cleared makes the
 			// fourth unrelated failure of a machine over its life the last one the pool ever retries.
 			nm.clearStartupAttemptRecord()
+
+			// The same gate clears the *shutdown*-attempt record: a machine that booted, registered and
+			// took the pool's work has ended the episode in which its scale-downs were refused, so the next
+			// scale-down of this slot starts from an unspent bound. A bound cleared only by a shutdown that
+			// lands is a lifetime sentence on a machine whose provider API is flaky, and the reset rule of
+			// the startup counter is the same one for the same reason (internal/fsm/shutdown_attempts.go).
+			nm.clearShutdownAttemptRecord()
 		}
 	}
 
@@ -216,13 +223,21 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 		logger.Info("Successfully released coordination lock after job completion", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect new state. The progress of the state the machine is in is the
-	// value, not Progress(e.Dst): the completion of a shutdown Job whose machine the cluster still
-	// observes up moved the machine to ready (see refuseUnobservedShutdown, enterShutdown), and a
-	// completion that records the shutdown that observation refused is the lie this file exists to
-	// keep out of a slot. Every other transition leaves the machine in e.Dst, so the two spellings
-	// write the same value.
-	nm.updateNodeProgress(infrav1alpha1.Progress(nm.GetCurrentState()))
+	// Update node status to reflect new state. The value is the progress of the transition this hook
+	// closes, Progress(e.Dst) - and that is what keeps updateNodeProgress's guard ("refuse a progress
+	// the state machine is not in") a check rather than a tautology. Passing the machine's own state
+	// (nm.GetCurrentState()) asks the guard "is the progress I am about to write the progress of the
+	// state I am in?" with the answer taken from the same field, so it can never fire from here, and a
+	// guard no caller can trip is a guard that documents a rule nothing respects.
+	//
+	// The two spellings differ on exactly one shape, and it is the one the guard is for: the completion
+	// of a shutdown Job whose machine the cluster still observes up. enterShutdown refused that
+	// completion, moved the machine to ready, and wrote ready (refuseUnobservedShutdown returns the
+	// progress it recorded, and that is the only writer of the slot on that completion). This hook's
+	// transition still says shutdown, so the guard refuses the write, the slot is written once, and the
+	// two hooks of one completion cannot disagree about a value the observation contradicts. Every other
+	// completion leaves the machine in e.Dst, so both spellings write the same value.
+	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
 
 	// Jobs are cleaned up automatically via TTL - no manual cleanup needed
 }
@@ -263,9 +278,11 @@ func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {
 		logger.Info("Successfully released coordination lock after job failure", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect failure and new state. The machine's own state is the value, as
-	// in afterJobCompleted: a rollback writes the stable progress the machine moved into.
-	nm.updateNodeProgress(infrav1alpha1.Progress(nm.GetCurrentState()))
+	// Update node status to reflect failure and new state: the progress of the transition this hook
+	// closes, which is what makes updateNodeProgress's guard a check (see afterJobCompleted for why the
+	// machine's own state is not the value to pass, and which shape is the one that differs). A rollback
+	// leaves the machine in e.Dst, so the value written is the one the transition took.
+	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
 
 	// Add failure condition
 	nm.addNodeCondition(metav1.Condition{
@@ -298,9 +315,8 @@ func (nm *NodeStateMachine) afterForceCleanup(ctx context.Context, e *fsm.Event)
 		logger.Info("Successfully force released coordination lock", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect cleanup. The machine's own state is the value, as in
-	// afterJobCompleted.
-	nm.updateNodeProgress(infrav1alpha1.Progress(nm.GetCurrentState()))
+	// Update node status to reflect cleanup: the progress of the transition, as in afterJobCompleted.
+	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
 
 	// Add cleanup condition
 	nm.addNodeCondition(metav1.Condition{
@@ -377,6 +393,27 @@ func (nm *NodeStateMachine) enterShuttingDown(ctx context.Context, e *fsm.Event)
 	// Update node status
 	nm.updateNodeProgress(infrav1alpha1.ProgressShuttingDown)
 
+	// Count the shutdown attempt, the mirror of enterStartingUp: this is the one place a shutdown
+	// attempt begins. The ready -> shuttingdown transition is what the coordination lock, the cordon
+	// and the shutdown lifecycle Job hang off, and every caller of ShutdownNode passes through it - the
+	// autoscaler's scale-down, the shutdown an observed-power correction releases, and the retry a refused
+	// shutdown completion leads back into.
+	//
+	// Counting it here, and not in the refusal, is what makes one bound cover the loop the refusal
+	// starts (internal/fsm/shutdown_completion.go): a pool whose spec.shutdownPodSpec exits 0 without
+	// the provider's power-off landing cycles Job, refused completion, correction, ShutdownNode, Job -
+	// and every pass of that loop re-cordons a node that is serving pods and spends a power operation on
+	// a real machine. The record is cleared where an attempt demonstrably succeeded: a shutdown
+	// completion the observation agreed with (enterShutdown), and the readiness gate of a boot
+	// (afterJobCompleted) - so the bound prices one scale-down episode, not the life of a slot. See
+	// internal/fsm/shutdown_attempts.go.
+	attempt := nm.recordShutdownAttempt()
+
+	logger.V(1).Info("Recorded a shutdown attempt",
+		"node", nm.node.Name,
+		"attempt", attempt,
+		"limit", ShutdownAttemptLimit)
+
 	// Add progressing condition
 	nm.addNodeCondition(metav1.Condition{
 		Type:               "ShutdownProgressing",
@@ -441,28 +478,48 @@ func (nm *NodeStateMachine) enterShutdown(ctx context.Context, e *fsm.Event) {
 	// cannot verify - its evidence is the exit code of a container the operator supplies (see the
 	// audit in shutdown_completion.go, and the live slot it closes). So the completion is conditional
 	// on the observation: a machine the cluster reports up (status.powerState on, and its corev1.Node
-	// Ready) is recorded at the progress the observation says, ready, and is not recorded shut down at
-	// all. From ready the claim that is already off reaches ShutdownNode again on the next pass; from
-	// shutdown nothing on this slot is reachable, which is the dead slot the record alone produced.
+	// Ready with a heartbeat newer than the shutdown Job's completion) is recorded at the progress the
+	// observation says, ready, and is not recorded shut down at all. From ready the claim that is
+	// already off reaches ShutdownNode again on the next pass; from shutdown nothing on this slot is
+	// reachable, which is the dead slot the record alone produced.
+	//
+	// The refusal returns the progress it wrote, and this hook is the only writer of the slot on that
+	// completion: afterJobCompleted then asks for the progress of its own transition (shutdown) and
+	// updateNodeProgress refuses it, because the machine is in ready. That is the shape
+	// updateNodeProgress's guard exists for, and why the hooks pass the transition's destination.
 	//
 	// A startup that died on the way (JobFailed / JobTimeout / ForceCleanup into shutdown) is not
 	// gated: those land on the stable off/shutdown pair by design, and the observation controllers
 	// write the machine they find - the rule that keeps that pair from resting is
 	// progress.ReconcileObservedPower, which applies the same precedence on the far side of its grace.
-	if e != nil && e.Event == EventJobCompleted && nm.refuseUnobservedShutdown(ctx) {
-		logger.Info("Not recording the shutdown completion: the machine is observed up",
-			"node", nm.node.Name,
-			"job", jobNameFromArgs(e),
-			"kubernetesNode", kubernetesNodeTarget(nm.node),
-			"powerstate", string(nm.node.Status.PowerState),
-			"recorded", string(infrav1alpha1.ProgressReady),
-			"why", "the shutdown Job exited 0 and the provider's observation says the machine is up: "+
-				"recording shutdown would strand the slot in a state the FSM cannot act on")
+	if e != nil && e.Event == EventJobCompleted {
+		job := jobFromArgs(e)
 
-		nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonShutdownNotObserved, ActionPowerOff,
-			shutdownNotObservedNote(nm, jobNameFromArgs(e)))
+		if recorded := nm.refuseUnobservedShutdown(ctx, job); recorded != "" {
+			attempts := ShutdownAttemptsOf(nm.node)
+			_, boundNote := shutdownObservationBound(nm.node, job)
 
-		return
+			logger.Info("Not recording the shutdown completion: the machine is observed up",
+				"node", nm.node.Name,
+				"job", jobNameFromArgs(e),
+				"kubernetesNode", kubernetesNodeTarget(nm.node),
+				"powerstate", string(nm.node.Status.PowerState),
+				"measuredAgainst", boundNote,
+				"shutdownAttempts", attempts,
+				"shutdownAttemptLimit", ShutdownAttemptLimit,
+				"recorded", string(recorded),
+				"why", "the shutdown Job exited 0 and the provider's observation says the machine is up: "+
+					"recording shutdown would strand the slot in a state the FSM cannot act on")
+
+			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonShutdownNotObserved, ActionPowerOff,
+				shutdownNotObservedNote(nm, job, boundNote, attempts))
+
+			return
+		}
+
+		// The completion is recorded, and the observation agreed the machine is off: that shutdown
+		// attempt landed, so the bound starts over for the next scale-down of this slot.
+		nm.clearShutdownAttemptRecord()
 	}
 
 	// Update node status

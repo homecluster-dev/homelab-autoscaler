@@ -51,9 +51,12 @@ const (
 	MaxLockRetryDelay = DefaultLockTimeout
 )
 
-// unknownLockValue is what a conflict reports for a lock that could not be read (the slot
-// moved under a retry), so the log line keeps its shape instead of printing an empty field.
-const unknownLockValue = "unknown"
+// unknownField is what a note reports for a value this path could not read - the holder of a
+// lock that moved under a retry, the group label of a slot, the lifecycle Job of a completion
+// whose event carried none - so a message an operator reads keeps its shape instead of printing
+// an empty field. One constant, because a note that spells the same absence three ways is three
+// things to grep for.
+const unknownField = "unknown"
 
 // Why an acquisition was refused. Both checks are kept, and the message of the older
 // one is preserved verbatim: it is what the operators grep for.
@@ -145,7 +148,7 @@ func AsLockConflict(err error) *LockConflictError {
 // transition schedules the retry from HolderAge.
 func (e *LockConflictError) HolderOperation() string {
 	if e.Holder == nil {
-		return unknownLockValue
+		return unknownField
 	}
 
 	return e.Holder.Operation
@@ -153,7 +156,7 @@ func (e *LockConflictError) HolderOperation() string {
 
 func (e *LockConflictError) HolderOwner() string {
 	if e.Holder == nil {
-		return unknownLockValue
+		return unknownField
 	}
 
 	return e.Holder.Owner

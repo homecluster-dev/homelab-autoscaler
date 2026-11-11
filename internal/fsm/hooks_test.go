@@ -528,12 +528,20 @@ func TestEnterShuttingDown(t *testing.T) {
 	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, updatedNode.Status.Progress)
 	assert.NotNil(t, updatedNode.Status.LastShutdownTime)
 
-	// Verify progressing condition was added
-	assert.Len(t, updatedNode.Status.Conditions, 1)
-	condition := updatedNode.Status.Conditions[0]
-	assert.Equal(t, "ShutdownProgressing", condition.Type)
-	assert.Equal(t, metav1.ConditionTrue, condition.Status)
-	assert.Equal(t, "NodeShuttingDown", condition.Reason)
+	// Verify the progressing condition was added, and that the transition itself counted the shutdown
+	// attempt: the ready -> shuttingdown transition is where the coordination lock, the cordon and the
+	// shutdown lifecycle Job hang off, so it is the one place the bound is paid (see
+	// internal/fsm/shutdown_attempts.go).
+	require.Len(t, updatedNode.Status.Conditions, 2, "the attempt record and the progressing record")
+
+	attempt := meta.FindStatusCondition(updatedNode.Status.Conditions, ConditionShutdownAttempts)
+	require.NotNil(t, attempt, "the attempt is recorded where it begins, before its Job can be refused")
+	assert.Equal(t, ReasonShutdownAttempt+"1", attempt.Reason)
+
+	progressing := meta.FindStatusCondition(updatedNode.Status.Conditions, "ShutdownProgressing")
+	require.NotNil(t, progressing)
+	assert.Equal(t, metav1.ConditionTrue, progressing.Status)
+	assert.Equal(t, "NodeShuttingDown", progressing.Reason)
 }
 
 func TestEnterReady(t *testing.T) {
