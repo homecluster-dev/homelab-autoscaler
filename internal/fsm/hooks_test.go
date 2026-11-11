@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -471,10 +472,18 @@ func TestEnterStartingUp(t *testing.T) {
 	assert.Equal(t, infrav1alpha1.ProgressStartingUp, updatedNode.Status.Progress)
 	assert.NotNil(t, updatedNode.Status.LastStartupTime)
 
-	// Verify progressing condition was added
-	assert.Len(t, updatedNode.Status.Conditions, 1)
-	condition := updatedNode.Status.Conditions[0]
-	assert.Equal(t, "StartupProgressing", condition.Type)
+	// Verify the progressing condition was added, and that the transition itself counted the startup
+	// attempt: the shutdown -> startingup transition is where a lifecycle Job and a powered-on machine
+	// hang off, so it is the one place the bound is paid (see internal/fsm/startup_attempts.go).
+	require.Len(t, updatedNode.Status.Conditions, 2, "the attempt record and the progressing record")
+
+	attempt := meta.FindStatusCondition(updatedNode.Status.Conditions, ConditionStartupAttempts)
+	require.NotNil(t, attempt, "the attempt is counted by the transition, not by the watchdog")
+	assert.Equal(t, ReasonStartupAttempt+"1", attempt.Reason)
+	assert.Equal(t, 1, StartupAttemptsOf(updatedNode))
+
+	condition := meta.FindStatusCondition(updatedNode.Status.Conditions, "StartupProgressing")
+	require.NotNil(t, condition)
 	assert.Equal(t, metav1.ConditionTrue, condition.Status)
 	assert.Equal(t, "NodeStarting", condition.Reason)
 }

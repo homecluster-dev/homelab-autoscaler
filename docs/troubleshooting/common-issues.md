@@ -154,11 +154,17 @@ slot's own request, and it waits out a ~7 minute grace around a lifecycle Job th
 - `spec.desiredPowerState: off` -> **settled** to `off`/`shutdown`, one `ProgressReconciled` Warning
   naming the progress it replaced.
 - `spec.desiredPowerState: on` (the autoscaler asked for this machine) -> **re-armed**: same pair, and
-  the claim left on, so the pool starts the machine again. The `ClaimRearmed` event names the attempt.
-  After 3 attempts (`progress.ClaimRearmLimit`) the controller stops and records one
-  `ClaimRearmLimitReached` **Warning**: the slot is a phantom, it is still counted as requested
-  capacity, and nothing will retry it again on its own. Scale the group down, or fix what keeps the
-  machine from booting (startup command, image, power API credentials).
+  the claim left on, so the pool starts the machine again. The `ClaimRearmed` event names the attempt
+  the arming leads to. The retries are bounded by one **startup-attempt counter** (3 per claim episode,
+  `progress.ClaimRearmLimit`): it counts the startup attempts of the slot, it is recorded by the
+  `StartNode` transition, and it is cleared when a boot passes the readiness gate. Both loops pay into
+  it - a startup whose machine never registers, and a startup Job that exits non-zero (that one leaves
+  the slot at the stable `off`/`shutdown` pair, so the watchdog never looks at it: the FSM's `StartNode`
+  is what refuses). Past the bound the watchdog **settles** the slot, `StartNode` refuses to start it,
+  and one `ClaimRearmLimitReached` **Warning** is recorded: the slot is counted as requested capacity
+  with no machine behind it, and nothing will retry it again on its own. Scale the group down, or fix
+  what keeps the machine from booting (startup command, image, power API credentials); a boot that
+  passes the readiness gate clears the counter and the 3 attempts with it.
 - `spec.desiredPowerState: on`, at `ready`, and the node is cordoned with no Job, lock, or
   autoscaler marker on it -> **uncordoned**, with a `CordonReconciled` Warning. This is the residue of
   a shutdown that timed out or failed: the paths that roll back into `ready` never reach the uncordon
@@ -167,13 +173,16 @@ slot's own request, and it waits out a ~7 minute grace around a lifecycle Job th
 ```bash
 kubectl describe node.infra.homecluster.dev <node-name>
 # Events: ProgressReconciled | ClaimRearmed | ClaimRearmLimitReached | CordonReconciled
+# Conditions: ClaimRearmed (ClaimRearmAttempt<N> while the attempts are being spent, then
+#            ClaimRearmLimitReached) - the startup-attempt record, readable from the slot
 kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
 kubectl get node <kubernetes-node-name> 2>&1              # no machine behind the slot
 ```
 
 A slot the watchdog leaves alone is a slot an operation owns: a `corev1.Node` (its status belongs to
 the observation controllers), a startup/shutdown Job in flight, a Job that finished inside the grace,
-or a live coordination lock.
+a startup stamped inside the grace by `status.lastStartupTime` when the Job object is already gone
+(the TTL collected it), or a live coordination lock.
 
 ### Who Cordoned My Node
 

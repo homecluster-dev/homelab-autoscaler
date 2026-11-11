@@ -316,6 +316,11 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 			if result, deferred := deferTransitionOnLockConflict(ctx, node, err); deferred {
 				return result, nil
 			}
+
+			if result, refused := deferStartupAttemptLimit(ctx, node, err); refused {
+				return result, nil
+			}
+
 			// controller-runtime discards the Result when the error is non-nil, the requeue
 			// backoff is decided by the controller, so only the error is returned here.
 			return ctrl.Result{}, err
@@ -391,6 +396,42 @@ func deferTransitionOnLockConflict(ctx context.Context, node *infrav1alpha1.Node
 
 	return ctrl.Result{RequeueAfter: conflict.RetryAfter()}, true
 }
+
+// deferStartupAttemptLimit turns a startup the FSM refused because the slot has used the startup
+// attempts of its claim episode into a result, and reports whether it did. It is the mirror of
+// deferTransitionOnLockConflict for the other refusal this controller knows how to read, and the
+// enforcement lives in the FSM (fsm.NodeStateMachine.StartNode), which is the one place every path
+// that starts a machine passes - so the count is checked once, on both entries of the failure loop,
+// and not re-implemented per caller.
+//
+// No error is returned, and that is deliberate twice over. The slot is at the stable pair the refusal
+// left it at - status.powerState off, status.progress shutdown, spec.desiredPowerState on - and
+// nothing a resync can do changes that: returning the error hands a permanent, operator-shaped
+// condition to controller-runtime's rate limiter, prints a failure on every pass, and buries the one
+// record that matters, the ClaimRearmLimitReached Warning on the slot. And no immediate requeue: the
+// pass that refused would refuse again. The idle resync is kept so the slot stays in the loop - a
+// Group whose template is fixed, or a claim the autoscaler drops, is picked up as it always is.
+func deferStartupAttemptLimit(ctx context.Context, node *infrav1alpha1.Node, err error) (ctrl.Result, bool) {
+	refusal := fsm.AsStartupAttemptLimit(err)
+	if refusal == nil {
+		return ctrl.Result{}, false
+	}
+
+	log.FromContext(ctx).Info("Startup refused: the slot has used its startup attempts",
+		"node", node.Name,
+		"attempts", refusal.Attempts,
+		"limit", refusal.Limit,
+		"state", "settled at the stable off/shutdown pair with its claim kept",
+		"recorded", "ClaimRearmLimitReached Warning on the slot")
+
+	return ctrl.Result{RequeueAfter: startupAttemptRefusalRequeue}, true
+}
+
+// startupAttemptRefusalRequeue is how long a slot whose startup attempts are spent waits before the
+// controller looks at it again. It is the idle resync of a stable slot, not a retry: the refusal is
+// not a transient failure, the record on the slot is the signal, and the pass that comes back finds
+// the same count and writes nothing.
+const startupAttemptRefusalRequeue = 5 * time.Minute
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {

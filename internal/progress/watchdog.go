@@ -49,10 +49,13 @@ limitations under the License.
 //   - a slot whose spec.desiredPowerState is on - a claim - is never settled, and never was, but
 //     it is not left pointing at a machine that does not exist either: it is re-armed. The slot
 //     moves to off / shutdown and keeps spec.desiredPowerState: on, which is the shape the FSM's
-//     StartNode is legal from, so the pool retries the machine. Bounded by ClaimRearmLimit, because
-//     a claim whose startup keeps failing must not recreate a server in a loop; at the bound the
-//     re-arming stops and a Warning names the phantom. See ClaimRearmLimit for why the claim cannot
-//     simply be given up on;
+//     StartNode is legal from, so the pool retries the machine. Re-arming is bounded by the
+//     startup-attempt counter the FSM owns (fsm.StartupAttemptLimit, counted where an attempt
+//     actually begins and cleared where a boot passes the readiness gate - see
+//     internal/fsm/startup_attempts.go), because a claim whose startup keeps failing must not
+//     recreate a server in a loop. Past the bound the re-arming stops and the slot is settled to the
+//     stable pair with one Warning naming it; see ClaimRearmLimit for why the claim cannot simply be
+//     given up on;
 //   - a slot that has a node object, is at ready, is claimed on, and is cordoned with nothing
 //     running on it is uncordoned. That is the safety net for the paths into ready that never call
 //     the uncordon hook (JobTimeout and JobFailed roll a slot back to ready), where a cordoned
@@ -65,15 +68,11 @@ package progress
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
@@ -122,6 +121,11 @@ import (
 // slot whose monitor died with its manager - the shape this package exists for, a manager restart
 // that takes the goroutine away - is healed inside the grace, well inside that horizon, and not on
 // every resync.
+//
+// A slot with no Job object at all is measured against the same window, from status.lastStartupTime
+// (see startupGrace): a startup Job collected by a short spec.ttlSecondsAfterFinished leaves the slot
+// in the position of a startup in flight, and a grace that only exists while the Job object does
+// would open inside the hook that owns the progress.
 const SettleGracePeriod = fsm.JobMonitorPollInterval +
 	fsm.DefaultUncordonTimeout +
 	fsm.DefaultReadinessGateTimeout +
@@ -138,10 +142,11 @@ const (
 	// ReasonClaimRearmed is recorded when a claimed slot whose machine never arrived is sent back
 	// through the startup path.
 	ReasonClaimRearmed = "ClaimRearmed"
-	// ReasonClaimRearmLimitReached is recorded when a claim has been re-armed ClaimRearmLimit times
-	// and the watchdog stopped: the slot is a phantom, the pool asked for a machine that will not
-	// boot, and only an operator can say why.
-	ReasonClaimRearmLimitReached = "ClaimRearmLimitReached"
+	// ReasonClaimRearmLimitReached is recorded when a slot has used its startup attempts and this
+	// package stopped re-arming it. The name is the FSM's, because the counter is the FSM's: the
+	// watchdog's limit pass and the FSM's refusal of a StartNode record the same reason, and the
+	// record they deduplicate on is shared (see fsm.ReasonStartupAttemptLimitReached).
+	ReasonClaimRearmLimitReached = fsm.ReasonStartupAttemptLimitReached
 	// ReasonCordonReconciled is recorded when the safety net uncordons a ready slot whose node is
 	// cordoned with no operation running on it.
 	ReasonCordonReconciled = "CordonReconciled"
@@ -154,30 +159,42 @@ const (
 	ActionUncordonNode = "UncordonNode"
 )
 
-// The claim re-arm. A slot cluster-autoscaler asked for (spec.desiredPowerState: on) whose startup
-// Job completed and whose machine never registered ends at {desired: on, powerState: off, progress:
-// ready}. Nothing in the system heals that shape: the watchdog's settlement refuses it (the claim
-// gate), CanTransition(StartNode) is false from ready, NodeGroupTargetSize counts the slot forever
-// so the autoscaler believes the group has capacity that never materialises, and
-// NodeGroupDecreaseTargetSize cannot cancel it (isStartingUpSlot wants progress: startingup). So the
-// slot is re-armed rather than settled, and the re-arm is bounded.
+// The claim re-arm, and the bound on it. A slot cluster-autoscaler asked for
+// (spec.desiredPowerState: on) whose startup Job completed and whose machine never registered ends at
+// {desired: on, powerState: off, progress: ready}. Nothing in the system heals that shape: the
+// watchdog's settlement refuses it (the claim gate), CanTransition(StartNode) is false from ready,
+// NodeGroupTargetSize counts the slot forever so the autoscaler believes the group has capacity that
+// never materialises, and NodeGroupDecreaseTargetSize cannot cancel it (isStartingUpSlot wants
+// progress: startingup). So the slot is re-armed rather than settled.
+//
+// The bound on the re-arm is not this package's to keep. It counts *startup attempts*, it is
+// incremented where an attempt actually begins (fsm.enterStartingUp, the transition both the
+// watchdog's re-arm and a JobFailed rollback lead back into), it is cleared where an attempt
+// demonstrably succeeded (the readiness gate of fsm.afterJobCompleted), and it is enforced by both
+// consumers: here, and by fsm.NodeStateMachine.StartNode, which refuses a StartNode on a slot that
+// has used its attempts. A counter this package kept for its own re-arms bounded one loop and left
+// the loud one - a startup Job that exits non-zero - running free, and never reset, so it was a
+// lifetime bound on a slot that is reused across claim episodes. The record is a status.conditions
+// entry (fsm.ConditionStartupAttempts), so the bound needs no CRD field, and both consumers read the
+// same field they deduplicate their Warning on. See internal/fsm/startup_attempts.go for the whole
+// rule and why it lives there.
 const (
-	// ClaimRearmLimit is how many times one slot's claim may be re-armed before the watchdog stops
-	// trying and tells the operator. It bounds the *watchdog's* retries, not the lifecycle's: each
-	// attempt is a real startup (the FSM's StartNode, a lifecycle Job, a power-on of a real
-	// machine), so the number is deliberately small - three attempts is three machines bought for
-	// one slot - and the operator sees the limit as a Warning rather than discovering it from the
-	// bill.
-	ClaimRearmLimit = 3
+	// ClaimRearmLimit is how many startup attempts one slot may make for one claim episode before
+	// the controller stops starting machines for it and tells the operator. Each attempt is a real
+	// startup (the FSM's StartNode, a lifecycle Job, a power-on of a real machine), so the number is
+	// deliberately small - three attempts is three machines bought for one slot - and the operator
+	// sees the limit as a Warning rather than discovering it from the bill. The value and the record
+	// are the FSM's; this is the name the watchdog's tests and docs use.
+	ClaimRearmLimit = fsm.StartupAttemptLimit
 
-	// ConditionClaimRearmed is the status.conditions entry that counts the re-arms of a slot. Its
-	// Reason carries the counter (ReasonClaimRearmAttempt + the count, e.g. ClaimRearmAttempt2),
-	// which is why no CRD field is needed to bound the loop: the record lives on the slot, survives
-	// a manager restart, shows in `kubectl describe`, and the deduplication of the limit Warning
-	// reads the same field the bound does.
-	ConditionClaimRearmed = "ClaimRearmed"
+	// ConditionClaimRearmed is the status.conditions entry that carries the startup-attempt count of
+	// the slot. Its Reason carries the counter (ReasonClaimRearmAttempt + the count, e.g.
+	// ClaimRearmAttempt2), which is why no CRD field is needed to bound the loop: the record lives on
+	// the slot, survives a manager restart, shows in `kubectl describe`, and the deduplication of the
+	// limit Warning reads the same field the bound does.
+	ConditionClaimRearmed = fsm.ConditionStartupAttempts
 	// ReasonClaimRearmAttempt prefixes the reason that carries the count.
-	ReasonClaimRearmAttempt = "ClaimRearmAttempt"
+	ReasonClaimRearmAttempt = fsm.ReasonStartupAttempt
 )
 
 // Action is what one pass of the watchdog decided to do about the slot. The three actions share one
@@ -191,13 +208,17 @@ const (
 	// progress already says what the cluster looks like.
 	ActionNone Action = ""
 
-	// ActionSettle writes the stable off / shutdown pair of a slot whose
-	// spec.desiredPowerState is off and whose machine is gone.
+	// ActionSettle writes the stable off / shutdown pair of a slot whose machine is gone, keeping
+	// spec.desiredPowerState as it is. It is the settlement of a desired-off slot, and - with
+	// decision.limited set - the closing of a claimed slot whose startup attempts are spent: the same
+	// pair, the claim kept, and the note that says the controller will not start another machine.
 	ActionSettle Action = "settle"
 
 	// ActionRearm writes progress: shutdown and powerState: off for a *claimed* slot whose machine
 	// is gone, and leaves spec.desiredPowerState: on: the request stands, only the lie about the
-	// machine is removed, which is what makes the FSM's StartNode legal again.
+	// machine is removed, which is what makes the FSM's StartNode legal again. It records no counter:
+	// the attempt is counted by the FSM where it begins, and the arm that is refused is the one past
+	// the bound (see ClaimRearmLimit).
 	ActionRearm Action = "rearm"
 
 	// ActionUncordon clears spec.unschedulable of the node of a ready slot that is claimed on and
@@ -228,8 +249,10 @@ type Outcome struct {
 	// written.
 	Previous infrav1alpha1.Progress
 
-	// Attempts is the re-arm count recorded by this pass, 0 for every other action. It is the
-	// number the operator sees in the event, and it is bounded by ClaimRearmLimit.
+	// Attempts is the startup-attempt count of the slot's claim episode, read off the record the FSM
+	// owns (fsm.StartupAttemptsOf): 0 for a desired-off settlement, the attempts already spent for the
+	// limit path, the attempts spent for a re-arm. It is the number the operator sees in the event, and
+	// it is bounded by ClaimRearmLimit. This pass writes none of it.
 	Attempts int
 
 	// RequeueAfter is how long the caller should wait before looking at this slot again: > 0
@@ -250,7 +273,10 @@ type Outcome struct {
 //     a pass over them writes nothing, which is what keeps this idempotent.
 //   - there must be no lifecycle Job in flight, and a Job that finished must be older than grace.
 //     The Job is the operation; the state machine that started it settles its progress, and the
-//     grace covers the gap between a Job finishing and that machine acting on it.
+//     grace covers the gap between a Job finishing and that machine acting on it. With no Job object
+//     at all - a Job collected by a short spec.ttlSecondsAfterFinished is the common shape - the
+//     grace is measured from status.lastStartupTime, the stamp the FSM's own progress write leaves,
+//     so a collected Job cannot open the gate inside a hook that is still running (see startupGrace).
 //   - the slot must carry no live coordination lock. A lock says an operation owns the slot right
 //     now - including the window in which the FSM has written the transitional progress and has
 //     not created the Job yet, and the scale-down the provider is running.
@@ -265,8 +291,13 @@ type Outcome struct {
 //     answered a scale-up request by declaring the capacity wanted is the failure the target-size
 //     fix removed. What is removed is the progress that names a machine that does not exist,
 //     because from ready the FSM cannot StartNode, and from shutdown it can: the pool retries the
-//     machine. Bounded by ClaimRearmLimit, and the limit is reported (ReasonClaimRearmLimitReached)
-//     so a slot that keeps failing is visible instead of infinite.
+//     machine. The retries are bounded by the startup-attempt counter the FSM owns
+//     (ClaimRearmLimit, counted where an attempt begins and cleared where a boot passes the
+//     readiness gate), and the FSM refuses the StartNode a re-arm leads to once the attempts are
+//     spent. Past the bound this pass stops re-arming and settles the slot to the stable pair with
+//     one Warning (ReasonClaimRearmLimitReached): the progress stops naming a machine the cluster does
+//     not have - which is what makes the slot healable by every other writer - while the claim, and
+//     with it the target-size unit the autoscaler asked for, stays.
 //   - spec.desiredPowerState on, a node object that is cordoned, progress ready, and no marker of
 //     cluster-autoscaler on the node -> uncordon. The paths that roll a slot back into ready
 //     (JobTimeout, JobFailed) never call the uncordon hook, so a machine cordoned by the shutdown
@@ -306,23 +337,6 @@ func Settle(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, reco
 
 	decision := decide(slot, obs)
 	if decision.action == ActionNone {
-		// The bound is checked before anything is written, and the note is the only write the limit
-		// path performs: a claim that has used its attempts stops being re-armed, and the slot says so
-		// on itself exactly once, so the Warning is the operator's signal and not a per-resync storm.
-		if decision.limited {
-			limited, err := noteRearmLimit(ctx, c, coord, slot, grace)
-			if err != nil {
-				return Outcome{}, err
-			}
-
-			if limited && recorder != nil {
-				recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonClaimRearmLimitReached, ActionRearmProgress,
-					"%s", rearmLimitNote(slot, obs.rearmAttempts))
-			}
-
-			return Outcome{Attempts: obs.rearmAttempts, Reason: decision.reason}, nil
-		}
-
 		if obs.lockHeld {
 			logger = logger.WithValues("lock", obs.lockNote)
 		}
@@ -368,6 +382,36 @@ func Settle(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, reco
 	case ActionSettle:
 		outcome.Settled = true
 
+		if decision.limited {
+			// The slot has used the startup attempts of its claim episode, so it is not re-armed: an
+			// armed slot is a slot the next pass starts, and the FSM refuses that start, so re-arming
+			// would leave the progress pointing at a machine again for nothing. It is settled to the
+			// stable off/shutdown pair the desired-off branch writes, with the claim kept, and the note
+			// the same write stamped says the controller will not start another machine for it. That
+			// closes the lie the progress tells: it now says what the cluster is - no machine, and no
+			// operation. The claim is untouched, so the slot is still counted as requested capacity
+			// (countsTowardsTargetSize counts a claimed slot whatever its progress says, and dropping a
+			// claim is the provider's arithmetic, never this pass's); what changes is that every reader of
+			// the progress now reads the truth, which is what makes the slot healable at all. Exactly one
+			// Warning - the record is the deduplication, so every later pass over this slot writes nothing
+			// and records nothing.
+			logger.Info("Settled a claimed slot that has used its startup attempts",
+				"previousProgress", string(previous),
+				"progress", string(infrav1alpha1.ProgressShutdown),
+				"powerstate", string(infrav1alpha1.PowerStateOff),
+				"desiredPowerState", string(slot.Spec.DesiredPowerState),
+				"attempts", attempts,
+				"limit", ClaimRearmLimit,
+				"kubernetesNode", slot.Spec.KubernetesNodeName)
+
+			if recorder != nil {
+				recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonClaimRearmLimitReached, ActionSettleProgress,
+					"%s", rearmLimitNote(slot, attempts))
+			}
+
+			return outcome, nil
+		}
+
 		logger.Info("Settled status.progress of a slot with no machine and no lifecycle Job",
 			"previousProgress", string(previous),
 			"progress", string(infrav1alpha1.ProgressShutdown),
@@ -382,18 +426,23 @@ func Settle(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, reco
 	case ActionRearm:
 		outcome.Rearmed = true
 
+		// attempts is the count the slot carries - the attempts already spent, written by the FSM's
+		// enterStartingUp hook, not by this pass. The event names the attempt the arming leads to
+		// (attempts+1), because that is the machine the pool is about to buy and the number the
+		// operator has to be able to count to.
 		logger.Info("Re-armed a claimed slot whose machine never arrived",
 			"previousProgress", string(previous),
 			"progress", string(infrav1alpha1.ProgressShutdown),
 			"powerstate", string(infrav1alpha1.PowerStateOff),
 			"desiredPowerState", string(slot.Spec.DesiredPowerState),
-			"attempts", attempts,
+			"attemptsUsed", attempts,
+			"nextAttempt", attempts+1,
 			"limit", ClaimRearmLimit,
 			"kubernetesNode", slot.Spec.KubernetesNodeName)
 
 		if recorder != nil {
 			recorder.Eventf(slot, nil, corev1.EventTypeNormal, ReasonClaimRearmed, ActionRearmProgress,
-				"%s", rearmNote(slot, previous, attempts))
+				"%s", rearmNote(slot, previous, attempts+1))
 		}
 
 	case ActionUncordon:
@@ -434,8 +483,10 @@ type observations struct {
 	// jobs are the slot's lifecycle Jobs.
 	jobs []batchv1.Job
 
-	// rearmAttempts is how many times this slot's claim has been re-armed before.
-	rearmAttempts int
+	// startupAttempts is how many startup attempts this slot has made in its current claim episode,
+	// read off the record the FSM owns (fsm.StartupAttemptsOf). This package never writes that number:
+	// it is incremented where an attempt begins and cleared where a boot passes the readiness gate.
+	startupAttempts int
 
 	// now and grace are the clock and the window the Job gates are measured against.
 	now   time.Time
@@ -443,7 +494,7 @@ type observations struct {
 }
 
 // observe pays for the reads of one pass: the slot's node object, its lifecycle Jobs, its
-// coordination lock, and its re-arm record. The cheap in-memory gates live in decide, so this is
+// coordination lock, and its startup-attempt record. The cheap in-memory gates live in decide, so this is
 // only ever called for a slot that is a candidate.
 func observe(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, grace time.Duration) (observations, error) {
 	obs := observations{now: time.Now(), grace: grace}
@@ -466,7 +517,7 @@ func observe(ctx context.Context, c client.Client, coord fsm.CoordinationManager
 
 	obs.jobs = jobs
 	obs.lockHeld, obs.lockNote = lockIsHeld(ctx, coord, slot)
-	obs.rearmAttempts = rearmAttempts(slot)
+	obs.startupAttempts = fsm.StartupAttemptsOf(slot)
 
 	return obs, nil
 }
@@ -482,32 +533,37 @@ func settlementNote(slot *infrav1alpha1.Node, previous infrav1alpha1.Progress) s
 		string(infrav1alpha1.PowerStateOff), kubernetesNodeName(slot))
 }
 
-// rearmNote renders the Normal event of a re-arm, with the attempt count in it: the operator sees
-// that the pool is retrying a machine that never booted, how many times it has done so, and that the
-// claim is untouched. Normal, not Warning: a re-arm is the system healing itself, and the shape worth
-// a Warning is the one where it stops (see rearmLimitNote).
-func rearmNote(slot *infrav1alpha1.Node, previous infrav1alpha1.Progress, attempts int) string {
+// rearmNote renders the Normal event of a re-arm, naming the startup attempt the arming leads to: the
+// operator sees that the pool is retrying a machine that never booted, which attempt of the bound this
+// is, and that the claim is untouched. Normal, not Warning: a re-arm is the system healing itself, and
+// the shape worth a Warning is the one where it stops (see rearmLimitNote). The count is the FSM's
+// record (fsm.StartupAttemptsOf), read here, not written.
+func rearmNote(slot *infrav1alpha1.Node, previous infrav1alpha1.Progress, attempt int) string {
 	return fmt.Sprintf(
-		"Re-armed the claim on node %s (%d of %d): status.progress %q named a machine the cluster does not have, so it "+
-			"is recorded %q with status.powerState %q while spec.desiredPowerState stays %q - the startup Job of this slot "+
-			"finished and no Kubernetes node %q ever registered, so the machine has to be started again and the slot is "+
-			"now in the state that allows it",
-		slot.Name, attempts, ClaimRearmLimit, string(previous), string(infrav1alpha1.ProgressShutdown),
+		"Re-armed the claim on node %s (this starts startup attempt %d of %d): status.progress %q named a machine the "+
+			"cluster does not have, so it is recorded %q with status.powerState %q while spec.desiredPowerState stays %q "+
+			"- the startup Job of this slot finished and no Kubernetes node %q ever registered, so the machine has to be "+
+			"started again and the slot is now in the state that allows it. The attempt count is recorded on the slot and "+
+			"is cleared by a boot that passes the readiness gate.",
+		slot.Name, attempt, ClaimRearmLimit, string(previous), string(infrav1alpha1.ProgressShutdown),
 		string(infrav1alpha1.PowerStateOff), string(infrav1alpha1.PowerStateOn), kubernetesNodeName(slot))
 }
 
-// rearmLimitNote renders the Warning that names the phantom: a claimed slot that has been re-armed
-// ClaimRearmLimit times and whose machine has not booted once. The re-arming has stopped, so the slot
-// reports capacity the cluster does not have and nothing will retry on its own - that is the fact an
-// operator has to be told, and the only safe response is a human looking at why this slot cannot
-// boot.
+// rearmLimitNote renders the Warning that closes the loop: a claimed slot whose startup attempts are
+// used up. The slot is settled to the stable off/shutdown pair, so the group stops reporting a machine
+// the cluster does not have, and the claim stays, so the request the autoscaler made is not answered by
+// a watchdog. What is left is a human looking at why this slot cannot boot, and the message says so,
+// with the attempts it spent and the rule that would reset them.
 func rearmLimitNote(slot *infrav1alpha1.Node, attempts int) string {
 	return fmt.Sprintf(
-		"Claim on node %s is not recoverable by re-arming: %d startup attempts, no Kubernetes node %q ever registered, "+
-			"and status.progress is left at %q. spec.desiredPowerState is still %q, so the slot is still counted as "+
-			"requested capacity. Scale the group down, or fix what keeps the machine from booting (startup command, "+
-			"image, power API credentials) - the controller will not create another server for this slot.",
-		slot.Name, attempts, kubernetesNodeName(slot), string(slot.Status.Progress), string(slot.Spec.DesiredPowerState))
+		"Claim on node %s is not recoverable by re-arming: %d of %d startup attempts used, no Kubernetes node %q ever "+
+			"registered. The slot is settled to status.progress %q with status.powerState %q, so it no longer reports a "+
+			"machine the cluster does not have, and spec.desiredPowerState stays %q, so the request is not dropped here. "+
+			"The controller will not start another machine for this slot: scale the group down to drop the claim, or fix "+
+			"what keeps the machine from booting (startup command, image, power API credentials) - a boot that passes the "+
+			"readiness gate clears the record and the %d attempts with it.",
+		slot.Name, attempts, ClaimRearmLimit, kubernetesNodeName(slot), string(infrav1alpha1.ProgressShutdown),
+		string(infrav1alpha1.PowerStateOff), string(slot.Spec.DesiredPowerState), ClaimRearmLimit)
 }
 
 // uncordonNote renders the event of the cordon safety net: which node was made schedulable, and why
@@ -542,11 +598,11 @@ type decision struct {
 	requeueAfter time.Duration
 	// reason is the human-readable explanation for the log line.
 	reason string
-	// limited is true when the refusal is the re-arm bound: the claim of this slot has used its
-	// attempts. It is a field, not a string match on the reason, because the limit path has to write
-	// its note exactly once and has to re-derive the shape from the object read back (see
-	// noteRearmLimit) - a comparison against a formatted sentence is how a reworded log line breaks a
-	// deduplication.
+	// limited is true when the settlement is the startup-attempt bound: the claim of this slot has
+	// used its attempts, so it is settled rather than re-armed and the write stamps the note. It is a
+	// field, not a string match on the reason, because the limit path has to stamp its note exactly
+	// once and has to re-derive the shape from the object read back - a comparison against a formatted
+	// sentence is how a reworded log line breaks a deduplication.
 	limited bool
 	// previous is the progress being replaced, set when the action writes a progress.
 	previous infrav1alpha1.Progress
@@ -593,6 +649,23 @@ func decide(slot *infrav1alpha1.Node, obs observations) decision {
 		return decision{requeueAfter: wait, reason: "a lifecycle Job of the slot finished inside the settle grace"}
 	}
 
+	if len(obs.jobs) == 0 {
+		// No lifecycle Job object at all. That is the normal shape of a slot whose startup Job was
+		// collected by its TTL (spec.ttlSecondsAfterFinished, 600s by default) with its machine never
+		// registered, and of the window in which the FSM has written the transitional progress and is
+		// on its way to create the Job. With no Job, the grace has nothing to be measured against, and
+		// the slot carries the one timestamp a startup in flight stamps: status.lastStartupTime, written
+		// by the FSM's own progress write on the transition into startingup. Measuring from it is what
+		// keeps a short ttlSecondsAfterFinished from pulling the gate inside a hook that is still
+		// running: a slot whose startup is younger than the grace is looked at again on the rest of the
+		// grace, and a slot older than it is the shape this package acts on. A slot with no stamp at all
+		// (it never started a machine) is not held by a deadline it has no evidence for.
+		if remaining, ok := startupGrace(slot, obs); ok {
+			return decision{requeueAfter: remaining,
+				reason: "the slot's startup is inside the settle grace, measured from status.lastStartupTime: no lifecycle Job object is left to measure against"}
+		}
+	}
+
 	// Nothing is running on the slot. What the claim and the node object say decides the action.
 	if slot.Spec.DesiredPowerState == infrav1alpha1.PowerStateOff {
 		if obs.nodePresent {
@@ -610,11 +683,30 @@ func decide(slot *infrav1alpha1.Node, obs observations) decision {
 	// A claim. The progress is not the request and is not the machine, so it is the thing that is
 	// wrong: from ready the FSM cannot StartNode, and from shutdown it can.
 	if !obs.nodePresent {
-		if obs.rearmAttempts >= ClaimRearmLimit {
+		if obs.startupAttempts >= ClaimRearmLimit {
+			// The attempts of this claim episode are spent. The slot is not re-armed: re-arming makes
+			// StartNode legal, and the FSM refuses that start, so the arming would buy nothing. It is
+			// settled to the same stable off/shutdown pair the desired-off branch writes, claim kept, and
+			// the write carries the note that says the controller stopped.
+			//
+			// What that closes is the progress, and it matters because the progress is what every other
+			// writer reads: a slot at ready with no machine is a slot the FSM cannot start (StartNode is
+			// illegal from ready), cannot shut down without building a shutdown Job for a server that is
+			// already gone, and cannot be healed by any other writer in the system. From the settled pair
+			// the FSM can start again the moment an operator fixes the template, and a scale-down lands on
+			// a slot that is already off.
+			//
+			// What it does not change is the arithmetic: spec.desiredPowerState is the request, and
+			// countsTowardsTargetSize counts a claimed slot whatever its progress says, so the slot stays
+			// counted as capacity the pool has been asked for. Dropping that is the provider's
+			// NodeGroupDecreaseTargetSize / DeleteNodes, never a watchdog's answer to a scale-up; the one
+			// Warning is what tells an operator the request is standing and will not be filled.
 			return decision{
-				limited: true,
-				reason: fmt.Sprintf("the claim has already been re-armed %d times, the limit is %d: the slot is a phantom and only an operator can say why",
-					obs.rearmAttempts, ClaimRearmLimit),
+				action:   ActionSettle,
+				limited:  true,
+				previous: slot.Status.Progress,
+				reason: fmt.Sprintf("the slot has used its %d startup attempts (limit %d): the claim is settled, not re-armed, and only an operator can say why the machine will not boot",
+					obs.startupAttempts, ClaimRearmLimit),
 			}
 		}
 
@@ -650,6 +742,29 @@ func impliesMachine(progress infrav1alpha1.Progress) bool {
 	default:
 		return false
 	}
+}
+
+// startupGrace measures the settle grace of a slot that has no lifecycle Job object to measure
+// against, from status.lastStartupTime: the timestamp the FSM stamps on the transition into
+// startingup, in the same status write that records the transitional progress. It is a fallback, not
+// a second gate: the Job object, when there is one, is the evidence the grace is measured from, and
+// the absence of one is not evidence that the operation is over - a Job collected by a short
+// spec.ttlSecondsAfterFinished leaves the slot exactly as a startup in flight leaves it, with the
+// after_JobCompleted hook of that Job minutes from writing the progress the hook owns. Stomping that
+// progress is the duplicate scale-up the grace exists to prevent, so a slot with a startup stamp
+// inside the grace is looked at again on the rest of it, and only a slot with no stamp at all (it
+// never started a machine) or a stamp older than the grace is acted on now.
+func startupGrace(slot *infrav1alpha1.Node, obs observations) (time.Duration, bool) {
+	if slot.Status.LastStartupTime == nil {
+		return 0, false
+	}
+
+	remaining := obs.grace - obs.now.Sub(slot.Status.LastStartupTime.Time)
+	if remaining <= 0 {
+		return 0, false
+	}
+
+	return remaining, true
 }
 
 // finishedAt reports when a finished lifecycle Job finished, and whether it is finished at all.
@@ -689,13 +804,17 @@ func finishedAt(job *batchv1.Job) (time.Time, bool) {
 // apply writes the decision, re-deriving the whole rule from the object read back. A write that
 // goes through on a slot someone else changed in the meantime is how a controller stomps an
 // operation, so the rule is evaluated against the fresh copy and the write is skipped when the slot
-// no longer qualifies, or qualifies for a different action than the one decided. It reports whether
-// it wrote, the progress it replaced, and the re-arm count it recorded.
+// no longer qualifies, or qualifies for a different action - or a different limit - than the one
+// decided. It reports whether it wrote, the progress it replaced, and the startup-attempt count the
+// slot carries. That count is read off the record the FSM owns and is never written here: the
+// watchdog arms attempts, it does not spend them, and a count this package incremented for its own
+// passes is the lifetime bound that froze healthy slots.
 //
-// One function for all three actions on purpose: settle and re-arm differ by two lines (the re-arm
-// stamps the counter, and never touches spec.desiredPowerState), and the cordon fix runs on the node
-// object of a slot whose progress is already the truth. Splitting them is how the gates of the three
-// drift apart, which is the failure this package exists to avoid.
+// One function for every action on purpose. The settlement of a desired-off slot, the settlement of a
+// claimed slot whose attempts are spent (the same pair, plus the note that says the controller
+// stopped), the re-arm (the same pair, no note, the claim kept) and the cordon fix (a write on the
+// node object of a slot whose progress is already the truth) share one body, so the gates of the four
+// cannot drift apart. Splitting them is the failure this package exists to avoid.
 func apply(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, d decision, grace time.Duration) (bool, infrav1alpha1.Progress, int, error) {
 	var (
 		wrote    bool
@@ -715,9 +834,10 @@ func apply(ctx context.Context, c client.Client, coord fsm.CoordinationManager, 
 		}
 
 		current := decide(fresh, obs)
-		if current.action != d.action {
-			// The slot stopped qualifying, or became a different action: an operation, a claim, a
-			// machine, or a cordon appeared.
+		if current.action != d.action || current.limited != d.limited {
+			// The slot stopped qualifying, became a different action, or its attempts are not spent
+			// any more: an operation, a claim, a machine, a cordon, or a boot that reset the
+			// startup-attempt record arrived between the decision and this write.
 			return nil
 		}
 
@@ -734,23 +854,29 @@ func apply(ctx context.Context, c client.Client, coord fsm.CoordinationManager, 
 			return nil
 		}
 
-		if d.action == ActionRearm {
-			attempts = obs.rearmAttempts + 1
-			stampRearmCondition(fresh, attempts, current.previous)
-		}
-
 		fresh.Status.Progress = infrav1alpha1.ProgressShutdown
 		fresh.Status.PowerState = infrav1alpha1.PowerStateOff
+
+		if d.limited {
+			// The note goes on in the same status update as the settlement it belongs to. It is the
+			// bound, the deduplication of the Warning, and the explanation an operator reads on
+			// `kubectl describe` a week later; a slot settled without it is a slot whose next pass
+			// notes it again, which is the event storm the record exists to prevent, and a note on a
+			// slot that was never settled is a record that lies about the progress.
+			fsm.StampStartupAttemptLimit(fresh, obs.startupAttempts, settleLimitCause(fresh))
+		}
 
 		if err := c.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
 
-		// spec is never written: the claim of a re-armed slot stays on, and that is what makes the
-		// FSM's StartNode legal from the progress written here.
+		// spec is never written: the claim of a settled, re-armed or limited slot stays on, and that
+		// is the request the provider made. Dropping a claim is the autoscaler's arithmetic
+		// (NodeGroupDecreaseTargetSize), never a watchdog's answer to a scale-up.
 
 		wrote = true
 		previous = current.previous
+		attempts = obs.startupAttempts
 
 		syncLocalCopy(slot, fresh)
 
@@ -763,130 +889,26 @@ func apply(ctx context.Context, c client.Client, coord fsm.CoordinationManager, 
 	return wrote, previous, attempts, nil
 }
 
+// settleLimitCause renders the evidence the note quotes when the watchdog is the writer. It is a
+// different sentence from the one the FSM's refusal quotes ("the startup Jobs exited non-zero" and
+// "no node ever registered" are different failures with the same bound), and the record has to say
+// which loop was closed: this one is the quiet loop, a claim whose machines were started and never
+// registered.
+func settleLimitCause(slot *infrav1alpha1.Node) string {
+	return fmt.Sprintf("no Kubernetes node %q ever registered for the machines those attempts started",
+		kubernetesNodeName(slot))
+}
+
 // syncLocalCopy keeps the caller's copy of the slot in step with what was written, so the pass that
 // acted does not act again on the values it replaced: the FSM reads its state from status.progress,
-// and the node controller has just run this pass with this object in hand.
+// the limit note is read back as the deduplication of the Warning, and the node controller has just
+// run this pass with this object in hand. Conditions are carried over for the same reason the
+// progress is - a caller holding a copy without the note the write stamped is a caller that writes
+// the note again.
 func syncLocalCopy(slot *infrav1alpha1.Node, fresh *infrav1alpha1.Node) {
 	slot.Status.Progress = fresh.Status.Progress
 	slot.Status.PowerState = fresh.Status.PowerState
-}
-
-// noteRearmLimit records, once, that a claimed slot has used its re-arm attempts and is left as a
-// phantom. It is the only write the limit path performs - the progress is not touched, because the
-// slot is not being healed any more - and the condition it stamps is what the bound and this
-// deduplication both read, so the passes after it write nothing and record nothing.
-//
-// It reports whether the note was written, which is what the caller uses to record the Warning: an
-// event per resync for a slot that is permanently broken is an event storm on a pool that stopped
-// booting.
-func noteRearmLimit(ctx context.Context, c client.Client, coord fsm.CoordinationManager, slot *infrav1alpha1.Node, grace time.Duration) (bool, error) {
-	noted := false
-
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &infrav1alpha1.Node{}
-		if err := c.Get(ctx, client.ObjectKeyFromObject(slot), fresh); err != nil {
-			return err
-		}
-
-		obs, err := observe(ctx, c, coord, fresh, grace)
-		if err != nil {
-			return err
-		}
-
-		current := decide(fresh, obs)
-		if !current.limited {
-			// The slot is not the limited shape any more: something arrived, a claim was dropped,
-			// an operation started. Nothing to note.
-			return nil
-		}
-
-		if rearmLimitNoted(fresh) {
-			// Steady state of a phantom: no write, no event.
-			return nil
-		}
-
-		stampRearmLimit(fresh, obs.rearmAttempts)
-
-		if err := c.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-
-		noted = true
-
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-
-	return noted, nil
-}
-
-// rearmAttempts returns how many times this slot's claim has been re-armed, read off the condition
-// the re-arm stamps. The count is in the condition's Reason (ReasonClaimRearmAttempt + the number)
-// so the bound needs no CRD field: the record is on the slot, survives a manager restart, and is
-// what `kubectl describe` shows. A slot with no record has never been re-armed, and a record whose
-// reason is the limit reads as the limit, so the bound cannot be escaped by a reason this package
-// does not write.
-func rearmAttempts(slot *infrav1alpha1.Node) int {
-	condition := meta.FindStatusCondition(slot.Status.Conditions, ConditionClaimRearmed)
-	if condition == nil {
-		return 0
-	}
-
-	if condition.Reason == ReasonClaimRearmLimitReached {
-		return ClaimRearmLimit
-	}
-
-	count, err := strconv.Atoi(strings.TrimPrefix(condition.Reason, ReasonClaimRearmAttempt))
-	if err != nil || count < 0 {
-		return 0
-	}
-
-	return count
-}
-
-// rearmLimitNoted reports whether the slot already carries the limit record, which is the
-// deduplication of the Warning: the passes after the first one write nothing.
-func rearmLimitNoted(slot *infrav1alpha1.Node) bool {
-	condition := meta.FindStatusCondition(slot.Status.Conditions, ConditionClaimRearmed)
-
-	return condition != nil && condition.Reason == ReasonClaimRearmLimitReached
-}
-
-// stampRearmCondition records the re-arm of attempt n on the slot. Status True says the claim of this
-// slot has been sent back through the startup path, the Reason is the counter, and the Message is the
-// evidence, so the whole history an operator needs to follow a pool that keeps buying machines is on
-// the slot.
-func stampRearmCondition(slot *infrav1alpha1.Node, attempts int, previous infrav1alpha1.Progress) {
-	meta.SetStatusCondition(&slot.Status.Conditions, metav1.Condition{
-		Type:               ConditionClaimRearmed,
-		Status:             metav1.ConditionTrue,
-		ObservedGeneration: slot.Generation,
-		Reason:             ReasonClaimRearmAttempt + strconv.Itoa(attempts),
-		Message: fmt.Sprintf(
-			"re-arm attempt %d of %d: status.progress %q named a machine the cluster does not have, no Kubernetes node "+
-				"%q ever registered for it, so the progress is recorded %q and spec.desiredPowerState is left %q for the "+
-				"startup to run again",
-			attempts, ClaimRearmLimit, string(previous), kubernetesNodeName(slot),
-			string(infrav1alpha1.ProgressShutdown), string(infrav1alpha1.PowerStateOn)),
-	})
-}
-
-// stampRearmLimit records that the bound is used up. The reason is stable - that is what makes the
-// deduplication work - and the message says what the controller stopped doing and why.
-func stampRearmLimit(slot *infrav1alpha1.Node, attempts int) {
-	meta.SetStatusCondition(&slot.Status.Conditions, metav1.Condition{
-		Type:               ConditionClaimRearmed,
-		Status:             metav1.ConditionTrue,
-		ObservedGeneration: slot.Generation,
-		Reason:             ReasonClaimRearmLimitReached,
-		Message: fmt.Sprintf(
-			"%d re-arm attempts, no Kubernetes node %q ever registered: the controller stopped re-arming this claim, so "+
-				"spec.desiredPowerState %q and status.progress %q stay as they are and the slot keeps being counted as "+
-				"requested capacity. Scale the group down, or fix what keeps the machine from booting.",
-			attempts, kubernetesNodeName(slot), string(slot.Spec.DesiredPowerState), string(slot.Status.Progress)),
-	})
+	slot.Status.Conditions = fresh.Status.Conditions
 }
 
 // hasAutoscalerMarker reports whether cluster-autoscaler has put one of its deletion markers on a

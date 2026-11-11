@@ -507,9 +507,16 @@ func TestNodeReconcileSettlesAProgressThatOutlivedItsMachine(t *testing.T) {
 			recorder := events.NewFakeRecorder(16)
 
 			node := machinelessSlot(previous)
+
+			// The stamp of a transition that is over. A slot with no lifecycle Job object left -
+			// the Job was collected by its TTL - has its grace measured from status.lastStartupTime
+			// (progress.startupGrace), so a startup stamped now is a startup whose hook may still be
+			// running and is requeued, not settled. A slot of a pool that churned is stamped long
+			// past the grace, and that is what this pass acts on.
+			stale := metav1.NewTime(time.Now().Add(-progress.SettleGracePeriod - time.Minute))
+
 			if previous == infrav1alpha1.ProgressStartingUp {
-				stamp := metav1.Now()
-				node.Status.LastStartupTime = &stamp
+				node.Status.LastStartupTime = &stale
 			} else {
 				stamp := metav1.Now()
 				node.Status.LastShutdownTime = &stamp
@@ -807,19 +814,28 @@ func TestNodeReconcileRearmsAClaimAndRetriesTheMachine(t *testing.T) {
 
 	require.Len(t, rearmed, 1, "one re-arm, one event")
 	assert.Contains(t, rearmed[0], "Normal", "a re-arm is the system healing itself")
-	assert.Contains(t, rearmed[0], "1 of "+fmt.Sprint(progress.ClaimRearmLimit), "and the event counts the attempt")
+	assert.Contains(t, rearmed[0], "startup attempt 1 of "+fmt.Sprint(progress.ClaimRearmLimit),
+		"and the event names the attempt the arming leads to")
 	assert.NotContains(t, strings.Join(rearmed, "\n"), progress.ReasonProgressReconciled,
 		"a re-arm is not a settlement: the events distinguish the two, so an operator can tell a claim that is being retried from a machine that is gone")
 
 	condition := meta.FindStatusCondition(after.Status.Conditions, progress.ConditionClaimRearmed)
 	require.NotNil(t, condition, "the attempt count lives on the slot, so the bound survives a manager restart")
-	assert.Equal(t, progress.ReasonClaimRearmAttempt+"1", condition.Reason)
+	assert.Equal(t, progress.ReasonClaimRearmAttempt+"1", condition.Reason,
+		"the attempt is counted by the startup the pass started, not by the re-arm that armed it")
 }
 
-// TestNodeReconcileRearmIsBoundedAtTheReconcileLevel walks the reconcile to the bound and asserts the
-// pass stops creating servers: each pass re-arms and starts one Job, and at ClaimRearmLimit the pass
-// records one Warning and builds nothing. A claim whose machine cannot boot must not buy a machine per
-// grace period, forever.
+// TestNodeReconcileRearmIsBoundedAtTheReconcileLevel walks the whole shared mechanism through
+// Reconcile: each pass re-arms a claimed slot whose machine never registered, the FSM then starts
+// one machine for it, and the attempt is counted by the transition the pass ran. At
+// progress.ClaimRearmLimit the re-arming stops, the slot settles to the stable pair, one Warning goes
+// out, and the pass builds nothing. A claim whose machine cannot boot must not buy a machine per
+// resync, forever.
+//
+// The bound is one counter for both failure loops, and the test asserts whose counter it is: the
+// number on the slot is written by the startup (fsm.enterStartingUp), not by the watchdog's re-arm,
+// so the loud loop - a startup Job that exits non-zero, which this package never sees - pays into the
+// same account. A counter the watchdog kept for its own passes left that loop unbounded.
 func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
 	node := claimedMachinelessSlot(infrav1alpha1.ProgressReady)
 	reconciler := newTaintReconciler(t, node, createTestGroup())
@@ -828,47 +844,49 @@ func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
 	recorder := events.NewFakeRecorder(64)
 	reconciler.EventRecorder = recorder
 
-	for attempt := 1; attempt <= progress.ClaimRearmLimit; attempt++ {
-		require.NoError(t, firstReconcile(reconciler, request))
+	stale := metav1.NewTime(time.Now().Add(-progress.SettleGracePeriod - time.Minute))
 
-		// The startup Job of this attempt finished and its machine never registered: the shape the
-		// watchdog acts on again. The lifecycle Jobs are removed so the gate opens, exactly as the
-		// Job TTL does it in a cluster.
+	for attempt := 1; attempt <= progress.ClaimRearmLimit; attempt++ {
+		require.NoErrorf(t, firstReconcile(reconciler, request), "attempt %d of %d is inside the bound",
+			attempt, progress.ClaimRearmLimit)
+
+		current := readReconciledSlot(t, reconciler)
+		assert.Equal(t, infrav1alpha1.ProgressStartingUp, current.Status.Progress,
+			"the pass re-armed the slot and the FSM started the machine again")
+		assert.Equal(t, attempt, fsm.StartupAttemptsOf(current),
+			"the startup counts the attempt, not the re-arm that armed it")
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1, "one machine per attempt")
+
+		// The startup of the attempt finished and its machine never registered: the Job is gone (the
+		// TTL collects it), the operation's lock is released, and the slot is left at a progress that
+		// names a machine. All three are what the watchdog's gates read.
 		for i := range listLifecycleJobs(t, reconciler.Client) {
 			require.NoError(t, reconciler.Delete(context.Background(), &listLifecycleJobs(t, reconciler.Client)[i]))
 		}
 
-		current := &infrav1alpha1.Node{}
-		require.NoError(t, reconciler.Get(context.Background(),
-			types.NamespacedName{Name: "test-node", Namespace: "default"}, current))
-
-		// The startup of the attempt completed: its coordination lock is released, its Job is
-		// removed by the TTL, and the slot is left at a progress that names a machine. All three are
-		// what the watchdog's gates read, so all three are the real shape between attempts.
-		for _, key := range []string{
-			fsm.OperationLockAnnotation, fsm.LockOwnerAnnotation,
-			fsm.LockTimestampAnnotation, fsm.LockTimeoutAnnotation,
-		} {
-			delete(current.Annotations, key)
-		}
-
-		if len(current.Annotations) == 0 {
-			current.Annotations = nil
-		}
-
-		require.NoError(t, reconciler.Update(context.Background(), current))
-
+		releaseLock(t, reconciler, current)
 		current.Status.Progress = infrav1alpha1.ProgressReady
 		current.Status.PowerState = infrav1alpha1.PowerStateOff
+
+		// The attempt is over: its Job was collected by the TTL, and the startup stamp the FSM left
+		// on the slot is what the watchdog measures its grace from when no Job object is left
+		// (progress.startupGrace). An attempt that finished a while ago is stamped past the grace,
+		// which is the shape between two attempts of a pool that churns; the test says so in
+		// milliseconds, so the stamp is moved by hand.
+		current.Status.LastStartupTime = &stale
+
 		require.NoError(t, reconciler.Status().Update(context.Background(), current))
 	}
 
-	// One more pass: the bound is used up, so the re-arming stops and the Warning goes out.
+	// One more pass: the bound is used up. The slot settles to the stable pair with its claim kept, one
+	// Warning goes out, the FSM refuses the start the arming would have led to, and no server is built.
 	require.NoError(t, firstReconcile(reconciler, request))
 
-	current := &infrav1alpha1.Node{}
-	require.NoError(t, reconciler.Get(context.Background(),
-		types.NamespacedName{Name: "test-node", Namespace: "default"}, current))
+	current := readReconciledSlot(t, reconciler)
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, current.Status.Progress,
+		"no machine, so no ready: the phantom is closed, not reported")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, current.Status.PowerState)
+	assert.Equal(t, infrav1alpha1.PowerStateOn, current.Spec.DesiredPowerState, "the claim is the provider's to drop")
 
 	condition := meta.FindStatusCondition(current.Status.Conditions, progress.ConditionClaimRearmed)
 	require.NotNil(t, condition)
@@ -885,11 +903,105 @@ func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
 		}
 	}
 
-	require.Len(t, warnings, 1, "the phantom is reported once, not on every resync")
+	require.Len(t, warnings, 1, "the bound is reported once, not on every resync")
 	assert.Contains(t, warnings[0], "Warning")
+	assert.Contains(t, warnings[0], fmt.Sprint(progress.ClaimRearmLimit), "the Warning names the attempts it spent")
 
 	require.NoError(t, firstReconcile(reconciler, request))
 	assert.Zero(t, len(drainEvents(recorder)), "and the passes after it are silent")
+	assert.Equal(t, current.ResourceVersion, readReconciledSlot(t, reconciler).ResourceVersion,
+		"a settled slot that will not boot writes nothing, so a broken pool costs no API traffic")
+}
+
+// TestNodeReconcileRefusesAStartOnASlotThatUsedItsAttempts is the second entry of the bound at the
+// reconcile level: the loud loop. A startup Job that exits non-zero leaves the slot at the stable
+// {desired: on, powerState: off, progress: shutdown} pair (afterJobFailed writes the progress and
+// nothing else), which is exactly the state the controller's StartNode branch fires from, and the
+// progress watchdog never looks at it: a progress of shutdown implies no machine. The bound is
+// therefore enforced by the FSM's StartNode, and the pass that finds the attempts spent must build no
+// Job, leave the slot at the stable pair, and record one Warning.
+//
+// It is also the steady-state case: the refusal is not a retry, so a slot that is permanently broken
+// writes and records nothing after the first pass, and the reconcile does not fail (the operator's
+// signal is the event, not controller-runtime's rate limiter).
+func TestNodeReconcileRefusesAStartOnASlotThatUsedItsAttempts(t *testing.T) {
+	node := claimedMachinelessSlot(infrav1alpha1.ProgressShutdown)
+	stamp := metav1.Now()
+	node.Status.LastStartupTime = &stamp
+
+	reconciler := newTaintReconciler(t, node, createTestGroup())
+
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"}}
+	recorder := events.NewFakeRecorder(32)
+	reconciler.EventRecorder = recorder
+
+	current := readReconciledSlot(t, reconciler)
+	meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+		Type:   progress.ConditionClaimRearmed,
+		Status: metav1.ConditionTrue,
+		Reason: progress.ReasonClaimRearmAttempt + fmt.Sprint(progress.ClaimRearmLimit),
+		Message: fmt.Sprintf("startup attempt %d recorded by the FSM: every startup Job of this slot exited non-zero",
+			progress.ClaimRearmLimit),
+	})
+	require.NoError(t, reconciler.Status().Update(context.Background(), current))
+
+	require.NoError(t, firstReconcile(reconciler, request),
+		"a refusal is not a reconcile failure: the slot is stable and the record is the event")
+
+	after := readReconciledSlot(t, reconciler)
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress, "the slot stays at the stable pair")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState)
+	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "and keeps the claim")
+	assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "the fourth StartNode is refused, so no machine is bought")
+
+	condition := meta.FindStatusCondition(after.Status.Conditions, progress.ConditionClaimRearmed)
+	require.NotNil(t, condition)
+	assert.Equal(t, progress.ReasonClaimRearmLimitReached, condition.Reason,
+		"the refusal stamps the note, which is what the deduplication reads")
+
+	recorded := drainEvents(recorder)
+	require.Len(t, recorded, 1, "one Warning for the bound")
+	assert.Contains(t, recorded[0], "Warning")
+	assert.Contains(t, recorded[0], progress.ReasonClaimRearmLimitReached)
+
+	before := readReconciledSlot(t, reconciler)
+
+	require.NoError(t, firstReconcile(reconciler, request))
+	assert.Zero(t, len(drainEvents(recorder)), "and every later pass is silent")
+	assert.Equal(t, before.ResourceVersion, readReconciledSlot(t, reconciler).ResourceVersion,
+		"with no status write at all")
+	assert.Empty(t, listLifecycleJobs(t, reconciler.Client))
+}
+
+// readReconciledSlot reads the slot the reconciler's client holds.
+func readReconciledSlot(t *testing.T, reconciler *NodeReconciler) *infrav1alpha1.Node {
+	t.Helper()
+
+	node := &infrav1alpha1.Node{}
+	require.NoError(t, reconciler.Get(context.Background(),
+		types.NamespacedName{Name: "test-node", Namespace: "default"}, node))
+
+	return node
+}
+
+// releaseLock removes the coordination lock annotations of a slot, which is what the completion of an
+// operation does: the lock is not the watchdog's to clear, and a test that leaves one on the slot
+// tests the lock gate instead of the attempt bound.
+func releaseLock(t *testing.T, reconciler *NodeReconciler, node *infrav1alpha1.Node) {
+	t.Helper()
+
+	for _, key := range []string{
+		fsm.OperationLockAnnotation, fsm.LockOwnerAnnotation,
+		fsm.LockTimestampAnnotation, fsm.LockTimeoutAnnotation,
+	} {
+		delete(node.Annotations, key)
+	}
+
+	if len(node.Annotations) == 0 {
+		node.Annotations = nil
+	}
+
+	require.NoError(t, reconciler.Update(context.Background(), node))
 }
 
 // TestReadinessTaintKeysStampedFromTheGroup is the wiring of the configurable gate key: the key belongs

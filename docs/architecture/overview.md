@@ -49,9 +49,13 @@ Homelab Autoscaler is a Kubernetes operator with gRPC integration for physical n
   ~7 minute settle grace, no live lock). A slot desired `off` is settled to `off`/`shutdown`
   (`ProgressReconciled` Warning). A **claim** - `spec.desiredPowerState: on`, the autoscaler asked for
   the machine - is never settled: it is **re-armed** to `shutdown` with the claim left on, so the FSM
-  can start it again (`ClaimRearmed`, bounded by 3 attempts, then one `ClaimRearmLimitReached`
-  Warning). A ready, claimed slot whose node is cordoned with nothing running on it is uncordoned
-  (`CordonReconciled`). It runs at the top of every pass, before any transition
+  can start it again (`ClaimRearmed`). The retries are bounded by **one startup-attempt counter**
+  (3 per claim episode, counted by the `StartNode` transition and cleared when a boot passes the
+  readiness gate) that both failure loops pay into - the watchdog's re-arm, and a startup Job that
+  exits non-zero and rolls the slot back to `shutdown`, which the watchdog never sees. Past the bound
+  the watchdog settles the slot and `StartNode` refuses to start it, with one
+  `ClaimRearmLimitReached` Warning. A ready, claimed slot whose node is cordoned with nothing running
+  on it is uncordoned (`CordonReconciled`). It runs at the top of every pass, before any transition
 
 **Core Controller** (`internal/controller/core/node_controller.go`)
 - Bridges Kubernetes nodes with Node CRDs

@@ -24,6 +24,7 @@ import (
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -115,6 +116,43 @@ func (nm *NodeStateMachine) StartNode() error {
 	ctx := context.TODO()
 
 	logger.Info("Triggering StartNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
+
+	// The startup-attempt bound, checked before the transition and therefore before the coordination
+	// lock, before the Job cleanup and before the Job: a slot that has used its attempts must not
+	// power a machine again, and it must not touch the slot of the operation that owns it either.
+	//
+	// This is the check that closes the loud loop. A startup Job that exits non-zero drives
+	// startingup -> JobFailed -> shutdown, afterJobFailed writes the *progress* only, and the next
+	// pass of the node controller sees desired on && powerState off && CanTransition(StartNode) and
+	// builds another Job and another machine. Unbounded, that is one machine per pass, forever, with
+	// no counter and no event. Bounded, this refusal is the end of it: the slot keeps the stable
+	// off/shutdown pair the rollback wrote, keeps its claim, and records one Warning naming the
+	// attempts it spent. The loop the progress watchdog re-arms (a startup whose Job completed with
+	// no node behind it) is the same counter, incremented by the same enterStartingUp hook and
+	// enforced by the same check - see internal/fsm/startup_attempts.go.
+	if attempts, exhausted := nm.StartupAttemptsSpent(); exhausted {
+		cause := startupAttemptRefusalCause(nm.node)
+
+		// The note is the deduplication: exactly one Warning per claim episode, whoever wrote the note
+		// (the watchdog's limit pass and this refusal share the record, so a slot is reported once).
+		_, noted := nm.noteStartupAttemptLimit(cause)
+		if noted {
+			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonStartupAttemptLimitReached, ActionPowerOn,
+				startupAttemptLimitNote(nm.node, attempts, cause))
+		}
+
+		// Info, not Error: the controller has stopped buying machines for a slot that cannot boot, and
+		// the refusal is the fix working. The attempts are in the line, because the question an
+		// operator asks next is "how many times did it try".
+		logger.Info("Refusing to start a slot that has used its startup attempts",
+			"node", nm.node.Name,
+			"attempts", attempts,
+			"limit", StartupAttemptLimit,
+			"evidence", cause,
+			"warning", "recorded on the slot"+notedSuffix(noted))
+
+		return &StartupAttemptLimitError{Node: nm.node.Name, Attempts: attempts, Limit: StartupAttemptLimit}
+	}
 
 	// Trigger FSM event. A cancellation from the coordination lock leaves status.progress on
 	// the stable state the transition started from (see beforeStartNode) and returns a
@@ -708,6 +746,53 @@ func (nm *NodeStateMachine) updateNodeProgress(progress infrav1alpha1.Progress) 
 	}
 }
 
+// startupAttemptRefusalCause renders the evidence a startup-attempt refusal quotes, read off the
+// slot itself. The two shapes the loop leaves behind are recorded on the slot - the JobFailed
+// condition afterJobFailed stamps, and the progress the attempt died at - so the Warning names what
+// happened to this slot's machines instead of guessing at a generic cause.
+func startupAttemptRefusalCause(node *infrav1alpha1.Node) string {
+	if condition := meta.FindStatusCondition(node.Status.Conditions, "JobFailed"); condition != nil &&
+		condition.Status == metav1.ConditionTrue {
+		return "the startup Jobs of those attempts exited non-zero, and the slot rolled back to status.progress " +
+			string(node.Status.Progress) + " each time"
+	}
+
+	if node.Spec.KubernetesNodeName != "" {
+		return fmt.Sprintf("no Kubernetes node %q ever registered for the machines those attempts started",
+			node.Spec.KubernetesNodeName)
+	}
+
+	return "each attempt ended back at status.powerState off with no Kubernetes node behind it"
+}
+
+// startupAttemptLimitNote renders the Warning of a refusal: the attempts, the evidence, what the
+// controller stopped doing, and the two things an operator can do about it. The condition the
+// refusal stamps carries the same facts for `kubectl describe`; this is the one-liner that shows up
+// in the event stream, where a pool that stopped booting has to be visible without opening an object.
+func startupAttemptLimitNote(node *infrav1alpha1.Node, attempts int, cause string) string {
+	return fmt.Sprintf(
+		"Scale up refused for %s: %d of %d startup attempts used (%s). The controller will not start "+
+			"another machine for this slot, so it stays at status.progress %q with status.powerState %q while "+
+			"spec.desiredPowerState stays %q - the request stands and the slot keeps being counted as requested "+
+			"capacity. Scale the group down to drop the claim, or fix what keeps the machine from booting (startup "+
+			"command, image, power API credentials): a boot that passes the readiness gate clears the record and the "+
+			"%d attempts with it.",
+		startupAttemptTarget(node), attempts, StartupAttemptLimit, cause,
+		string(node.Status.Progress), string(node.Status.PowerState), string(node.Spec.DesiredPowerState),
+		StartupAttemptLimit)
+}
+
+// notedSuffix says, for the log line, whether the Warning went out with this refusal. The note is
+// written once per claim episode, so every later refusal logs the refusal and records nothing, and
+// the log has to say which of the two happened.
+func notedSuffix(noted bool) string {
+	if noted {
+		return " on the slot"
+	}
+
+	return ", already recorded on the slot"
+}
+
 // setNodeUnschedulable cordons the Kubernetes node to prevent new pods from being scheduled
 func (nm *NodeStateMachine) setNodeUnschedulable(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "cordon")
@@ -899,10 +984,13 @@ func (p *schedulablePoll) wait() {
 // stamped before the node is uncordoned, so the machine is tainted before a pod can be bound to it
 // (see the loop body for the ordering).
 //
-// The loop also re-stamps the coordination lock of the slot (see renewOperationLock): the gate can
-// outlast the lock's own timeout, and a lock that ages out stops protecting the slot it names,
-// which is precisely the window in which the progress watchdog, the next acquisition and the
-// expired-lock cleanup all conclude that the operation is over.
+// The loop also re-stamps the coordination lock of the slot (see renewOperationLock), on every pass
+// of both halves: the gate can outlast the lock's own timeout, and a lock that ages out stops
+// protecting the slot it names, which is precisely the window in which the progress watchdog, the
+// next acquisition and the expired-lock cleanup all conclude that the operation is over. Renewing
+// only in the readiness half is the bug this closes: a startup Job longer than ~3m arrives at the
+// gate with the lock already expired, RenewLock will not resurrect an expired lock, and the whole
+// 4m gate then runs with nothing protecting the slot.
 //
 // A timeout does not wedge anything: the loop uncordons the node on the way out, records a Warning
 // on the Node CR naming the gate it was waiting on, and returns an error the caller logs and
@@ -948,6 +1036,15 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		kubeNode := &corev1.Node{}
 		if err := nm.client.Get(ctx, client.ObjectKey{Name: nodeName}, kubeNode); err != nil {
 			logger.Info("Node not found yet, retrying", "error", err.Error(), "elapsed", time.Since(start).String())
+
+			// The registration wait keeps the lock too, and this is the half that used to run with
+			// none: a startup Job longer than ~3m means the lock - acquired when the transition into
+			// startingup ran, with DefaultLockTimeout (5m) - has already aged out by the time the
+			// node object appears, and RenewLock deliberately refuses to resurrect an expired lock.
+			// Renewing here is what keeps the lock alive across the whole gate: the slot is held for
+			// the registration wait as much as for the readiness half, and a watchdog that sees a stale
+			// lock settles a slot whose hook is still running.
+			nm.renewOperationLock()
 			poll.wait()
 
 			continue
@@ -1010,6 +1107,7 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		}
 
 		logger.Info("Retrying uncordon operation", "error", err.Error(), "elapsed", time.Since(start).String())
+		nm.renewOperationLock()
 		poll.wait()
 	}
 }

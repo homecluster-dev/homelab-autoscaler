@@ -187,8 +187,25 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 			// uncordon itself has already been attempted by the loop on the way out of its timeout
 			// (setNodeSchedulableWithRetry), so the only case that leaves the node cordoned is a
 			// write that the API server refused, and the next startup's loop is the one that fixes it.
+			//
+			// A gate that timed out does NOT reset the startup-attempt record. The slot is about to be
+			// recorded ready with the bootstrap taint still on it, which is the machine the pool paid
+			// for and cannot use - the exact failure the bound exists to price. Only a gate that
+			// answered resets, in the else branch below.
 		} else {
 			logger.Info("Successfully uncordoned Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
+
+			// The gate is satisfied: the node object exists, it reports Ready, it is free of every
+			// readiness taint the Group declares, and it is uncordoned. That is the proof the claim
+			// episode booted a machine the pool can use, and the one place the startup-attempt counter
+			// is reset. JobCompleted alone is not: a startup whose Job succeeded and whose machine never
+			// clears its CNI taint has spent its attempts and must keep them counted, or the bound is
+			// cleared by the failure it bounds and the loop it exists for is unbounded again.
+			//
+			// Resetting here is also what keeps the counter from becoming a lifetime sentence: slots are
+			// long-lived and are reused across claim episodes, so a count that is never cleared makes the
+			// fourth unrelated failure of a machine over its life the last one the pool ever retries.
+			nm.clearStartupAttemptRecord()
 		}
 	}
 
@@ -304,6 +321,24 @@ func (nm *NodeStateMachine) enterStartingUp(ctx context.Context, e *fsm.Event) {
 
 	// Update node status
 	nm.updateNodeProgress(infrav1alpha1.ProgressStartingUp)
+
+	// Count the startup attempt. This is the one place every startup attempt begins: the
+	// shutdown -> startingup transition is what a lifecycle Job and a power-on of a real machine hang
+	// off, and both entries of the failure loop pass through it - the controller's StartNode after a
+	// JobFailed/JobTimeout rollback, and the re-arm the progress watchdog writes for a claim whose
+	// machine never registered, which hands the slot to that same StartNode. Counting here is what
+	// makes one bound cover both loops; counting the watchdog's re-arms covered one of them and left
+	// the loud one unbounded, buying a machine per pass.
+	//
+	// The record is cleared where an attempt demonstrably succeeded - the readiness gate of
+	// afterJobCompleted - so the bound is a bound on one claim episode, not on the life of a slot
+	// that is reused across claims. See internal/fsm/startup_attempts.go.
+	attempt := nm.recordStartupAttempt()
+
+	logger.V(1).Info("Recorded a startup attempt",
+		"node", nm.node.Name,
+		"attempt", attempt,
+		"limit", StartupAttemptLimit)
 
 	// Add progressing condition
 	nm.addNodeCondition(metav1.Condition{

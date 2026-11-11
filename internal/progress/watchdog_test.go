@@ -230,7 +230,7 @@ func TestSettleNeverOverridesTheClaimIsTheRearm(t *testing.T) {
 	require.True(t, outcome.Rearmed, "a claimed slot whose machine is gone is re-armed, not left pointing at one")
 	assert.Equal(t, ActionRearm, outcome.Action)
 	assert.Equal(t, infrav1alpha1.ProgressReady, outcome.Previous, "the outcome names the progress it replaced")
-	assert.Equal(t, 1, outcome.Attempts, "the first re-arm is attempt 1")
+	assert.Zero(t, outcome.Attempts, "no attempt has been spent yet: the count is the FSMs, and this pass arms the first")
 
 	after := readSlot(t, c)
 	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress, "progress: shutdown is the state StartNode is legal from")
@@ -250,7 +250,7 @@ func TestSettleNeverOverridesTheClaimIsTheRearm(t *testing.T) {
 	event := <-recorder.Events
 	assert.Contains(t, event, corev1.EventTypeNormal, "a re-arm is the system healing itself, not an incident")
 	assert.Contains(t, event, ReasonClaimRearmed)
-	assert.Contains(t, event, "1 of 3", "the event counts the attempts, so a pool that keeps buying machines is legible")
+	assert.Contains(t, event, "startup attempt 1 of 3", "the event names the attempt the arming leads to, so a pool that keeps buying machines is legible")
 	assert.Contains(t, event, string(infrav1alpha1.ProgressReady), "and names the progress it replaced")
 }
 
@@ -381,62 +381,109 @@ func readKubernetesNode(t *testing.T, c client.Client) *corev1.Node {
 	return node
 }
 
-// TestSettleRearmBoundIsEnforcedStopsTheLoopAndSaysSoOnce is the bound: each re-arm is a real startup
-// of a real machine, so a claim whose machine cannot boot may not recreate a server every grace
-// period forever. At ClaimRearmLimit the re-arming stops, the slot keeps the progress it had (it is
-// not being healed any more), a Warning names the phantom, and the passes after it write and record
-// nothing.
-func TestSettleRearmBoundIsEnforcedStopsTheLoopAndSaysSoOnce(t *testing.T) {
+// stampAttempts writes the startup-attempt record the FSM owns onto the slot in the client, in the
+// wire shape the bound reads (fsm.ReasonStartupAttempt + the count). The watchdog never writes that
+// record, so a test of its bound has to put it there the way the cluster does: an attempt counted by
+// the transition into startingup, not by a pass of this package.
+func stampAttempts(t *testing.T, c client.Client, attempts int) {
+	t.Helper()
+
+	current := readSlot(t, c)
+
+	meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+		Type:    ConditionClaimRearmed,
+		Status:  metav1.ConditionTrue,
+		Reason:  ReasonClaimRearmAttempt + fmt.Sprint(attempts),
+		Message: fmt.Sprintf("startup attempt %d recorded by the FSM", attempts),
+	})
+
+	require.NoError(t, c.Status().Update(context.Background(), current))
+}
+
+// TestSettleSpentAttemptsRearmsUntilTheBoundThenSettlesAndSaysSoOnce is the bound and the phantom
+// closed. Each re-arm is a startup the pool is about to make, and the count that bounds it is the
+// FSM's startup-attempt record: the watchdog reads it, never writes it. Until the bound the slot is
+// re-armed so the pool retries the machine; at the bound the re-arming stops and the slot is settled
+// to the stable off/shutdown pair, with the claim kept and exactly one Warning naming it.
+//
+// The settlement at the bound is the point. Refusing to re-arm and leaving the progress where it was
+// leaves a slot at ready with no machine: a slot the FSM cannot start (StartNode is illegal from
+// ready), cannot shut down without building a shutdown Job for a server that is already gone, and
+// cannot be healed by any other writer - the bound would have traded an unbounded loop for a frozen
+// phantom. The claim and its target-size unit stay in both shapes, by design: the request is the
+// provider's to drop (countsTowardsTargetSize counts a claimed slot whatever its progress says), and
+// what the settlement changes is that the progress stops lying, which is what makes the slot
+// healable when an operator fixes the template.
+func TestSettleSpentAttemptsRearmsUntilTheBoundThenSettlesAndSaysSoOnce(t *testing.T) {
 	node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
 	node.Status.PowerState = infrav1alpha1.PowerStateOff
 	c := newClient(t, node)
 
-	for attempt := 1; attempt <= ClaimRearmLimit; attempt++ {
+	for spent := 0; spent < ClaimRearmLimit; spent++ {
 		recorder := events.NewFakeRecorder(8)
 
-		// Each attempt is the shape the previous one left: progress shutdown, desired on, and the
-		// startup that ran from it finished with no node behind it.
+		// Each pass is the shape the previous attempt left: the slot is at a progress that names a
+		// machine, the startup that ran from the last re-arm finished, and the FSM counted that
+		// attempt on the transition into startingup.
 		current := readSlot(t, c)
 		current.Status.Progress = infrav1alpha1.ProgressReady
+		current.Status.PowerState = infrav1alpha1.PowerStateOff
 		require.NoError(t, c.Status().Update(context.Background(), current))
 
-		outcome := settle(t, c, current, recorder)
+		if spent > 0 {
+			stampAttempts(t, c, spent)
+		}
 
-		require.True(t, outcome.Rearmed, "attempt %d of %d re-arms", attempt, ClaimRearmLimit)
-		assert.Equal(t, attempt, outcome.Attempts, "the counter is on the slot, not in the process")
+		outcome := settle(t, c, readSlot(t, c), recorder)
 
-		condition := rearmCondition(t, c)
-		assert.Equal(t, ReasonClaimRearmAttempt+fmt.Sprint(attempt), condition.Reason, "the record is the counter")
+		require.True(t, outcome.Rearmed, "%d attempts spent of %d: the slot is still armed", spent, ClaimRearmLimit)
+		assert.Equal(t, spent, outcome.Attempts, "the count the pass reports is the FSM's, read not written")
+
+		after := readSlot(t, c)
+		assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress)
+		assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "the claim stands")
+		assert.Equal(t, spent, fsm.StartupAttemptsOf(after),
+			"a re-arm arms an attempt, it does not spend one: the counter belongs to the transition that starts the machine, so the loud loop (a Job that exits non-zero) pays into the same account")
 
 		event := <-recorder.Events
 		assert.Contains(t, event, ReasonClaimRearmed)
-		assert.Contains(t, event, fmt.Sprintf("%d of %d", attempt, ClaimRearmLimit))
+		assert.Contains(t, event, fmt.Sprintf("startup attempt %d of %d", spent+1, ClaimRearmLimit),
+			"the event names the attempt the arming leads to")
 	}
 
-	// The bound is used up. The slot is a phantom: it stays at a progress that names a machine, it is
-	// counted as requested capacity, and the controller says so - once.
+	// The bound is used up: the third attempt booted nothing, and the FSM counted it. The slot
+	// settles, keeps its claim, and says so - once.
 	recorder := events.NewFakeRecorder(8)
+
+	stampAttempts(t, c, ClaimRearmLimit)
 
 	current := readSlot(t, c)
 	current.Status.Progress = infrav1alpha1.ProgressReady
+	current.Status.PowerState = infrav1alpha1.PowerStateOff
 	require.NoError(t, c.Status().Update(context.Background(), current))
 
-	outcome := settle(t, c, current, recorder)
+	outcome := settle(t, c, readSlot(t, c), recorder)
 
-	assert.Equal(t, ActionNone, outcome.Action, "the re-arming stopped")
-	assert.False(t, outcome.Rearmed)
+	assert.Equal(t, ActionSettle, outcome.Action, "the re-arming stopped, and the slot is settled in its place")
+	assert.True(t, outcome.Settled)
 	assert.Zero(t, outcome.RequeueAfter, "and it is not scheduled to resume: the bound is the end of the loop")
-	assert.Contains(t, outcome.Reason, "limit")
+	assert.Empty(t, outcome.Reason, "the action is reported by its event; the refusal reason is for the no-action path")
+	assert.Equal(t, ClaimRearmLimit, outcome.Attempts, "the Warning names the attempts that were spent")
 
 	after := readSlot(t, c)
-	assert.Equal(t, infrav1alpha1.ProgressReady, after.Status.Progress, "a slot nothing is healing is not moved")
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress,
+		"no machine, so no ready: the phantom is closed, not renamed")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState)
 	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "and its claim is untouched")
 
-	require.Len(t, recorder.Events, 1, "the limit is an operator-visible Warning")
+	require.Len(t, recorder.Events, 1, "the bound is an operator-visible Warning")
 	event := <-recorder.Events
-	assert.Contains(t, event, corev1.EventTypeWarning, "this one is the shape that costs money: a slot counted as capacity with no machine")
+	assert.Contains(t, event, corev1.EventTypeWarning)
 	assert.Contains(t, event, ReasonClaimRearmLimitReached)
-	assert.Contains(t, event, fmt.Sprint(ClaimRearmLimit), "the event names the bound that was hit")
+	assert.Contains(t, event, fmt.Sprint(ClaimRearmLimit), "the Warning names the bound that was hit")
+
+	assert.Equal(t, ReasonClaimRearmLimitReached, rearmCondition(t, c).Reason,
+		"the record is the note, so the passes after it have nothing left to write")
 
 	before := readSlot(t, c)
 
@@ -445,11 +492,26 @@ func TestSettleRearmBoundIsEnforcedStopsTheLoopAndSaysSoOnce(t *testing.T) {
 		again := settle(t, c, readSlot(t, c), quiet)
 
 		assert.Equal(t, ActionNone, again.Action)
-		assert.Zero(t, len(quiet.Events), "a phantom is reported once, not on every resync")
+		assert.Zero(t, len(quiet.Events), "a slot that will not boot is reported once, not on every resync")
 	}
 
 	assert.Equal(t, before.ResourceVersion, readSlot(t, c).ResourceVersion, "and the note is written exactly once")
-	assert.Equal(t, ReasonClaimRearmLimitReached, rearmCondition(t, c).Reason)
+}
+
+// TestSettleRearmLeavesTheAttemptRecordAlone: the counter is the FSM's. A re-arm that stamped the
+// record is a count that charges the watchdog's passes, which is the shape that made a bound of 3 a
+// lifetime sentence - slots are reused across claim episodes, and the record never went away.
+func TestSettleRearmLeavesTheAttemptRecordAlone(t *testing.T) {
+	node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node.Status.PowerState = infrav1alpha1.PowerStateOff
+	c := newClient(t, node)
+
+	settle(t, c, node, events.NewFakeRecorder(8))
+
+	after := readSlot(t, c)
+	assert.Zero(t, fsm.StartupAttemptsOf(after), "the watchdog arms attempts and counts none")
+	assert.Nil(t, meta.FindStatusCondition(after.Status.Conditions, ConditionClaimRearmed),
+		"and writes no record at all")
 }
 
 // TestSettleRearmIsIdempotent: a slot that was re-armed and has not run a startup since is at
@@ -699,9 +761,14 @@ func TestDecideIsTheRule(t *testing.T) {
 			wantReasonIs: "startup finished",
 		},
 		{
-			name:         "claimed, at the re-arm bound: stop, and say the reason is the bound",
+			// The bound closes the slot, it does not freeze it: a claimed slot whose startup
+			// attempts are spent is settled to the stable pair, because leaving it at ready with no
+			// machine is the phantom the whole path exists to remove, and the FSM refuses the start
+			// a re-arm would lead to.
+			name:         "claimed, at the startup-attempt bound: settle, and say the reason is the bound",
 			node:         claimed(infrav1alpha1.ProgressReady),
-			obs:          observations{rearmAttempts: ClaimRearmLimit},
+			obs:          observations{startupAttempts: ClaimRearmLimit},
+			wantAction:   ActionSettle,
 			wantReasonIs: "limit",
 		},
 		{
@@ -1233,6 +1300,160 @@ func TestSettleLeavesACordonThatMeansSomethingAlone(t *testing.T) {
 				"the node keeps the cordon that means something")
 			assert.Equal(t, beforeSlot.ResourceVersion, readSlot(t, c).ResourceVersion, "and the slot is not written")
 			assert.Zero(t, len(recorder.Events))
+		})
+	}
+}
+
+// TestSettleGraceIsMeasuredFromTheStartupStampWhenNoJobObjectIsGone closes the gap the Job gate
+// leaves. The grace is measured from the lifecycle Job, and a slot very often has no Job object to
+// measure: a startup Job whose spec.ttlSecondsAfterFinished is short is collected minutes after it
+// finished, and its after_JobCompleted hook - registration wait, readiness gate - can be minutes
+// from writing the progress that hook owns. With no Job the gate opened immediately, so the watchdog
+// settled the slot mid-hook and the hook wrote ready on top of it: two writers, one slot, a
+// progress that named a machine for a second time, and the duplicate scale-up the grace exists to
+// prevent. status.lastStartupTime is the stamp the FSM's own progress write leaves on the transition
+// into startingup, so it carries the window across the gap.
+func TestSettleGraceIsMeasuredFromTheStartupStampWhenNoJobObjectIsGone(t *testing.T) {
+	t.Run("a startup stamped inside the grace is left alone", func(t *testing.T) {
+		for _, desired := range []infrav1alpha1.PowerState{infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn} {
+			t.Run(string(desired), func(t *testing.T) {
+				recorder := events.NewFakeRecorder(8)
+
+				node := slot(desired, infrav1alpha1.ProgressStartingUp)
+				node.Status.PowerState = infrav1alpha1.PowerStateOn
+				stamp := metav1.NewTime(time.Now().Add(-time.Minute))
+				node.Status.LastStartupTime = &stamp
+
+				c := newClient(t, node)
+				before := readSlot(t, c)
+
+				outcome := settle(t, c, node, recorder)
+
+				assert.Equal(t, ActionNone, outcome.Action,
+					"a startup younger than the grace is an operation whose writer may still be running, with or without a Job object")
+				assert.Greater(t, outcome.RequeueAfter, time.Duration(0), "and the look is scheduled, not forgotten")
+				assert.Less(t, outcome.RequeueAfter, SettleGracePeriod, "on the rest of the grace, not on a fresh one")
+				assert.Contains(t, outcome.Reason, "lastStartupTime", "the log says what the window was measured from")
+
+				assert.Equal(t, before.ResourceVersion, readSlot(t, c).ResourceVersion, "nothing is written")
+				assert.Zero(t, len(recorder.Events), "and nothing is recorded")
+			})
+		}
+	})
+
+	t.Run("a startup stamped past the grace is the shape this package acts on", func(t *testing.T) {
+		recorder := events.NewFakeRecorder(8)
+
+		node := slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		stamp := metav1.NewTime(time.Now().Add(-SettleGracePeriod - time.Minute))
+		node.Status.LastStartupTime = &stamp
+
+		c := newClient(t, node)
+		outcome := settle(t, c, node, recorder)
+
+		assert.True(t, outcome.Settled, "the slot whose startup ran out of its grace is settled: the stamp is a floor, not a freeze")
+		assert.Equal(t, infrav1alpha1.ProgressShutdown, readSlot(t, c).Status.Progress)
+	})
+
+	t.Run("a slot with no startup stamp is not held by a deadline it has no evidence for", func(t *testing.T) {
+		recorder := events.NewFakeRecorder(8)
+
+		node := slot(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node.Status.PowerState = infrav1alpha1.PowerStateOff
+
+		c := newClient(t, node)
+		outcome := settle(t, c, node, recorder)
+
+		assert.True(t, outcome.Rearmed, "a slot that never stamped a startup has no window to wait out")
+		assert.Zero(t, outcome.RequeueAfter)
+	})
+
+	t.Run("the Job object stays the evidence when there is one", func(t *testing.T) {
+		recorder := events.NewFakeRecorder(8)
+
+		node := slot(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		stamp := metav1.NewTime(time.Now().Add(-SettleGracePeriod - time.Minute))
+		node.Status.LastStartupTime = &stamp
+
+		// A Job that finished 30s ago: the stamp is older than the grace, and the Job is not. The
+		// tightest deadline wins, and the Job is the one that says a writer is still running.
+		c := newClient(t, node, lifecycleJob(fsm.PhaseStartup, time.Now().Add(-30*time.Second)))
+		outcome := settle(t, c, node, recorder)
+
+		assert.Equal(t, ActionNone, outcome.Action)
+		assert.Greater(t, outcome.RequeueAfter, time.Duration(0))
+		assert.Contains(t, outcome.Reason, "settle grace")
+	})
+}
+
+// TestSettleSteadyStateWritesNothingAndRecordsNothing is the idempotency rule as one table: every
+// shape of a pool at rest is passed over with no status write and no event, on every resync. It
+// includes the two states the bound leaves behind - a slot that was re-armed (so its progress is the
+// stable shutdown, and the machine of the attempt is on its way), and a slot whose startup attempts
+// are spent (settled, noted, and reported once) - because the passes after an action are where an
+// event storm is born.
+func TestSettleSteadyStateWritesNothingAndRecordsNothing(t *testing.T) {
+	tests := []struct {
+		name     string
+		desired  infrav1alpha1.PowerState
+		progress infrav1alpha1.Progress
+		attempts int
+		object   client.Object
+	}{
+		{name: "no claim, already shutdown", desired: infrav1alpha1.PowerStateOff, progress: infrav1alpha1.ProgressShutdown},
+		{name: "no claim, never seeded", desired: infrav1alpha1.PowerStateOff, progress: ""},
+		{name: "claimed, shutdown: the re-arm's own steady state", desired: infrav1alpha1.PowerStateOn, progress: infrav1alpha1.ProgressShutdown},
+		{
+			name:     "claimed, shutdown, attempts spent: the bound's steady state",
+			desired:  infrav1alpha1.PowerStateOn,
+			progress: infrav1alpha1.ProgressShutdown,
+			attempts: ClaimRearmLimit,
+		},
+		{
+			name:     "claimed, ready, with a machine behind it",
+			desired:  infrav1alpha1.PowerStateOn,
+			progress: infrav1alpha1.ProgressReady,
+			object:   liveNode(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := slot(tc.desired, tc.progress)
+			node.Status.PowerState = infrav1alpha1.PowerStateOff
+
+			objects := []client.Object{node}
+			if tc.object != nil {
+				objects = append(objects, tc.object)
+			}
+
+			c := newClient(t, objects...)
+
+			if tc.attempts > 0 {
+				stampAttempts(t, c, tc.attempts)
+			}
+
+			if tc.attempts >= ClaimRearmLimit {
+				// The settled-and-noted slot is what the bound's own pass leaves behind.
+				current := readSlot(t, c)
+				fsm.StampStartupAttemptLimit(current, tc.attempts, settleLimitCause(current))
+				require.NoError(t, c.Status().Update(context.Background(), current))
+			}
+
+			before := readSlot(t, c)
+
+			for range 3 {
+				recorder := events.NewFakeRecorder(8)
+
+				outcome := settle(t, c, readSlot(t, c), recorder)
+
+				assert.Equal(t, ActionNone, outcome.Action)
+				assert.Zero(t, outcome.RequeueAfter, "nothing in flight, so nothing scheduled")
+				assert.NotEmpty(t, outcome.Reason)
+				assert.Zero(t, len(recorder.Events), "a pool at rest records nothing")
+			}
+
+			assert.Equal(t, before.ResourceVersion, readSlot(t, c).ResourceVersion, "and writes nothing")
 		})
 	}
 }

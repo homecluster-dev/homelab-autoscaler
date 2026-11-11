@@ -130,8 +130,11 @@ that check.
      `ProgressReconciled` Warning naming the progress it replaced;
    - `spec.desiredPowerState: on` (a claim) -> **re-arm**: the same pair, and the claim left alone,
      which is the shape `StartNode` is legal from, so the pool retries the machine. A `ClaimRearmed`
-     Normal event names the attempt; at `ClaimRearmLimit` (3) the re-arming stops and a
-     `ClaimRearmLimitReached` Warning names the phantom;
+     Normal event names the attempt the arming leads to. The retries are bounded by the
+     **startup-attempt counter** the FSM owns (`fsm.StartupAttemptLimit`, 3): it counts startup
+     attempts, not watchdog passes, and past the bound the re-arming stops and the slot is **settled**
+     to the stable pair with one `ClaimRearmLimitReached` Warning, so a slot whose machine will not
+     boot is never left at `ready` with nothing behind it;
    - the slot has a node object, is at `ready`, is claimed on, is cordoned, and carries no
      cluster-autoscaler marker -> **uncordon** it, with a `CordonReconciled` Warning. That is the
      residue of the paths that land in `ready` without the uncordon hook (`JobTimeout`, `JobFailed`).
@@ -147,14 +150,40 @@ allowed to fix the transitional values, and still is not.
 
 The two gates that are not obvious:
 
-- **The claim.** A slot with `spec.desiredPowerState: on` is never *settled*: the claim is the
-  request, and settling it would tell the provider its requested capacity does not exist. A claim
-  whose machine never booted is not left pointing at one either: it is re-armed (progress and power
-  state made true, `spec.desiredPowerState` untouched), because the alternative is a slot that
-  `StartNode` cannot leave, that `NodeGroupTargetSize` counts forever, that
-  `NodeGroupDecreaseTargetSize` cannot cancel, and that no other writer in the system heals. Giving
-  up on a claim - dropping `spec.desiredPowerState` - stays the provider's arithmetic, and is not
-  done here.
+- **The claim.** A slot with `spec.desiredPowerState: on` is never settled *out of the claim*: the
+  claim is the request, and dropping it, or telling the provider its requested capacity does not
+  exist, is the autoscaler's arithmetic (`NodeGroupDecreaseTargetSize`) and not this controller's
+  answer to a scale-up. A claim whose machine never booted is not left pointing at one either: it is
+  re-armed (progress and power state made true, `spec.desiredPowerState` untouched), because the
+  alternative is a slot that `StartNode` cannot leave, that `NodeGroupTargetSize` counts forever, that
+  `NodeGroupDecreaseTargetSize` cannot cancel, and that no other writer in the system heals. Past the
+  startup-attempt bound the same pair is written as a **settlement** - the progress is made true and
+  the claim is still left on - because the bound is the point where retrying stops and an operator has
+  to say why. What the settlement changes is the progress, which is what every other writer reads: from
+  `shutdown` the FSM can start the machine again the moment an operator fixes the template, and a
+  scale-down lands on a slot that is already off instead of building a shutdown Job for a server that is
+  gone. What it does not change is the arithmetic - a claimed slot counts toward the target size whatever
+  its progress says, because the request is what the autoscaler asked for, and dropping it stays
+  `NodeGroupDecreaseTargetSize` / `NodeGroupDeleteNodes`, never the watchdog's. The
+  `ClaimRearmLimitReached` Warning is what tells an operator the request is standing and will not be
+  filled.
+- **The startup-attempt bound.** A re-arm is a machine the pool is about to pay for, so the retries
+  are bounded - by one counter, shared by both failure loops, owned by the FSM
+  (`internal/fsm/startup_attempts.go`):
+  - it counts **startup attempts**, incremented where an attempt begins: the `StartNode` transition
+    (`enterStartingUp`, `shutdown -> startingup`), which is where the lifecycle Job and the power-on
+    hang off, and the one place the watchdog's re-arm and a `JobFailed` rollback both lead into;
+  - it is cleared where an attempt **demonstrably succeeded**: the readiness gate of
+    `afterJobCompleted`, the same place that decides the slot may be recorded `ready`. A completed
+    startup Job is not the proof - a machine that boots, registers and never clears its CNI bootstrap
+    taint has spent its attempts and keeps them counted - and a slot is reused across claim episodes,
+    so a count that is never cleared is a lifetime bound, not a bound on the failure;
+  - it is enforced on **both** paths: the watchdog refuses to re-arm past the limit, and
+    `fsm.NodeStateMachine.StartNode` refuses to start (the loud loop - a startup Job that exits
+    non-zero - leaves the slot at the stable `off`/`shutdown` pair, which implies no machine, so the
+    watchdog never sees it at all and the FSM is the only writer in front of it). Past the bound the
+    slot is settled to the stable pair, its claim is kept, and exactly one `ClaimRearmLimitReached`
+    Warning is recorded.
 - **The grace.** `SettleGracePeriod` (~7 minutes) is how long a *finished* lifecycle Job keeps its
   slot out of reach. The Job is the operation and the state machine that started it is the writer
   that settles the progress it moved, and the hook that settles it is not instantaneous: it runs
@@ -169,7 +198,12 @@ The two gates that are not obvious:
   against the 5m Job timeout: it applies only to a finished Job, and a Job that is pending or
   running is never acted on at all, at any length. The bound it does respect is the 15m
   `StuckTransitionThreshold`: a slot whose monitor died with its manager - the shape the watchdog
-  exists for - is healed well inside the horizon an operator calls stuck.
+  exists for - is healed well inside the horizon an operator calls stuck. With no Job object left at
+  all - the TTL collected it, which a short `spec.ttlSecondsAfterFinished` makes routine - the same
+  window is measured from `status.lastStartupTime`, the stamp the FSM's own progress write leaves on
+  the transition into `startingup`: the absence of a Job is not evidence that the operation is over,
+  and a grace that only exists while the Job object does would open inside the hook that owns the
+  progress.
 
 ### Ready means the machine can take the pool's work
 
@@ -304,15 +338,29 @@ The FSM provides robust error recovery:
   [The authority order for status.progress](#the-authority-order-for-statusprogress))
 - A **claim** (a slot with `spec.desiredPowerState: on`) whose machine never booted is re-armed, not
   settled: the progress and the power state are made true, the claim stays, and the pool retries the
-  machine (`ClaimRearmed`, naming the attempt). After `ClaimRearmLimit` attempts the re-arming stops
-  and one `ClaimRearmLimitReached` Warning names the slot as a phantom, so a claim that cannot boot
-  buys a bounded number of machines and an operator sees it
+  machine (`ClaimRearmed`, naming the attempt)
+- The retries are bounded by **one startup-attempt counter** (`fsm.StartupAttemptLimit`, 3) that both
+  failure loops pay into, because they spend the same thing - a machine:
+  - it is incremented where an attempt begins, the `StartNode` transition
+    (`enterStartingUp` -> `shutdown -> startingup`), which is what the lifecycle Job and the power-on
+    hang off, and what both the watchdog's re-arm and a `JobFailed` rollback lead back into;
+  - it is cleared where an attempt demonstrably succeeded: the **readiness gate** of
+    `afterJobCompleted`, the place that decides the slot may be recorded `ready`. A completed startup
+    Job is not the proof - a machine that boots, registers and never clears its CNI bootstrap taint
+    has spent its attempts and keeps them counted - and slots are reused across claim episodes, so a
+    count that never resets is a lifetime sentence;
+  - it is enforced on both paths: the watchdog refuses to re-arm, and `StartNode` refuses to start, so
+    the loud loop (a startup Job that exits non-zero, which lands at the stable `off`/`shutdown` pair
+    the watchdog never looks at) is bounded too. Past the bound the slot is settled to that pair, the
+    claim is kept, and exactly one `ClaimRearmLimitReached` Warning is recorded, so a claim that cannot
+    boot buys a bounded number of machines and an operator sees it
 - A ready, claimed slot whose node is cordoned with no Job, no lock and no autoscaler marker on it is
   uncordoned (`CordonReconciled`): the paths that roll back into `ready` never call the uncordon hook,
   and a cordoned node is invisible to scale-down, so it is never removed and never stops costing
-- A lifecycle Job in flight, a Job that finished inside the settle grace, a live coordination lock,
-  or a node object (whose status belongs to the observation controllers) keeps the watchdog away from
-  the slot: the operation owns it
+- A lifecycle Job in flight, a Job that finished inside the settle grace - measured from
+  `status.lastStartupTime` when no Job object is left, so a short `ttlSecondsAfterFinished` cannot open
+  the gate inside a running hook - a live coordination lock, or a node object (whose status belongs to
+  the observation controllers) keeps the watchdog away from the slot: the operation owns it
 
 ## Integration Points
 
