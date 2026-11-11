@@ -117,9 +117,26 @@ This document outlines current known issues, limitations, and workarounds for th
 
 1. **Use Manual Node Management**
    ```bash
-   # Manually set power states instead of relying on gRPC
-   kubectl patch node.infra.homecluster.dev <node-name> \
-     --type='merge' -p='{"spec":{"powerState":"on"}}'
+   # Ask for a machine directly, instead of relying on the autoscaler's gRPC call
+   kubectl apply -f - <<'YAML'
+   apiVersion: infra.homecluster.dev/v2alpha1
+   kind: NodeClaim
+   metadata:
+     name: manual-<node-name>
+     namespace: homelab-autoscaler-system
+     labels:
+       group: <group>
+       infra.homecluster.dev/node: <node-name>
+   spec:
+     slotRef:
+       name: <node-name>
+     requestedBy: you
+     request:
+       call: IncreaseSize
+       group: <group>
+   YAML
+   # Power it off again by cancelling the request
+   kubectl delete nodeclaim manual-<node-name> -n homelab-autoscaler-system
    ```
 
 2. **Monitor Job Status**

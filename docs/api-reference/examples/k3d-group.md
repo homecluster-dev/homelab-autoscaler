@@ -6,7 +6,7 @@ This example demonstrates a basic autoscaling group setup for development using 
 # Example Group configuration for k3d testing environment
 # This demonstrates a basic autoscaling group setup for development
 
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: k3d-workers

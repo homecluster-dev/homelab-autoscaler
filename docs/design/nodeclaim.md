@@ -6,8 +6,11 @@ replaces the scalar `spec.powerState` claim with a short-lived, attributed, dead
 object, and settles the questions the 0.1.19–0.1.22 fixes kept re-opening.
 
 Every statement about current behaviour names the file that implements it, so the model can be
-checked against the code. The model itself is **not implemented**: the current release is
-`0.1.22` (`dist/chart/Chart.yaml`), and this design lands in chart `0.2.0` (§9).
+checked against the code.
+
+**Status: implemented, in chart `0.2.0`** (`dist/chart/Chart.yaml`). `v2alpha1` is the served and
+storage version of `nodes`, `groups` and the new `nodeclaims`, and `v1alpha1` is removed
+(§9). Where the running code is not exactly the sketch above, §11 says so.
 
 ## 1. The Problem This Replaces
 
@@ -524,7 +527,12 @@ be empty for ten minutes.
 
 ## 10. Open Questions / Future Work
 
-**Claim-side cancellation for `DeleteNodes`, or a finalizer on the node.** The design puts the
+**Claim-side cancellation for `DeleteNodes`, or a finalizer on the node.** Settled: the finalizer
+goes on the **claim** (§11). The machine-deleted-by-hand case is read as the design says — the
+deadline fails the claim, and the claim controller's finalizer path ends it once the slot's
+observation reports the machine off — and deleting a claim by hand is a supported cancel
+(`reason: DeletedByHand`). What stays open is the operator's view of the case the finalizer cannot
+satisfy on a machine that is gone: today the deadline is what frees the slot. The design puts the
 finalizer on the claim: deleting a `booting`/`ready` claim *is* the shutdown request, which keeps
 "the boot is committed" true and gives the scale-down one object to report on. The cost is that a
 claim then outlives the machine it asked for, and a machine deleted by hand — a Hetzner console, a
@@ -534,7 +542,12 @@ alternative is a finalizer on the `Node`, where today's `handleNodeDeletion` alr
 (`internal/controller/infra/node_controller.go`), and a claim that is deleted with no cleanup at
 all. Pick one before the CRD ships: a finalizer is not a field you remove later.
 
-**Should `status.progress` be persisted at all?** §6 makes it derived and read by nobody, and a
+**Should `status.progress` be persisted at all?** Settled: it is not (§11). The derived report is
+persisted, under a new name and a new vocabulary — `Node.status.phase` — because the field it
+replaced was the FSM's state and the report at once. The `kubectl get` column survives, and
+`kubectl get nodeclaim` is now the other command. What stays open is whether a derived field should
+be persisted at all, and the answer is the same precedent the design cites: keep what an operator
+reads in a crisis. §6 makes it derived and read by nobody, and a
 value that is computed from `(live claim, observation)` can be computed on read instead of written
 on every observation — no status write, no stale report, no `SettleGracePeriod` to protect it. It
 cannot be a computed field, so the choices are: keep persisting it (cheap for the writer, and
@@ -562,6 +575,57 @@ machine up: the manual action is creating a `NodeClaim` by hand, with `requested
 it. The mirror case — a machine deleted out of the pool — is the shape the watchdog handles today
 and the claim's deadline handles here; what is not settled is whether an operator is allowed to
 delete a claim, or has to cancel it through the autoscaler.
+
+## 11. Implementation Notes
+
+Four places where the code diverges from, or sharpens, the sketch. Each is the model holding, with
+one detail settled by what the tests showed.
+
+- **`status.progress` is removed, not mirrored.** §6 said the field stays, derived and read by
+  nobody. The implementation deletes it and ships the derived value as **`Node.status.phase`**, with
+  the new vocabulary (`off`, `pending`, `booting`, `ready`, `draining`) and one formula
+  (`phase.Derive`, `internal/phase/phase.go`). Keeping a field named `progress` alongside a claim
+  phase named `booting` would have left two words for one fact, and the ambiguity this design
+  removes is a vocabulary ambiguity first: `progress` had to be both "what the FSM last did" and
+  "what the world looks like" because it was the FSM's state. A derived report has no such history,
+  so it is a new field with a name that says what it is. `internal/progress` — the watchdog and the
+  observed-power precedence rule — is deleted with it: the deadline of a claim and the input law
+  are their jobs.
+- **A readiness gate that times out fails the claim.** §3 describes the gate as holding a claim at
+  `booting` until the node is Ready and free of the pool's readiness taints, and §4's budget includes
+  that gate. The implementation goes one step further: `afterJobCompleted` moves the claim to
+  **`failed` with `reason: ReadinessGateTimeout`** when the gate's 4m expires
+  (`internal/fsm/hooks.go`). A machine that booted but never cleared the gate is exactly the
+  attempt the model has a word for, and the row "a slot is not reported `ready` with the bootstrap
+  taint on it" is enforced by the phase, not by a comment: the input law powers the machine off, the
+  slot becomes free, and the next claim is attempt N+1. The node is still uncordoned on the way out,
+  because a cordoned node is invisible to scale-down and is paid for forever.
+- **A shutdown whose machine is observed up reports `draining`, and counts its attempts on the
+  claim.** §6 lists `draining` as "a claim marked for scale-down, node cordoned, machine still
+  observed up". The implementation covers the wider case, and states it in
+  `docs/architecture/state.md`: a shutdown Job that completed while the machine is still observed up
+  leaves the slot at `draining` (`phase.Derive` reads `ShutdownJobInFlight` first), the claim keeps
+  its finalizer, and `BumpScaleDownAttempt` counts the attempt on the claim that asked for the
+  scale-down. Past `claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that
+  will not land and the record is the `ShutdownAttemptLimitReached` warning on the claim. This is
+  the design's own rule — the bound lives on the request — applied to the scale-down, and it is what
+  the v1alpha1 `ShutdownAttempts` condition did on the slot, with its two reset sites.
+- **"Live" and "wanted" are two questions, and the code names them.** §3's "a live claim per slot"
+  and "the only shape `IncreaseSize` may claim" need the pair. `claim.LiveOfSlot` returns the slot's
+  newest live claim, **including one a scale-down has marked** — that claim owns the slot, its boot
+  is committed, and the finalizer is the request that reverses it, which is what makes the report
+  row "a live claim, marked, observed up → `draining`" reachable. `claim.WantsMachine` is the
+  stronger question, and law 1 of the input law asks it: a marked claim is not a boot target. The
+  provider's `TargetSize` excludes a marked claim (its unit comes off on the write that named it)
+  while `ClaimedSlots` includes it (the slot is not free), and `NodeGroupDeleteNodes` is idempotent
+  over an already-marked claim.
+- Two smaller settlements: `spec.maxNodeProvisionTime` is the claim's field for the number in force
+  (§4 called it "the sibling field for reporting"), and one-live-claim-per-slot is enforced at
+  admission as well as in the claim controller (`NodeClaimCustomValidator`), so the rule is refused
+  where it can be seen and repaired where it cannot.
+
+The annotations above are the record of where the implementation settled a question the sketch left
+open. Everything else in this document is the model as it runs.
 
 ## Related Documentation
 

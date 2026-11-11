@@ -1,19 +1,25 @@
 # Node CRD Reference
 
-The Node Custom Resource Definition (CRD) represents individual physical machines in the homelab autoscaler system.
+The Node Custom Resource Definition (CRD) is the declaration of one machine slot in the pool: what
+the slot *is* (its lifecycle pods, its shape, its taints, its price), and nothing about what anyone
+wants it to do next.
 
 ## API Version
 - **Group**: `infra.homecluster.dev`
-- **Version**: `v1alpha1`
+- **Version**: `v2alpha1` (served and storage; `v1alpha1` is removed in this release)
 - **Kind**: `Node`
 
 ## Specification
 
 ### NodeSpec
 
+The spec is Git-owned configuration. **`spec.powerState` is removed in `v2alpha1`**: there is no
+field for a runtime intent, so an apply can never contradict a scale-up and a scale-up can never
+overwrite a declaration. A machine is wanted exactly when a live
+[`NodeClaim`](nodeclaim.md) names this slot.
+
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `powerState` | `PowerState` | No | The desired power *claim*: `on` or `off`, defaulted to `off` by the API server. The autoscaler is the writer (scale-up claims `on`, scale-down drops it to `off`), so a GitOps manifest must not declare it: an applied value is re-written over the claim on every sync, which shuts a machine down mid-use. See [FSM Architecture](../../architecture/state.md) for formal state management |
 | `startupPodSpec` | `MinimalPodSpec` | Yes | Pod specification for startup operations |
 | `shutdownPodSpec` | `MinimalPodSpec` | Yes | Pod specification for shutdown operations |
 | `kubernetesNodeName` | `string` | Yes | Name of the corresponding Kubernetes node |
@@ -21,17 +27,6 @@ The Node Custom Resource Definition (CRD) represents individual physical machine
 | `nodeCapacity` | `corev1.ResourceList` | No | The shape of the machine this slot boots, as the kubelet reports it. Applied to the node template resource by resource, which is what lets a pool at `minSize: 0` scale back up; `pods` is defaulted for you |
 | `nodeTaints` | `[]corev1.Taint` | No | Taints this machine must carry, applied to the Kubernetes node and included in the node template |
 | `taintsToRemove` | `[]corev1.Taint` | No | Taints stripped from the node template so the autoscaler ignores them |
-
-#### PowerState
-
-```go
-type PowerState string
-
-const (
-    PowerStateOn  PowerState = "on"
-    PowerStateOff PowerState = "off"
-)
-```
 
 #### MinimalPodSpec
 
@@ -64,25 +59,45 @@ const (
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `conditions` | `[]metav1.Condition` | Standard Kubernetes conditions |
+| `powerState` | `PowerState` | What the provider observes: `on` when the `corev1.Node` reports `NodeReady=True`, `off` otherwise. An observation, and one of the three inputs of every decision |
+| `phase` | `NodePhase` | The **derived report** of the slot: `off`, `pending`, `booting`, `ready`, `draining`. Computed from (live claim, observed power, node usability) and read by nothing that decides. `status.progress` is removed with the model that needed it |
+| `lastClaim` | `LastClaimSummary` | The digest of the slot's most recent claim: `{name, phase, attempt, call, group, reason, requestedAt, deadlineAt, finishedAt}`. It survives the claim's TTL collection, seeds the next claim's `status.attempt`, and answers "who asked, when, how many attempts, why did it end" from `kubectl describe` |
+| `conditions` | `[]metav1.Condition` | Standard Kubernetes conditions: the autoscaler markers (`AutoscalerDeletionCandidate`, `AutoscalerDeletionRequested`), `NodeReadinessTaints` (the gate this slot is waiting on), lifecycle conditions written by the transitions |
 | `health` | `string` | Health status: `healthy`, `offline`, `unknown` |
-| `powerState` | `PowerState` | Current power state: `on` or `off` |
-| `progress` | `Progress` | Current operation progress |
 | `lastStartupTime` | `*metav1.Time` | Last successful startup time |
 | `lastShutdownTime` | `*metav1.Time` | Last successful shutdown time |
 
-#### Progress
+#### PowerState
 
 ```go
-type Progress string
+type PowerState string
 
 const (
-    ProgressShuttingDown Progress = "shuttingdown"
-    ProgressShutdown     Progress = "shutdown"
-    ProgressStartingUp   Progress = "startingup"
-    ProgressReady        Progress = "ready"
+    PowerStateOn  PowerState = "on"   // the node object reports NodeReady=True
+    PowerStateOff PowerState = "off"  // everything else, including a NotReady leftover
 )
 ```
+
+`on`/`off` accept `true`/`false` on the way in, for manifests written against the old field.
+
+#### Phase (derived, reported)
+
+```go
+type NodePhase string
+
+const (
+    NodePhaseOff       NodePhase = "off"       // no live claim, no observed machine
+    NodePhasePending   NodePhase = "pending"   // a live pending claim, no lifecycle Job yet
+    NodePhaseBooting   NodePhase = "booting"   // a live claim whose boot is in flight
+    NodePhaseReady     NodePhase = "ready"     // a ready claim, node observed Ready and gate-clear
+    NodePhaseDraining  NodePhase = "draining"  // a machine the pool no longer wants, observed up
+)
+```
+
+The table that computes it is in [State Management](../../architecture/state.md#the-input-law).
+It is a report: write a value that contradicts the claim and the observation and nothing about the
+operator's behaviour changes — the next pass overwrites the value from its inputs. The phase the
+model acts on is the **claim's** (`NodeClaim.status.phase`).
 
 ### Node Taints
 
@@ -257,7 +272,7 @@ out the same way. Keys the pool declares, `node.kubernetes.io/role` included, ar
 ## Example
 
 ```yaml
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: worker-01
@@ -267,7 +282,6 @@ metadata:
     node-type: worker
     zone: homelab
 spec:
-  powerState: on
   kubernetesNodeName: worker-01
   startupPodSpec:
     image: homelab/power-manager:latest
@@ -299,33 +313,50 @@ spec:
     effect: NoSchedule
 status:
   health: healthy
-  powerState: on
-  progress: ready
+  powerState: on          # observed
+  phase: ready            # derived from (live claim, observed power, node usability)
+  lastClaim:              # the digest of the request that owns this machine
+    name: worker-01-7f4b9c
+    phase: ready
+    attempt: 2
+    call: IncreaseSize
+    group: worker-nodes
+    requestedAt: "2025-01-01T11:52:00Z"
+    deadlineAt: "2025-01-01T11:59:10Z"
   lastStartupTime: "2025-01-01T12:00:00Z"
   conditions:
-  - type: Available
+  - type: NodeReadinessTaints
     status: "True"
-    reason: NodeReady
-    message: "Node is powered on and ready"
-    lastTransitionTime: "2025-01-01T12:00:00Z"
+    reason: ReadinessTaints
+    message: "node.cilium.io/agent-not-ready"
+    lastTransitionTime: "2025-01-01T11:52:00Z"
 ```
+
+The claim behind that status is [the NodeClaim CRD](nodeclaim.md).
 
 ## Power Management
 
 ### Startup Process
 
-1. **Trigger**: `spec.powerState` set to `on`
-2. **Job Creation**: Node controller creates Job from `startupPodSpec`
-3. **Progress Tracking**: Status updated to `startingup`
-4. **Completion**: Node joins cluster, status becomes `ready`
+1. **Trigger**: a live `NodeClaim` names the slot and the machine is off
+2. **Job Creation**: the slot reconciler takes the coordination lock and creates the Job from
+   `spec.startupPodSpec`, in the same write that moves the claim `pending → booting`
+3. **Report**: the slot reports `booting` while the startup is in flight
+4. **Completion**: the node registers, passes the readiness gate, the claim moves to `ready`, and
+   the slot reports `ready`
 
 ### Shutdown Process
 
-1. **Trigger**: `spec.powerState` set to `off`
-2. **Node Drain**: Pods evicted from Kubernetes node (⚠️ Not implemented)
-3. **Job Creation**: Node controller creates Job from `shutdownPodSpec`
-4. **Progress Tracking**: Status updated to `shuttingdown`
-5. **Completion**: Node leaves cluster, status becomes `shutdown`
+1. **Trigger**: no live claim names the slot while its machine is observed up — a scale-down
+   cancelled the claim, or the claim hit its deadline
+2. **Node Drain**: cluster-autoscaler evicts the pods before it calls `DeleteNodes`; the
+   provider observes and records the marker, it does not evict
+3. **Job Creation**: the slot reconciler cordons the node and creates the Job from
+   `spec.shutdownPodSpec`
+4. **Report**: the slot reports `draining` while the machine is still observed up — a shutdown Job
+   that exits 0 is not evidence that the machine is off
+5. **Completion**: the machine is observed off, the scale-down claim ends `completed`, and the slot
+   reports `off`
 
 ## Power Operation Examples
 
@@ -397,17 +428,43 @@ kubectl describe node.infra.homecluster.dev worker-01 -n homelab-autoscaler-syst
 kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system -w
 ```
 
-### Manual Power Operations
+### Manual power operations
+
+There is no field to declare. A manual scale-up is a claim, and a manual scale-down is the
+cancellation of one — the same two objects the autoscaler's RPCs produce, with `requestedBy`
+naming who did it:
+
+```yaml
+# power on: ask for the machine
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: worker-01-manual
+  namespace: homelab-autoscaler-system
+  labels:
+    group: worker-nodes
+    infra.homecluster.dev/node: worker-01
+spec:
+  slotRef:
+    name: worker-01
+  requestedBy: filippo
+  request:
+    call: IncreaseSize      # the closest label for a hand-made request
+    group: worker-nodes
+```
 
 ```bash
-# Power on a node
-kubectl patch node.infra.homecluster.dev worker-01 -n homelab-autoscaler-system \
-  --type='merge' -p='{"spec":{"powerState":"on"}}'
+# power on
+kubectl apply -f worker-01-manual.yaml
+kubectl get nodeclaim -n homelab-autoscaler-system -w
 
-# Power off a node
-kubectl patch node.infra.homecluster.dev worker-01 -n homelab-autoscaler-system \
-  --type='merge' -p='{"spec":{"powerState":"off"}}'
+# power off: cancel it. A pending claim is deleted outright; a booting/ready claim runs the
+# shutdown path through its finalizer, and ends when the machine is observed off.
+kubectl delete nodeclaim worker-01-manual -n homelab-autoscaler-system
 ```
+
+A second live claim on one slot is refused by the webhook, naming the slot. See
+[the NodeClaim CRD](nodeclaim.md).
 
 ## Best Practices
 
@@ -437,10 +494,15 @@ kubectl patch node.infra.homecluster.dev worker-01 -n homelab-autoscaler-system 
 
 ### Common Issues
 
-1. **Node stuck in starting up**
-   - Check startup job logs: `kubectl logs job/node-startup-<hash>`
-   - Verify network connectivity to target node
-   - Check credentials and permissions
+1. **A slot that never leaves `booting`**
+   - The boot is the claim's: `kubectl get nodeclaim -n homelab-autoscaler-system -l
+     infra.homecluster.dev/node=<slot>` and read `status.phase`, `status.reason`,
+     `spec.deadlineAt`
+   - Check startup job logs: `kubectl logs -n homelab-autoscaler-system job/<startup-job>`
+   - Verify network connectivity to the target node, and the credentials it uses
+   - If the gate is what is slow, `kubectl describe node.infra.homecluster.dev <slot>
+     -n homelab-autoscaler-system` shows the `NodeReadinessTaints` condition: the key the
+     slot is waiting for. Past the gate's 4m the claim fails with `ReadinessGateTimeout`
 
 2. **Node not joining cluster**
    - Verify `kubernetesNodeName` matches actual node name
@@ -484,5 +546,7 @@ kubectl describe node.infra.homecluster.dev <node-name> -n homelab-autoscaler-sy
 ## Related Documentation
 
 - [Group CRD](group.md) - Autoscaling group configuration
-- [NodeClaim Design](../../design/nodeclaim.md) - Removes `spec.powerState` in v2alpha1, where this field's claim lives instead
+- [NodeClaim CRD](nodeclaim.md) - the request for a machine: the field this Node CRD no longer has
+- [NodeClaim Design](../../design/nodeclaim.md) - why `spec.powerState` is gone
+- [State Management](../../architecture/state.md) - the input law, and the report `status.phase` is
 - [Architecture Overview](../../architecture/overview.md) - System design

@@ -4,7 +4,7 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 
 ## API Version
 - **Group**: `infra.homecluster.dev`
-- **Version**: `v1alpha1`
+- **Version**: `v2alpha1` (served and storage; `v1alpha1` is removed in this release)
 - **Kind**: `Group`
 
 ## Specification
@@ -17,7 +17,7 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 | `scaleDownGpuUtilizationThreshold` | `string` | Yes | GPU utilization threshold for scale-down, a decimal string (`"0.5"`) |
 | `scaleDownUnneededTime` | `*metav1.Duration` | Yes | Time a node must be unneeded before scale-down |
 | `scaleDownUnreadyTime` | `*metav1.Duration` | Yes | Time an unready node waits before scale-down |
-| `maxNodeProvisionTime` | `*metav1.Duration` | Yes | Maximum time to wait for node provisioning |
+| `maxNodeProvisionTime` | `*metav1.Duration` | Yes | Maximum time to wait for node provisioning. Reported to cluster-autoscaler as its own scale-up termination deadline (`GetOptions` → `MaxNodeProvisionDuration`), and the **floor of a claim's `spec.deadlineAt`**: a claim never dies while the autoscaler is still waiting for it |
 | `zeroOrMaxNodeScaling` | `bool` | Yes | Whether to scale to zero or max nodes only |
 | `ignoreDaemonSetsUtilization` | `bool` | Yes | Ignore DaemonSet pods in utilization calculations |
 | `minSize` | `int32` | No | Floor cluster-autoscaler must not scale the group below. Defaults to `0` |
@@ -25,8 +25,9 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 
 ## Readiness Gate
 
-`nodeReadinessTaints` is the list the **scale-up** transition into `ready` (`JobCompleted` → Ready)
-waits for. The kubelet marks a node Ready long before the CNI has programmed its datapath, and the
+`nodeReadinessTaints` is the list the gate for a claim's **`ready`** phase waits for: the
+`JobCompleted` → Ready transition of the scale-up, which is the only writer of
+`NodeClaim.status.phase: ready`. The kubelet marks a node Ready long before the CNI has programmed its datapath, and the
 pool's workloads do not tolerate the bootstrap taint the CNI stamps while it works, so a slot declared
 ready in that window is read by cluster-autoscaler as capacity its pending pod cannot land on - and
 the pool buys a second machine for a node that is about to work. The controller holds the scale-up
@@ -45,8 +46,11 @@ open until the taint is gone, so pool workloads need no toleration for it.
   taint the slot keeps putting back. `taints.IsProtectedKey` refuses Cilium's key in `nodeTaints`.
 - The gate is bounded: 90s for the node object to register, then 4m for readiness, counted from the
   moment the object appears. A timeout **uncordons** the node, records a `ReadinessGateTimeout`
-  Warning on the slot, and completes the transition, because a cordoned node is skipped by
-  cluster-autoscaler's scale-down - never drained, never deleted, and paid for forever.
+  Warning on the slot, and **fails the claim** with that reason, because a cordoned node is skipped
+  by cluster-autoscaler's scale-down - never drained, never deleted, and paid for forever. The
+  input law then powers the machine off, the slot becomes free, and the next claim on it is
+  attempt N+1. Under `v1alpha1` a timed-out gate completed the transition and recorded the slot
+  `ready`; the claim model refuses to call capacity that cannot take the pool's work ready.
 
 ```yaml
 spec:
@@ -67,7 +71,7 @@ that has been booting for ten minutes says what it is waiting for. See
 ## Example
 
 ```yaml
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: worker-nodes
@@ -173,12 +177,20 @@ is never called, so the group stays at zero and the floor that works is `minSize
 
 ### Common Issues
 
-1. **Nodes not joining group**
-   - Check that `group` label is set on Node CRDs
+1. **Nodes not joining the group**
+   - Check that the `group` label is set on the Node CRs: the group's slots are exactly the Node
+     CRs labelled `group: <name>`, and that count is the group's `maxSize`
 
 2. **Scaling not working**
    - Verify gRPC server is running and accessible
    - Check controller logs for errors
+   - The group's requests are objects: `kubectl get nodeclaim -n homelab-autoscaler-system
+     -l group=<group>` — `pending` means the provider answered the autoscaler and nothing has
+     started, a `failed` claim says why in `status.reason`
+
+3. **The pool grows past its floor, or refuses to shrink**
+   - `spec.minSize` is enforced by the provider at `DeleteNodes` and `DecreaseTargetSize`, judged
+     against the target size the request can actually produce (the count of live claims)
 
 ### Debugging Commands
 
@@ -192,6 +204,9 @@ kubectl get nodes -l group=worker-nodes
 # Check node CRDs
 kubectl get nodes.infra.homecluster.dev -l group=worker-nodes
 
+# Check the requests of the group, and the budget they carry
+kubectl get nodeclaim -n homelab-autoscaler-system -l group=worker-nodes -o wide
+
 # Verify gRPC server status
 kubectl port-forward -n homelab-autoscaler-system service/homelab-autoscaler-grpc 50051:50051
 ```
@@ -199,4 +214,6 @@ kubectl port-forward -n homelab-autoscaler-system service/homelab-autoscaler-grp
 ## Related Documentation
 
 - [Node CRD](node.md) - Individual node management
+- [NodeClaim CRD](nodeclaim.md) - the requests the pool's capacity is made of, and where
+  `maxNodeProvisionTime` lands: `spec.deadlineAt`, floored by this field
 - [Architecture Overview](../../architecture/overview.md) - System design

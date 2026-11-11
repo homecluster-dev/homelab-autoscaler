@@ -105,7 +105,7 @@ This will:
 
 When modifying Go struct definitions:
 
-1. **Modify Go structs** in `api/infra/v1alpha1/`
+1. **Modify Go structs** in `api/infra/v2alpha1/`
 2. **Run `make manifests`** - This automatically:
    - Generates new CRDs via controller-gen
    - Syncs CRDs to Helm chart
@@ -115,7 +115,7 @@ When modifying Go struct definitions:
 ## File Structure
 
 ```
-├── api/infra/v1alpha1/
+├── api/infra/v2alpha1/
 │   ├── group_types.go              # Go struct definitions
 │   └── node_types.go
 ├── config/crd/bases/               # Kubebuilder-generated CRDs

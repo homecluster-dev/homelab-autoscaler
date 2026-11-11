@@ -90,7 +90,6 @@ controller:
     repository: ghcr.io/homecluster-dev/homelab-autoscaler
     tag: "latest"
     pullPolicy: IfNotPresent
-  
   # Resource limits
   resources:
     limits:
@@ -104,7 +103,6 @@ grpcServer:
   # Enable gRPC server for cluster autoscaler integration
   enabled: true
   port: 50051
-  
   # Service configuration
   service:
     type: ClusterIP
@@ -116,7 +114,6 @@ clusterAutoscaler:
   image:
     repository: registry.k8s.io/autoscaling/cluster-autoscaler
     tag: "v1.27.0"
-  
   # Cluster autoscaler configuration
   config:
     scaleDownDelayAfterAdd: "10m"
@@ -149,7 +146,6 @@ controller:
   image:
     tag: "v0.1.0"  # Use specific version
     pullPolicy: Always
-  
   resources:
     limits:
       cpu: 1000m
@@ -157,7 +153,6 @@ controller:
     requests:
       cpu: 100m
       memory: 128Mi
-  
   # Enable leader election for HA
   leaderElection:
     enabled: true
@@ -222,7 +217,7 @@ Create your first autoscaling group:
 
 ```yaml
 # group-example.yaml
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: worker-nodes
@@ -245,7 +240,7 @@ Define your physical machines:
 
 ```yaml
 # node-example.yaml
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: worker-01
@@ -255,7 +250,6 @@ metadata:
     node-type: worker
 spec:
   kubernetesNodeName: worker-01
-  powerState: "off"
   pricing:
     hourlyRate: "1.5"
     podRate: "0.0"
