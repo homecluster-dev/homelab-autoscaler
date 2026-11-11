@@ -134,10 +134,20 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 		// node, on every pass, before the node is uncordoned: the taint has to be on the machine
 		// before a pod can be bound to it, and the loop is the first place this controller knows
 		// the node object exists. See setNodeSchedulableWithRetry.
+		//
+		// The loop holds this transition open until the machine can take the pool's pods: Ready
+		// plus Cilium's bootstrap taint gone (fsm.TaintCiliumAgentNotReady), because the update of
+		// status.progress below is what the autoscaler reads as usable capacity. It is bounded, and
+		// a timeout does not wedge the transition: the loop uncordons the node on the way out,
+		// returns an error that is logged here, and the transition completes as it always has, so
+		// a readiness gate nothing can answer for never blocks the lock release below and never
+		// leaves the slot transitional.
 		if err := nm.setNodeSchedulableWithRetry(nm.node.Spec.KubernetesNodeName); err != nil {
-			logger.Error(err, "Failed to uncordon Kubernetes node after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
-			// Continue anyway - don't block the operation if uncordon fails
-			// The node will remain cordoned until manually uncordoned or until next startup
+			logger.Error(err, "Failed to confirm the Kubernetes node is usable after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
+			// Continue anyway - don't block the operation if the gate cannot be satisfied. The
+			// uncordon itself has already been attempted by the loop on the way out of its timeout
+			// (setNodeSchedulableWithRetry), so the only case that leaves the node cordoned is a
+			// write that the API server refused, and the next startup's loop is the one that fixes it.
 		} else {
 			logger.Info("Successfully uncordoned Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 		}

@@ -111,6 +111,14 @@ const (
 	// shuttingdown) may last before CheckStuckState forces a cleanup. The event recorded
 	// for that cleanup quotes it, so it is a named constant rather than a literal.
 	StuckTransitionThreshold = 15 * time.Minute
+
+	// JobMonitorPollInterval is how often the lifecycle Job monitor of a state machine reads
+	// its Job (see monitorJobCompletion), and so how long after a Job finishes the
+	// JobCompleted transition can be. It is a named constant because progress.SettleGracePeriod
+	// is measured against it: the watchdog that settles a slot with no machine and no Job has to
+	// wait out the polls of the writer it defers to, or it stomps a transition that is about to
+	// be recorded by its owner.
+	JobMonitorPollInterval = 30 * time.Second
 )
 
 // NodeStateMachine represents the FSM for node state management

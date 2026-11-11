@@ -223,6 +223,10 @@ func main() {
 	if err := (&corecontroller.KubernetesNodeReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// This is the controller that watches the corev1.Node, so it is the one that sees what
+		// cluster-autoscaler decided about the machine: the DeletionCandidate / ToBeDeleted markers
+		// and the cordon that goes with them are recorded on the Node CR (see internal/autoscaler).
+		EventRecorder: mgr.GetEventRecorder("homelab-autoscaler"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create kubernetes node controller", "controller", "KubernetesNode")
 		os.Exit(1)

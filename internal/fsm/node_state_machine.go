@@ -313,7 +313,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 	defer cancel()
 
 	// Poll job status every 1 second for tests, 30 seconds for production
-	pollInterval := 30 * time.Second
+	pollInterval := JobMonitorPollInterval
 	if nm.jobTimeout < 5*time.Second {
 		pollInterval = 100 * time.Millisecond // Fast polling for tests
 	}
@@ -802,10 +802,66 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 	return nil
 }
 
-// setNodeSchedulableWithRetry attempts to uncordon a Kubernetes node with exponential backoff
-// This is used after node startup to handle the case where the node hasn't registered yet.
+// TaintCiliumAgentNotReady is Cilium's bootstrap taint: Cilium's agent adds it to a node that
+// has just joined, with a NoExecute effect, and removes it once its datapath is programmed for
+// that node. The kubelet marks the node Ready long before that happens, so Ready is not evidence
+// that the machine can take work.
+//
+// It is waited for here, on the scale-up path, because the pool's pods do not tolerate it: the
+// scheduler cannot place them on the node while it is there. Declaring the slot ready before the
+// taint clears makes the autoscaler look at a Ready node its pending pod still cannot land on,
+// conclude the group has no room, and buy another machine for a node that is about to work - the
+// live trace of a pool that churns. Waiting is also the honest reading of the FSM: a slot is
+// Ready when it can run the pool's workloads, not when its kubelet checked in.
+//
+// The key is matched on its own, and no taint is ever written or removed here: Cilium owns the
+// taint, exactly like the keys taints.IsProtectedKey refuses to let spec.nodeTaints write. A slot
+// that declares this key in spec.nodeTaints gates its own scale-up for the whole uncordon
+// timeout, which is the honest outcome for a declaration that fights its owner.
+const TaintCiliumAgentNotReady = "node.cilium.io/agent-not-ready"
+
+// nodeUsability reports whether a node object is Ready and free of Cilium's bootstrap taint, and
+// returns the reason it is not, for the retry log. An empty reason means the machine can take the
+// pool's pods.
+func nodeUsability(kubeNode *corev1.Node) string {
+	isReady := false
+
+	for _, cond := range kubeNode.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			isReady = cond.Status == corev1.ConditionTrue
+
+			break
+		}
+	}
+
+	if !isReady {
+		return "node is not Ready"
+	}
+
+	for _, taint := range kubeNode.Spec.Taints {
+		if taint.Key == TaintCiliumAgentNotReady {
+			return "node carries Cilium's bootstrap taint " + TaintCiliumAgentNotReady
+		}
+	}
+
+	return ""
+}
+
+// setNodeSchedulableWithRetry attempts to uncordon a Kubernetes node with exponential backoff.
+// This is used after node startup to handle the case where the node hasn't registered yet, and -
+// once it has - to hold the transition open until the machine can actually take the pool's pods:
+// Ready plus no Cilium bootstrap taint (see TaintCiliumAgentNotReady).
+//
 // On every pass, once the node object exists, it first stamps the taints the slot declares
 // (spec.nodeTaints) so the node is tainted before it becomes schedulable.
+//
+// The gate is bounded by nm.uncordonTimeout, and the timeout does not wedge anything: the loop
+// uncordons the node on the way out and returns an error the caller logs and continues past (see
+// afterJobCompleted). That is deliberate, twice over. Teardown must not block on a readiness gate
+// nothing can answer for, and a node left cordoned is worse than a node that is not ready yet:
+// cluster-autoscaler skips cordoned nodes when it picks scale-down candidates, so a cordoned
+// machine is never drained, never deleted, and keeps the pool paying for it, while the slot's
+// lifecycle operation is over and there is nothing left to run the uncordon.
 func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon-retry")
 
@@ -818,10 +874,29 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 	retryInterval := 2 * time.Second
 	maxRetryInterval := 10 * time.Second
 
+	// waitingOn records why the last pass refused the node, so the timeout line names the gate
+	// that was never satisfied instead of leaving the operator to guess.
+	waitingOn := "the node object has not appeared"
+
 	for {
 		elapsed := time.Since(start)
 		if elapsed >= nm.uncordonTimeout {
-			return fmt.Errorf("nm.uncordonTimeout after %v: failed to uncordon node %s", nm.uncordonTimeout, nodeName)
+			logger.Info("Timed out waiting for the node to become usable, uncordoning it anyway",
+				"elapsed", elapsed.String(),
+				"waitingOn", waitingOn,
+				"timeout", nm.uncordonTimeout.String(),
+				"why", "a cordoned node is skipped by cluster-autoscaler's scale-down, and the lifecycle "+
+					"operation is over, so nothing would uncordon it again")
+
+			if err := nm.setNodeSchedulableInternal(nodeName); err != nil {
+				logger.Error(err, "Best-effort uncordon after the readiness timeout failed, leaving the node cordoned",
+					"elapsed", elapsed.String())
+			}
+
+			// The caller logs this and continues: the transition completes, the lock is released,
+			// the slot is not left transitional. See afterJobCompleted.
+			return fmt.Errorf("timeout after %v: node %s never became usable (%s), uncordoned it anyway",
+				nm.uncordonTimeout, nodeName, waitingOn)
 		}
 
 		// Get current node status
@@ -851,17 +926,15 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 			logger.Info("Failed to apply declared taints before uncordon", "error", err.Error(), "elapsed", elapsed.String())
 		}
 
-		// Check if node is Ready
-		isReady := false
-		for _, cond := range kubeNode.Status.Conditions {
-			if cond.Type == corev1.NodeReady {
-				isReady = cond.Status == corev1.ConditionTrue
-				break
-			}
-		}
+		// The gate: Ready, and free of Cilium's bootstrap taint. Both are required before the node
+		// is uncordoned and before the transition is treated as complete, because completing the
+		// transition writes status.progress: ready, and the autoscaler reads that as capacity it can
+		// place pods on. Declaring it early is what makes the pool buy a second machine for a node
+		// that is about to work.
+		if reason := nodeUsability(kubeNode); reason != "" {
+			waitingOn = reason
 
-		if !isReady {
-			logger.Info("Node not Ready yet, retrying", "elapsed", elapsed.String())
+			logger.Info("Node cannot take the pool's pods yet, retrying", "reason", reason, "elapsed", elapsed.String())
 			time.Sleep(retryInterval)
 			retryInterval *= 2
 			if retryInterval > maxRetryInterval {

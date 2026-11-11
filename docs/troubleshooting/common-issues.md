@@ -111,6 +111,59 @@ kubectl get jobs -n homelab-autoscaler-system -o wide
 2. Verify power operation scripts work manually
 3. Check node power state: `kubectl describe node.infra.homecluster.dev <node-name>`
 
+### A Fresh Node Takes No Pods (Cilium Bootstrap Taint)
+
+A node that joins and is `Ready` is not yet able to run the pool's workloads: Cilium adds
+`node.cilium.io/agent-not-ready` to a node that has just joined and removes it once its datapath is
+programmed, which is minutes after the kubelet checked in. The controller waits for that taint to
+clear before it uncordons the node and before the scale-up transition is treated as complete, so
+**the pool's workloads do not need to tolerate the taint** - declare it nowhere, and do not add a
+toleration to work that is supposed to land on the pool.
+
+If a node of a Cilium cluster stays cordoned, read the node controller's logs for the uncordon
+line: it names the gate it is waiting on. Past the 90s uncordon timeout the controller uncordons the
+node and completes the transition anyway (a cordoned node is skipped by cluster-autoscaler's
+scale-down, so it would never be drained, never deleted, and the pool would keep paying for it),
+and the taint is visible on the node object:
+
+```bash
+kubectl get node <node> -o jsonpath='{.spec.taints}' ; echo
+kubectl get node <node> -o jsonpath='{.spec.unschedulable}' ; echo
+```
+
+### The Slot Reports a Machine That Is Not There
+
+`status.progress: ready`, `startingup` or `shuttingdown` on a slot with no `corev1.Node` and no
+lifecycle Job is what a machine deleted out of band leaves behind (a Hetzner server removed from the
+console, a startup whose manager restarted mid-flight). The node controller settles it to
+`off`/`shutdown` and records a `ProgressReconciled` Warning on the Node CR, after a 2 minute grace
+around a lifecycle Job that just finished. To see why a slot was settled:
+
+```bash
+kubectl describe node.infra.homecluster.dev <node-name>   # Events: ProgressReconciled
+kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
+kubectl get node <kubernetes-node-name> 2>&1              # no machine behind the slot
+```
+
+A slot the watchdog leaves alone is a slot an operation owns: a `corev1.Node`, a startup/shutdown
+Job, a coordination lock, or `spec.desiredPowerState: on` (a claim is never overridden).
+
+### Who Cordoned My Node
+
+cluster-autoscaler marks the nodes it is about to remove with its own taints, and the operator side
+records them on the Node CR, once per transition, so a cordon is attributable without raising the
+autoscaler's verbosity:
+
+```bash
+kubectl describe node.infra.homecluster.dev <node-name>
+# Events:  AutoscalerDeletionCandidate  (DeletionCandidateOfClusterAutoscaler, the soft marker)
+#          AutoscalerDeletionRequested  (ToBeDeletedByClusterAutoscaler, draining for deletion)
+# Condition: ClusterAutoscalerMarkedForDeletion, with the node's taints and spec.unschedulable
+```
+
+The controller reports the markers; it never adds, edits, or removes one, and it never writes
+`spec.desiredPowerState` - the scale-down request itself is the gRPC provider's to make.
+
 ### Autoscaling Not Triggering
 1. Verify resource utilization metrics
 2. Check group scaling thresholds

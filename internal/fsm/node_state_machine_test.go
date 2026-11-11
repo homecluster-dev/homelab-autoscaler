@@ -17,16 +17,22 @@ limitations under the License.
 package fsm
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/stretchr/testify/assert"
@@ -1476,4 +1482,252 @@ func TestNodeStateMachine_PriorityClassName(t *testing.T) {
 
 func ptrToString(s string) *string {
 	return &s
+}
+
+// taintLiftClient reads a corev1.Node and, from the nth read on, reports it without
+// Cilium's bootstrap taint: that is what Cilium does when its agent finishes with a node that
+// has just joined. It also records every write of a node object, in order, so a test can tell
+// uncordoning the node from refusing it.
+type taintLiftClient struct {
+	client.Client
+	liftFrom int
+	key      string
+	gets     int
+	writes   []string
+}
+
+func (c *taintLiftClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.Client.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+
+	kubeNode, isKubeNode := obj.(*corev1.Node)
+	if !isKubeNode {
+		return nil
+	}
+
+	c.gets++
+
+	if c.key != "" && c.liftFrom > 0 && c.gets >= c.liftFrom {
+		kept := make([]corev1.Taint, 0, len(kubeNode.Spec.Taints))
+
+		for _, taint := range kubeNode.Spec.Taints {
+			if taint.Key == c.key {
+				continue
+			}
+
+			kept = append(kept, taint)
+		}
+
+		kubeNode.Spec.Taints = kept
+	}
+
+	return nil
+}
+
+func (c *taintLiftClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if kubeNode, isKubeNode := obj.(*corev1.Node); isKubeNode {
+		keys := make([]string, 0, len(kubeNode.Spec.Taints))
+		for _, taint := range kubeNode.Spec.Taints {
+			keys = append(keys, taint.Key)
+		}
+
+		c.writes = append(c.writes, fmt.Sprintf("update unschedulable=%v taints=[%s]",
+			kubeNode.Spec.Unschedulable, strings.Join(keys, ",")))
+	}
+
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+// ciliumNode builds the node object of a machine that has just joined: cordoned by the scale-down
+// that preceded it, Ready, and carrying Cilium's bootstrap taint because the agent has not
+// finished programming it.
+func ciliumNode(taints ...corev1.Taint) *corev1.Node {
+	node := CreateTestKubernetesNode("test-node-k8s", true)
+	node.Spec.Taints = taints
+
+	return node
+}
+
+// TestSetNodeSchedulableWaitsForTheCiliumBootstrapTaint is the live symptom of a pool that
+// churns: the kubelet marks a fresh machine Ready minutes before Cilium clears
+// node.cilium.io/agent-not-ready, and the pool's pods do not tolerate that taint. Completing the
+// scale-up on Ready tells the autoscaler the slot is capacity, the pending pod still cannot land,
+// and the pool buys a second machine for a node that is about to work.
+//
+// The gate has to be passed, not read: the node is uncordoned on the pass where the taint is
+// gone, and the pass that saw the taint wrote nothing.
+func TestSetNodeSchedulableWaitsForTheCiliumBootstrapTaint(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	bootstrap := corev1.Taint{
+		Key:    TaintCiliumAgentNotReady,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoExecute,
+	}
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
+	recorder := &taintLiftClient{Client: base, key: TaintCiliumAgentNotReady, liftFrom: 2}
+
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
+	nm.uncordonTimeout = 20 * time.Second
+
+	start := time.Now()
+
+	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "the gate is satisfied on a later pass, so the uncordon succeeds")
+
+	assert.GreaterOrEqual(t, recorder.gets, 3, "the loop refused the node while Cilium was still bootstrapping")
+	assert.GreaterOrEqual(t, elapsed, 2*time.Second, "each refusal waits a retry interval, it is not a busy loop")
+
+	require.Len(t, recorder.writes, 1, "the node object is written once, when the gate is satisfied")
+	assert.NotContains(t, recorder.writes[0], TaintCiliumAgentNotReady,
+		"the uncordon never carries the bootstrap taint back onto the node: \"%s\"", recorder.writes[0])
+	assert.Contains(t, recorder.writes[0], "unschedulable=false")
+
+	updated := &corev1.Node{}
+	require.NoError(t, base.Get(context.TODO(), client.ObjectKey{Name: "test-node-k8s"}, updated))
+	assert.False(t, updated.Spec.Unschedulable, "the node ends up schedulable")
+}
+
+// TestSetNodeSchedulableDoesNotWaitForACiliumItDoesNotHave: a pool on a CNI that does not add the
+// bootstrap taint must not pay for the gate. Ready and clean is uncordoned on the first pass,
+// with no retry, and unrelated taints (the pool's own, the kubelet's) never hold the transition
+// open.
+func TestSetNodeSchedulableDoesNotWaitForACiliumItDoesNotHave(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+	unreachable := corev1.Taint{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoExecute}
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node, ciliumNode(role, unreachable))
+	recorder := &taintLiftClient{Client: base}
+
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
+	nm.uncordonTimeout = 20 * time.Second
+
+	start := time.Now()
+
+	require.NoError(t, nm.setNodeSchedulableWithRetry("test-node-k8s"))
+
+	assert.Less(t, time.Since(start), time.Second, "no Cilium, no waiting")
+	assert.Equal(t, 2, recorder.gets, "one read for the gate, one for the uncordon, no retry")
+	require.Len(t, recorder.writes, 1)
+	assert.Contains(t, recorder.writes[0], "node.kubernetes.io/role", "the taints of the slot are kept by the uncordon")
+}
+
+// captureLogs installs a logger writing to a buffer for the duration of a test and returns it.
+// The FSM logs through controller-runtime's global logger (log.Log), so a test that asserts an
+// operator-visible line has to install one. The previous logger is restored on cleanup.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	buffer := &bytes.Buffer{}
+
+	log.SetLogger(zap.New(zap.WriteTo(buffer), zap.UseDevMode(true)))
+	t.Cleanup(func() { log.SetLogger(logr.Discard()) })
+
+	return buffer
+}
+
+// TestSetNodeSchedulableTimeoutUncordonsAndLogs is the bounded half of the gate. A machine whose
+// CNI never finishes must not wedge the slot: the loop uncordons the node on the way out, names
+// the gate it was waiting on, and returns an error the caller logs and continues past. The
+// uncordon matters more than the gate - a cordoned node is skipped by cluster-autoscaler's
+// scale-down, so it is never drained, never deleted, and nothing would ever uncordon it again.
+func TestSetNodeSchedulableTimeoutUncordonsAndLogs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	logs := captureLogs(t)
+
+	bootstrap := corev1.Taint{Key: TaintCiliumAgentNotReady, Value: "true", Effect: corev1.TaintEffectNoExecute}
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
+	recorder := &taintLiftClient{Client: base}
+
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
+	nm.uncordonTimeout = 100 * time.Millisecond
+
+	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
+
+	require.Error(t, err, "the caller is told the gate was never satisfied")
+	assert.Contains(t, err.Error(), "never became usable")
+	assert.Contains(t, err.Error(), TaintCiliumAgentNotReady, "the error names the gate that timed out")
+
+	updated := &corev1.Node{}
+	require.NoError(t, base.Get(context.TODO(), client.ObjectKey{Name: "test-node-k8s"}, updated))
+	assert.False(t, updated.Spec.Unschedulable, "the timeout path uncordons: a cordoned machine is invisible to scale-down")
+
+	require.Len(t, recorder.writes, 1, "one write, the best-effort uncordon")
+	assert.Contains(t, recorder.writes[0], "unschedulable=false")
+
+	// The operator-facing half: the line that names the gate and the reason it is passed over.
+	contents := logs.String()
+	assert.Contains(t, contents, "Timed out waiting for the node to become usable, uncordoning it anyway")
+	assert.Contains(t, contents, TaintCiliumAgentNotReady, "the log says what the loop was waiting on")
+}
+
+// TestSetNodeSchedulableOnMissingNodeTimesOutWithoutWriting is the shape of a startup whose
+// machine never registers: there is no node object at all. The loop times out, and the
+// best-effort uncordon must not invent a node object.
+func TestSetNodeSchedulableOnMissingNodeTimesOutWithoutWriting(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	base := CreateFakeClient(scheme, node)
+	recorder := &taintLiftClient{Client: base}
+
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager())
+	nm.uncordonTimeout = 100 * time.Millisecond
+
+	require.Error(t, nm.setNodeSchedulableWithRetry("test-node-k8s"))
+	assert.Empty(t, recorder.writes, "nothing to uncordon, so nothing is written")
+}
+
+// TestNodeUsability is the gate itself: Ready is necessary and not sufficient, Cilium's bootstrap
+// taint is what holds the transition open, and the taints of the slot and of the kubelet are none
+// of its business.
+func TestNodeUsability(t *testing.T) {
+	bootstrap := corev1.Taint{Key: TaintCiliumAgentNotReady, Value: "true", Effect: corev1.TaintEffectNoExecute}
+	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+
+	notReady := CreateTestKubernetesNode("test-node-k8s", true)
+	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
+
+	noCondition := CreateTestKubernetesNode("test-node-k8s", true)
+	noCondition.Status.Conditions = nil
+
+	tests := []struct {
+		name       string
+		node       *corev1.Node
+		wantReason string
+	}{
+		{"Ready and clean", CreateTestKubernetesNode("test-node-k8s", true), ""},
+		{"Ready with the pool's own taint", CreateTestKubernetesNode("test-node-k8s", true), ""},
+		{"not Ready", notReady, "node is not Ready"},
+		{"no Ready condition at all", noCondition, "node is not Ready"},
+		{"Ready, Cilium still bootstrapping", ciliumNode(bootstrap), TaintCiliumAgentNotReady},
+	}
+
+	tests[1].node.Spec.Taints = []corev1.Taint{role}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := nodeUsability(tc.node)
+			assert.Contains(t, reason, tc.wantReason)
+		})
+	}
 }

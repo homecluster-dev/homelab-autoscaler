@@ -35,6 +35,7 @@ import (
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/progress"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
@@ -62,7 +63,8 @@ type NodeReconciler struct {
 	Scheme *runtime.Scheme
 
 	// EventRecorder publishes Kubernetes Events on the Node CR for the scale up/down
-	// transitions the FSM runs (nil = no events, which is what the unit tests use).
+	// transitions the FSM runs and for the progress settlements the watchdog makes (see
+	// internal/progress). nil records nothing, which is what the unit tests use.
 	// Built once in cmd/main.go with mgr.GetEventRecorder, the new events API.
 	EventRecorder events.EventRecorder
 }
@@ -156,17 +158,68 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return r.handleNodeDeletion(ctx, node, groupName, req.Name)
 	}
 
+	// Settle a status.progress that outlived the machine behind it, before any FSM branch can act
+	// on it. This runs first on purpose: the slot below is the live failure, a progress of ready
+	// (or a transitional one) with no corev1.Node and no lifecycle Job, and every branch that sees
+	// it wants to act on a machine that is not there. From ready the FSM fires a ShutdownNode and
+	// builds a shutdown Job for a server that was already deleted; a transitional progress is
+	// gated out of every transition by validateStateTransition, so it is simply frozen. Neither
+	// shape heals itself - see internal/progress for why not.
+	//
+	// The wrapper returns the deadline the watchdog asked for when it declined to settle (a Job in
+	// flight, a Job that just finished inside the grace), which is folded into the result below so
+	// the settlement is scheduled and not left to the next resync.
+	watchdogRequeue := r.reconcileObservedProgress(ctx, node)
+
 	// Validate state before attempting transitions with smart backoff
 	if result, err := r.validateStateTransition(ctx, node); err != nil {
 		logger.Error(err, "Invalid state transition", "node", node.Name)
 		return ctrl.Result{}, err
 	} else if result.RequeueAfter > 0 {
 		// Smart backoff is requesting a requeue
-		return result, nil
+		return shortenRequeue(result, watchdogRequeue), nil
 	}
 
 	// Handle power state transitions using FSM
-	return r.handleStateTransitionsWithFSM(ctx, node)
+	result, err := r.handleStateTransitionsWithFSM(ctx, node)
+
+	return shortenRequeue(result, watchdogRequeue), err
+}
+
+// reconcileObservedProgress settles a slot whose status.progress names a machine the cluster does
+// not have, and returns how long the watchdog wants to be looked at again (0 = no deadline). See
+// internal/progress for the rule, the grace period it is built on, and the event it records.
+//
+// A failure of the watchdog is never fatal to the pass: it means the settlement did not happen,
+// and the next pass is the next attempt. Failing a reconcile because a slot that is already
+// broken could not be repaired would hide the reason it is broken.
+func (r *NodeReconciler) reconcileObservedProgress(ctx context.Context, node *infrav1alpha1.Node) time.Duration {
+	outcome, err := progress.Settle(ctx, r.Client, node, r.EventRecorder, progress.SettleGracePeriod)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to reconcile status.progress against observed reality",
+			"node", node.Name, "progress", string(node.Status.Progress))
+
+		return progress.SettleGracePeriod
+	}
+
+	return outcome.RequeueAfter
+}
+
+// shortenRequeue moves a reconcile result forward to an earlier deadline the caller was asked to
+// honour, and never delays one: a requeue the FSM asked for, a transition that finished and wants
+// to run now, wins over the watchdog's deadline.
+func shortenRequeue(result ctrl.Result, requeueAfter time.Duration) ctrl.Result {
+	if requeueAfter <= 0 {
+		return result
+	}
+
+	if result.RequeueAfter > 0 && result.RequeueAfter <= requeueAfter {
+		return result
+	}
+
+	result.RequeueAfter = requeueAfter
+
+	return result
 }
 
 // handleStateTransitionsWithFSM uses the FSM for state management

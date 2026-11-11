@@ -22,12 +22,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
@@ -38,6 +40,12 @@ var namespaceConfig = config.NewNamespaceConfig()
 type KubernetesNodeReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// EventRecorder publishes the cluster-autoscaler decisions this controller observes on a
+	// node (see internal/autoscaler) on the Node CR, so `kubectl describe
+	// node.infra.homecluster.dev <name>` shows what the autoscaler decided about the machine.
+	// nil records nothing, which is what the unit tests use.
+	EventRecorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch;create;update;patch;delete
@@ -80,11 +88,17 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	nodeStatus := r.getNodeStatus(node)
 	logger.Info("Node status retrieved", "name", node.Name, "status", nodeStatus)
 
+	// What cluster-autoscaler decided about this node is an observation of the same node object,
+	// so it is derived and written together with the power state. It is deduplicated on the slot:
+	// a marker that is already recorded is no change, and a pass that records nothing writes
+	// nothing.
+	_, markerChanged := autoscaler.ApplyMarker(nodeCR.DeepCopy(), node)
+
 	// Only update when the recorded status disagrees with what is observed. A status
 	// write on every reconcile would keep this controller hot, so the fast path covers
 	// "power state unchanged AND progress needing no correction (consistent, or
-	// transitional and owned by the state machine)".
-	if !applyObservedPowerState(nodeCR.DeepCopy(), nodeStatus) {
+	// transitional and owned by the state machine)", and no new autoscaler marker.
+	if !applyObservedPowerState(nodeCR.DeepCopy(), nodeStatus) && !markerChanged {
 		logger.V(1).Info("Node status unchanged, skipping update", "node", node.Name, "status", nodeStatus)
 		return ctrl.Result{}, nil
 	}
@@ -92,19 +106,34 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// The state machine writes the transitional progress values concurrently, so re-read
 	// the CR and re-derive the correction on every attempt. Same status-update and
 	// conflict-retry pattern as fsm.NodeStateMachine.updateNodeProgress.
+	var recorded autoscaler.Decision
+
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &infrav1alpha1.Node{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(nodeCR), fresh); err != nil {
 			return err
 		}
 
-		if !applyObservedPowerState(fresh, nodeStatus) {
+		powerChanged := applyObservedPowerState(fresh, nodeStatus)
+
+		decision, markerChanged := autoscaler.ApplyMarker(fresh, node)
+		if !powerChanged && !markerChanged {
 			// Someone (usually the state machine) already recorded what we observed.
 			return nil
 		}
 
 		// Use status subresource to avoid conflicts with spec updates
-		return r.Status().Update(ctx, fresh)
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+
+		// Remember what landed, so the event is published for a write that succeeded and not
+		// for one that a concurrent writer answered first.
+		if decision.Recorded {
+			recorded = decision
+		}
+
+		return nil
 	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			// The Node CR disappeared underneath us, nothing left to record.
@@ -119,6 +148,13 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	logger.Info("Successfully updated Node status", "node", node.Name, "powerstate", nodeStatus)
+
+	// Publish the autoscaler decision the write above recorded: the Event on the Node CR, the
+	// node's taints and spec.unschedulable in the log. After the write, so a record is never
+	// published for a status update that did not land.
+	if recorded.Recorded {
+		autoscaler.Emit(ctx, r.EventRecorder, nodeCR, node, recorded)
+	}
 
 	return ctrl.Result{}, nil
 
@@ -170,10 +206,12 @@ func expectedProgress(powerState infrav1alpha1.PowerState) (infrav1alpha1.Progre
 // enterReady is written by the state machine when the startup Job finishes
 // (fsm.hooks.enterReady), the Job being only the power-on command, and the node object
 // appears later, when the kubelet registers: fsm.setNodeSchedulableWithRetry retries for
-// 90s precisely because the node is not Ready yet. So {desired: on, status.powerState:
-// off, progress: ready} plus a NotReady node object is the normal state of every boot
-// window, and writing shutdown there would restart the state machine (the FSM reads its
-// state from progress): a second startup Job, a second scale-up event, the
+// 90s precisely because the node is not Ready yet, and it holds the transition open past
+// Ready until Cilium's bootstrap taint clears (fsm.TaintCiliumAgentNotReady), because a
+// node that cannot take the pool's pods is not a ready slot. So {desired: on,
+// status.powerState: off, progress: ready} plus a NotReady node object is the normal state
+// of every boot window, and writing shutdown there would restart the state machine (the FSM
+// reads its state from progress): a second startup Job, a second scale-up event, the
 // cluster-autoscaler taint removed from a node that has not joined, targetSize dipping
 // to 0.
 //

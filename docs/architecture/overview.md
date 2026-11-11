@@ -44,11 +44,29 @@ Homelab Autoscaler is a Kubernetes operator with gRPC integration for physical n
 - Finite State Machine architecture
 - Coordination locking for race prevention
 - Power operation integration (in development)
+- Progress watchdog (`internal/progress`): settles a `status.progress` that names a machine the
+  cluster does not have (no `corev1.Node`, no lifecycle Job, no lock, `spec.desiredPowerState: off`)
+  to `off`/`shutdown`, with a `ProgressReconciled` Warning on the Node CR. It runs at the top of
+  every pass, before any transition, and never overrides a claim
 
 **Core Controller** (`internal/controller/core/node_controller.go`)
 - Bridges Kubernetes nodes with Node CRDs
 - Syncs node health status
 - Handles node registration/deregistration
+- Records what cluster-autoscaler decided about the machine (`internal/autoscaler`): the
+  `DeletionCandidateOfClusterAutoscaler` / `ToBeDeletedByClusterAutoscaler` markers become a
+  `AutoscalerDeletionCandidate` / `AutoscalerDeletionRequested` event on the Node CR, once per
+  transition, and the node's taints and `spec.unschedulable` are logged so a cordon is attributable
+  without raising the autoscaler's verbosity
+
+### Scale-up readiness
+
+The scale-up transition into `ready` completes when the node is `Ready` **and** Cilium's bootstrap
+taint `node.cilium.io/agent-not-ready` is gone (bounded by the 90s uncordon timeout, which uncordons
+and logs on the way out). Pool workloads therefore do not need to tolerate that taint: the
+controller waits it out, because declaring a slot ready before its datapath works makes the
+autoscaler look at a Ready node its pending pod cannot land on and buy another machine. See
+[State Management](state.md).
 
 ### gRPC Server (`internal/grpcserver/server.go`)
 

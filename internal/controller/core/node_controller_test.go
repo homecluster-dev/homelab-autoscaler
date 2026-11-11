@@ -24,13 +24,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 )
 
 var _ = Describe("Node Controller", func() {
@@ -386,5 +389,167 @@ func TestApplyObservedPowerState(t *testing.T) {
 			assert.Equal(t, tc.wantProgress, node.Status.Progress)
 			assert.Equal(t, tc.desired, node.Spec.DesiredPowerState, "the request must never touch spec.desiredPowerState")
 		})
+	}
+}
+
+// markNode puts cluster-autoscaler's markers, and the cordon that goes with them, on a managed
+// Kubernetes node: the evidence the operator could not attribute in the live trace.
+func markNode(node *corev1.Node, cordoned bool, taints ...corev1.Taint) *corev1.Node {
+	node.Spec.Unschedulable = cordoned
+	node.Spec.Taints = taints
+
+	return node
+}
+
+// The two markers are cluster-autoscaler's own keys; internal/autoscaler owns the constants.
+var (
+	softMarker    = corev1.Taint{Key: autoscalerpkg.TaintDeletionCandidate, Effect: corev1.TaintEffectPreferNoSchedule}
+	hardMarker    = corev1.Taint{Key: autoscalerpkg.TaintDeletionRequested, Effect: corev1.TaintEffectNoSchedule}
+	poolRoleTaint = corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+)
+
+// TestK8sNodeReconcilerRecordsTheAutoscalerMarkerOnce is the observability fix at the reconcile
+// level. Live, a node of a freshly started slot was cordoned about a minute after it joined and
+// nothing on the operator side said who did it: cluster-autoscaler's own markers -
+// DeletionCandidateOfClusterAutoscaler, then ToBeDeletedByClusterAutoscaler - are on the node
+// object this controller already watches, so they are recorded on the Node CR, once per
+// transition.
+//
+// "Once" is the constraint. This reconciler runs on every event of every managed node, and an
+// event per pass is an event storm on a pool that is being scaled down.
+func TestK8sNodeReconcilerRecordsTheAutoscalerMarkerOnce(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	node := markNode(managedNode("omni-remote-7", true), true, poolRoleTaint, hardMarker)
+	r := newK8sNodeReconciler(t,
+		slot("omni-remote-7", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		node,
+	)
+	r.EventRecorder = recorder
+
+	reconcileK8sNode(t, r, "omni-remote-7")
+
+	recorded := drainK8sEvents(recorder)
+	require.Len(t, recorded, 1, "one transition, one event")
+	assert.Contains(t, recorded[0], "Normal", "the autoscaler marking a node is a decision, not an incident")
+	assert.Contains(t, recorded[0], autoscalerpkg.ReasonDeletionRequested)
+	assert.Contains(t, recorded[0], "omni-remote-7", "the event names the node")
+	assert.Contains(t, recorded[0], autoscalerpkg.TaintDeletionRequested)
+	assert.Contains(t, recorded[0], "node.kubernetes.io/role", "the event carries the taints it read, so a cordon is attributable")
+
+	condition := meta.FindStatusCondition(slotFrom(t, r.Client, "omni-remote-7").Status.Conditions,
+		autoscalerpkg.ConditionMarkedForDeletion)
+	require.NotNil(t, condition, "the record lives on the slot")
+	assert.Equal(t, metav1.ConditionTrue, condition.Status)
+	assert.Equal(t, autoscalerpkg.ReasonDeletionRequested, condition.Reason)
+
+	// The steady state: the controller sees the same node on every event, and must neither write
+	// the slot nor record anything.
+	before := slotFrom(t, r.Client, "omni-remote-7")
+
+	for range 3 {
+		reconcileK8sNode(t, r, "omni-remote-7")
+	}
+
+	after := slotFrom(t, r.Client, "omni-remote-7")
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "a marker that is already recorded writes nothing")
+	assert.Zero(t, len(drainK8sEvents(recorder)), "and records nothing")
+}
+
+// TestK8sNodeReconcilerMarkerTransitionsAreAllRecorded walks the sequence the live pool went
+// through: candidate, then delete request, then unmarked, then marked again. Each transition is
+// recorded, the unmarking is a status write without an event, and the reappearance is a new event
+// - which is the answer to "did the autoscaler decide twice about this node".
+func TestK8sNodeReconcilerMarkerTransitionsAreAllRecorded(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	node := markNode(managedNode("omni-remote-8", true), false, poolRoleTaint, softMarker)
+	r := newK8sNodeReconciler(t,
+		slot("omni-remote-8", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		node,
+	)
+	r.EventRecorder = recorder
+
+	reconcileK8sNode(t, r, "omni-remote-8")
+
+	recorded := drainK8sEvents(recorder)
+	require.Len(t, recorded, 1)
+	assert.Contains(t, recorded[0], autoscalerpkg.ReasonDeletionCandidate)
+
+	// The candidate becomes a delete request: a new marker, a new event.
+	live := &corev1.Node{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "omni-remote-8"}, live))
+	markNode(live, true, poolRoleTaint, hardMarker)
+	require.NoError(t, r.Update(context.Background(), live))
+
+	reconcileK8sNode(t, r, "omni-remote-8")
+
+	recorded = drainK8sEvents(recorder)
+	require.Len(t, recorded, 1, "the hard marker is a transition from the soft one")
+	assert.Contains(t, recorded[0], autoscalerpkg.ReasonDeletionRequested)
+
+	// The autoscaler backs off: recorded on the slot, no event.
+	live = &corev1.Node{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "omni-remote-8"}, live))
+	markNode(live, false, poolRoleTaint)
+	require.NoError(t, r.Update(context.Background(), live))
+
+	reconcileK8sNode(t, r, "omni-remote-8")
+
+	assert.Zero(t, len(drainK8sEvents(recorder)), "a marker that disappeared is not an event")
+
+	condition := meta.FindStatusCondition(slotFrom(t, r.Client, "omni-remote-8").Status.Conditions,
+		autoscalerpkg.ConditionMarkedForDeletion)
+	require.NotNil(t, condition)
+	assert.Equal(t, metav1.ConditionFalse, condition.Status)
+	assert.Equal(t, autoscalerpkg.ReasonNotMarked, condition.Reason)
+
+	// It comes back, and that is a new transition with a new event.
+	live = &corev1.Node{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "omni-remote-8"}, live))
+	markNode(live, true, poolRoleTaint, hardMarker)
+	require.NoError(t, r.Update(context.Background(), live))
+
+	reconcileK8sNode(t, r, "omni-remote-8")
+
+	recorded = drainK8sEvents(recorder)
+	require.Len(t, recorded, 1, "a reappearance is a new decision, not a repeat")
+	assert.Contains(t, recorded[0], autoscalerpkg.ReasonDeletionRequested)
+}
+
+// TestK8sNodeReconcilerRecordsNothingForACleanNode is the fast path of a healthy pool: no marker,
+// no condition, no status write, no event. The recording must cost a pool that cluster-autoscaler
+// never touched nothing at all.
+func TestK8sNodeReconcilerRecordsNothingForACleanNode(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	r := newK8sNodeReconciler(t,
+		slot("omni-remote-9", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		markNode(managedNode("omni-remote-9", true), false, poolRoleTaint),
+	)
+	r.EventRecorder = recorder
+
+	before := slotFrom(t, r.Client, "omni-remote-9")
+	reconcileK8sNode(t, r, "omni-remote-9")
+	reconcileK8sNode(t, r, "omni-remote-9")
+
+	after := slotFrom(t, r.Client, "omni-remote-9")
+	assert.Equal(t, before.Status, after.Status, "nothing to record, so the status is untouched")
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
+	assert.Empty(t, after.Status.Conditions, "no condition added to a slot the autoscaler never marked")
+	assert.Zero(t, len(drainK8sEvents(recorder)))
+}
+
+// drainK8sEvents empties the fake recorder's channel and returns everything it buffered.
+func drainK8sEvents(recorder *events.FakeRecorder) []string {
+	var collected []string
+
+	for {
+		select {
+		case event := <-recorder.Events:
+			collected = append(collected, event)
+		default:
+			return collected
+		}
 	}
 }

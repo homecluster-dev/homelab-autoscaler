@@ -24,8 +24,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,6 +37,8 @@ import (
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/progress"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
@@ -462,4 +466,199 @@ func drainEvents(recorder *events.FakeRecorder) []string {
 			return collected
 		}
 	}
+}
+
+// machinelessSlot is a slot of a pool that churns: the Hetzner server behind it is deleted, so no
+// corev1.Node points at it and no lifecycle Job is behind it, and cluster-autoscaler has asked for
+// it to be off. The status still says the machine is up and the progress names one.
+func machinelessSlot(previous infrav1alpha1.Progress) *infrav1alpha1.Node {
+	node := createTestNode(infrav1alpha1.PowerStateOff, previous)
+	node.Status.PowerState = infrav1alpha1.PowerStateOn
+
+	return node
+}
+
+// listLifecycleJobs returns every startup/shutdown Job the controller created.
+func listLifecycleJobs(t *testing.T, c client.Client) []batchv1.Job {
+	t.Helper()
+
+	jobs := &batchv1.JobList{}
+	require.NoError(t, c.List(context.Background(), jobs))
+
+	return jobs.Items
+}
+
+// TestNodeReconcileSettlesAProgressThatOutlivedItsMachine is the live failure wired through
+// Reconcile: a slot at ready, desired off, no Kubernetes node and no lifecycle Job. Pre-fix this
+// pass fired ShutdownNode on a machine that does not exist - a shutdown Job for a deleted server,
+// a cordon of a node object that is not there, and a slot that lands back at ready when the Job
+// fails, so the pool pays for the loop. The watchdog settles the slot before any FSM branch looks
+// at it, and the settlement is the one Warning that says so.
+func TestNodeReconcileSettlesAProgressThatOutlivedItsMachine(t *testing.T) {
+	for _, previous := range []infrav1alpha1.Progress{
+		infrav1alpha1.ProgressReady,
+		infrav1alpha1.ProgressStartingUp,
+		infrav1alpha1.ProgressShuttingDown,
+	} {
+		t.Run(string(previous), func(t *testing.T) {
+			recorder := events.NewFakeRecorder(16)
+
+			node := machinelessSlot(previous)
+			if previous == infrav1alpha1.ProgressStartingUp {
+				stamp := metav1.Now()
+				node.Status.LastStartupTime = &stamp
+			} else {
+				stamp := metav1.Now()
+				node.Status.LastShutdownTime = &stamp
+			}
+
+			reconciler := newTaintReconciler(t, node, createTestGroup())
+			reconciler.EventRecorder = recorder
+
+			_, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
+			})
+			require.NoError(t, err)
+
+			after := &infrav1alpha1.Node{}
+			require.NoError(t, reconciler.Get(context.Background(),
+				types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
+
+			assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress,
+				"a progress naming a machine the cluster does not have is settled")
+			assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState)
+			assert.Empty(t, listLifecycleJobs(t, reconciler.Client),
+				"no lifecycle Job is built for a machine that is gone, that is the churn this closes")
+
+			var settled []string
+
+			for _, event := range drainEvents(recorder) {
+				if strings.Contains(event, progress.ReasonProgressReconciled) {
+					settled = append(settled, event)
+				}
+			}
+
+			require.Len(t, settled, 1, "one settlement, one Warning")
+			assert.Contains(t, settled[0], "Warning")
+			assert.Contains(t, settled[0], string(previous), "the event names the progress it replaced")
+		})
+	}
+}
+
+// TestNodeReconcileSettlementIsIdempotent runs the reconcile on a slot that is already settled:
+// nothing is written, nothing is recorded. A slot of a healthy off pool is reconciled on every
+// resync, and a settlement that fires every time is an event storm on a pool at rest.
+func TestNodeReconcileSettlementIsIdempotent(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	node := machinelessSlot(infrav1alpha1.ProgressReady)
+	reconciler := newTaintReconciler(t, node, createTestGroup())
+	reconciler.EventRecorder = recorder
+
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"}}
+
+	require.NoError(t, firstReconcile(reconciler, request))
+	drainEvents(recorder)
+
+	for range 3 {
+		require.NoError(t, firstReconcile(reconciler, request))
+	}
+
+	after := &infrav1alpha1.Node{}
+	require.NoError(t, reconciler.Get(context.Background(),
+		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
+
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress)
+	assert.Zero(t, len(drainEvents(recorder)), "a settled slot records nothing on the passes after the settlement")
+}
+
+// firstReconcile is the Reconcile call of the tests above, with the error surfaced.
+func firstReconcile(reconciler *NodeReconciler, request reconcile.Request) error {
+	_, err := reconciler.Reconcile(context.Background(), request)
+
+	return err
+}
+
+// TestNodeReconcileLeavesASlotWithALiveJobAlone is the FSM's ownership, seen from the reconcile:
+// a slot whose lifecycle Job is pending is an operation in flight, and the watchdog must not
+// write over it. The FSM's own transitional progress is what the pass leaves behind.
+func TestNodeReconcileLeavesASlotWithALiveJobAlone(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	node := machinelessSlot(infrav1alpha1.ProgressShuttingDown)
+	stamp := metav1.Now()
+	node.Status.LastShutdownTime = &stamp
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-node-shutdown-1700000000",
+			Namespace: "default",
+			Labels: map[string]string{
+				fsm.LabelApp:        fsm.LifecycleAppName,
+				fsm.LabelType:       fsm.PhaseShutdown,
+				fsm.LabelNodeCR:     "test-node",
+				fsm.LabelNodeLegacy: "test-node-k8s",
+			},
+		},
+	}
+
+	reconciler := newTaintReconciler(t, node, createTestGroup(), job)
+	reconciler.EventRecorder = recorder
+
+	result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
+	})
+	require.NoError(t, err)
+
+	after := &infrav1alpha1.Node{}
+	require.NoError(t, reconciler.Get(context.Background(),
+		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
+
+	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, after.Status.Progress, "the operation owns the progress")
+	assert.Zero(t, len(drainEvents(recorder)), "a pass that settles nothing records nothing")
+	assert.LessOrEqual(t, result.RequeueAfter, progress.SettleGracePeriod, "the slot is looked at again, not forgotten")
+}
+
+// TestNodeReconcileHonoursTheWatchdogDeadline: a transitional slot is on the FSM's progressive
+// backoff (2 minutes at 5 minutes of transition age). When the watchdog has a tighter deadline -
+// a lifecycle Job that finished 90s ago, so it leaves the grace in 30s - the pass comes back on
+// the earlier one, and the settlement is scheduled rather than left to the next resync.
+func TestNodeReconcileHonoursTheWatchdogDeadline(t *testing.T) {
+	node := machinelessSlot(infrav1alpha1.ProgressShuttingDown)
+	stamp := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	node.Status.LastShutdownTime = &stamp
+
+	completed := metav1.NewTime(time.Now().Add(-90 * time.Second))
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-node-shutdown-1700000000",
+			Namespace: "default",
+			Labels: map[string]string{
+				fsm.LabelApp:        fsm.LifecycleAppName,
+				fsm.LabelType:       fsm.PhaseShutdown,
+				fsm.LabelNodeCR:     "test-node",
+				fsm.LabelNodeLegacy: "test-node-k8s",
+			},
+		},
+		Status: batchv1.JobStatus{
+			Failed:         1,
+			CompletionTime: &completed,
+		},
+	}
+
+	reconciler := newTaintReconciler(t, node, createTestGroup(), job)
+
+	result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
+	})
+	require.NoError(t, err)
+
+	assert.InDelta(t, (30 * time.Second).Seconds(), result.RequeueAfter.Seconds(), 2,
+		"the grace expires in 30s, so the pass comes back then, not on the 2m transition backoff")
+	assert.Less(t, result.RequeueAfter, 2*time.Minute, "earlier than the FSM's backoff for this transition")
+
+	after := &infrav1alpha1.Node{}
+	require.NoError(t, reconciler.Get(context.Background(),
+		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
+	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, after.Status.Progress, "the Job is still inside its grace")
 }
