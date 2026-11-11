@@ -30,6 +30,23 @@ type GroupSpec struct {
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
 	// NodeSelector                     map[string]string `json:"nodeSelector"`
+
+	// MinSize is the floor that cluster-autoscaler must not scale this group below. It is
+	// reported to cluster-autoscaler as the min size of the node group, so a pool that has
+	// to keep a machine up sets minSize: 1 and the autoscaler stops reclaiming that node
+	// (no keepalive pod pinning the slot is needed any more).
+	//
+	// 0 is the default and the previous behaviour: the group may scale down to nothing.
+	//
+	// maxSize is not a field, it is derived from the number of Node CRs labelled with this
+	// group, so the invariant minSize <= maxSize cannot be expressed in the CRD. It is
+	// asserted at the gRPC boundary: a minSize larger than the number of slots is clamped
+	// to it when the group is reported, and scale operations that would cross the floor are
+	// refused.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MinSize int32 `json:"minSize,omitempty"`
+
 	ScaleDownUtilizationThreshold    string           `json:"scaleDownUtilizationThreshold"`
 	ScaleDownGpuUtilizationThreshold string           `json:"scaleDownGpuUtilizationThreshold"`
 	ScaleDownUnneededTime            *metav1.Duration `json:"scaleDownUnneededTime"`

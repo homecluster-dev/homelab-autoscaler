@@ -76,6 +76,100 @@ func (s *HomeClusterProviderServer) initializeMockData() {
 	logger.Info("Data initialization completed", "gpuTypes", len(s.gpuTypes))
 }
 
+// groupNodes lists the slots (Node CRs) committed to a group. The number of slots is the
+// max size of the group: maxSize is not a field of the Group CR, it is how many Node CRs
+// carry the group label.
+func (s *HomeClusterProviderServer) groupNodes(ctx context.Context, groupName string) ([]infrav1alpha1.Node, error) {
+	nodes := &infrav1alpha1.NodeList{}
+	listOpts := &client.ListOptions{LabelSelector: labels.SelectorFromSet(map[string]string{"group": groupName})}
+	if err := s.Client.List(ctx, nodes, listOpts); err != nil {
+		return nil, err
+	}
+
+	return nodes.Items, nil
+}
+
+// countsTowardsTargetSize reports whether a slot counts as capacity the provider is
+// serving: a slot whose progress is a shutdown (shutdown/shuttingdown) is not counted,
+// which is what leaves the group headroom for cluster-autoscaler.
+func countsTowardsTargetSize(node infrav1alpha1.Node) bool {
+	return node.Status.Progress != infrav1alpha1.ProgressShuttingDown &&
+		node.Status.Progress != infrav1alpha1.ProgressShutdown
+}
+
+// targetSizeOf counts the slots that make up the target size of a group. This is the one
+// definition of "target size" in the provider: it is what NodeGroupTargetSize reports to
+// cluster-autoscaler, and every minSize/maxSize check must be compared against this same
+// number, because the autoscaler sizes the group from it. Do not derive the size from a
+// subset of the slots (powered on plus starting up, say): that is a different quantity and
+// a floor judged against it refuses requests that do not cross the floor, which
+// cluster-autoscaler then retries forever.
+func targetSizeOf(nodes []infrav1alpha1.Node) int32 {
+	var targetSize int32
+	for _, node := range nodes {
+		if countsTowardsTargetSize(node) {
+			targetSize++
+		}
+	}
+
+	return targetSize
+}
+
+// isStartingUpSlot reports the one slot shape NodeGroupDecreaseTargetSize can cancel: a
+// slot that is desired on, has not powered on yet and is mid startup. Cancelling it takes
+// it out of the target size (its progress becomes shuttingdown), which is what makes
+// starting up slots the only capacity this entry point can decrease.
+func isStartingUpSlot(node infrav1alpha1.Node) bool {
+	return node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
+		node.Status.PowerState == infrav1alpha1.PowerStateOff &&
+		node.Status.Progress == infrav1alpha1.ProgressStartingUp
+}
+
+// effectiveMinSize returns the floor cluster-autoscaler must not scale the group below,
+// clamped to the number of slots the provider has, and reports whether the clamp kicked
+// in. maxSize is derived from the Node CR count rather than stored on the Group, so the
+// CRD cannot express minSize <= maxSize; that invariant is asserted here, at the gRPC
+// boundary. A floor the provider cannot fill is clamped instead of reported: telling
+// cluster-autoscaler it needs more slots than exist makes it scale up and fail on "no
+// powered off nodes found".
+func effectiveMinSize(group *infrav1alpha1.Group, maxSize int32) (int32, bool) {
+	if group == nil || group.Spec.MinSize <= 0 {
+		return 0, false
+	}
+	if group.Spec.MinSize > maxSize {
+		return maxSize, true
+	}
+
+	return group.Spec.MinSize, false
+}
+
+// groupMinSize resolves the floor of a group from its Group CR. A group that cannot be
+// read has no floor (0) and is reported in the log: scale requests for it are answered by
+// the node lookups, which surface the real error, and refusing the request on a transient
+// API failure would stall the autoscaler.
+func (s *HomeClusterProviderServer) groupMinSize(ctx context.Context, groupName string, maxSize int32) int32 {
+	logger := log.Log.WithName("grpc-server")
+
+	group := &infrav1alpha1.Group{}
+	if err := s.Client.Get(ctx, client.ObjectKey{Name: groupName, Namespace: namespaceConfig.Get()}, group); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			logger.V(1).Info("Group not found, no minimum size to enforce", "group", groupName)
+		} else {
+			logger.Error(err, "Failed to get group, no minimum size to enforce", "group", groupName)
+		}
+
+		return 0
+	}
+
+	minSize, clamped := effectiveMinSize(group, maxSize)
+	if clamped {
+		logger.Info("Clamping the minSize of the group to the slots it has",
+			"group", groupName, "specMinSize", group.Spec.MinSize, "maxSize", maxSize, "minSize", minSize)
+	}
+
+	return minSize
+}
+
 // NodeGroups returns all node groups
 func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.NodeGroupsRequest) (*pb.NodeGroupsResponse, error) {
 	logger := log.Log.WithName("grpc-server")
@@ -96,26 +190,30 @@ func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.Node
 	for _, group := range groups.Items {
 
 		var maxSize int32
-		labelSelector := labels.SelectorFromSet(map[string]string{"group": group.Name})
-		listOpts := &client.ListOptions{LabelSelector: labelSelector}
-		nodes := &infrav1alpha1.NodeList{}
-		err = s.Client.List(ctx, nodes, listOpts)
+		nodes, err := s.groupNodes(ctx, group.Name)
 		if err != nil {
+			logger.Error(err, "Failed to list nodes for group", "group", group.Name)
 			maxSize = 0
 		} else {
-			maxSize = int32(len(nodes.Items))
+			maxSize = int32(len(nodes))
 		}
 
-		// Create NodeGroup with: minSize=0, maxSize=GroupSpec.MaxSize, id=GroupSpec.Name
+		minSize, clamped := effectiveMinSize(&group, maxSize)
+		if clamped {
+			logger.Info("Clamping the minSize of the group to the slots it has",
+				"group", group.Name, "specMinSize", group.Spec.MinSize, "maxSize", maxSize, "minSize", minSize)
+		}
+
+		// Create NodeGroup with: minSize=GroupSpec.MinSize, maxSize=<slots in the group>, id=group name
 		nodeGroup := &pb.NodeGroup{
 			Id:      group.Name,
-			MinSize: 0,
+			MinSize: minSize,
 			MaxSize: maxSize,
-			Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Name, maxSize),
+			Debug:   fmt.Sprintf("Group %s - MinSize: %d, MaxSize: %d", group.Name, minSize, maxSize),
 		}
 
 		nodeGroups = append(nodeGroups, nodeGroup)
-		logger.Info("Added group to NodeGroups response", "group", group.Name, "nodeCount", maxSize)
+		logger.Info("Added group to NodeGroups response", "group", group.Name, "minSize", minSize, "nodeCount", maxSize)
 	}
 
 	logger.Info("NodeGroups response completed", "totalGroups", len(nodeGroups))
@@ -158,10 +256,7 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 	}
 
 	var maxSize int32 = 0
-	labelSelector := labels.SelectorFromSet(map[string]string{"group": groupName})
-	listOpts := &client.ListOptions{LabelSelector: labelSelector}
-	nodes := &infrav1alpha1.NodeList{}
-	err = s.Client.List(ctx, nodes, listOpts)
+	nodes, err := s.groupNodes(ctx, groupName)
 	if err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			maxSize = 0
@@ -169,10 +264,10 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 			logger.Error(err, "error listing nodes", "group", groupName)
 		}
 	} else {
-		maxSize = int32(len(nodes.Items))
+		maxSize = int32(len(nodes))
 	}
 
-	for _, node := range nodes.Items {
+	for _, node := range nodes {
 		if node.Name == req.Node.Name && node.Status.PowerState == infrav1alpha1.PowerStateOn {
 			return &pb.NodeGroupForNodeResponse{
 				NodeGroup: &pb.NodeGroup{Id: groupName},
@@ -180,11 +275,17 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 		}
 	}
 
+	minSize, clamped := effectiveMinSize(group, maxSize)
+	if clamped {
+		logger.Info("Clamping the minSize of the group to the slots it has",
+			"group", groupName, "specMinSize", group.Spec.MinSize, "maxSize", maxSize, "minSize", minSize)
+	}
+
 	nodeGroup := &pb.NodeGroup{
 		Id:      groupName,
-		MinSize: 0,
+		MinSize: minSize,
 		MaxSize: maxSize,
-		Debug:   fmt.Sprintf("Group %s - MaxSize: %d", group.Name, len(nodes.Items)),
+		Debug:   fmt.Sprintf("Group %s - MinSize: %d, MaxSize: %d", group.Name, minSize, len(nodes)),
 	}
 
 	logger.Info("Found node group for node", "node", req.Node.Name, "group", group.Name)
@@ -307,10 +408,7 @@ func (s *HomeClusterProviderServer) NodeGroupTargetSize(ctx context.Context, req
 		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
 	}
 
-	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
-	listOpts := &client.ListOptions{LabelSelector: labelSelector}
-	nodes := &infrav1alpha1.NodeList{}
-	err := s.Client.List(ctx, nodes, listOpts)
+	nodes, err := s.groupNodes(ctx, req.Id)
 	if err != nil {
 		logger.Error(err, "failed to list nodes for group", "group", req.Id)
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
@@ -318,16 +416,9 @@ func (s *HomeClusterProviderServer) NodeGroupTargetSize(ctx context.Context, req
 
 	// Count nodes that should be running (target size = nodes not shutting down or shutdown)
 	// This represents the desired number of active nodes in the group
-	var targetSize int32 = 0
-	for _, node := range nodes.Items {
-		// Count nodes that are not in shutdown states
-		if node.Status.Progress != infrav1alpha1.ProgressShuttingDown &&
-			node.Status.Progress != infrav1alpha1.ProgressShutdown {
-			targetSize++
-		}
-	}
+	targetSize := targetSizeOf(nodes)
 
-	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id, "targetSize", targetSize, "totalNodes", len(nodes.Items))
+	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id, "targetSize", targetSize, "totalNodes", len(nodes))
 	return &pb.NodeGroupTargetSizeResponse{
 		TargetSize: targetSize,
 	}, nil
@@ -348,20 +439,31 @@ func (s *HomeClusterProviderServer) NodeGroupIncreaseSize(ctx context.Context, r
 		return nil, status.Errorf(codes.InvalidArgument, "delta must be positive, got %d", req.Delta)
 	}
 
-	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
-	listOpts := &client.ListOptions{LabelSelector: labelSelector}
-	nodes := &infrav1alpha1.NodeList{}
-	err := s.Client.List(ctx, nodes, listOpts)
+	nodes, err := s.groupNodes(ctx, req.Id)
 	if err != nil {
 		logger.Error(err, "failed to list nodes for group", "group", req.Id)
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
+	}
+
+	// The max size of the group is the number of slots committed to it. Refuse a scale up
+	// that would exceed it explicitly: cluster-autoscaler sizes the group from this same
+	// count, so a request that crosses it means its view is stale and powering a slot on
+	// anyway would take the pool over the machines the operator committed.
+	maxSize := int32(len(nodes))
+	currentSize := targetSizeOf(nodes)
+	if currentSize+req.Delta > maxSize {
+		logger.Info("Refusing to increase the size of the group beyond its max size",
+			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize, "maxSize", maxSize)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"increasing node group %s by %d would exceed its max size %d (current target size %d)",
+			req.Id, req.Delta, maxSize, currentSize)
 	}
 
 	// Find an unhealthy node
 	var node *infrav1alpha1.Node
 	var nodeName string
 
-	for _, nodeCR := range nodes.Items {
+	for _, nodeCR := range nodes {
 		desiredPowerState := nodeCR.Spec.DesiredPowerState
 		powerState := nodeCR.Status.PowerState
 		progress := nodeCR.Status.Progress
@@ -392,7 +494,13 @@ func (s *HomeClusterProviderServer) NodeGroupIncreaseSize(ctx context.Context, r
 	return &pb.NodeGroupIncreaseSizeResponse{}, nil
 }
 
-// NodeGroupDeleteNodes deletes nodes from this node group
+// NodeGroupDeleteNodes deletes nodes from this node group. The floor of the group
+// (spec.minSize) is judged against the target size that results from the request, using
+// targetSizeOf, the same number NodeGroupTargetSize reports. A request that deletes
+// nothing takes no capacity away, so it is answered as a no-op success: the group can
+// already be at or below its floor while a shutdown from an earlier request is still in
+// flight, and a FailedPrecondition there is a refusal the autoscaler retries forever for
+// an operation that would change nothing.
 func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDeleteNodesRequest) (*pb.NodeGroupDeleteNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDeleteNodes called", "nodeGroup", req.Id, "nodes", len(req.Nodes))
@@ -400,6 +508,47 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 	// Check for context cancellation
 	if ctx.Err() != nil {
 		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
+	}
+
+	// Enforce the floor of the group before touching anything. cluster-autoscaler keeps its
+	// own min-size check, but a provider that accepts a scale down below minSize silently
+	// powers machines off, so refuse here and say why in the log.
+	nodes, err := s.groupNodes(ctx, req.Id)
+	if err != nil {
+		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
+	}
+
+	maxSize := int32(len(nodes))
+	minSize := s.groupMinSize(ctx, req.Id, maxSize)
+	currentSize := targetSizeOf(nodes)
+
+	requested := make(map[string]bool, len(req.Nodes))
+	for _, node := range req.Nodes {
+		requested[node.Name] = true
+	}
+
+	// Only the slots that count towards the target size are capacity that goes away; a slot
+	// that is already shut down is off the books and can be "deleted" again.
+	var deleting int32
+	for _, node := range nodes {
+		if requested[node.Name] && countsTowardsTargetSize(node) {
+			deleting++
+		}
+	}
+
+	// Only a request that actually takes capacity away can cross the floor. A slot that is
+	// already shut down is off the target size, so a request that deletes nothing projects
+	// the current size: when the group is already at or below its floor (a shutdown from an
+	// earlier delete is still in flight) that is not a request crossing the floor and
+	// refusing it would wedge the autoscaler over a no-op.
+	if projected := currentSize - deleting; deleting > 0 && projected < minSize {
+		logger.Info("Refusing to delete nodes, the group would fall below its minSize",
+			"nodeGroup", req.Id, "nodesRequested", len(req.Nodes), "deleting", deleting,
+			"currentSize", currentSize, "projectedSize", projected, "minSize", minSize)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"deleting %d node(s) from node group %s would take it below its minSize %d (current target size %d)",
+			deleting, req.Id, minSize, currentSize)
 	}
 
 	// Process each node to be deleted
@@ -431,7 +580,12 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 	return &pb.NodeGroupDeleteNodesResponse{}, nil
 }
 
-// NodeGroupDecreaseTargetSize decreases the target size of the node group
+// NodeGroupDecreaseTargetSize decreases the target size of the node group by cancelling
+// the slots that are still starting. The floor of the group (spec.minSize) is judged
+// against the target size that this request can actually produce, using the same
+// targetSizeOf that NodeGroupTargetSize reports, and a request that cannot take any
+// capacity away is a no-op success: cluster-autoscaler retries a FailedPrecondition
+// forever and never corrects its own view of the target size.
 func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.NodeGroupDecreaseTargetSizeRequest) (*pb.NodeGroupDecreaseTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDecreaseTargetSize called", "nodeGroup", req.Id, "delta", req.Delta)
@@ -446,36 +600,68 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 		return nil, status.Errorf(codes.InvalidArgument, "delta must be negative, got %d", req.Delta)
 	}
 
-	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
-	listOpts := &client.ListOptions{LabelSelector: labelSelector}
-	nodes := &infrav1alpha1.NodeList{}
-	err := s.Client.List(ctx, nodes, listOpts)
+	nodes, err := s.groupNodes(ctx, req.Id)
 	if err != nil {
 		logger.Error(err, "failed to list nodes for group", "group", req.Id)
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
 	}
 
-	// Separate nodes by their current state
-	var poweredOnNodes []infrav1alpha1.Node
+	// The only capacity this entry point can take away is slots that are still starting:
+	// a running machine is left to NodeGroupDeleteNodes, and a slot whose progress is
+	// already a shutdown is off the target size. Cancelling one moves its progress to
+	// shuttingdown, which is exactly one unit off targetSizeOf.
 	var startingUpNodes []infrav1alpha1.Node
-
-	for _, node := range nodes.Items {
-		if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
-			node.Status.PowerState == infrav1alpha1.PowerStateOn &&
-			node.Status.Progress == infrav1alpha1.ProgressReady {
-			poweredOnNodes = append(poweredOnNodes, node)
-		} else if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
-			node.Status.PowerState == infrav1alpha1.PowerStateOff &&
-			node.Status.Progress == infrav1alpha1.ProgressStartingUp {
+	for _, node := range nodes {
+		if isStartingUpSlot(node) {
 			startingUpNodes = append(startingUpNodes, node)
 		}
 	}
 
-	currentSize := int32(len(poweredOnNodes) + len(startingUpNodes))
-	newDesiredSize := int32(len(poweredOnNodes)) + req.Delta // req.Delta is negative
+	// The target size is the single definition from targetSizeOf, the number
+	// NodeGroupTargetSize reports. cluster-autoscaler calls this entry point precisely when
+	// its view of the target size is stale, so a request that lands on the floor has to be
+	// accepted. The arithmetic that decides the floor has been wrong twice: it first
+	// compared the floor against the running slots only, dropping the ones that are starting
+	// (minSize 1, one running + one starting, delta -1 lands on the floor, was refused), and
+	// then against the uncapped delta, so a request that can only reach the floor was
+	// refused as well (see the nodesToShutdown cap below).
+	currentSize := targetSizeOf(nodes)
 
-	if newDesiredSize < 0 {
-		newDesiredSize = 0
+	// Nothing to cancel means the request cannot take any capacity away: answer it as a
+	// no-op success rather than an error, so the autoscaler is not stuck retrying a
+	// request the provider can never carry out, and moves on to reconcile its view.
+	if len(startingUpNodes) == 0 {
+		logger.Info("Nothing to cancel, the target size of the group cannot be decreased by this request",
+			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize, "resultingSize", currentSize)
+		return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
+	}
+
+	minSize := s.groupMinSize(ctx, req.Id, int32(len(nodes)))
+
+	// How many slots this request will actually cancel. Cancelling one starting slot is one
+	// unit off the target size, so carrying out the delta means cancelling -delta of them,
+	// and a request that asks for more than exist cancels all of them: the provider reports
+	// success for what it actually did, and cluster-autoscaler reads the new target size back
+	// from NodeGroupTargetSize.
+	nodesToShutdown := -req.Delta
+	if available := int32(len(startingUpNodes)); nodesToShutdown > available {
+		nodesToShutdown = available
+	}
+
+	// The floor is judged against the size the request will produce, which is the current
+	// target size minus the slots it can cancel, not minus the delta it was asked for. With
+	// minSize 1, one running + two starting slots and delta -3 the achievable result is 1,
+	// exactly the floor: refusing that (the uncapped arithmetic produced 0) is the same class
+	// of unrecoverable FailedPrecondition as the case above, one level down.
+	resultingSize := currentSize - nodesToShutdown
+	if resultingSize < minSize {
+		logger.Info("Refusing to decrease the target size below the minSize of the group",
+			"nodeGroup", req.Id, "delta", req.Delta, "cancellable", int32(len(startingUpNodes)),
+			"nodesToShutdown", nodesToShutdown, "currentSize", currentSize,
+			"resultingSize", resultingSize, "minSize", minSize)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"decreasing node group %s by %d would take it below its minSize %d (current target size %d, %d slot(s) can be cancelled)",
+			req.Id, req.Delta, minSize, currentSize, nodesToShutdown)
 	}
 
 	// Sort starting up nodes by last startup time (oldest first)
@@ -488,12 +674,6 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 		}
 		return startingUpNodes[i].Status.LastStartupTime.Before(startingUpNodes[j].Status.LastStartupTime)
 	})
-
-	// Calculate how many starting up nodes to shut down
-	nodesToShutdown := int32(len(startingUpNodes)) - newDesiredSize
-	if nodesToShutdown < 0 {
-		nodesToShutdown = 0
-	}
 
 	// Shut down the required number of starting up nodes
 	for i := 0; i < int(nodesToShutdown) && i < len(startingUpNodes); i++ {
@@ -516,7 +696,10 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 		logger.Info("Successfully marked node for shutdown", "node", node.Name, "group", req.Id)
 	}
 
-	logger.Info("NodeGroupDecreaseTargetSize completed", "nodeGroup", req.Id, "currentSize", currentSize, "newSize", newDesiredSize, "delta", req.Delta, "nodesShutdown", nodesToShutdown)
+	// The size reported here is the target size after the cancellations that were actually
+	// carried out (the cap above), not the one the delta asked for.
+	logger.Info("NodeGroupDecreaseTargetSize completed", "nodeGroup", req.Id, "delta", req.Delta,
+		"nodesShutdown", nodesToShutdown, "currentSize", currentSize, "newSize", currentSize-nodesToShutdown)
 
 	return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 }

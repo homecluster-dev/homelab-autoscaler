@@ -74,11 +74,19 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(resp.NodeGroups).To(HaveLen(8)) // Based on test data: test-group, gpu-group, cpu-group,
 				// offline-group, unknown-group, empty-group, fast-scale-group, dev-group
 
-				// Verify specific groups
-				groupNames := make([]string, len(resp.NodeGroups))
-				for i, group := range resp.NodeGroups {
-					groupNames[i] = group.Id
-					Expect(group.MinSize).To(Equal(int32(0)))
+				// Verify specific groups. dev-group is the group that declares a per-group
+				// minimum size in the test data; every other group keeps the default floor of 0.
+				groupNames := make([]string, 0, len(resp.NodeGroups))
+				for _, group := range resp.NodeGroups {
+					groupNames = append(groupNames, group.Id)
+
+					expectedMinSize := int32(0)
+					if group.Id == "dev-group" {
+						expectedMinSize = 1
+					}
+					Expect(group.MinSize).To(Equal(expectedMinSize), "minSize of group %s", group.Id)
+					Expect(group.MinSize).To(BeNumerically("<=", group.MaxSize),
+						"minSize of group %s must not exceed its slots", group.Id)
 					Expect(group.MaxSize).To(BeNumerically(">=", 0))
 				}
 				Expect(groupNames).To(ContainElements("test-group", "gpu-group", "cpu-group", "offline-group",

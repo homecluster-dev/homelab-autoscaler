@@ -228,6 +228,8 @@ spec:
   scaleDownUnneededTime: "60m"
   scaleDownUnreadyTime: "90m"
   maxNodeProvisionTime: "30m"
+  # The pool has exactly one slot: the floor keeps cluster-autoscaler from reclaiming it.
+  minSize: 1
   zeroOrMaxNodeScaling: false
   ignoreDaemonSetsUtilization: true
 status:

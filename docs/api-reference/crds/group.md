@@ -13,14 +13,14 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | `string` | Yes | Unique identifier for the group |
-| `scaleDownUtilizationThreshold` | `float64` | Yes | CPU utilization threshold for scale-down (0.0-1.0) |
-| `scaleDownGpuUtilizationThreshold` | `float64` | Yes | GPU utilization threshold for scale-down (0.0-1.0) |
+| `scaleDownUtilizationThreshold` | `string` | Yes | CPU utilization threshold for scale-down, a decimal string (`"0.5"`) |
+| `scaleDownGpuUtilizationThreshold` | `string` | Yes | GPU utilization threshold for scale-down, a decimal string (`"0.5"`) |
 | `scaleDownUnneededTime` | `*metav1.Duration` | Yes | Time a node must be unneeded before scale-down |
 | `scaleDownUnreadyTime` | `*metav1.Duration` | Yes | Time an unready node waits before scale-down |
 | `maxNodeProvisionTime` | `*metav1.Duration` | Yes | Maximum time to wait for node provisioning |
 | `zeroOrMaxNodeScaling` | `bool` | Yes | Whether to scale to zero or max nodes only |
 | `ignoreDaemonSetsUtilization` | `bool` | Yes | Ignore DaemonSet pods in utilization calculations |
+| `minSize` | `int32` | No | Floor cluster-autoscaler must not scale the group below. Defaults to `0` |
 
 ## Example
 
@@ -31,13 +31,10 @@ metadata:
   name: worker-nodes
   namespace: homelab-autoscaler-system
 spec:
-  name: worker-nodes
-  maxSize: 5
-  nodeSelector:
-    node-type: worker
-    zone: homelab
-  scaleDownUtilizationThreshold: 0.5
-  scaleDownGpuUtilizationThreshold: 0.5
+  # Keep one node of the pool up; omit for a group that may scale to nothing.
+  minSize: 1
+  scaleDownUtilizationThreshold: "0.5"
+  scaleDownGpuUtilizationThreshold: "0.5"
   scaleDownUnneededTime: "10m"
   scaleDownUnreadyTime: "20m"
   maxNodeProvisionTime: "15m"
@@ -52,6 +49,10 @@ spec:
 1. **Set scaling thresholds** for CPU and GPU utilization
 2. **Configure timing parameters** for scale-down behavior
 3. **Apply the Group resource** to your cluster
+
+The size of a group is not part of the spec beyond `minSize`: its max size is the number
+of Node CRs labelled `group: <group name>`, so a pool grows and shrinks by committing
+slots, not by editing the Group.
 
 ```bash
 kubectl apply -f group.yaml
@@ -82,6 +83,25 @@ kubectl get groups -n homelab-autoscaler-system -w
 - GPU utilization below `scaleDownGpuUtilizationThreshold`
 - Node unneeded for longer than `scaleDownUnneededTime`
 - Node unready for longer than `scaleDownUnreadyTime`
+
+### Minimum Size
+
+`minSize` is the floor of the group. The gRPC cloud provider reports it to
+cluster-autoscaler as the min size of the node group, and refuses its own scale-down
+entry points (`NodeGroupDeleteNodes`, `NodeGroupDecreaseTargetSize`) when the request
+would take the group below it, so a pool that has to keep a machine up sets `minSize: 1`
+and the autoscaler stops reclaiming that node. A pool that used a keepalive pod to pin an
+always-on slot above the utilization threshold can drop the pod once the group declares
+the floor.
+
+Two things to know:
+
+- `0` is the default and matches the behaviour of every release before the field existed:
+  the group may scale down to nothing.
+- `maxSize` is **not** a field. The provider derives it by counting the Node CRs labelled
+  `group: <group name>`. The CRD therefore cannot assert `minSize <= maxSize`; the gRPC
+  boundary does, clamping a `minSize` above the number of slots to that count and refusing
+  a scale up that would exceed it.
 
 ### Timing Parameters
 

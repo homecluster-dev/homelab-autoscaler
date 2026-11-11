@@ -18,10 +18,13 @@ package grpcserver
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -359,11 +362,476 @@ func TestNodeGroupIncreaseSizePicksSeededOffSlot(t *testing.T) {
 }
 
 func TestNodeGroupIncreaseSizeFailsWithoutFreeSlot(t *testing.T) {
+	// Two slots, so the max size check does not fire: the only spare slot is mid-shutdown
+	// (progress shuttingdown) and cannot be started, and running slots are not free.
 	server := newServer(t,
-		nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCRInGroup(testGroup, "slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCRInGroup(testGroup, "slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
 	)
 
 	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no powered off nodes found")
+}
+
+// testNamespace is the namespace the gRPC server resolves Group CRs in
+// (internal/config.NamespaceConfig default).
+const testNamespace = "homelab-autoscaler-system"
+
+// groupCR builds a Group CR with a per-group minimum size.
+func groupCR(name string, minSize int32) *infrav1alpha1.Group {
+	return &infrav1alpha1.Group{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+		Spec:       infrav1alpha1.GroupSpec{MinSize: minSize},
+	}
+}
+
+// nodeCRInGroup builds a Node CR (a slot) of an arbitrary group.
+func nodeCRInGroup(group, name string, desired, status infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
+	node := nodeCR(name, desired, status, progress)
+	node.Labels["group"] = group
+
+	return node
+}
+
+// TestNodeGroupsReportsGroupMinSize: the provider used to hardcode MinSize 0, so a pool
+// could never express "keep at least one node" and cluster-autoscaler was free to
+// reclaim the always-on slot (the gitops repo worked around that with a keepalive pod).
+// The Group CR is now the source of the floor, and a floor above the number of slots the
+// provider has is clamped to it: maxSize is derived from the Node CR count, so the CRD
+// cannot assert minSize <= maxSize.
+func TestNodeGroupsReportsGroupMinSize(t *testing.T) {
+	server := newServer(t,
+		groupCR(testGroup, 1),
+		nodeCRInGroup(testGroup, "slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCRInGroup(testGroup, "slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCRInGroup(testGroup, "slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+
+		groupCR("group-no-min", 0),
+		nodeCRInGroup("group-no-min", "spare-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+
+		groupCR("group-over-min", 5),
+		nodeCRInGroup("group-over-min", "only-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCRInGroup("group-over-min", "only-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+
+		groupCR("group-empty", 1),
+	)
+
+	resp, err := server.NodeGroups(context.Background(), &pb.NodeGroupsRequest{})
+	require.NoError(t, err)
+
+	got := make(map[string][2]int32, len(resp.NodeGroups))
+	for _, group := range resp.NodeGroups {
+		got[group.Id] = [2]int32{group.MinSize, group.MaxSize}
+	}
+
+	assert.Equal(t, map[string][2]int32{
+		testGroup:        {1, 3},
+		"group-no-min":   {0, 1},
+		"group-over-min": {2, 2}, // clamped: there is no floor the provider cannot fill
+		"group-empty":    {0, 0},
+	}, got)
+}
+
+// TestNodeGroupForNodeReportsGroupMinSize covers the same floor on the per-node path.
+func TestNodeGroupForNodeReportsGroupMinSize(t *testing.T) {
+	server := newServer(t,
+		groupCR(testGroup, 2),
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+			Name:   "slot-off",
+			Labels: map[string]string{"infra.homecluster.dev/group": testGroup},
+		}},
+		nodeCRInGroup(testGroup, "slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCRInGroup(testGroup, "slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	resp, err := server.NodeGroupForNode(context.Background(), &pb.NodeGroupForNodeRequest{
+		Node: &pb.ExternalGrpcNode{Name: "slot-off"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.NodeGroup)
+
+	assert.Equal(t, testGroup, resp.NodeGroup.Id)
+	assert.Equal(t, int32(2), resp.NodeGroup.MinSize)
+	assert.Equal(t, int32(2), resp.NodeGroup.MaxSize)
+}
+
+// slotInSystemNamespace builds a slot of the test group in the namespace the server
+// resolves Node CRs in, which is what NodeGroupDeleteNodes looks the slot up by.
+func slotInSystemNamespace(name string, desired, status infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
+	node := nodeCRInGroup(testGroup, name, desired, status, progress)
+	node.Namespace = testNamespace
+
+	return node
+}
+
+func externalNodes(names ...string) []*pb.ExternalGrpcNode {
+	nodes := make([]*pb.ExternalGrpcNode, 0, len(names))
+	for _, name := range names {
+		nodes = append(nodes, &pb.ExternalGrpcNode{Name: name})
+	}
+
+	return nodes
+}
+
+func desiredPowerStates(t *testing.T, server *HomeClusterProviderServer, names ...string) map[string]infrav1alpha1.PowerState {
+	t.Helper()
+
+	got := make(map[string]infrav1alpha1.PowerState, len(names))
+	for _, name := range names {
+		node := &infrav1alpha1.Node{}
+		require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
+		got[name] = node.Spec.DesiredPowerState
+	}
+
+	return got
+}
+
+// TestNodeGroupDeleteNodesRefusesBelowMinSize: the provider must not power machines off
+// below the floor of the group. The refusal is explicit and logged, not a silent accept
+// that leaves the always-on slot destroyed. A request that deletes nothing takes no
+// capacity away, so it is a no-op success even when the group is already at or below its
+// floor.
+func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
+	running := func(name string) *infrav1alpha1.Node {
+		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	}
+
+	tests := []struct {
+		name    string
+		objects []client.Object
+		nodes   []string
+		refuse  bool
+	}{
+		{
+			name:    "deleting the last node of a minSize 1 group is refused",
+			objects: []client.Object{groupCR(testGroup, 1), running("slot-1")},
+			nodes:   []string{"slot-1"},
+			refuse:  true,
+		},
+		{
+			name:    "deleting both nodes of a minSize 1 group is refused",
+			objects: []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2")},
+			nodes:   []string{"slot-1", "slot-2"},
+			refuse:  true,
+		},
+		{
+			name:    "deleting one of two nodes of a minSize 1 group is allowed",
+			objects: []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2")},
+			nodes:   []string{"slot-2"},
+			refuse:  false,
+		},
+		{
+			// The group is below its floor while a shutdown from an earlier request is still
+			// in flight, and this request deletes a slot that is already shut down, so it
+			// takes no capacity away. Refusing it asks the autoscaler to do something the
+			// provider cannot act on and locks the delete loop on a no-op.
+			name: "a request that deletes nothing is allowed while the group is below its floor",
+			objects: []client.Object{
+				groupCR(testGroup, 2),
+				slotInSystemNamespace("slot-powering-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+				slotInSystemNamespace("slot-shut", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+			},
+			nodes:  []string{"slot-shut"},
+			refuse: false,
+		},
+		{
+			name:    "a group without a Group CR keeps the old, unbounded behaviour",
+			objects: []client.Object{running("slot-1")},
+			nodes:   []string{"slot-1"},
+			refuse:  false,
+		},
+		{
+			name: "slots that are already shut down do not count against the floor",
+			objects: []client.Object{
+				groupCR(testGroup, 1),
+				running("slot-1"),
+				slotInSystemNamespace("slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+			},
+			nodes:  []string{"slot-2"},
+			refuse: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newServer(t, tc.objects...)
+
+			_, err := server.NodeGroupDeleteNodes(context.Background(), &pb.NodeGroupDeleteNodesRequest{
+				Id:    testGroup,
+				Nodes: externalNodes(tc.nodes...),
+			})
+
+			if tc.refuse {
+				require.Error(t, err)
+				st, ok := grpcstatus.FromError(err)
+				require.True(t, ok)
+				assert.Equal(t, codes.FailedPrecondition, st.Code())
+				assert.Contains(t, st.Message(), "minSize")
+
+				// nothing was touched
+				for _, name := range tc.nodes {
+					assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, name)[name],
+						"a refused delete must leave %s desired on", name)
+				}
+
+				return
+			}
+
+			require.NoError(t, err)
+			for _, name := range tc.nodes {
+				assert.Equal(t, infrav1alpha1.PowerStateOff, desiredPowerStates(t, server, name)[name])
+			}
+		})
+	}
+}
+
+// TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize mirrors the same floor on the
+// decrease path: cancelling slots that are still starting must not take the group below
+// its minimum size. The floor is judged against the target size the request can actually
+// produce (targetSizeOf minus the slots it is able to cancel), and a request that cannot
+// take any capacity away is a no-op success, because cluster-autoscaler retries a refusal
+// forever.
+func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
+	startingUp := func(name string) *infrav1alpha1.Node {
+		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	}
+	running := func(name string) *infrav1alpha1.Node {
+		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	}
+	// midShutdown is a slot being powered off: desired off, the machine still on, progress
+	// not yet a shutdown, so it still counts towards the target size.
+	midShutdown := func(name string) *infrav1alpha1.Node {
+		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	}
+
+	tests := []struct {
+		name     string
+		objects  []client.Object
+		delta    int32
+		refuse   bool
+		wantShed []string // slots the request must cancel: desired off, progress shuttingdown
+		wantKeep []string // slots this request must not cancel
+	}{
+		{
+			// The reported bug: the floor has to be judged against the target size that
+			// results from the request. Cancelling the starting slot takes the target size
+			// from 2 to 1, which is the floor, not below it, and refusing that leaves
+			// cluster-autoscaler retrying the refusal forever with a target size it can
+			// never correct (the pre-fix arithmetic counted the running slots only, so it
+			// compared 1 + (-1) = 0 against the floor).
+			name:     "minSize 1, one running + one starting: delta -1 lands on the floor and is carried out",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1"},
+		},
+		{
+			// Nothing to cancel means no capacity goes away, so there is nothing to refuse:
+			// a FailedPrecondition here is retried forever.
+			name:     "minSize 1 with one running node and nothing to cancel is a no-op success",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1")},
+			delta:    -1,
+			refuse:   false,
+			wantKeep: []string{"slot-1"},
+		},
+		{
+			// The only capacity this entry point owns is the starting slot, so a delta that is
+			// bigger than the slots it can cancel cannot cross the floor either: cancelling the
+			// one starting slot takes the target size from 3 to 2, which is the floor.
+			name:     "minSize 2, two running + one starting: delta -2 cancels the one starting slot and lands on the floor",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
+			delta:    -2,
+			refuse:   false,
+			wantShed: []string{"slot-3"},
+			wantKeep: []string{"slot-1", "slot-2"},
+		},
+		{
+			// The case that genuinely crosses the floor: one running slot and one starting
+			// slot, so the only cancellation this request can carry out takes the target size
+			// from 2 to 1, below the floor. It is refused, nothing is cancelled.
+			name:     "minSize 2, one running + one starting: delta -2 crosses the floor and is refused",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2")},
+			delta:    -2,
+			refuse:   true,
+			wantKeep: []string{"slot-1", "slot-2"},
+		},
+		{
+			name:     "minSize 2, two running + one starting: delta -1 lands on the floor",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-3"},
+			wantKeep: []string{"slot-1", "slot-2"},
+		},
+		{
+			// The floor is compared against targetSizeOf, the number NodeGroupTargetSize
+			// reports, not against a count of the running slots. A slot that is mid shutdown
+			// is still part of the target size, so cancelling the starting slot here lands on
+			// the floor; counting only the running slots would refuse it.
+			name:     "minSize 2, one running + one starting + one mid shutdown: delta -1 lands on the floor",
+			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2"), midShutdown("slot-3")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1", "slot-3"},
+		},
+		{
+			// The floor has to be judged against the size the request can actually produce,
+			// not against the uncapped delta: the target size is 3 (one running + two starting),
+			// two slots can be cancelled, so the achievable result is 1, exactly the floor. The
+			// uncapped arithmetic compared 3 - 3 = 0 against the floor and refused it, the same
+			// class of unrecoverable FailedPrecondition as the case above, one level down.
+			name:     "minSize 1, one running + two starting: delta -3 cancels both starting slots and lands on the floor",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2"), startingUp("slot-3")},
+			delta:    -3,
+			refuse:   false,
+			wantShed: []string{"slot-2", "slot-3"},
+			wantKeep: []string{"slot-1"},
+		},
+		{
+			// Cancelling one starting slot is one unit off the target size, so the delta is
+			// carried out on the slots that can be cancelled and the running machines, which
+			// this entry point does not own, stay up.
+			name:     "minSize 1 with two running nodes and one starting cancels the starting slot",
+			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2"), startingUp("slot-3")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-3"},
+			wantKeep: []string{"slot-1", "slot-2"},
+		},
+		{
+			// A delta larger than the slots that can be cancelled cancels all of them and
+			// still succeeds: cluster-autoscaler reads the resulting target size back from
+			// NodeGroupTargetSize, it does not track the arithmetic itself.
+			name:     "no floor, delta larger than the starting slots cancels all of them",
+			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
+			delta:    -2,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1"},
+		},
+		{
+			name:     "no floor keeps the old behaviour",
+			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
+			delta:    -1,
+			refuse:   false,
+			wantShed: []string{"slot-2"},
+			wantKeep: []string{"slot-1"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newServer(t, tc.objects...)
+
+			_, err := server.NodeGroupDecreaseTargetSize(context.Background(), &pb.NodeGroupDecreaseTargetSizeRequest{
+				Id:    testGroup,
+				Delta: tc.delta,
+			})
+
+			if tc.refuse {
+				require.Error(t, err)
+				st, ok := grpcstatus.FromError(err)
+				require.True(t, ok)
+				assert.Equal(t, codes.FailedPrecondition, st.Code())
+				assert.Contains(t, st.Message(), "minSize")
+			} else {
+				require.NoError(t, err)
+			}
+
+			all := append(append([]string{}, tc.wantShed...), tc.wantKeep...)
+			for _, name := range all {
+				if slices.Contains(tc.wantShed, name) {
+					desired, progress := slotState(t, server, name)
+					assert.Equal(t, infrav1alpha1.PowerStateOff, desired, "cancelled slot %s must be desired off", name)
+					assert.Equal(t, infrav1alpha1.ProgressShuttingDown, progress, "cancelled slot %s leaves the target size", name)
+
+					continue
+				}
+
+				_, progress := slotState(t, server, name)
+				assert.NotEqual(t, infrav1alpha1.ProgressShuttingDown, progress, "slot %s must not be cancelled", name)
+			}
+		})
+	}
+}
+
+// slotState reads the desired power state and the recorded progress of a slot.
+func slotState(t *testing.T, server *HomeClusterProviderServer, name string) (infrav1alpha1.PowerState, infrav1alpha1.Progress) {
+	t.Helper()
+
+	node := &infrav1alpha1.Node{}
+	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
+
+	return node.Spec.DesiredPowerState, node.Status.Progress
+}
+
+// TestNodeGroupIncreaseSizeRefusesBeyondMaxSize: maxSize is the number of slots committed
+// to the group, so a scale up that would exceed it is refused by the provider too.
+func TestNodeGroupIncreaseSizeRefusesBeyondMaxSize(t *testing.T) {
+	server := newServer(t,
+		groupCR(testGroup, 1),
+		slotInSystemNamespace("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+	)
+
+	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+	require.Error(t, err)
+
+	st, ok := grpcstatus.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.FailedPrecondition, st.Code())
+	assert.Contains(t, st.Message(), "max size")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-1")["slot-1"])
+
+	// within the max size, the scale up still powers a spare slot on
+	server = newServer(t,
+		groupCR(testGroup, 1),
+		slotInSystemNamespace("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slotInSystemNamespace("slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	_, err = server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+	require.NoError(t, err)
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-2")["slot-2"])
+}
+
+func TestEffectiveMinSize(t *testing.T) {
+	tests := []struct {
+		name        string
+		group       *infrav1alpha1.Group
+		maxSize     int32
+		want        int32
+		wantClamped bool
+	}{
+		{"nil group", nil, 3, 0, false},
+		{"zero is the default", groupCR("g", 0), 3, 0, false},
+		{"negative is treated as zero", groupCR("g", -1), 3, 0, false},
+		{"floor below the max size is reported as is", groupCR("g", 2), 3, 2, false},
+		{"floor equal to the max size is reported as is", groupCR("g", 3), 3, 3, false},
+		{"floor above the max size is clamped", groupCR("g", 4), 3, 3, true},
+		{"floor with no slots is clamped to zero", groupCR("g", 1), 0, 0, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			minSize, clamped := effectiveMinSize(tc.group, tc.maxSize)
+			assert.Equal(t, tc.want, minSize)
+			assert.Equal(t, tc.wantClamped, clamped)
+		})
+	}
+}
+
+func TestTargetSizeOf(t *testing.T) {
+	nodes := []infrav1alpha1.Node{
+		*nodeCRInGroup(testGroup, "ready", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		*nodeCRInGroup(testGroup, "starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+		*nodeCRInGroup(testGroup, "stopping", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
+		*nodeCRInGroup(testGroup, "off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		*nodeCRInGroup(testGroup, "seeded", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	}
+
+	assert.Equal(t, int32(2), targetSizeOf(nodes))
+	assert.Equal(t, int32(0), targetSizeOf(nil))
 }

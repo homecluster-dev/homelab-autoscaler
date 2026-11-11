@@ -6,8 +6,16 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: group-sample
 spec:
-  maxSize: 3
-  scaleDownUtilizationThreshold: 0.3
+  # minSize is the floor cluster-autoscaler must not scale this group below. 0 (the
+  # default) lets the group scale to nothing; 1 keeps a node up, so the pool does not
+  # need a keepalive pod to stop the autoscaler from reclaiming an always-on node.
+  # maxSize is derived from the number of Node CRs labelled with this group, so a
+  # minSize above that count is clamped to it when the group is reported.
+  minSize: 1
+  scaleDownUtilizationThreshold: "0.3"
+  scaleDownGpuUtilizationThreshold: "0.3"
   scaleDownUnneededTime: "5m"
   scaleDownUnreadyTime: "2m"
   maxNodeProvisionTime: "10m"
+  zeroOrMaxNodeScaling: false
+  ignoreDaemonSetsUtilization: true
