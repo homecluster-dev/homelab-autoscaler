@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
@@ -200,6 +201,89 @@ func WithGroupScaleDownThreshold(threshold string) GroupOption {
 
 // NodeOption is a function that modifies a Node CR
 type NodeOption func(*infrav2alpha1.Node)
+
+// ClaimOption mutates a NodeClaim built by WithNodeClaim.
+type ClaimOption func(*infrav2alpha1.NodeClaim)
+
+// WithNodeClaim adds a NodeClaim: the request that makes a slot capacity. In v2alpha1 the
+// provider counts these, cancels these and creates these, so a fixture of a pool that is at
+// capacity is a fixture of slots with live claims.
+func (b *MockClientBuilder) WithNodeClaim(name, slotName string, opts ...ClaimOption) *MockClientBuilder {
+	nodeClaim := &infrav2alpha1.NodeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "infra.homecluster.dev/v2alpha1",
+			Kind:       "NodeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: config.NewNamespaceConfig().Get(),
+			UID:       types.UID(fmt.Sprintf("nodeclaim-%s-uid", name)),
+			Labels: map[string]string{
+				claim.LabelSlot: slotName,
+			},
+		},
+		Spec: infrav2alpha1.NodeClaimSpec{
+			SlotRef:     corev1.ObjectReference{Name: slotName},
+			RequestedAt: metav1.Now(),
+			RequestedBy: claim.RequestedByAutoscaler,
+			Request: infrav2alpha1.ClaimRequest{
+				Call:  infrav2alpha1.ClaimCallIncreaseSize,
+				Delta: 1,
+			},
+		},
+		Status: infrav2alpha1.NodeClaimStatus{
+			Phase:   infrav2alpha1.NodeClaimReady,
+			Attempt: 1,
+		},
+	}
+
+	for _, opt := range opts {
+		opt(nodeClaim)
+	}
+
+	_ = b.client.AddObject(nodeClaim)
+
+	return b
+}
+
+// WithClaimGroup is the node group the request was for, on the claim and on its label: the
+// provider lists a group's claims by that label.
+func WithClaimGroup(groupName string) ClaimOption {
+	return func(nodeClaim *infrav2alpha1.NodeClaim) {
+		nodeClaim.Spec.Request.Group = groupName
+		nodeClaim.Labels[claim.LabelGroup] = groupName
+	}
+}
+
+// WithClaimPhase is the phase of the claim: pending, booting and ready are live, failed and
+// completed are terminal and free their slot.
+func WithClaimPhase(claimPhase infrav2alpha1.NodeClaimPhase) ClaimOption {
+	return func(nodeClaim *infrav2alpha1.NodeClaim) {
+		nodeClaim.Status.Phase = claimPhase
+	}
+}
+
+// WithClaimReason records why a claim ended.
+func WithClaimReason(reason string) ClaimOption {
+	return func(nodeClaim *infrav2alpha1.NodeClaim) {
+		nodeClaim.Status.Reason = reason
+	}
+}
+
+// WithClaimCall is the entry point the request came from, and the nodes a DeleteNodes named.
+func WithClaimCall(call string, nodes ...string) ClaimOption {
+	return func(nodeClaim *infrav2alpha1.NodeClaim) {
+		nodeClaim.Spec.Request.Call = call
+		nodeClaim.Spec.Request.Nodes = nodes
+	}
+}
+
+// WithClaimAttempt is the attempt number of the claim for its slot.
+func WithClaimAttempt(attempt int32) ClaimOption {
+	return func(nodeClaim *infrav2alpha1.NodeClaim) {
+		nodeClaim.Status.Attempt = attempt
+	}
+}
 
 // WithNodeGroup assigns a Node to a Group
 func WithNodeGroup(groupName string) NodeOption {

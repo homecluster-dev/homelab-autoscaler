@@ -31,6 +31,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
@@ -208,10 +209,11 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				}
 				resp, err := server.NodeGroupTargetSize(testCtx, req)
 
-				// Verify response
+				// Verify response: the target size is the count of the group's live claims,
+				// and the fixture gives test-group two of them.
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp).NotTo(BeNil())
-				Expect(resp.TargetSize).To(BeNumerically(">=", 0))
+				Expect(resp.TargetSize).To(Equal(int32(2)))
 			})
 		})
 
@@ -236,12 +238,18 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 	})
 
 	Describe("NodeGroupIncreaseSize endpoint", func() {
-		Context("when powered off nodes are available", func() {
-			It("should power on nodes to increase size", func() {
-				// Setup test data with gpu-group that has a powered off node
+		Context("when a free slot is available", func() {
+			It("should create a NodeClaim for it, attributed to the request", func() {
+				// Setup test data with gpu-group, whose second slot has no live claim: the slot
+				// a failed claim freed (claim-gpu-node-2, DeadlineExceeded), which is the only
+				// shape IncreaseSize may claim in v2alpha1.
 				mockClient, err := loader.CreateMockClientWithAllData()
 				Expect(err).NotTo(HaveOccurred())
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				before, err := server.NodeGroupTargetSize(testCtx, &pb.NodeGroupTargetSizeRequest{Id: "gpu-group"})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(before.TargetSize).To(Equal(int32(1)), "only gpu-node-1 has a live claim")
 
 				// Call NodeGroupIncreaseSize endpoint
 				req := &pb.NodeGroupIncreaseSizeRequest{
@@ -254,11 +262,38 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp).NotTo(BeNil())
 
-				// Verify node was updated to desired power state on
-				node := &infrav2alpha1.Node{}
-				err = mockClient.Get(testCtx, client.ObjectKey{Name: "gpu-node-2", Namespace: namespace.Get()}, node)
+				// The request is an object now, and the object says who asked and for what.
+				claims := &infrav2alpha1.NodeClaimList{}
+				Expect(mockClient.List(testCtx, claims, &client.ListOptions{Namespace: namespace.Get()})).To(Succeed())
+
+				var created *infrav2alpha1.NodeClaim
+
+				for i := range claims.Items {
+					candidate := &claims.Items[i]
+					if candidate.Spec.SlotRef.Name == "gpu-node-2" && candidate.Spec.Request.Call == infrav2alpha1.ClaimCallIncreaseSize &&
+						candidate.Status.Phase == "" {
+						created = candidate
+
+						break
+					}
+				}
+
+				requireClaimsFor(created, "gpu-node-2", "gpu-group", int32(1))
+
+				// The phase of a created claim is the schema's default and the claim
+				// controller's first write; the mock client applies neither, so the fixture
+				// lands it and the provider's arithmetic is read back on a live claim.
+				created.Status.Phase = infrav2alpha1.NodeClaimPending
+				Expect(mockClient.Update(testCtx, created)).To(Succeed())
+
+				after, err := server.NodeGroupTargetSize(testCtx, &pb.NodeGroupTargetSizeRequest{Id: "gpu-group"})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(node.Spec.DesiredPowerState).To(Equal(infrav2alpha1.PowerStateOn))
+				Expect(after.TargetSize).To(Equal(int32(2)), "the count of live claims is the target size, and the created claim is one")
+
+				// No field of the slot carries the request: the spec is Git-owned configuration.
+				node := &infrav2alpha1.Node{}
+				Expect(mockClient.Get(testCtx, client.ObjectKey{Name: "gpu-node-2", Namespace: namespace.Get()}, node)).To(Succeed())
+				Expect(node.Spec.KubernetesNodeName).To(Equal("gpu-node-2"), "the handler wrote no field of the slot")
 			})
 		})
 
@@ -308,12 +343,17 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 	})
 
 	Describe("NodeGroupDeleteNodes endpoint", func() {
-		Context("when nodes exist and are powered on", func() {
-			It("should set nodes to desired power state off", func() {
-				// Setup test data
+		Context("when a slot's machine is named for deletion", func() {
+			It("should cancel the claim that owns it", func() {
+				// Setup test data: test-group has two running slots, each owned by a live
+				// ready claim. cluster-autoscaler drains first, then calls DeleteNodes.
 				mockClient, err := loader.CreateMockClientWithGroup("test-group")
 				Expect(err).NotTo(HaveOccurred())
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				before, err := server.NodeGroupTargetSize(testCtx, &pb.NodeGroupTargetSizeRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(before.TargetSize).To(Equal(int32(2)))
 
 				// Call NodeGroupDeleteNodes endpoint
 				req := &pb.NodeGroupDeleteNodesRequest{
@@ -328,17 +368,36 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp).NotTo(BeNil())
 
-				// Verify node was updated to desired power state off
-				node := &infrav2alpha1.Node{}
-				err = mockClient.Get(testCtx, client.ObjectKey{Name: "test-node-1", Namespace: namespace.Get()}, node)
+				// The claim of the named slot is cancelled: its unit comes off the target size
+				// on the write that asked for it, and the slot reconciler powers the machine off
+				// because nothing wants it any more.
+				claims := &infrav2alpha1.NodeClaimList{}
+				Expect(mockClient.List(testCtx, claims, &client.ListOptions{Namespace: namespace.Get()})).To(Succeed())
+
+				for _, candidate := range claims.Items {
+					Expect(candidate.Spec.SlotRef.Name).NotTo(Equal("test-node-1"),
+						"the request that owned the named slot is cancelled, not left live")
+				}
+
+				after, err := server.NodeGroupTargetSize(testCtx, &pb.NodeGroupTargetSizeRequest{Id: "test-group"})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(node.Spec.DesiredPowerState).To(Equal(infrav2alpha1.PowerStateOff))
+				Expect(after.TargetSize).To(Equal(int32(1)), "the autoscaler reads the size the request produced")
+
+				// The slot itself is untouched: DeleteNodes records and cancels a claim, it does
+				// not write a slot.
+				node := &infrav2alpha1.Node{}
+				Expect(mockClient.Get(testCtx, client.ObjectKey{Name: "test-node-1", Namespace: namespace.Get()}, node)).To(Succeed())
+				Expect(node.Spec.KubernetesNodeName).To(Equal("test-node-1"))
 			})
 		})
 
-		Context("when nodes do not exist", func() {
-			It("should handle non-existent nodes gracefully", func() {
-				// Setup empty mock client
+		Context("when the named machine has no slot", func() {
+			It("answers the request as the no-op it is", func() {
+				// The v1alpha1 handler looked each name up as a slot and answered the miss
+				// with codes.Internal, which cluster-autoscaler retried. Under the claim model
+				// the request cancels the claim of a slot; a name the provider has no slot for
+				// cancels nothing, takes no capacity away, and is answered as a success so the
+				// autoscaler moves on.
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).Build()
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
 
@@ -350,12 +409,15 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 					},
 				}
 				_, err := server.NodeGroupDeleteNodes(testCtx, req)
+				Expect(err).NotTo(HaveOccurred())
 
-				// Verify error
-				Expect(err).To(HaveOccurred())
-				st, ok := status.FromError(err)
-				Expect(ok).To(BeTrue())
-				Expect(st.Code()).To(Equal(codes.Internal))
+				claims := &infrav2alpha1.NodeClaimList{}
+				Expect(mockClient.List(testCtx, claims, &client.ListOptions{Namespace: namespace.Get()})).To(Succeed())
+				Expect(claims.Items).To(BeEmpty(), "a request that names no slot creates nothing")
+
+				size, err := server.NodeGroupTargetSize(testCtx, &pb.NodeGroupTargetSizeRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(size.TargetSize).To(Equal(int32(0)))
 			})
 		})
 	})
@@ -532,7 +594,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
 						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
 					WithNode("test-node-2", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff)).
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff)).
 					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group")).
 					Build()
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
@@ -556,7 +618,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff),
 						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
 					Build()
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
@@ -594,7 +656,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff),
 						mocks.WithNodeCapacity("1950m", "3.2Gi")).
 					Build()
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
@@ -627,7 +689,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOn),
 						mocks.WithNodeCapacity("1950m", "3.2Gi")).
 					// the builder's node reports 3.8 CPU / 7.5 GiB allocatable
 					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group")).
@@ -662,7 +724,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOn),
 						mocks.WithNodeTaints([]corev1.Taint{role})).
 					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group"),
 						mocks.WithKubernetesNodeTaint("node.kubernetes.io/role", "agent", corev1.TaintEffectNoSchedule),
@@ -981,3 +1043,21 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 		})
 	})
 })
+
+// requireClaimsFor asserts the attribution a scale-up request leaves on the object it created:
+// the slot it asks for, the call that asked, the delta it asked for, the group, and the caller.
+// This is the question the v1alpha1 scalar could not answer - who asked, why, for what.
+func requireClaimsFor(nodeClaim *infrav2alpha1.NodeClaim, slotName, groupName string, delta int32) {
+	GinkgoHelper()
+
+	Expect(nodeClaim).NotTo(BeNil(), "no claim was created for slot %s", slotName)
+	Expect(nodeClaim.Spec.SlotRef.Name).To(Equal(slotName))
+	Expect(nodeClaim.Spec.Request.Call).To(Equal(infrav2alpha1.ClaimCallIncreaseSize))
+	Expect(nodeClaim.Spec.Request.Group).To(Equal(groupName))
+	Expect(nodeClaim.Spec.Request.Delta).To(Equal(delta))
+	Expect(nodeClaim.Spec.RequestedBy).NotTo(BeEmpty(), "the claim says who asked")
+	Expect(nodeClaim.Spec.RequestedAt.Time).NotTo(BeZero())
+	Expect(nodeClaim.Spec.DeadlineAt).NotTo(BeNil(), "the claim is born with a budget")
+	Expect(nodeClaim.Labels[claim.LabelSlot]).To(Equal(slotName), "the slot's claims are one label away")
+	Expect(nodeClaim.Labels[claim.LabelGroup]).To(Equal(groupName))
+}
