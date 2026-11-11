@@ -37,7 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
@@ -46,9 +46,9 @@ import (
 )
 
 // taintNodeCR returns the shared test Node CR with spec.nodeTaints declared.
-func taintNodeCR(declared ...corev1.Taint) *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+func taintNodeCR(declared ...corev1.Taint) *infrav2alpha1.Node {
+	node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 	node.Spec.NodeTaints = declared
 
 	return node
@@ -74,7 +74,7 @@ func newTaintReconciler(t *testing.T, objects ...client.Object) *NodeReconciler 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).
-		WithStatusSubresource(&infrav1alpha1.Node{}).
+		WithStatusSubresource(&infrav2alpha1.Node{}).
 		Build()
 
 	return &NodeReconciler{Client: fakeClient, Scheme: scheme}
@@ -310,9 +310,9 @@ func TestApplyNodeTaintsRecordsNoEventWhenNothingIsSkipped(t *testing.T) {
 // capacityNodeCR returns the shared test Node CR that declares spec.nodeCapacity: the shape a
 // 2 vCPU / 4 GiB machine reports once the kubelet subtracted its system reservation, 1950m of cpu
 // and 3.2Gi of memory.
-func capacityNodeCR() *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+func capacityNodeCR() *infrav2alpha1.Node {
+	node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 	node.Spec.NodeCapacity = corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("1950m"),
 		corev1.ResourceMemory: resource.MustParse("3.2Gi"),
@@ -386,7 +386,7 @@ func TestDeclaredNodeCapacityDriftWarns(t *testing.T) {
 func TestDeclaredNodeCapacityRecordsNothing(t *testing.T) {
 	tests := []struct {
 		name     string
-		declared *infrav1alpha1.Node
+		declared *infrav2alpha1.Node
 		live     *corev1.Node
 	}{
 		{
@@ -401,7 +401,7 @@ func TestDeclaredNodeCapacityRecordsNothing(t *testing.T) {
 		},
 		{
 			name:     "the slot declares nothing, so nothing can be stale",
-			declared: createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+			declared: createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 			live:     capacityK8sNode("1", "1Gi", true),
 		},
 		{
@@ -474,9 +474,9 @@ func drainEvents(recorder *events.FakeRecorder) []string {
 // machinelessSlot is a slot of a pool that churns: the Hetzner server behind it is deleted, so no
 // corev1.Node points at it and no lifecycle Job is behind it, and cluster-autoscaler has asked for
 // it to be off. The status still says the machine is up and the progress names one.
-func machinelessSlot(previous infrav1alpha1.Progress) *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOff, previous)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+func machinelessSlot(previous infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	node := createTestNode(infrav2alpha1.PowerStateOff, previous)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 
 	return node
 }
@@ -498,10 +498,10 @@ func listLifecycleJobs(t *testing.T, c client.Client) []batchv1.Job {
 // fails, so the pool pays for the loop. The watchdog settles the slot before any FSM branch looks
 // at it, and the settlement is the one Warning that says so.
 func TestNodeReconcileSettlesAProgressThatOutlivedItsMachine(t *testing.T) {
-	for _, previous := range []infrav1alpha1.Progress{
-		infrav1alpha1.ProgressReady,
-		infrav1alpha1.ProgressStartingUp,
-		infrav1alpha1.ProgressShuttingDown,
+	for _, previous := range []infrav2alpha1.NodePhase{
+		infrav2alpha1.NodePhaseReady,
+		infrav2alpha1.NodePhaseBooting,
+		infrav2alpha1.NodePhaseDraining,
 	} {
 		t.Run(string(previous), func(t *testing.T) {
 			recorder := events.NewFakeRecorder(16)
@@ -515,7 +515,7 @@ func TestNodeReconcileSettlesAProgressThatOutlivedItsMachine(t *testing.T) {
 			// past the grace, and that is what this pass acts on.
 			stale := metav1.NewTime(time.Now().Add(-progress.SettleGracePeriod - time.Minute))
 
-			if previous == infrav1alpha1.ProgressStartingUp {
+			if previous == infrav2alpha1.NodePhaseBooting {
 				node.Status.LastStartupTime = &stale
 			} else {
 				stamp := metav1.Now()
@@ -530,13 +530,13 @@ func TestNodeReconcileSettlesAProgressThatOutlivedItsMachine(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			after := &infrav1alpha1.Node{}
+			after := &infrav2alpha1.Node{}
 			require.NoError(t, reconciler.Get(context.Background(),
 				types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
 
-			assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress,
+			assert.Equal(t, infrav2alpha1.NodePhaseOff, after.Status.Phase,
 				"a progress naming a machine the cluster does not have is settled")
-			assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState)
+			assert.Equal(t, infrav2alpha1.PowerStateOff, after.Status.PowerState)
 			assert.Empty(t, listLifecycleJobs(t, reconciler.Client),
 				"no lifecycle Job is built for a machine that is gone, that is the churn this closes")
 
@@ -561,7 +561,7 @@ func TestNodeReconcileSettlesAProgressThatOutlivedItsMachine(t *testing.T) {
 func TestNodeReconcileSettlementIsIdempotent(t *testing.T) {
 	recorder := events.NewFakeRecorder(16)
 
-	node := machinelessSlot(infrav1alpha1.ProgressReady)
+	node := machinelessSlot(infrav2alpha1.NodePhaseReady)
 	reconciler := newTaintReconciler(t, node, createTestGroup())
 	reconciler.EventRecorder = recorder
 
@@ -574,11 +574,11 @@ func TestNodeReconcileSettlementIsIdempotent(t *testing.T) {
 		require.NoError(t, firstReconcile(reconciler, request))
 	}
 
-	after := &infrav1alpha1.Node{}
+	after := &infrav2alpha1.Node{}
 	require.NoError(t, reconciler.Get(context.Background(),
 		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
 
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, after.Status.Phase)
 	assert.Zero(t, len(drainEvents(recorder)), "a settled slot records nothing on the passes after the settlement")
 }
 
@@ -595,7 +595,7 @@ func firstReconcile(reconciler *NodeReconciler, request reconcile.Request) error
 func TestNodeReconcileLeavesASlotWithALiveJobAlone(t *testing.T) {
 	recorder := events.NewFakeRecorder(16)
 
-	node := machinelessSlot(infrav1alpha1.ProgressShuttingDown)
+	node := machinelessSlot(infrav2alpha1.NodePhaseDraining)
 	stamp := metav1.Now()
 	node.Status.LastShutdownTime = &stamp
 
@@ -620,11 +620,11 @@ func TestNodeReconcileLeavesASlotWithALiveJobAlone(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	after := &infrav1alpha1.Node{}
+	after := &infrav2alpha1.Node{}
 	require.NoError(t, reconciler.Get(context.Background(),
 		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
 
-	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, after.Status.Progress, "the operation owns the progress")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, after.Status.Phase, "the operation owns the progress")
 	assert.Zero(t, len(drainEvents(recorder)), "a pass that settles nothing records nothing")
 	assert.LessOrEqual(t, result.RequeueAfter, progress.SettleGracePeriod, "the slot is looked at again, not forgotten")
 }
@@ -634,7 +634,7 @@ func TestNodeReconcileLeavesASlotWithALiveJobAlone(t *testing.T) {
 // a lifecycle Job that finished 90s ago, so it leaves the grace in 30s - the pass comes back on
 // the earlier one, and the settlement is scheduled rather than left to the next resync.
 func TestNodeReconcileHonoursTheWatchdogDeadline(t *testing.T) {
-	node := machinelessSlot(infrav1alpha1.ProgressShuttingDown)
+	node := machinelessSlot(infrav2alpha1.NodePhaseDraining)
 	stamp := metav1.NewTime(time.Now().Add(-5 * time.Minute))
 	node.Status.LastShutdownTime = &stamp
 
@@ -670,10 +670,10 @@ func TestNodeReconcileHonoursTheWatchdogDeadline(t *testing.T) {
 		"the grace expires in 30s, so the pass comes back then, not on the 2m transition backoff")
 	assert.Less(t, result.RequeueAfter, 2*time.Minute, "earlier than the FSM's backoff for this transition")
 
-	after := &infrav1alpha1.Node{}
+	after := &infrav2alpha1.Node{}
 	require.NoError(t, reconciler.Get(context.Background(),
 		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
-	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, after.Status.Progress, "the Job is still inside its grace")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, after.Status.Phase, "the Job is still inside its grace")
 }
 
 // TestShortenRequeue is the caller-side rule of the watchdog, tested directly: the pass honours a
@@ -767,9 +767,9 @@ func TestShortenRequeue(t *testing.T) {
 // sits at {desired: on, powerState: off, progress: ready}. The FSM cannot StartNode from ready, the
 // provider counts it as capacity forever, and the autoscaler plans against a machine that does not
 // exist.
-func claimedMachinelessSlot(previous infrav1alpha1.Progress) *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOn, previous)
-	node.Status.PowerState = infrav1alpha1.PowerStateOff
+func claimedMachinelessSlot(previous infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	node := createTestNode(infrav2alpha1.PowerStateOn, previous)
+	node.Status.PowerState = infrav2alpha1.PowerStateOff
 
 	return node
 }
@@ -782,7 +782,7 @@ func claimedMachinelessSlot(previous infrav1alpha1.Progress) *infrav1alpha1.Node
 func TestNodeReconcileRearmsAClaimAndRetriesTheMachine(t *testing.T) {
 	recorder := events.NewFakeRecorder(16)
 
-	node := claimedMachinelessSlot(infrav1alpha1.ProgressReady)
+	node := claimedMachinelessSlot(infrav2alpha1.NodePhaseReady)
 	reconciler := newTaintReconciler(t, node, createTestGroup())
 	reconciler.EventRecorder = recorder
 
@@ -791,14 +791,14 @@ func TestNodeReconcileRearmsAClaimAndRetriesTheMachine(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	after := &infrav1alpha1.Node{}
+	after := &infrav2alpha1.Node{}
 	require.NoError(t, reconciler.Get(context.Background(),
 		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
 
-	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "the claim stands: it is the request")
-	assert.Equal(t, infrav1alpha1.ProgressStartingUp, after.Status.Progress,
+	assert.Equal(t, infrav2alpha1.PowerStateOn, after.Spec.DesiredPowerState, "the claim stands: it is the request")
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, after.Status.Phase,
 		"the pass re-armed the slot (shutdown) and the FSM then started it again (startingup)")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState, "the machine is off, and the status says so")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, after.Status.PowerState, "the machine is off, and the status says so")
 
 	jobs := listLifecycleJobs(t, reconciler.Client)
 	require.Len(t, jobs, 1, "the retry is a real startup: one Job for one attempt")
@@ -837,7 +837,7 @@ func TestNodeReconcileRearmsAClaimAndRetriesTheMachine(t *testing.T) {
 // so the loud loop - a startup Job that exits non-zero, which this package never sees - pays into the
 // same account. A counter the watchdog kept for its own passes left that loop unbounded.
 func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
-	node := claimedMachinelessSlot(infrav1alpha1.ProgressReady)
+	node := claimedMachinelessSlot(infrav2alpha1.NodePhaseReady)
 	reconciler := newTaintReconciler(t, node, createTestGroup())
 
 	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"}}
@@ -851,7 +851,7 @@ func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
 			attempt, progress.ClaimRearmLimit)
 
 		current := readReconciledSlot(t, reconciler)
-		assert.Equal(t, infrav1alpha1.ProgressStartingUp, current.Status.Progress,
+		assert.Equal(t, infrav2alpha1.NodePhaseBooting, current.Status.Phase,
 			"the pass re-armed the slot and the FSM started the machine again")
 		assert.Equal(t, attempt, fsm.StartupAttemptsOf(current),
 			"the startup counts the attempt, not the re-arm that armed it")
@@ -865,8 +865,8 @@ func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
 		}
 
 		releaseLock(t, reconciler, current)
-		current.Status.Progress = infrav1alpha1.ProgressReady
-		current.Status.PowerState = infrav1alpha1.PowerStateOff
+		current.Status.Phase = infrav2alpha1.NodePhaseReady
+		current.Status.PowerState = infrav2alpha1.PowerStateOff
 
 		// The attempt is over: its Job was collected by the TTL, and the startup stamp the FSM left
 		// on the slot is what the watchdog measures its grace from when no Job object is left
@@ -883,10 +883,10 @@ func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
 	require.NoError(t, firstReconcile(reconciler, request))
 
 	current := readReconciledSlot(t, reconciler)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, current.Status.Progress,
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, current.Status.Phase,
 		"no machine, so no ready: the phantom is closed, not reported")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, current.Status.PowerState)
-	assert.Equal(t, infrav1alpha1.PowerStateOn, current.Spec.DesiredPowerState, "the claim is the provider's to drop")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, current.Status.PowerState)
+	assert.Equal(t, infrav2alpha1.PowerStateOn, current.Spec.DesiredPowerState, "the claim is the provider's to drop")
 
 	condition := meta.FindStatusCondition(current.Status.Conditions, progress.ConditionClaimRearmed)
 	require.NotNil(t, condition)
@@ -925,7 +925,7 @@ func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
 // writes and records nothing after the first pass, and the reconcile does not fail (the operator's
 // signal is the event, not controller-runtime's rate limiter).
 func TestNodeReconcileRefusesAStartOnASlotThatUsedItsAttempts(t *testing.T) {
-	node := claimedMachinelessSlot(infrav1alpha1.ProgressShutdown)
+	node := claimedMachinelessSlot(infrav2alpha1.NodePhaseOff)
 	stamp := metav1.Now()
 	node.Status.LastStartupTime = &stamp
 
@@ -949,9 +949,9 @@ func TestNodeReconcileRefusesAStartOnASlotThatUsedItsAttempts(t *testing.T) {
 		"a refusal is not a reconcile failure: the slot is stable and the record is the event")
 
 	after := readReconciledSlot(t, reconciler)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress, "the slot stays at the stable pair")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState)
-	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "and keeps the claim")
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, after.Status.Phase, "the slot stays at the stable pair")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, after.Status.PowerState)
+	assert.Equal(t, infrav2alpha1.PowerStateOn, after.Spec.DesiredPowerState, "and keeps the claim")
 	assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "the fourth StartNode is refused, so no machine is bought")
 
 	condition := meta.FindStatusCondition(after.Status.Conditions, progress.ConditionClaimRearmed)
@@ -974,10 +974,10 @@ func TestNodeReconcileRefusesAStartOnASlotThatUsedItsAttempts(t *testing.T) {
 }
 
 // readReconciledSlot reads the slot the reconciler's client holds.
-func readReconciledSlot(t *testing.T, reconciler *NodeReconciler) *infrav1alpha1.Node {
+func readReconciledSlot(t *testing.T, reconciler *NodeReconciler) *infrav2alpha1.Node {
 	t.Helper()
 
-	node := &infrav1alpha1.Node{}
+	node := &infrav2alpha1.Node{}
 	require.NoError(t, reconciler.Get(context.Background(),
 		types.NamespacedName{Name: "test-node", Namespace: "default"}, node))
 
@@ -987,7 +987,7 @@ func readReconciledSlot(t *testing.T, reconciler *NodeReconciler) *infrav1alpha1
 // releaseLock removes the coordination lock annotations of a slot, which is what the completion of an
 // operation does: the lock is not the watchdog's to clear, and a test that leaves one on the slot
 // tests the lock gate instead of the attempt bound.
-func releaseLock(t *testing.T, reconciler *NodeReconciler, node *infrav1alpha1.Node) {
+func releaseLock(t *testing.T, reconciler *NodeReconciler, node *infrav2alpha1.Node) {
 	t.Helper()
 
 	for _, key := range []string{
@@ -1028,7 +1028,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+			node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 			group := createTestGroup()
 			group.Spec.NodeReadinessTaints = tc.spec
 
@@ -1037,7 +1037,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 			keys := reconciler.readinessTaintKeys(context.Background(), node, group)
 			assert.Equal(t, tc.want, keys, "the FSM gets exactly the list the Group declares")
 
-			stamped := &infrav1alpha1.Node{}
+			stamped := &infrav2alpha1.Node{}
 			require.NoError(t, reconciler.Get(context.Background(),
 				types.NamespacedName{Name: "test-node", Namespace: "default"}, stamped))
 
@@ -1058,7 +1058,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 			// The steady state: the same Group, the same record, no write.
 			assert.Equal(t, tc.want, reconciler.readinessTaintKeys(context.Background(), stamped, group))
 
-			after := &infrav1alpha1.Node{}
+			after := &infrav2alpha1.Node{}
 			require.NoError(t, reconciler.Get(context.Background(),
 				types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
 			assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "a resync of an unchanged Group writes nothing")
@@ -1066,7 +1066,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 	}
 
 	t.Run("no group to read falls back to the slot's record", func(t *testing.T) {
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 		autoscalerpkg.StampReadinessTaints(node, []string{"node.cilium.io/agent-not-ready"})
 
 		reconciler := newTaintReconciler(t, node, createTestGroup())

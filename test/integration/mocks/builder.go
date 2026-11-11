@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
@@ -47,9 +47,9 @@ func NewMockClientBuilder(scheme *runtime.Scheme) *MockClientBuilder {
 
 // WithGroup adds a Group CR to the mock client
 func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockClientBuilder {
-	group := &infrav1alpha1.Group{
+	group := &infrav2alpha1.Group{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: "infra.homecluster.dev/v1alpha1",
+			APIVersion: "infra.homecluster.dev/v2alpha1",
 			Kind:       "Group",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -58,7 +58,7 @@ func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockCli
 			UID:       types.UID(fmt.Sprintf("group-%s-uid", name)),
 			Labels:    make(map[string]string),
 		},
-		Spec: infrav1alpha1.GroupSpec{
+		Spec: infrav2alpha1.GroupSpec{
 			ScaleDownUtilizationThreshold:    "0.5",
 			ScaleDownGpuUtilizationThreshold: "0.5",
 			ScaleDownUnneededTime:            &metav1.Duration{Duration: 10 * time.Minute},
@@ -67,7 +67,7 @@ func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockCli
 			ZeroOrMaxNodeScaling:             false,
 			IgnoreDaemonSetsUtilization:      true,
 		},
-		Status: infrav1alpha1.GroupStatus{
+		Status: infrav2alpha1.GroupStatus{
 			Health: "healthy",
 		},
 	}
@@ -83,9 +83,9 @@ func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockCli
 
 // WithNode adds a Node CR to the mock client
 func (b *MockClientBuilder) WithNode(name string, opts ...NodeOption) *MockClientBuilder {
-	node := &infrav1alpha1.Node{
+	node := &infrav2alpha1.Node{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: "infra.homecluster.dev/v1alpha1",
+			APIVersion: "infra.homecluster.dev/v2alpha1",
 			Kind:       "Node",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -94,28 +94,27 @@ func (b *MockClientBuilder) WithNode(name string, opts ...NodeOption) *MockClien
 			UID:       types.UID(fmt.Sprintf("node-%s-uid", name)),
 			Labels:    make(map[string]string),
 		},
-		Spec: infrav1alpha1.NodeSpec{
-			DesiredPowerState:  infrav1alpha1.PowerStateOn,
+		Spec: infrav2alpha1.NodeSpec{
 			KubernetesNodeName: name,
-			StartupPodSpec: infrav1alpha1.MinimalPodSpec{
+			StartupPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "startup:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'starting up'"},
 			},
-			ShutdownPodSpec: infrav1alpha1.MinimalPodSpec{
+			ShutdownPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "shutdown:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'shutting down'"},
 			},
-			Pricing: infrav1alpha1.PricingSpec{
+			Pricing: infrav2alpha1.PricingSpec{
 				HourlyRate: "0.10",
 				PodRate:    "0.01",
 			},
 		},
-		Status: infrav1alpha1.NodeStatus{
+		Status: infrav2alpha1.NodeStatus{
 			Health:     "healthy",
-			PowerState: infrav1alpha1.PowerStateOn,
-			Progress:   infrav1alpha1.ProgressReady,
+			PowerState: infrav2alpha1.PowerStateOn,
+			Phase:      infrav2alpha1.NodePhaseReady,
 		},
 	}
 
@@ -173,18 +172,18 @@ func (b *MockClientBuilder) Build() client.Client {
 }
 
 // GroupOption is a function that modifies a Group CR
-type GroupOption func(*infrav1alpha1.Group)
+type GroupOption func(*infrav2alpha1.Group)
 
 // WithGroupHealth sets the health status of a Group
 func WithGroupHealth(health string) GroupOption {
-	return func(g *infrav1alpha1.Group) {
+	return func(g *infrav2alpha1.Group) {
 		g.Status.Health = health
 	}
 }
 
 // WithGroupLabel adds a label to a Group
 func WithGroupLabel(key, value string) GroupOption {
-	return func(g *infrav1alpha1.Group) {
+	return func(g *infrav2alpha1.Group) {
 		if g.Labels == nil {
 			g.Labels = make(map[string]string)
 		}
@@ -194,17 +193,17 @@ func WithGroupLabel(key, value string) GroupOption {
 
 // WithGroupScaleDownThreshold sets the scale down utilization threshold
 func WithGroupScaleDownThreshold(threshold string) GroupOption {
-	return func(g *infrav1alpha1.Group) {
+	return func(g *infrav2alpha1.Group) {
 		g.Spec.ScaleDownUtilizationThreshold = threshold
 	}
 }
 
 // NodeOption is a function that modifies a Node CR
-type NodeOption func(*infrav1alpha1.Node)
+type NodeOption func(*infrav2alpha1.Node)
 
 // WithNodeGroup assigns a Node to a Group
 func WithNodeGroup(groupName string) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		if n.Labels == nil {
 			n.Labels = make(map[string]string)
 		}
@@ -212,31 +211,33 @@ func WithNodeGroup(groupName string) NodeOption {
 	}
 }
 
-// WithNodePowerState sets the power state of a Node
-func WithNodePowerState(desired, actual infrav1alpha1.PowerState) NodeOption {
-	return func(n *infrav1alpha1.Node) {
-		n.Spec.DesiredPowerState = desired
+// WithNodePowerState sets the power the provider observes for the machine of a Node. In v2alpha1
+// this is an observation only: the spec of a slot carries no runtime intent, and the machine is
+// wanted while a NodeClaim names the slot.
+func WithNodePowerState(actual infrav2alpha1.PowerState) NodeOption {
+	return func(n *infrav2alpha1.Node) {
 		n.Status.PowerState = actual
 	}
 }
 
-// WithNodeProgress sets the progress status of a Node
-func WithNodeProgress(progress infrav1alpha1.Progress) NodeOption {
-	return func(n *infrav1alpha1.Node) {
-		n.Status.Progress = progress
+// WithNodePhase sets the derived phase the slot reports. It is a report, never an input, so tests
+// that need a transitional slot create a claim, they do not write a phase.
+func WithNodePhase(nodePhase infrav2alpha1.NodePhase) NodeOption {
+	return func(n *infrav2alpha1.Node) {
+		n.Status.Phase = nodePhase
 	}
 }
 
 // WithNodeHealth sets the health status of a Node
 func WithNodeHealth(health string) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		n.Status.Health = health
 	}
 }
 
 // WithNodePricing sets the pricing information for a Node
 func WithNodePricing(hourlyRate, podRate string) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		n.Spec.Pricing.HourlyRate = hourlyRate
 		n.Spec.Pricing.PodRate = podRate
 	}
@@ -244,7 +245,7 @@ func WithNodePricing(hourlyRate, podRate string) NodeOption {
 
 // WithNodeLabel adds a label to a Node
 func WithNodeLabel(key, value string) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		if n.Labels == nil {
 			n.Labels = make(map[string]string)
 		}
@@ -254,7 +255,7 @@ func WithNodeLabel(key, value string) NodeOption {
 
 // WithNodeTaintsToRemove adds a list of taints that should be stripped when generating a template node.
 func WithNodeTaintsToRemove(taints []corev1.Taint) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		n.Spec.TaintsToRemove = taints
 	}
 }
@@ -262,7 +263,7 @@ func WithNodeTaintsToRemove(taints []corev1.Taint) NodeOption {
 // WithNodeTaints adds the taints a Node CR declares for its machine (spec.nodeTaints): the node
 // controller applies them to the Kubernetes node and the provider puts them in the template.
 func WithNodeTaints(taints []corev1.Taint) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		n.Spec.NodeTaints = taints
 	}
 }
@@ -319,14 +320,14 @@ func kubeletAllocatable(cpu, memory string) corev1.ResourceList {
 // because that is the list a kubelet reports and the list the drift check compares: a fixture that
 // declares two resources on a node that reports four describes a machine no real slot boots.
 func WithNodeCapacity(cpu, memory string) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		n.Spec.NodeCapacity = kubeletCapacity(cpu, memory)
 	}
 }
 
 // WithNodeLastStartupTime sets the last startup time
 func WithNodeLastStartupTime(t time.Time) NodeOption {
-	return func(n *infrav1alpha1.Node) {
+	return func(n *infrav2alpha1.Node) {
 		metaTime := metav1.NewTime(t)
 		n.Status.LastStartupTime = &metaTime
 	}
@@ -427,7 +428,7 @@ func NewBasicTestScenario(scheme *runtime.Scheme) client.Client {
 		WithGroup("test-group").
 		WithNode("test-node-1", WithNodeGroup("test-group")).
 		WithNode("test-node-2", WithNodeGroup("test-group"),
-			WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff)).
+			WithNodePowerState(infrav2alpha1.PowerStateOff)).
 		WithKubernetesNode("test-node-1", WithKubernetesNodeGroupLabel("test-group")).
 		WithKubernetesNode("test-node-2", WithKubernetesNodeGroupLabel("test-group")).
 		Build()
@@ -452,10 +453,10 @@ func NewScaleUpScenario(scheme *runtime.Scheme) client.Client {
 	return NewMockClientBuilder(scheme).
 		WithGroup("scale-group").
 		WithNode("powered-on-node", WithNodeGroup("scale-group"),
-			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn)).
+			WithNodePowerState(infrav2alpha1.PowerStateOn)).
 		WithNode("powered-off-node", WithNodeGroup("scale-group"),
-			WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff),
-			WithNodeProgress(infrav1alpha1.ProgressShutdown)).
+			WithNodePowerState(infrav2alpha1.PowerStateOff),
+			WithNodePhase(infrav2alpha1.NodePhaseOff)).
 		WithKubernetesNode("powered-on-node", WithKubernetesNodeGroupLabel("scale-group")).
 		WithKubernetesNode("powered-off-node", WithKubernetesNodeGroupLabel("scale-group")).
 		Build()
@@ -466,14 +467,14 @@ func NewScaleDownScenario(scheme *runtime.Scheme) client.Client {
 	return NewMockClientBuilder(scheme).
 		WithGroup("scale-group").
 		WithNode("running-node-1", WithNodeGroup("scale-group"),
-			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
-			WithNodeProgress(infrav1alpha1.ProgressReady)).
+			WithNodePowerState(infrav2alpha1.PowerStateOn),
+			WithNodePhase(infrav2alpha1.NodePhaseReady)).
 		WithNode("running-node-2", WithNodeGroup("scale-group"),
-			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
-			WithNodeProgress(infrav1alpha1.ProgressReady)).
+			WithNodePowerState(infrav2alpha1.PowerStateOn),
+			WithNodePhase(infrav2alpha1.NodePhaseReady)).
 		WithNode("starting-node", WithNodeGroup("scale-group"),
-			WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff),
-			WithNodeProgress(infrav1alpha1.ProgressStartingUp),
+			WithNodePowerState(infrav2alpha1.PowerStateOff),
+			WithNodePhase(infrav2alpha1.NodePhaseBooting),
 			WithNodeLastStartupTime(time.Now().Add(-5*time.Minute))).
 		WithKubernetesNode("running-node-1", WithKubernetesNodeGroupLabel("scale-group")).
 		WithKubernetesNode("running-node-2", WithKubernetesNodeGroupLabel("scale-group")).

@@ -1,4 +1,4 @@
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: k3d-homelab-autoscaler-agent-0
@@ -7,7 +7,6 @@ metadata:
   namespace: homelab-autoscaler-system
 spec:
   kubernetesNodeName: k3d-homelab-autoscaler-agent-0
-  powerState: "on"
   pricing:
     hourlyRate: "1.5"
     podRate: "0.0"
@@ -43,7 +42,7 @@ spec:
         secretName: auth-secrets
         mountPath: /auth
 ---
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: k3d-homelab-autoscaler-agent-1
@@ -52,7 +51,6 @@ metadata:
   namespace: homelab-autoscaler-system
 spec:
   kubernetesNodeName: k3d-homelab-autoscaler-agent-1
-  powerState: "on"
   pricing:
     hourlyRate: "1.5"
     podRate: "0.0"

@@ -31,7 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
 
@@ -42,24 +42,24 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	return scheme
 }
 
 // nodeCR builds a Node CR (a slot) of the given group and power state.
-func nodeCR(name string, desired infrav1alpha1.PowerState, status infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+func nodeCR(name string, desired infrav2alpha1.PowerState, status infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: "default",
 			Labels:    map[string]string{"group": testGroup},
 		},
-		Spec: infrav1alpha1.NodeSpec{
+		Spec: infrav2alpha1.NodeSpec{
 			DesiredPowerState:  desired,
 			KubernetesNodeName: name,
 		},
-		Status: infrav1alpha1.NodeStatus{
+		Status: infrav2alpha1.NodeStatus{
 			PowerState: status,
 			Progress:   progress,
 		},
@@ -76,8 +76,8 @@ func k8sNode(name, providerID string) *corev1.Node {
 }
 
 // slotWithoutKubernetesNodeName builds a Node CR whose spec.kubernetesNodeName is empty.
-func slotWithoutKubernetesNodeName(name string, desired infrav1alpha1.PowerState) *infrav1alpha1.Node {
-	node := nodeCR(name, desired, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+func slotWithoutKubernetesNodeName(name string, desired infrav2alpha1.PowerState) *infrav2alpha1.Node {
+	node := nodeCR(name, desired, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 	node.Spec.KubernetesNodeName = ""
 
 	return node
@@ -88,7 +88,7 @@ func newServer(t *testing.T, objects ...client.Object) *HomeClusterProviderServe
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).
-		WithStatusSubresource(&infrav1alpha1.Node{}).
+		WithStatusSubresource(&infrav2alpha1.Node{}).
 		Build()
 
 	return NewHomeClusterProviderServer(k8sClient, scheme)
@@ -107,7 +107,7 @@ func TestNodeGroupNodes(t *testing.T) {
 			// Reporting it is what made the autoscaler provision extra machines.
 			name: "off slot without a kubernetes node is skipped",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{},
 		},
@@ -117,7 +117,7 @@ func TestNodeGroupNodes(t *testing.T) {
 			// by spec.providerID, so it must not look like an unregistered node.
 			name: "off slot with a kubernetes node is deleting",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 				k8sNode("slot-1", "homelab://slot-1"),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -127,7 +127,7 @@ func TestNodeGroupNodes(t *testing.T) {
 		{
 			name: "off slot with a kubernetes node without providerID falls back to the node CR identity",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 				k8sNode("slot-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -137,14 +137,14 @@ func TestNodeGroupNodes(t *testing.T) {
 		{
 			name: "off slot whose kubernetes node name is empty is skipped",
 			objects: []client.Object{
-				slotWithoutKubernetesNodeName("slot-1", infrav1alpha1.PowerStateOff),
+				slotWithoutKubernetesNodeName("slot-1", infrav2alpha1.PowerStateOff),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{},
 		},
 		{
 			name: "slot that is on without a kubernetes node is provisioning",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
 				"homelab://slot-1": pb.InstanceStatus_instanceCreating,
@@ -153,7 +153,7 @@ func TestNodeGroupNodes(t *testing.T) {
 		{
 			name: "slot that is on with a kubernetes node is running",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 				k8sNode("slot-1", "homelab://slot-1"),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -163,7 +163,7 @@ func TestNodeGroupNodes(t *testing.T) {
 		{
 			name: "empty providerID falls back to the provider id the operator writes",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 				k8sNode("slot-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -173,7 +173,7 @@ func TestNodeGroupNodes(t *testing.T) {
 		{
 			name: "slot without a kubernetes node name is provisioning and keeps an id",
 			objects: []client.Object{
-				slotWithoutKubernetesNodeName("slot-1", infrav1alpha1.PowerStateOn),
+				slotWithoutKubernetesNodeName("slot-1", infrav2alpha1.PowerStateOn),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
 				"homelab://slot-1": pb.InstanceStatus_instanceCreating,
@@ -183,14 +183,14 @@ func TestNodeGroupNodes(t *testing.T) {
 			name: "mixed pool reports every slot with a machine and skips spare capacity",
 			objects: []client.Object{
 				// fresh, never provisioned slot of a 15 slot pool, no machine and no node object
-				nodeCR("slot-seeded", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				nodeCR("slot-seeded", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 				// scaled down slot, the machine is off and the node object is left over
-				nodeCR("slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				nodeCR("slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 				k8sNode("slot-off", "homelab://slot-off"),
 				// slot requested by IncreaseSize, machine not joined yet
-				nodeCR("slot-new", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+				nodeCR("slot-new", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
 				// running slot without a cloud-controller-manager
-				nodeCR("omni-remote-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+				nodeCR("omni-remote-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 				k8sNode("omni-remote-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -228,7 +228,7 @@ func TestNodeGroupNodes(t *testing.T) {
 // machine joins. The id reported before the node exists must be the same, otherwise the
 // in-flight instance is invisible and a single pending pod produces two scale ups.
 func TestNodeGroupNodesStableIdentityAcrossProvisioning(t *testing.T) {
-	server := newServer(t, nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp))
+	server := newServer(t, nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting))
 
 	ctx := context.Background()
 
@@ -252,7 +252,7 @@ func TestNodeGroupNodesStableIdentityAcrossProvisioning(t *testing.T) {
 // spec.kubernetesNodeName yet: the Get must be skipped so the call keeps returning a
 // stable provisioning instance instead of a non-NotFound error every time.
 func TestNodeGroupNodesIgnoresEmptyKubernetesNodeName(t *testing.T) {
-	server := newServer(t, slotWithoutKubernetesNodeName("slot-1", infrav1alpha1.PowerStateOn))
+	server := newServer(t, slotWithoutKubernetesNodeName("slot-1", infrav2alpha1.PowerStateOn))
 
 	for range 3 {
 		resp, err := server.NodeGroupNodes(context.Background(), &pb.NodeGroupNodesRequest{Id: testGroup})
@@ -270,12 +270,12 @@ func TestNodeGroupNodesIgnoresEmptyKubernetesNodeName(t *testing.T) {
 // instance, marked deleting, while a never provisioned slot must stay invisible.
 func TestNodeGroupNodesInstancePerMachine(t *testing.T) {
 	server := newServer(t,
-		nodeCR("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCR("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		k8sNode("slot-running", "homelab://slot-running"),
-		nodeCR("slot-creating", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-		nodeCR("slot-deleting", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCR("slot-creating", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		nodeCR("slot-deleting", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 		k8sNode("slot-deleting", "homelab://slot-deleting"),
-		nodeCR("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCR("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	resp, err := server.NodeGroupNodes(context.Background(), &pb.NodeGroupNodesRequest{Id: testGroup})
@@ -302,7 +302,7 @@ func TestNodeGroupNodesInstancePerMachine(t *testing.T) {
 // against, so the id must not change when the slot moves from running to deleting.
 func TestNodeGroupNodesStableIdentityAcrossShutdown(t *testing.T) {
 	server := newServer(t,
-		nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		k8sNode("slot-1", "homelab://slot-1"),
 	)
 
@@ -315,9 +315,9 @@ func TestNodeGroupNodesStableIdentityAcrossShutdown(t *testing.T) {
 
 	// NodeGroupDeleteNodes sets the desired state to off; the machine powers off and the node
 	// object stays behind, NotReady.
-	slot := &infrav1alpha1.Node{}
+	slot := &infrav2alpha1.Node{}
 	require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: "slot-1", Namespace: "default"}, slot))
-	slot.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
+	slot.Spec.DesiredPowerState = infrav2alpha1.PowerStateOff
 	require.NoError(t, server.Client.Update(ctx, slot))
 
 	resp, err = server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
@@ -329,11 +329,11 @@ func TestNodeGroupNodesStableIdentityAcrossShutdown(t *testing.T) {
 
 func TestNodeGroupTargetSizeIgnoresSeededSlots(t *testing.T) {
 	server := newServer(t,
-		nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		nodeCR("slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		nodeCR("slot-3", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		nodeCR("slot-4", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-		nodeCR("slot-5", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
+		nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		nodeCR("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		nodeCR("slot-3", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		nodeCR("slot-4", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		nodeCR("slot-5", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
 	)
 
 	resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
@@ -344,29 +344,29 @@ func TestNodeGroupTargetSizeIgnoresSeededSlots(t *testing.T) {
 
 func TestNodeGroupIncreaseSizePicksSeededOffSlot(t *testing.T) {
 	server := newServer(t,
-		nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		nodeCR("slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
+		nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		nodeCR("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
 	)
 
 	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
 	require.NoError(t, err)
 
-	updated := &infrav1alpha1.Node{}
+	updated := &infrav2alpha1.Node{}
 	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: "slot-1", Namespace: "default"}, updated))
-	assert.Equal(t, infrav1alpha1.PowerStateOn, updated.Spec.DesiredPowerState)
+	assert.Equal(t, infrav2alpha1.PowerStateOn, updated.Spec.DesiredPowerState)
 
 	// the shutting down slot must not be touched
-	stillOff := &infrav1alpha1.Node{}
+	stillOff := &infrav2alpha1.Node{}
 	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: "slot-2", Namespace: "default"}, stillOff))
-	assert.Equal(t, infrav1alpha1.PowerStateOff, stillOff.Spec.DesiredPowerState)
+	assert.Equal(t, infrav2alpha1.PowerStateOff, stillOff.Spec.DesiredPowerState)
 }
 
 func TestNodeGroupIncreaseSizeFailsWithoutFreeSlot(t *testing.T) {
 	// Two slots, so the max size check does not fire: the only spare slot is mid-shutdown
 	// (progress shuttingdown) and cannot be started, and running slots are not free.
 	server := newServer(t,
-		nodeCRInGroup(testGroup, "slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		nodeCRInGroup(testGroup, "slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
+		nodeCRInGroup(testGroup, "slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		nodeCRInGroup(testGroup, "slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
 	)
 
 	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
@@ -379,15 +379,15 @@ func TestNodeGroupIncreaseSizeFailsWithoutFreeSlot(t *testing.T) {
 const testNamespace = "homelab-autoscaler-system"
 
 // groupCR builds a Group CR with a per-group minimum size.
-func groupCR(name string, minSize int32) *infrav1alpha1.Group {
-	return &infrav1alpha1.Group{
+func groupCR(name string, minSize int32) *infrav2alpha1.Group {
+	return &infrav2alpha1.Group{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
-		Spec:       infrav1alpha1.GroupSpec{MinSize: minSize},
+		Spec:       infrav2alpha1.GroupSpec{MinSize: minSize},
 	}
 }
 
 // nodeCRInGroup builds a Node CR (a slot) of an arbitrary group.
-func nodeCRInGroup(group, name string, desired, status infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
+func nodeCRInGroup(group, name string, desired, status infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase) *infrav2alpha1.Node {
 	node := nodeCR(name, desired, status, progress)
 	node.Labels["group"] = group
 
@@ -403,16 +403,16 @@ func nodeCRInGroup(group, name string, desired, status infrav1alpha1.PowerState,
 func TestNodeGroupsReportsGroupMinSize(t *testing.T) {
 	server := newServer(t,
 		groupCR(testGroup, 1),
-		nodeCRInGroup(testGroup, "slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		nodeCRInGroup(testGroup, "slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		nodeCRInGroup(testGroup, "slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCRInGroup(testGroup, "slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		nodeCRInGroup(testGroup, "slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		nodeCRInGroup(testGroup, "slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 
 		groupCR("group-no-min", 0),
-		nodeCRInGroup("group-no-min", "spare-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCRInGroup("group-no-min", "spare-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 
 		groupCR("group-over-min", 5),
-		nodeCRInGroup("group-over-min", "only-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		nodeCRInGroup("group-over-min", "only-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCRInGroup("group-over-min", "only-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		nodeCRInGroup("group-over-min", "only-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 
 		groupCR("group-empty", 1),
 	)
@@ -441,8 +441,8 @@ func TestNodeGroupForNodeReportsGroupMinSize(t *testing.T) {
 			Name:   "slot-off",
 			Labels: map[string]string{"infra.homecluster.dev/group": testGroup},
 		}},
-		nodeCRInGroup(testGroup, "slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		nodeCRInGroup(testGroup, "slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCRInGroup(testGroup, "slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		nodeCRInGroup(testGroup, "slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	resp, err := server.NodeGroupForNode(context.Background(), &pb.NodeGroupForNodeRequest{
@@ -458,7 +458,7 @@ func TestNodeGroupForNodeReportsGroupMinSize(t *testing.T) {
 
 // slotInSystemNamespace builds a slot of the test group in the namespace the server
 // resolves Node CRs in, which is what NodeGroupDeleteNodes looks the slot up by.
-func slotInSystemNamespace(name string, desired, status infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
+func slotInSystemNamespace(name string, desired, status infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase) *infrav2alpha1.Node {
 	node := nodeCRInGroup(testGroup, name, desired, status, progress)
 	node.Namespace = testNamespace
 
@@ -474,12 +474,12 @@ func externalNodes(names ...string) []*pb.ExternalGrpcNode {
 	return nodes
 }
 
-func desiredPowerStates(t *testing.T, server *HomeClusterProviderServer, names ...string) map[string]infrav1alpha1.PowerState {
+func desiredPowerStates(t *testing.T, server *HomeClusterProviderServer, names ...string) map[string]infrav2alpha1.PowerState {
 	t.Helper()
 
-	got := make(map[string]infrav1alpha1.PowerState, len(names))
+	got := make(map[string]infrav2alpha1.PowerState, len(names))
 	for _, name := range names {
-		node := &infrav1alpha1.Node{}
+		node := &infrav2alpha1.Node{}
 		require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
 		got[name] = node.Spec.DesiredPowerState
 	}
@@ -493,8 +493,8 @@ func desiredPowerStates(t *testing.T, server *HomeClusterProviderServer, names .
 // capacity away, so it is a no-op success even when the group is already at or below its
 // floor.
 func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
-	running := func(name string) *infrav1alpha1.Node {
-		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	running := func(name string) *infrav2alpha1.Node {
+		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	}
 
 	tests := []struct {
@@ -529,8 +529,8 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 			name: "a request that deletes nothing is allowed while the group is below its floor",
 			objects: []client.Object{
 				groupCR(testGroup, 2),
-				slotInSystemNamespace("slot-powering-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-				slotInSystemNamespace("slot-shut", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				slotInSystemNamespace("slot-powering-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+				slotInSystemNamespace("slot-shut", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 			},
 			nodes:  []string{"slot-shut"},
 			refuse: false,
@@ -546,7 +546,7 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 			objects: []client.Object{
 				groupCR(testGroup, 1),
 				running("slot-1"),
-				slotInSystemNamespace("slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+				slotInSystemNamespace("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 			},
 			nodes:  []string{"slot-2"},
 			refuse: false,
@@ -571,7 +571,7 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 
 				// nothing was touched
 				for _, name := range tc.nodes {
-					assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, name)[name],
+					assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, name)[name],
 						"a refused delete must leave %s desired on", name)
 				}
 
@@ -580,7 +580,7 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 
 			require.NoError(t, err)
 			for _, name := range tc.nodes {
-				assert.Equal(t, infrav1alpha1.PowerStateOff, desiredPowerStates(t, server, name)[name])
+				assert.Equal(t, infrav2alpha1.PowerStateOff, desiredPowerStates(t, server, name)[name])
 			}
 		})
 	}
@@ -593,16 +593,16 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 // take any capacity away is a no-op success, because cluster-autoscaler retries a refusal
 // forever.
 func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
-	startingUp := func(name string) *infrav1alpha1.Node {
-		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	startingUp := func(name string) *infrav2alpha1.Node {
+		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 	}
-	running := func(name string) *infrav1alpha1.Node {
-		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	running := func(name string) *infrav2alpha1.Node {
+		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	}
 	// midShutdown is a slot being powered off: desired off, the machine still on, progress
 	// not yet a shutdown, so it still counts towards the target size.
-	midShutdown := func(name string) *infrav1alpha1.Node {
-		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	midShutdown := func(name string) *infrav2alpha1.Node {
+		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	}
 
 	tests := []struct {
@@ -756,20 +756,20 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			for _, name := range all {
 				if slices.Contains(tc.wantShed, name) {
 					desired, progress := slotState(t, server, name)
-					assert.Equal(t, infrav1alpha1.PowerStateOff, desired, "cancelled slot %s must be desired off", name)
+					assert.Equal(t, infrav2alpha1.PowerStateOff, desired, "cancelled slot %s must be desired off", name)
 					// The progress is the FSM's to write. The cancellation is the spec write,
 					// and countsTowardsTargetSize excludes the desired-off + startingup shape it
 					// produces, so the slot leaves the target size on that write alone - the
 					// node controller's ShutdownNode, with its Job and its lock, lands the
 					// progress on shuttingdown afterwards.
-					assert.Equal(t, infrav1alpha1.ProgressStartingUp, progress,
+					assert.Equal(t, infrav2alpha1.NodePhaseBooting, progress,
 						"cancelled slot %s keeps the progress the FSM wrote", name)
 
 					continue
 				}
 
 				_, progress := slotState(t, server, name)
-				assert.NotEqual(t, infrav1alpha1.ProgressShuttingDown, progress, "slot %s must not be cancelled", name)
+				assert.NotEqual(t, infrav2alpha1.NodePhaseDraining, progress, "slot %s must not be cancelled", name)
 			}
 
 			// The request lands exactly on the size it asked for, judged by the number
@@ -783,13 +783,13 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 }
 
 // slotState reads the desired power state and the recorded progress of a slot.
-func slotState(t *testing.T, server *HomeClusterProviderServer, name string) (infrav1alpha1.PowerState, infrav1alpha1.Progress) {
+func slotState(t *testing.T, server *HomeClusterProviderServer, name string) (infrav2alpha1.PowerState, infrav2alpha1.NodePhase) {
 	t.Helper()
 
-	node := &infrav1alpha1.Node{}
+	node := &infrav2alpha1.Node{}
 	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
 
-	return node.Spec.DesiredPowerState, node.Status.Progress
+	return node.Spec.DesiredPowerState, node.Status.Phase
 }
 
 // TestNodeGroupIncreaseSizeRefusesBeyondMaxSize: maxSize is the number of slots committed
@@ -797,7 +797,7 @@ func slotState(t *testing.T, server *HomeClusterProviderServer, name string) (in
 func TestNodeGroupIncreaseSizeRefusesBeyondMaxSize(t *testing.T) {
 	server := newServer(t,
 		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slotInSystemNamespace("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 	)
 
 	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
@@ -807,24 +807,24 @@ func TestNodeGroupIncreaseSizeRefusesBeyondMaxSize(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, codes.FailedPrecondition, st.Code())
 	assert.Contains(t, st.Message(), "max size")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-1")["slot-1"])
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-1")["slot-1"])
 
 	// within the max size, the scale up still powers a spare slot on
 	server = newServer(t,
 		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		slotInSystemNamespace("slot-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		slotInSystemNamespace("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	_, err = server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
 	require.NoError(t, err)
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-2")["slot-2"])
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-2")["slot-2"])
 }
 
 func TestEffectiveMinSize(t *testing.T) {
 	tests := []struct {
 		name        string
-		group       *infrav1alpha1.Group
+		group       *infrav2alpha1.Group
 		maxSize     int32
 		want        int32
 		wantClamped bool
@@ -848,12 +848,12 @@ func TestEffectiveMinSize(t *testing.T) {
 }
 
 func TestTargetSizeOf(t *testing.T) {
-	nodes := []infrav1alpha1.Node{
-		*nodeCRInGroup(testGroup, "ready", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		*nodeCRInGroup(testGroup, "starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-		*nodeCRInGroup(testGroup, "stopping", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
-		*nodeCRInGroup(testGroup, "off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		*nodeCRInGroup(testGroup, "seeded", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	nodes := []infrav2alpha1.Node{
+		*nodeCRInGroup(testGroup, "ready", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		*nodeCRInGroup(testGroup, "starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		*nodeCRInGroup(testGroup, "stopping", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
+		*nodeCRInGroup(testGroup, "off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		*nodeCRInGroup(testGroup, "seeded", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	}
 
 	assert.Equal(t, int32(2), targetSizeOf(nodes))
@@ -862,36 +862,36 @@ func TestTargetSizeOf(t *testing.T) {
 
 // TestCountsTowardsTargetSize pins the definition of a slot the provider is committed to
 // serve. The claimed rows are the burst fix: NodeGroupIncreaseSize claims a slot by writing
-// spec.desiredPowerState = on, and status.progress - owned by the FSM - keeps saying
+// spec.desiredPowerState = on, and status.phase - owned by the FSM - keeps saying
 // "shutdown" until the node controller picks the slot up seconds later and the machine then
 // takes minutes to boot. A target size read off progress alone reports the slot as gone for
 // that whole window, so cluster-autoscaler asks for the same slot again in the same loop.
 func TestCountsTowardsTargetSize(t *testing.T) {
 	tests := []struct {
 		name     string
-		desired  infrav1alpha1.PowerState
-		status   infrav1alpha1.PowerState
-		progress infrav1alpha1.Progress
+		desired  infrav2alpha1.PowerState
+		status   infrav2alpha1.PowerState
+		progress infrav2alpha1.NodePhase
 		want     bool
 	}{
-		{"a running slot counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, true},
-		{"a slot that is starting up counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, true},
+		{"a running slot counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, true},
+		{"a slot that is starting up counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting, true},
 		// (a) the claimed slot: this is the row the pre-fix helper got wrong.
-		{"a claimed slot whose FSM has not moved yet counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, true},
-		{"a claimed slot with no progress recorded yet counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, "", true},
+		{"a claimed slot whose FSM has not moved yet counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff, true},
+		{"a claimed slot with no progress recorded yet counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, "", true},
 		// (b) a slot that is genuinely being torn down stays excluded, the exclusion the
 		// autoscaler needs for its headroom.
-		{"a slot mid shutdown does not count", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown, false},
-		{"a shut down slot does not count", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, false},
+		{"a slot mid shutdown does not count", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining, false},
+		{"a shut down slot does not count", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff, false},
 		// A machine that is up and desired off is capacity the provider is serving: only
 		// NodeGroupDeleteNodes owns it, and the autoscaler must keep seeing it until the
 		// shutdown job has run.
-		{"a machine still running while desired off counts", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, true},
+		{"a machine still running while desired off counts", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, true},
 		// The shape a cancelled startup lands in: NodeGroupDecreaseTargetSize cleared the spec
 		// and left the progress to the FSM. The request is off and the machine never came up, so
 		// it is not capacity - and this is the row that keeps the target size drop immediate now
 		// that the handler no longer writes progress: shuttingdown itself.
-		{"a cancelled startup does not count", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, false},
+		{"a cancelled startup does not count", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting, false},
 	}
 
 	for _, tc := range tests {
@@ -908,10 +908,10 @@ func TestCountsTowardsTargetSize(t *testing.T) {
 // With 1 the autoscaler concludes the group did not grow and calls IncreaseSize again.
 func TestNodeGroupTargetSizeCountsClaimedSlot(t *testing.T) {
 	server := newServer(t,
-		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		slotInSystemNamespace("slot-stopping", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
-		slotInSystemNamespace("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		slotInSystemNamespace("slot-stopping", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
+		slotInSystemNamespace("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
@@ -928,8 +928,8 @@ func TestNodeGroupTargetSizeCountsClaimedSlot(t *testing.T) {
 func TestNodeGroupIncreaseSizeRefusesWhenClaimsReachMaxSize(t *testing.T) {
 	server := newServer(t,
 		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		slotInSystemNamespace("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		slotInSystemNamespace("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	ctx := context.Background()
@@ -937,7 +937,7 @@ func TestNodeGroupIncreaseSizeRefusesWhenClaimsReachMaxSize(t *testing.T) {
 	// The first scale up is served: the group is at 1 of 2 slots.
 	_, err := server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
 	require.NoError(t, err)
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-spare")["slot-spare"])
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-spare")["slot-spare"])
 
 	// The claim is capacity now, so the group reads full at the max size. Pre-fix this
 	// answered 1 - the running machine only - which is the number that made the autoscaler
@@ -975,9 +975,9 @@ func TestNodeGroupIncreaseSizeRefusesWhenClaimsReachMaxSize(t *testing.T) {
 func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
 	server := newServer(t,
 		groupCR(testGroup, 2),
-		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		slotInSystemNamespace("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		slotInSystemNamespace("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	ctx := context.Background()
@@ -989,18 +989,18 @@ func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
 	// and a cancelled startup (desired off, progress still the startingup the FSM wrote) is off
 	// the target size, while a claimed slot counts on spec alone
 	desired, progress := slotState(t, server, "slot-starting")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, desired)
-	assert.Equal(t, infrav1alpha1.ProgressStartingUp, progress, "the cancellation does not write status.progress")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, desired)
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, progress, "the cancellation does not write status.phase")
 
 	// the claim is untouched: cancelling it is not this entry point's, and a claim whose spec
 	// was cleared would silently drop out of the target size
 	desired, progress = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "a claim in flight is not a cancel target")
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, progress)
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "a claim in flight is not a cancel target")
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, progress)
 
 	desired, progress = slotState(t, server, "slot-running")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desired)
-	assert.Equal(t, infrav1alpha1.ProgressReady, progress)
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desired)
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, progress)
 
 	// the size that landed on the floor is the one NodeGroupTargetSize reports: running + claim
 	resp, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
@@ -1014,24 +1014,24 @@ func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
 	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
 	require.NoError(t, err)
 	desired, _ = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "the claim is not a cancel target")
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "the claim is not a cancel target")
 
 	// and a request that asks for more than the cancellable slots cannot cross the floor
 	// either: 3 of them, of which one is cancellable, produce 2, exactly the floor.
 	server = newServer(t,
 		groupCR(testGroup, 2),
-		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		slotInSystemNamespace("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		slotInSystemNamespace("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
 	require.NoError(t, err)
 	desired, progress = slotState(t, server, "slot-starting")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, desired)
-	assert.Equal(t, infrav1alpha1.ProgressStartingUp, progress)
+	assert.Equal(t, infrav2alpha1.PowerStateOff, desired)
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, progress)
 	desired, _ = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desired)
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desired)
 
 	// A decrease that would take the pool under the floor is still refused with the claim
 	// counted: the target size is 4, the two starting slots are all this entry point can
@@ -1039,10 +1039,10 @@ func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
 	// number NodeGroupTargetSize reports, on both sides of the fix.
 	server = newServer(t,
 		groupCR(testGroup, 3),
-		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		slotInSystemNamespace("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-		slotInSystemNamespace("slot-starting-2", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		slotInSystemNamespace("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		slotInSystemNamespace("slot-starting-2", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -3})
@@ -1052,12 +1052,12 @@ func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
 	assert.Equal(t, codes.FailedPrecondition, st.Code())
 	assert.Contains(t, st.Message(), "minSize")
 	desired, _ = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "a refused decrease cancels nothing")
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "a refused decrease cancels nothing")
 }
 
 // TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress is the behaviour change on
 // the cancel path. Cancelling a starting slot is a spec write, the shape NodeGroupDeleteNodes
-// produces, and never a write of status.progress. The handler used to set
+// produces, and never a write of status.phase. The handler used to set
 // progress: shuttingdown itself - no transition, no lifecycle Job, no coordination lock, no
 // lastShutdownTime - which makes it the one writer of a transitional progress that is not a
 // transition: the slot is excluded from the target size, validateStateTransition gates every
@@ -1070,11 +1070,11 @@ func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
 // off the target size, on the write that asks for it, and the shutdown runs through
 // ShutdownNode with its Job and its lock.
 func TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress(t *testing.T) {
-	startingUp := func(name string) *infrav1alpha1.Node {
-		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	startingUp := func(name string) *infrav2alpha1.Node {
+		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 	}
-	running := func(name string) *infrav1alpha1.Node {
-		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	running := func(name string) *infrav2alpha1.Node {
+		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	}
 
 	server := newServer(t,
@@ -1093,20 +1093,20 @@ func TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress(t *testing.
 	require.NoError(t, err)
 
 	for _, name := range []string{"slot-3", "slot-4"} {
-		node := &infrav1alpha1.Node{}
+		node := &infrav2alpha1.Node{}
 		require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: testNamespace}, node))
 
-		assert.Equal(t, infrav1alpha1.PowerStateOff, node.Spec.DesiredPowerState, "cancelled slot %s is desired off", name)
-		assert.Equal(t, infrav1alpha1.ProgressStartingUp, node.Status.Progress,
-			"cancelled slot %s keeps the progress the FSM wrote: this handler does not own status.progress", name)
+		assert.Equal(t, infrav2alpha1.PowerStateOff, node.Spec.DesiredPowerState, "cancelled slot %s is desired off", name)
+		assert.Equal(t, infrav2alpha1.NodePhaseBooting, node.Status.Phase,
+			"cancelled slot %s keeps the progress the FSM wrote: this handler does not own status.phase", name)
 		assert.Nil(t, node.Status.LastShutdownTime,
 			"cancelled slot %s records no shutdown: the FSM stamps it when its ShutdownNode runs", name)
 	}
 
 	for _, name := range []string{"slot-1", "slot-2"} {
 		desired, progress := slotState(t, server, name)
-		assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "running machine %s is left to NodeGroupDeleteNodes", name)
-		assert.Equal(t, infrav1alpha1.ProgressReady, progress)
+		assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "running machine %s is left to NodeGroupDeleteNodes", name)
+		assert.Equal(t, infrav2alpha1.NodePhaseReady, progress)
 	}
 
 	// The size lands exactly on what the request asked for, on the spec write alone: 4 - 2,
@@ -1118,10 +1118,10 @@ func TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress(t *testing.
 	// The shutdown the FSM runs on the next reconcile keeps the slot off the target size: the
 	// progress moves to shuttingdown with its timestamp, and the number does not move again.
 	for _, name := range []string{"slot-3", "slot-4"} {
-		node := &infrav1alpha1.Node{}
+		node := &infrav2alpha1.Node{}
 		require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: testNamespace}, node))
 
-		node.Status.Progress = infrav1alpha1.ProgressShuttingDown
+		node.Status.Phase = infrav2alpha1.NodePhaseDraining
 		now := metav1.Now()
 		node.Status.LastShutdownTime = &now
 		require.NoError(t, server.Client.Status().Update(ctx, node))
@@ -1140,8 +1140,8 @@ func TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress(t *testing.
 func TestNodeGroupDeleteNodesCountsClaimedSlotAsCapacity(t *testing.T) {
 	server := newServer(t,
 		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		slotInSystemNamespace("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		slotInSystemNamespace("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	_, err := server.NodeGroupDeleteNodes(context.Background(), &pb.NodeGroupDeleteNodesRequest{
@@ -1156,6 +1156,6 @@ func TestNodeGroupDeleteNodesCountsClaimedSlotAsCapacity(t *testing.T) {
 	assert.Contains(t, st.Message(), "minSize")
 
 	desired, progress := slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "a refused delete must leave the claim in place")
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, progress)
+	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "a refused delete must leave the claim in place")
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, progress)
 }

@@ -34,19 +34,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 )
 
 func setupTestScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
-	_ = infrav1alpha1.AddToScheme(scheme)
+	_ = infrav2alpha1.AddToScheme(scheme)
 	return scheme
 }
 
-func createTestNode(powerState infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+func createTestNode(powerState infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-node",
 			Namespace: "default",
@@ -54,34 +54,34 @@ func createTestNode(powerState infrav1alpha1.PowerState, progress infrav1alpha1.
 				"group": "test-group",
 			},
 		},
-		Spec: infrav1alpha1.NodeSpec{
+		Spec: infrav2alpha1.NodeSpec{
 			DesiredPowerState:  powerState,
 			KubernetesNodeName: "test-node-k8s",
-			StartupPodSpec: infrav1alpha1.MinimalPodSpec{
+			StartupPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/startup:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'starting node'"},
 			},
-			ShutdownPodSpec: infrav1alpha1.MinimalPodSpec{
+			ShutdownPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/shutdown:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'shutting down node'"},
 			},
 		},
-		Status: infrav1alpha1.NodeStatus{
+		Status: infrav2alpha1.NodeStatus{
 			PowerState: powerState,
 			Progress:   progress,
 		},
 	}
 }
 
-func createTestGroup() *infrav1alpha1.Group {
-	return &infrav1alpha1.Group{
+func createTestGroup() *infrav2alpha1.Group {
+	return &infrav2alpha1.Group{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-group",
 			Namespace: "default",
 		},
-		Spec: infrav1alpha1.GroupSpec{
+		Spec: infrav2alpha1.GroupSpec{
 			ScaleDownUtilizationThreshold:    "0.5",
 			ScaleDownGpuUtilizationThreshold: "0.5",
 			ZeroOrMaxNodeScaling:             false,
@@ -114,8 +114,8 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 
 	t.Run("successful node startup", func(t *testing.T) {
 		// Create test objects
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff // Current state is off, desired is on
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff)
+		node.Status.PowerState = infrav2alpha1.PowerStateOff // Current state is off, desired is on
 		group := createTestGroup()
 		k8sNode := createTestKubernetesNode()
 
@@ -123,7 +123,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -157,16 +157,16 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		assert.Equal(t, "test/startup:latest", job.Spec.Template.Spec.Containers[0].Image)
 
 		// Verify node status was updated
-		updatedNode := &infrav1alpha1.Node{}
+		updatedNode := &infrav2alpha1.Node{}
 		err = fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.ProgressStartingUp, updatedNode.Status.Progress)
+		assert.Equal(t, infrav2alpha1.NodePhaseBooting, updatedNode.Status.Phase)
 	})
 
 	t.Run("successful node shutdown", func(t *testing.T) {
 		// Create test objects
-		node := createTestNode(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady)
-		node.Status.PowerState = infrav1alpha1.PowerStateOn // Current state is on, desired is off
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady)
+		node.Status.PowerState = infrav2alpha1.PowerStateOn // Current state is on, desired is off
 		group := createTestGroup()
 		k8sNode := createTestKubernetesNode()
 
@@ -174,7 +174,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -208,16 +208,16 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		assert.Equal(t, "test/shutdown:latest", job.Spec.Template.Spec.Containers[0].Image)
 
 		// Verify node status was updated
-		updatedNode := &infrav1alpha1.Node{}
+		updatedNode := &infrav2alpha1.Node{}
 		err = fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.ProgressShuttingDown, updatedNode.Status.Progress)
+		assert.Equal(t, infrav2alpha1.NodePhaseDraining, updatedNode.Status.Phase)
 	})
 
 	t.Run("node already in desired state", func(t *testing.T) {
 		// Create test objects - node already in desired state
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-		node.Status.PowerState = infrav1alpha1.PowerStateOn // Already on and ready
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		node.Status.PowerState = infrav2alpha1.PowerStateOn // Already on and ready
 		group := createTestGroup()
 		k8sNode := createTestKubernetesNode()
 
@@ -225,7 +225,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -256,8 +256,8 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 
 	t.Run("node in transitional state", func(t *testing.T) {
 		// Create test objects - node in transitional state
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+		node.Status.PowerState = infrav2alpha1.PowerStateOff
 		group := createTestGroup()
 		k8sNode := createTestKubernetesNode()
 
@@ -265,7 +265,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -297,8 +297,8 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 
 	t.Run("coordination lock conflict defers the transition instead of failing it", func(t *testing.T) {
 		// Create test objects with existing coordination lock
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff)
+		node.Status.PowerState = infrav2alpha1.PowerStateOff
 		node.Annotations = map[string]string{
 			"homelab-autoscaler.dev/operation-lock": "scale-up",
 			"homelab-autoscaler.dev/lock-owner":     "cluster-autoscaler",
@@ -312,7 +312,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -352,10 +352,10 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		// behind, which is what keeps the next reconcile from being gated out of the slot by
 		// validateStateTransition - nothing in a reconcile undoes a transitional progress, only
 		// the operation that wrote it does.
-		updated := &infrav1alpha1.Node{}
+		updated := &infrav2alpha1.Node{}
 		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "test-node", Namespace: "default"}, updated))
-		assert.Equal(t, infrav1alpha1.ProgressShutdown, updated.Status.Progress)
-		assert.Equal(t, infrav1alpha1.PowerStateOn, updated.Spec.DesiredPowerState)
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, updated.Status.Phase)
+		assert.Equal(t, infrav2alpha1.PowerStateOn, updated.Spec.DesiredPowerState)
 
 		// The lock of the operation in flight survived the refusal: scale-up and scale-down of
 		// one slot stay mutually exclusive.
@@ -365,8 +365,8 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 
 	t.Run("invalid transition", func(t *testing.T) {
 		// Create test objects with invalid transition (try to start already running node)
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-		node.Status.PowerState = infrav1alpha1.PowerStateOn // Already on and ready, can't start again
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		node.Status.PowerState = infrav2alpha1.PowerStateOn // Already on and ready, can't start again
 		group := createTestGroup()
 		k8sNode := createTestKubernetesNode()
 
@@ -374,7 +374,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -410,8 +410,8 @@ func TestNodeReconciler_BackoffBehavior(t *testing.T) {
 
 	t.Run("backoff calculation for transitional states", func(t *testing.T) {
 		// Create test objects in transitional state with recent timestamp
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+		node.Status.PowerState = infrav2alpha1.PowerStateOff
 		now := metav1.Now()
 		node.Status.LastStartupTime = &now
 		group := createTestGroup()
@@ -421,7 +421,7 @@ func TestNodeReconciler_BackoffBehavior(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -448,8 +448,8 @@ func TestNodeReconciler_BackoffBehavior(t *testing.T) {
 
 	t.Run("stuck state detection and cleanup", func(t *testing.T) {
 		// Create test objects in transitional state with old timestamp (stuck)
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+		node.Status.PowerState = infrav2alpha1.PowerStateOff
 		oldTime := metav1.NewTime(time.Now().Add(-20 * time.Minute)) // Very old timestamp
 		node.Status.LastStartupTime = &oldTime
 		group := createTestGroup()
@@ -459,7 +459,7 @@ func TestNodeReconciler_BackoffBehavior(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -495,7 +495,7 @@ func TestNodeReconciler_ErrorHandling(t *testing.T) {
 
 	t.Run("missing group reference", func(t *testing.T) {
 		// Create node without group
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff)
 		node.Labels = nil // Remove group label
 		k8sNode := createTestKubernetesNode()
 
@@ -503,7 +503,7 @@ func TestNodeReconciler_ErrorHandling(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -529,15 +529,15 @@ func TestNodeReconciler_ErrorHandling(t *testing.T) {
 
 	t.Run("missing kubernetes node", func(t *testing.T) {
 		// Create test objects without kubernetes node
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff)
+		node.Status.PowerState = infrav2alpha1.PowerStateOff
 		group := createTestGroup()
 
 		// Create fake client without kubernetes node
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node, group).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build()
 
 		// Create reconciler
@@ -582,27 +582,27 @@ func TestNodeReconciler_StateConsistency(t *testing.T) {
 	t.Run("state matches node progress", func(t *testing.T) {
 		testCases := []struct {
 			name        string
-			progress    infrav1alpha1.Progress
+			progress    infrav2alpha1.NodePhase
 			expectedFSM string
 		}{
 			{
 				name:        "shutdown progress maps to shutdown state",
-				progress:    infrav1alpha1.ProgressShutdown,
+				progress:    infrav2alpha1.NodePhaseOff,
 				expectedFSM: fsm.StateShutdown,
 			},
 			{
 				name:        "starting up progress maps to starting up state",
-				progress:    infrav1alpha1.ProgressStartingUp,
+				progress:    infrav2alpha1.NodePhaseBooting,
 				expectedFSM: fsm.StateStartingUp,
 			},
 			{
 				name:        "ready progress maps to ready state",
-				progress:    infrav1alpha1.ProgressReady,
+				progress:    infrav2alpha1.NodePhaseReady,
 				expectedFSM: fsm.StateReady,
 			},
 			{
 				name:        "shutting down progress maps to shutting down state",
-				progress:    infrav1alpha1.ProgressShuttingDown,
+				progress:    infrav2alpha1.NodePhaseDraining,
 				expectedFSM: fsm.StateShuttingDown,
 			},
 		}
@@ -610,7 +610,7 @@ func TestNodeReconciler_StateConsistency(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				// Create test objects
-				node := createTestNode(infrav1alpha1.PowerStateOn, tc.progress)
+				node := createTestNode(infrav2alpha1.PowerStateOn, tc.progress)
 				group := createTestGroup()
 				k8sNode := createTestKubernetesNode()
 
@@ -618,7 +618,7 @@ func TestNodeReconciler_StateConsistency(t *testing.T) {
 				fakeClient := fake.NewClientBuilder().
 					WithScheme(scheme).
 					WithObjects(node, group, k8sNode).
-					WithStatusSubresource(&infrav1alpha1.Node{}).
+					WithStatusSubresource(&infrav2alpha1.Node{}).
 					Build()
 
 				// Create FSM directly to verify state mapping

@@ -39,37 +39,37 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 func TestNewNodeStateMachine(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	tests := []struct {
 		name          string
-		nodeProgress  infrav1alpha1.Progress
+		nodeProgress  infrav2alpha1.NodePhase
 		expectedState string
 	}{
 		{
 			name:          "shutdown node creates FSM in shutdown state",
-			nodeProgress:  infrav1alpha1.ProgressShutdown,
+			nodeProgress:  infrav2alpha1.NodePhaseOff,
 			expectedState: StateShutdown,
 		},
 		{
 			name:          "starting up node creates FSM in startingup state",
-			nodeProgress:  infrav1alpha1.ProgressStartingUp,
+			nodeProgress:  infrav2alpha1.NodePhaseBooting,
 			expectedState: StateStartingUp,
 		},
 		{
 			name:          "ready node creates FSM in ready state",
-			nodeProgress:  infrav1alpha1.ProgressReady,
+			nodeProgress:  infrav2alpha1.NodePhaseReady,
 			expectedState: StateReady,
 		},
 		{
 			name:          "shutting down node creates FSM in shuttingdown state",
-			nodeProgress:  infrav1alpha1.ProgressShuttingDown,
+			nodeProgress:  infrav2alpha1.NodePhaseDraining,
 			expectedState: StateShuttingDown,
 		},
 		{
@@ -81,7 +81,7 @@ func TestNewNodeStateMachine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, tt.nodeProgress)
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, tt.nodeProgress)
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
@@ -103,72 +103,72 @@ func TestNewNodeStateMachine(t *testing.T) {
 func TestNodeStateMachine_CanTransition(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	tests := []struct {
 		name          string
-		currentState  infrav1alpha1.Progress
+		currentState  infrav2alpha1.NodePhase
 		event         string
 		canTransition bool
 	}{
 		// Valid transitions
 		{
 			name:          "can start node from shutdown",
-			currentState:  infrav1alpha1.ProgressShutdown,
+			currentState:  infrav2alpha1.NodePhaseOff,
 			event:         EventStartNode,
 			canTransition: true,
 		},
 		{
 			name:          "can shutdown node from ready",
-			currentState:  infrav1alpha1.ProgressReady,
+			currentState:  infrav2alpha1.NodePhaseReady,
 			event:         EventShutdownNode,
 			canTransition: true,
 		},
 		{
 			name:          "can complete job from starting up",
-			currentState:  infrav1alpha1.ProgressStartingUp,
+			currentState:  infrav2alpha1.NodePhaseBooting,
 			event:         EventJobCompleted,
 			canTransition: true,
 		},
 		{
 			name:          "can complete job from shutting down",
-			currentState:  infrav1alpha1.ProgressShuttingDown,
+			currentState:  infrav2alpha1.NodePhaseDraining,
 			event:         EventJobCompleted,
 			canTransition: true,
 		},
 		{
 			name:          "can fail job from starting up",
-			currentState:  infrav1alpha1.ProgressStartingUp,
+			currentState:  infrav2alpha1.NodePhaseBooting,
 			event:         EventJobFailed,
 			canTransition: true,
 		},
 		{
 			name:          "can fail job from shutting down",
-			currentState:  infrav1alpha1.ProgressShuttingDown,
+			currentState:  infrav2alpha1.NodePhaseDraining,
 			event:         EventJobFailed,
 			canTransition: true,
 		},
 		{
 			name:          "can timeout from starting up",
-			currentState:  infrav1alpha1.ProgressStartingUp,
+			currentState:  infrav2alpha1.NodePhaseBooting,
 			event:         EventJobTimeout,
 			canTransition: true,
 		},
 		{
 			name:          "can timeout from shutting down",
-			currentState:  infrav1alpha1.ProgressShuttingDown,
+			currentState:  infrav2alpha1.NodePhaseDraining,
 			event:         EventJobTimeout,
 			canTransition: true,
 		},
 		{
 			name:          "can force cleanup from starting up",
-			currentState:  infrav1alpha1.ProgressStartingUp,
+			currentState:  infrav2alpha1.NodePhaseBooting,
 			event:         EventForceCleanup,
 			canTransition: true,
 		},
 		{
 			name:          "can force cleanup from shutting down",
-			currentState:  infrav1alpha1.ProgressShuttingDown,
+			currentState:  infrav2alpha1.NodePhaseDraining,
 			event:         EventForceCleanup,
 			canTransition: true,
 		},
@@ -176,37 +176,37 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 		// Invalid transitions
 		{
 			name:          "cannot start node from ready",
-			currentState:  infrav1alpha1.ProgressReady,
+			currentState:  infrav2alpha1.NodePhaseReady,
 			event:         EventStartNode,
 			canTransition: false,
 		},
 		{
 			name:          "cannot shutdown node from shutdown",
-			currentState:  infrav1alpha1.ProgressShutdown,
+			currentState:  infrav2alpha1.NodePhaseOff,
 			event:         EventShutdownNode,
 			canTransition: false,
 		},
 		{
 			name:          "cannot complete job from ready",
-			currentState:  infrav1alpha1.ProgressReady,
+			currentState:  infrav2alpha1.NodePhaseReady,
 			event:         EventJobCompleted,
 			canTransition: false,
 		},
 		{
 			name:          "cannot complete job from shutdown",
-			currentState:  infrav1alpha1.ProgressShutdown,
+			currentState:  infrav2alpha1.NodePhaseOff,
 			event:         EventJobCompleted,
 			canTransition: false,
 		},
 		{
 			name:          "cannot force cleanup from ready",
-			currentState:  infrav1alpha1.ProgressReady,
+			currentState:  infrav2alpha1.NodePhaseReady,
 			event:         EventForceCleanup,
 			canTransition: false,
 		},
 		{
 			name:          "cannot force cleanup from shutdown",
-			currentState:  infrav1alpha1.ProgressShutdown,
+			currentState:  infrav2alpha1.NodePhaseOff,
 			event:         EventForceCleanup,
 			canTransition: false,
 		},
@@ -214,7 +214,7 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, tt.currentState)
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, tt.currentState)
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
@@ -230,10 +230,10 @@ func TestNodeStateMachine_CanTransition(t *testing.T) {
 func TestNodeStateMachine_StartNode(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("successful node start", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -277,7 +277,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 	})
 
 	t.Run("coordination lock failure", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -301,7 +301,7 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 	})
 
 	t.Run("invalid state transition", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -324,10 +324,10 @@ func TestNodeStateMachine_StartNode(t *testing.T) {
 func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("successful node shutdown with kubernetes node cordoning", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", false) // Initially schedulable
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
@@ -378,7 +378,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 	})
 
 	t.Run("successful node shutdown without kubernetes node", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node) // No Kubernetes node
 
@@ -400,7 +400,7 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 	})
 
 	t.Run("coordination lock failure", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -427,10 +427,10 @@ func TestNodeStateMachine_ShutdownNode(t *testing.T) {
 func TestNodeStateMachine_JobEvents(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("startup job completed uncordons kubernetes node", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", true) // Initially unschedulable
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
@@ -457,7 +457,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 	})
 
 	t.Run("shutdown job completed does not uncordon kubernetes node", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", true) // Initially unschedulable
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node, kubeNode)
@@ -481,13 +481,13 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 
 	tests := []struct {
 		name          string
-		initialState  infrav1alpha1.Progress
+		initialState  infrav2alpha1.NodePhase
 		event         func(*NodeStateMachine) error
 		expectedState string
 	}{
 		{
 			name:         "job completed from starting up",
-			initialState: infrav1alpha1.ProgressStartingUp,
+			initialState: infrav2alpha1.NodePhaseBooting,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.JobCompleted(nil)
 			},
@@ -495,7 +495,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		},
 		{
 			name:         "job completed from shutting down",
-			initialState: infrav1alpha1.ProgressShuttingDown,
+			initialState: infrav2alpha1.NodePhaseDraining,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.JobCompleted(nil)
 			},
@@ -503,7 +503,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		},
 		{
 			name:         "job failed from starting up",
-			initialState: infrav1alpha1.ProgressStartingUp,
+			initialState: infrav2alpha1.NodePhaseBooting,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.JobFailed()
 			},
@@ -511,7 +511,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		},
 		{
 			name:         "job failed from shutting down",
-			initialState: infrav1alpha1.ProgressShuttingDown,
+			initialState: infrav2alpha1.NodePhaseDraining,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.JobFailed()
 			},
@@ -519,7 +519,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		},
 		{
 			name:         "job timeout from starting up",
-			initialState: infrav1alpha1.ProgressStartingUp,
+			initialState: infrav2alpha1.NodePhaseBooting,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.JobTimeout()
 			},
@@ -527,7 +527,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		},
 		{
 			name:         "job timeout from shutting down",
-			initialState: infrav1alpha1.ProgressShuttingDown,
+			initialState: infrav2alpha1.NodePhaseDraining,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.JobTimeout()
 			},
@@ -535,7 +535,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		},
 		{
 			name:         "force cleanup from starting up",
-			initialState: infrav1alpha1.ProgressStartingUp,
+			initialState: infrav2alpha1.NodePhaseBooting,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.ForceCleanup()
 			},
@@ -543,7 +543,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 		},
 		{
 			name:         "force cleanup from shutting down",
-			initialState: infrav1alpha1.ProgressShuttingDown,
+			initialState: infrav2alpha1.NodePhaseDraining,
 			event: func(fsm *NodeStateMachine) error {
 				return fsm.ForceCleanup()
 			},
@@ -553,7 +553,7 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, tt.initialState)
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, tt.initialState)
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
@@ -573,9 +573,9 @@ func TestNodeStateMachine_JobEvents(t *testing.T) {
 func TestNodeStateMachine_CalculateBackoff(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -637,9 +637,9 @@ func TestNodeStateMachine_CalculateBackoff(t *testing.T) {
 func TestNodeStateMachine_IsTransitionStuck(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -675,10 +675,10 @@ func TestNodeStateMachine_IsTransitionStuck(t *testing.T) {
 func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("job completes successfully", func(t *testing.T) {
-		node := CreateTestNode("test-node-monitor-1", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node-monitor-1", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -716,7 +716,7 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 	})
 
 	t.Run("job fails", func(t *testing.T) {
-		node := CreateTestNode("test-node-monitor-2", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node-monitor-2", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -754,7 +754,7 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 	})
 
 	t.Run("job times out", func(t *testing.T) {
-		node := CreateTestNode("test-node-monitor-3", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node-monitor-3", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -795,10 +795,10 @@ func TestNodeStateMachine_MonitorJobCompletion(t *testing.T) {
 func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("cleanup multiple pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create multiple pending jobs for the same node
@@ -841,7 +841,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	})
 
 	t.Run("cleanup with no pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -861,7 +861,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	})
 
 	t.Run("cleanup with empty kubernetes node name", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		node.Spec.KubernetesNodeName = "" // Empty node name
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
@@ -876,7 +876,7 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 	})
 
 	t.Run("cleanup only affects startup and shutdown jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create jobs with different types
@@ -909,10 +909,10 @@ func TestNodeStateMachine_CleanupPendingJobs(t *testing.T) {
 func TestNodeStateMachine_StartNodeWithCleanup(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("startup cleans up existing pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create existing pending jobs
@@ -946,10 +946,10 @@ func TestNodeStateMachine_StartNodeWithCleanup(t *testing.T) {
 func TestNodeStateMachine_ShutdownNodeWithCleanup(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("shutdown cleans up existing pending jobs", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create existing pending jobs
@@ -983,10 +983,10 @@ func TestNodeStateMachine_ShutdownNodeWithCleanup(t *testing.T) {
 func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("startup job uses default ServiceAccount when not specified", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -1008,7 +1008,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 
 	t.Run("startup job uses specified ServiceAccount", func(t *testing.T) {
 		serviceAccountName := "custom-service-account"
-		node := CreateTestNode("test-node-sa", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node-sa", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		node.Spec.StartupPodSpec.ServiceAccount = &serviceAccountName
 
 		mockCoord := NewMockCoordinationManager()
@@ -1031,8 +1031,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	})
 
 	t.Run("startup job mounts Secret volume", func(t *testing.T) {
-		node := CreateTestNode("test-node-secret", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
-		node.Spec.StartupPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+		node := CreateTestNode("test-node-secret", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		node.Spec.StartupPodSpec.Volumes = []infrav2alpha1.VolumeMountSpec{
 			{
 				Name:       "credentials",
 				MountPath:  "/etc/credentials",
@@ -1071,8 +1071,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	})
 
 	t.Run("startup job mounts ConfigMap volume", func(t *testing.T) {
-		node := CreateTestNode("test-node-configmap", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
-		node.Spec.StartupPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+		node := CreateTestNode("test-node-configmap", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		node.Spec.StartupPodSpec.Volumes = []infrav2alpha1.VolumeMountSpec{
 			{
 				Name:          "config",
 				MountPath:     "/etc/config",
@@ -1111,8 +1111,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	})
 
 	t.Run("startup job mounts multiple volumes", func(t *testing.T) {
-		node := CreateTestNode("test-node-multi", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
-		node.Spec.StartupPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+		node := CreateTestNode("test-node-multi", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		node.Spec.StartupPodSpec.Volumes = []infrav2alpha1.VolumeMountSpec{
 			{
 				Name:       "credentials",
 				MountPath:  "/credentials",
@@ -1164,7 +1164,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	})
 
 	t.Run("shutdown job uses default ServiceAccount when not specified", func(t *testing.T) {
-		node := CreateTestNode("test-node-shutdown-sa", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node-shutdown-sa", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -1186,7 +1186,7 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 
 	t.Run("shutdown job uses specified ServiceAccount", func(t *testing.T) {
 		serviceAccountName := "shutdown-service-account"
-		node := CreateTestNode("test-node-shutdown-sa2", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node-shutdown-sa2", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		node.Spec.ShutdownPodSpec.ServiceAccount = &serviceAccountName
 
 		mockCoord := NewMockCoordinationManager()
@@ -1209,8 +1209,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	})
 
 	t.Run("shutdown job mounts Secret volume", func(t *testing.T) {
-		node := CreateTestNode("test-node-shutdown-secret", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-		node.Spec.ShutdownPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+		node := CreateTestNode("test-node-shutdown-secret", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		node.Spec.ShutdownPodSpec.Volumes = []infrav2alpha1.VolumeMountSpec{
 			{
 				Name:       "credentials",
 				MountPath:  "/etc/credentials",
@@ -1249,8 +1249,8 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	})
 
 	t.Run("shutdown job mounts ConfigMap volume", func(t *testing.T) {
-		node := CreateTestNode("test-node-shutdown-configmap", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-		node.Spec.ShutdownPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+		node := CreateTestNode("test-node-shutdown-configmap", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		node.Spec.ShutdownPodSpec.Volumes = []infrav2alpha1.VolumeMountSpec{
 			{
 				Name:          "config",
 				MountPath:     "/etc/config",
@@ -1290,9 +1290,9 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 
 	t.Run("shutdown job uses volumes and ServiceAccount together", func(t *testing.T) {
 		serviceAccountName := "shutdown-sa"
-		node := CreateTestNode("test-node-shutdown-combined", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node-shutdown-combined", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		node.Spec.ShutdownPodSpec.ServiceAccount = &serviceAccountName
-		node.Spec.ShutdownPodSpec.Volumes = []infrav1alpha1.VolumeMountSpec{
+		node.Spec.ShutdownPodSpec.Volumes = []infrav2alpha1.VolumeMountSpec{
 			{
 				Name:       "credentials",
 				MountPath:  "/credentials",
@@ -1346,29 +1346,29 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	const nodeUID = types.UID("11111111-2222-3333-4444-555555555555")
 
 	tests := []struct {
 		name     string
 		phase    string
-		power    infrav1alpha1.PowerState
-		progress infrav1alpha1.Progress
+		power    infrav2alpha1.PowerState
+		progress infrav2alpha1.NodePhase
 		action   func(*NodeStateMachine) error
 	}{
 		{
 			name:     "startup job",
 			phase:    PhaseStartup,
-			power:    infrav1alpha1.PowerStateOff,
-			progress: infrav1alpha1.ProgressShutdown,
+			power:    infrav2alpha1.PowerStateOff,
+			progress: infrav2alpha1.NodePhaseOff,
 			action:   func(f *NodeStateMachine) error { return f.StartNode() },
 		},
 		{
 			name:     "shutdown job",
 			phase:    PhaseShutdown,
-			power:    infrav1alpha1.PowerStateOn,
-			progress: infrav1alpha1.ProgressReady,
+			power:    infrav2alpha1.PowerStateOn,
+			progress: infrav2alpha1.NodePhaseReady,
 			action:   func(f *NodeStateMachine) error { return f.ShutdownNode() },
 		},
 	}
@@ -1428,7 +1428,7 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 			// tree uses to show the Job under the Node.
 			refs := job.GetOwnerReferences()
 			require.Len(t, refs, 1, "job must have exactly one owner reference")
-			assert.Equal(t, infrav1alpha1.GroupVersion.String(), refs[0].APIVersion)
+			assert.Equal(t, infrav2alpha1.GroupVersion.String(), refs[0].APIVersion)
 			assert.Equal(t, "Node", refs[0].Kind)
 			assert.Equal(t, "test-node", refs[0].Name)
 			assert.Equal(t, nodeUID, refs[0].UID)
@@ -1444,50 +1444,50 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 func TestNodeStateMachine_PriorityClassName(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	tests := []struct {
 		name     string
 		priority *string
-		podSpec  func(*infrav1alpha1.Node, *string)
-		power    infrav1alpha1.PowerState
-		progress infrav1alpha1.Progress
+		podSpec  func(*infrav2alpha1.Node, *string)
+		power    infrav2alpha1.PowerState
+		progress infrav2alpha1.NodePhase
 		action   func(*NodeStateMachine) error
 		expected string
 	}{
 		{
 			name:     "startup job applies priorityClassName",
 			priority: ptrToString("system-cluster-critical"),
-			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.StartupPodSpec.PriorityClassName = p },
-			power:    infrav1alpha1.PowerStateOff,
-			progress: infrav1alpha1.ProgressShutdown,
+			podSpec:  func(n *infrav2alpha1.Node, p *string) { n.Spec.StartupPodSpec.PriorityClassName = p },
+			power:    infrav2alpha1.PowerStateOff,
+			progress: infrav2alpha1.NodePhaseOff,
 			action:   func(f *NodeStateMachine) error { return f.StartNode() },
 			expected: "system-cluster-critical",
 		},
 		{
 			name:     "shutdown job applies priorityClassName",
 			priority: ptrToString("power-management"),
-			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.ShutdownPodSpec.PriorityClassName = p },
-			power:    infrav1alpha1.PowerStateOn,
-			progress: infrav1alpha1.ProgressReady,
+			podSpec:  func(n *infrav2alpha1.Node, p *string) { n.Spec.ShutdownPodSpec.PriorityClassName = p },
+			power:    infrav2alpha1.PowerStateOn,
+			progress: infrav2alpha1.NodePhaseReady,
 			action:   func(f *NodeStateMachine) error { return f.ShutdownNode() },
 			expected: "power-management",
 		},
 		{
 			name:     "startup job without priorityClassName stays empty",
 			priority: nil,
-			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.StartupPodSpec.PriorityClassName = p },
-			power:    infrav1alpha1.PowerStateOff,
-			progress: infrav1alpha1.ProgressShutdown,
+			podSpec:  func(n *infrav2alpha1.Node, p *string) { n.Spec.StartupPodSpec.PriorityClassName = p },
+			power:    infrav2alpha1.PowerStateOff,
+			progress: infrav2alpha1.NodePhaseOff,
 			action:   func(f *NodeStateMachine) error { return f.StartNode() },
 			expected: "",
 		},
 		{
 			name:     "shutdown job without priorityClassName stays empty",
 			priority: nil,
-			podSpec:  func(n *infrav1alpha1.Node, p *string) { n.Spec.ShutdownPodSpec.PriorityClassName = p },
-			power:    infrav1alpha1.PowerStateOn,
-			progress: infrav1alpha1.ProgressReady,
+			podSpec:  func(n *infrav2alpha1.Node, p *string) { n.Spec.ShutdownPodSpec.PriorityClassName = p },
+			power:    infrav2alpha1.PowerStateOn,
+			progress: infrav2alpha1.NodePhaseReady,
 			action:   func(f *NodeStateMachine) error { return f.ShutdownNode() },
 			expected: "",
 		},
@@ -1605,7 +1605,7 @@ func ciliumNode(taints ...corev1.Taint) *corev1.Node {
 func TestSetNodeSchedulableWaitsForTheCiliumBootstrapTaint(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	bootstrap := corev1.Taint{
 		Key:    TaintCiliumAgentNotReady,
@@ -1613,7 +1613,7 @@ func TestSetNodeSchedulableWaitsForTheCiliumBootstrapTaint(t *testing.T) {
 		Effect: corev1.TaintEffectNoExecute,
 	}
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
 	recorder := &taintLiftClient{Client: base, key: TaintCiliumAgentNotReady, liftFrom: 2}
 
@@ -1648,12 +1648,12 @@ func TestSetNodeSchedulableWaitsForTheCiliumBootstrapTaint(t *testing.T) {
 func TestSetNodeSchedulableDoesNotWaitForACiliumItDoesNotHave(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
 	unreachable := corev1.Taint{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoExecute}
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node, ciliumNode(role, unreachable))
 	recorder := &taintLiftClient{Client: base}
 
@@ -1693,13 +1693,13 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 func TestSetNodeSchedulableTimeoutUncordonsAndLogs(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	logs := captureLogs(t)
 
 	bootstrap := corev1.Taint{Key: TaintCiliumAgentNotReady, Value: "true", Effect: corev1.TaintEffectNoExecute}
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
 	recorder := &taintLiftClient{Client: base}
 
@@ -1733,9 +1733,9 @@ func TestSetNodeSchedulableTimeoutUncordonsAndLogs(t *testing.T) {
 func TestSetNodeSchedulableOnMissingNodeTimesOutWithoutWriting(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node)
 	recorder := &taintLiftClient{Client: base}
 
@@ -1797,7 +1797,7 @@ func TestNodeUsability(t *testing.T) {
 // newGateMachine is the loop with both budgets spelled out, so a test says which half it is
 // exercising: registration is the wait for the node object, the gate is the wait for that object to
 // be Ready and free of the readiness taints, counted from the pass it appears on.
-func newGateMachine(node *infrav1alpha1.Node, c client.Client, scheme *runtime.Scheme, coord CoordinationManager, keys []string, registration, gate time.Duration) *NodeStateMachine {
+func newGateMachine(node *infrav2alpha1.Node, c client.Client, scheme *runtime.Scheme, coord CoordinationManager, keys []string, registration, gate time.Duration) *NodeStateMachine {
 	nm := NewNodeStateMachine(node, c, scheme, coord, WithReadinessTaintKeys(keys))
 	nm.uncordonTimeout = registration
 	nm.readinessGateTimeout = gate
@@ -1817,9 +1817,9 @@ func newGateMachine(node *infrav1alpha1.Node, c client.Client, scheme *runtime.S
 func TestSetNodeSchedulableGateHasItsOwnDeadline(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node, ciliumNode())
 
 	// Ready on the 3rd read: the loop must still be waiting for the gate, not out of budget.
@@ -1848,9 +1848,9 @@ func TestSetNodeSchedulableGateHasItsOwnDeadline(t *testing.T) {
 func TestSetNodeSchedulableRegistrationDeadlineIsTheNodeObject(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node)
 	recorder := &taintLiftClient{Client: base}
 
@@ -1879,9 +1879,9 @@ func TestSetNodeSchedulableRegistrationDeadlineIsTheNodeObject(t *testing.T) {
 func TestReadinessGateKeepsTheCoordinationLockAlive(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node, ciliumNode())
 	recorder := &taintLiftClient{Client: base, readyFrom: 3}
 
@@ -1910,11 +1910,11 @@ func TestReadinessGateKeepsTheCoordinationLockAlive(t *testing.T) {
 func TestReadinessGateTimeoutRecordsAWarningOnTheSlot(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	bootstrap := corev1.Taint{Key: TaintCiliumAgentNotReady, Value: "true", Effect: corev1.TaintEffectNoExecute}
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	base := CreateFakeClient(scheme, node, ciliumNode(bootstrap))
 	recorder := &taintLiftClient{Client: base}
 	rec := events.NewFakeRecorder(16)
@@ -1951,9 +1951,9 @@ func TestReadinessGateTimeoutRecordsAWarningOnTheSlot(t *testing.T) {
 func TestWithReadinessGateTimeoutZeroKeepsTheDefault(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	nm := NewNodeStateMachine(node, CreateFakeClient(scheme, node), scheme, NewMockCoordinationManager(),
 		WithReadinessGateTimeout(0))
 

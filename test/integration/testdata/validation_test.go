@@ -22,7 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 func TestDataConsistency(t *testing.T) {
@@ -31,7 +31,7 @@ func TestDataConsistency(t *testing.T) {
 	if err := scheme.AddToScheme(testScheme); err != nil {
 		t.Fatalf("Failed to add core types to scheme: %v", err)
 	}
-	if err := infrav1alpha1.AddToScheme(testScheme); err != nil {
+	if err := infrav2alpha1.AddToScheme(testScheme); err != nil {
 		t.Fatalf("Failed to add infra types to scheme: %v", err)
 	}
 
@@ -47,7 +47,7 @@ func TestLoadAllTestData(t *testing.T) {
 	if err := scheme.AddToScheme(testScheme); err != nil {
 		t.Fatalf("Failed to add core types to scheme: %v", err)
 	}
-	if err := infrav1alpha1.AddToScheme(testScheme); err != nil {
+	if err := infrav2alpha1.AddToScheme(testScheme); err != nil {
 		t.Fatalf("Failed to add infra types to scheme: %v", err)
 	}
 
@@ -116,7 +116,7 @@ func TestCreateMockClients(t *testing.T) {
 	if err := scheme.AddToScheme(testScheme); err != nil {
 		t.Fatalf("Failed to add core types to scheme: %v", err)
 	}
-	if err := infrav1alpha1.AddToScheme(testScheme); err != nil {
+	if err := infrav2alpha1.AddToScheme(testScheme); err != nil {
 		t.Fatalf("Failed to add infra types to scheme: %v", err)
 	}
 

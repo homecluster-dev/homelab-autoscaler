@@ -39,7 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 )
 
@@ -89,17 +89,17 @@ func newK8sNodeReconciler(t *testing.T, objects ...client.Object) *KubernetesNod
 		Client: fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(objects...).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build(),
 		Scheme: scheme,
 	}
 }
 
 // slotFrom reads a Node CR (a slot) back from the client.
-func slotFrom(t *testing.T, c client.Client, name string) *infrav1alpha1.Node {
+func slotFrom(t *testing.T, c client.Client, name string) *infrav2alpha1.Node {
 	t.Helper()
 
-	node := &infrav1alpha1.Node{}
+	node := &infrav2alpha1.Node{}
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: slotNamespace}, node))
 
 	return node
@@ -117,22 +117,22 @@ func reconcileK8sNode(t *testing.T, r *KubernetesNodeReconciler, name string) {
 // TestK8sNodeReconcilerCorrectsProgressWhenPowerStateUnchanged pins the live bug: a slot
 // that was shut down and started again (desiredPowerState back to "on", node Ready) keeps
 // status.powerState: "on", so the power-state short circuit used to return before the
-// progress correction and status.progress stayed "shutdown" forever. That stale progress
+// progress correction and status.phase stayed "shutdown" forever. That stale progress
 // is not cosmetic: NodeGroupTargetSize excludes slots whose progress is
 // shutdown/shuttingdown, so a group with one Ready node reports targetSize 0 and
 // cluster-autoscaler refuses to scale.
 func TestK8sNodeReconcilerCorrectsProgressWhenPowerStateUnchanged(t *testing.T) {
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown),
+		slot("omni-remote-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff),
 		managedNode("omni-remote-1", true),
 	)
 
 	reconcileK8sNode(t, r, "omni-remote-1")
 
 	node := slotFrom(t, r.Client, "omni-remote-1")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, node.Status.PowerState, "power state stays as observed")
-	assert.Equal(t, infrav1alpha1.ProgressReady, node.Status.Progress, "progress must follow the observed power state")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, node.Spec.DesiredPowerState, "spec must not be touched")
+	assert.Equal(t, infrav2alpha1.PowerStateOn, node.Status.PowerState, "power state stays as observed")
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, node.Status.Phase, "progress must follow the observed power state")
+	assert.Equal(t, infrav2alpha1.PowerStateOn, node.Spec.DesiredPowerState, "spec must not be touched")
 }
 
 // TestK8sNodeReconcilerRecordsABootWindowWithoutTouchingProgress is the regression test
@@ -147,7 +147,7 @@ func TestK8sNodeReconcilerCorrectsProgressWhenPowerStateUnchanged(t *testing.T) 
 // removed from a node that has not joined, targetSize dipping to 0).
 func TestK8sNodeReconcilerRecordsABootWindowWithoutTouchingProgress(t *testing.T) {
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-2", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady),
+		slot("omni-remote-2", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady),
 		managedNode("omni-remote-2", false),
 	)
 
@@ -156,8 +156,8 @@ func TestK8sNodeReconcilerRecordsABootWindowWithoutTouchingProgress(t *testing.T
 	reconcileK8sNode(t, r, "omni-remote-2")
 
 	node := slotFrom(t, r.Client, "omni-remote-2")
-	assert.Equal(t, infrav1alpha1.ProgressReady, node.Status.Progress, "a NotReady node during boot must not stomp ready")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState)
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, node.Status.Phase, "a NotReady node during boot must not stomp ready")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, node.Status.PowerState)
 	assert.Equal(t, before.Status, node.Status)
 	assert.Equal(t, before.ResourceVersion, node.ResourceVersion, "nothing to record during the boot window, so no status write")
 }
@@ -168,15 +168,15 @@ func TestK8sNodeReconcilerRecordsABootWindowWithoutTouchingProgress(t *testing.T
 // progress has to be corrected in the same write.
 func TestK8sNodeReconcilerCorrectsProgressToShutdownWhenTheMachineTurnsOff(t *testing.T) {
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-5", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slot("omni-remote-5", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		managedNode("omni-remote-5", false),
 	)
 
 	reconcileK8sNode(t, r, "omni-remote-5")
 
 	node := slotFrom(t, r.Client, "omni-remote-5")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState, "the power state change is recorded")
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress, "a real power state change corrects the progress")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, node.Status.PowerState, "the power state change is recorded")
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, node.Status.Phase, "a real power state change corrects the progress")
 }
 
 // TestK8sNodeReconcilerLeavesShutdownWindowAlone is the mirror of the boot-window test and
@@ -190,7 +190,7 @@ func TestK8sNodeReconcilerCorrectsProgressToShutdownWhenTheMachineTurnsOff(t *te
 // duplicate shutdown Job.
 func TestK8sNodeReconcilerLeavesShutdownWindowAlone(t *testing.T) {
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-6", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown),
+		slot("omni-remote-6", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff),
 		managedNode("omni-remote-6", true),
 	)
 
@@ -199,9 +199,9 @@ func TestK8sNodeReconcilerLeavesShutdownWindowAlone(t *testing.T) {
 	reconcileK8sNode(t, r, "omni-remote-6")
 
 	node := slotFrom(t, r.Client, "omni-remote-6")
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress, "a shutdown that is already recorded must not be flipped back to ready")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, node.Status.PowerState, "the machine is still observed up during the grace period")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Spec.DesiredPowerState, "spec must not be touched")
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, node.Status.Phase, "a shutdown that is already recorded must not be flipped back to ready")
+	assert.Equal(t, infrav2alpha1.PowerStateOn, node.Status.PowerState, "the machine is still observed up during the grace period")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, node.Spec.DesiredPowerState, "spec must not be touched")
 	assert.Equal(t, before.Status, node.Status)
 	assert.Equal(t, before.ResourceVersion, node.ResourceVersion, "nothing to record during the shutdown window, so no status write")
 }
@@ -212,31 +212,31 @@ func TestK8sNodeReconcilerLeavesShutdownWindowAlone(t *testing.T) {
 func TestK8sNodeReconcilerLeavesTransitionalProgressAlone(t *testing.T) {
 	tests := []struct {
 		name         string
-		slot         *infrav1alpha1.Node
+		slot         *infrav2alpha1.Node
 		ready        bool
-		wantPower    infrav1alpha1.PowerState
-		wantProgress infrav1alpha1.Progress
+		wantPower    infrav2alpha1.PowerState
+		wantProgress infrav2alpha1.NodePhase
 	}{
 		{
 			name:         "starting up slot with a not ready node keeps startingup",
-			slot:         slot("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+			slot:         slot("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
 			ready:        false,
-			wantPower:    infrav1alpha1.PowerStateOff,
-			wantProgress: infrav1alpha1.ProgressStartingUp,
+			wantPower:    infrav2alpha1.PowerStateOff,
+			wantProgress: infrav2alpha1.NodePhaseBooting,
 		},
 		{
 			name:         "shutting down slot with a ready node keeps shuttingdown",
-			slot:         slot("slot-stopping", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
+			slot:         slot("slot-stopping", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
 			ready:        true,
-			wantPower:    infrav1alpha1.PowerStateOn,
-			wantProgress: infrav1alpha1.ProgressShuttingDown,
+			wantPower:    infrav2alpha1.PowerStateOn,
+			wantProgress: infrav2alpha1.NodePhaseDraining,
 		},
 		{
 			name:         "starting up slot whose node joined keeps startingup",
-			slot:         slot("slot-joined", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp),
+			slot:         slot("slot-joined", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting),
 			ready:        true,
-			wantPower:    infrav1alpha1.PowerStateOn,
-			wantProgress: infrav1alpha1.ProgressStartingUp,
+			wantPower:    infrav2alpha1.PowerStateOn,
+			wantProgress: infrav2alpha1.NodePhaseBooting,
 		},
 	}
 
@@ -248,7 +248,7 @@ func TestK8sNodeReconcilerLeavesTransitionalProgressAlone(t *testing.T) {
 
 			node := slotFrom(t, r.Client, tc.slot.Name)
 			assert.Equal(t, tc.wantPower, node.Status.PowerState, "power state follows the observation")
-			assert.Equal(t, tc.wantProgress, node.Status.Progress, "transitional progress is never overwritten")
+			assert.Equal(t, tc.wantProgress, node.Status.Phase, "transitional progress is never overwritten")
 		})
 	}
 }
@@ -260,13 +260,13 @@ func TestK8sNodeReconcilerLeavesTransitionalProgressAlone(t *testing.T) {
 func TestK8sNodeReconcilerSkipsStatusWriteWhenConsistent(t *testing.T) {
 	tests := []struct {
 		name  string
-		slot  *infrav1alpha1.Node
+		slot  *infrav2alpha1.Node
 		ready bool
 	}{
-		{"on and ready, node ready", slot("slot-ready", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady), true},
-		{"off and shutdown, node not ready", slot("slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown), false},
-		{"on and startingup, node ready", slot("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp), true},
-		{"off and shuttingdown, node not ready", slot("slot-stopping", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown), false},
+		{"on and ready, node ready", slot("slot-ready", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady), true},
+		{"off and shutdown, node not ready", slot("slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff), false},
+		{"on and startingup, node ready", slot("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting), true},
+		{"off and shuttingdown, node not ready", slot("slot-stopping", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseDraining), false},
 	}
 
 	for _, tc := range tests {
@@ -287,14 +287,14 @@ func TestK8sNodeReconcilerSkipsStatusWriteWhenConsistent(t *testing.T) {
 // following reconciles, which is what the controller does on every node event, are no-ops.
 func TestK8sNodeReconcilerProgressCorrectionIsIdempotent(t *testing.T) {
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-3", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown),
+		slot("omni-remote-3", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff),
 		managedNode("omni-remote-3", true),
 	)
 
 	reconcileK8sNode(t, r, "omni-remote-3")
 
 	after := slotFrom(t, r.Client, "omni-remote-3")
-	require.Equal(t, infrav1alpha1.ProgressReady, after.Status.Progress)
+	require.Equal(t, infrav2alpha1.NodePhaseReady, after.Status.Phase)
 
 	for range 3 {
 		reconcileK8sNode(t, r, "omni-remote-3")
@@ -308,14 +308,14 @@ func TestK8sNodeReconcilerProgressCorrectionIsIdempotent(t *testing.T) {
 func TestK8sNodeReconcilerIgnoresUnmanagedAndMissingObjects(t *testing.T) {
 	t.Run("kubernetes node without the slot label is skipped", func(t *testing.T) {
 		r := newK8sNodeReconciler(t,
-			slot("omni-remote-4", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown),
+			slot("omni-remote-4", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff),
 			unmanagedNode("omni-remote-4"),
 		)
 
 		reconcileK8sNode(t, r, "omni-remote-4")
 
 		node := slotFrom(t, r.Client, "omni-remote-4")
-		assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress, "an unmanaged node must not be touched")
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, node.Status.Phase, "an unmanaged node must not be touched")
 	})
 
 	t.Run("missing kubernetes node is not an error", func(t *testing.T) {
@@ -331,12 +331,12 @@ func TestK8sNodeReconcilerIgnoresUnmanagedAndMissingObjects(t *testing.T) {
 
 func TestExpectedProgress(t *testing.T) {
 	tests := []struct {
-		powerState infrav1alpha1.PowerState
-		progress   infrav1alpha1.Progress
+		powerState infrav2alpha1.PowerState
+		progress   infrav2alpha1.NodePhase
 		ok         bool
 	}{
-		{infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, true},
-		{infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, true},
+		{infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, true},
+		{infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff, true},
 		{"", "", false},
 	}
 
@@ -350,20 +350,20 @@ func TestExpectedProgress(t *testing.T) {
 func TestApplyObservedPowerState(t *testing.T) {
 	tests := []struct {
 		name         string
-		desired      infrav1alpha1.PowerState
-		powerState   infrav1alpha1.PowerState
-		observed     infrav1alpha1.PowerState
-		progress     infrav1alpha1.Progress
+		desired      infrav2alpha1.PowerState
+		powerState   infrav2alpha1.PowerState
+		observed     infrav2alpha1.PowerState
+		progress     infrav2alpha1.NodePhase
 		wantChange   bool
-		wantPower    infrav1alpha1.PowerState
-		wantProgress infrav1alpha1.Progress
+		wantPower    infrav2alpha1.PowerState
+		wantProgress infrav2alpha1.NodePhase
 	}{
-		{"power state change derives progress", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
-		{"progress corrected without a power state change", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown, true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
-		{"observed on fills in an empty progress", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, "", true, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
-		{"power state change to off corrects ready to shutdown", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown},
-		{"boot window: not ready node, slot already recorded off, keeps ready", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady},
-		{"boot window: unrecorded progress of a slot that is already off is left alone", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, "", false, infrav1alpha1.PowerStateOff, ""},
+		{"power state change derives progress", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff, true, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady},
+		{"progress corrected without a power state change", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff, true, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady},
+		{"observed on fills in an empty progress", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, "", true, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady},
+		{"power state change to off corrects ready to shutdown", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady, true, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff},
+		{"boot window: not ready node, slot already recorded off, keeps ready", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady, false, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady},
+		{"boot window: unrecorded progress of a slot that is already off is left alone", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, "", false, infrav2alpha1.PowerStateOff, ""},
 		{
 			// The mirror of the live bug, gated by spec.desiredPowerState: enterShutdown has
 			// already recorded progress=shutdown when the shutdown Job submitted the power-off,
@@ -371,18 +371,18 @@ func TestApplyObservedPowerState(t *testing.T) {
 			// to ready makes the FSM derive StateReady and the infra controller fires a second
 			// ShutdownNode, i.e. a duplicate shutdown Job.
 			name:         "shutdown window: ready node of a slot that is desired off keeps shutdown",
-			desired:      infrav1alpha1.PowerStateOff,
-			powerState:   infrav1alpha1.PowerStateOn,
-			observed:     infrav1alpha1.PowerStateOn,
-			progress:     infrav1alpha1.ProgressShutdown,
+			desired:      infrav2alpha1.PowerStateOff,
+			powerState:   infrav2alpha1.PowerStateOn,
+			observed:     infrav2alpha1.PowerStateOn,
+			progress:     infrav2alpha1.NodePhaseOff,
 			wantChange:   false,
-			wantPower:    infrav1alpha1.PowerStateOn,
-			wantProgress: infrav1alpha1.ProgressShutdown,
+			wantPower:    infrav2alpha1.PowerStateOn,
+			wantProgress: infrav2alpha1.NodePhaseOff,
 		},
-		{"startingup is owned by the state machine", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, false, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
-		{"shuttingdown is owned by the state machine", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown, false, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown},
-		{"startingup survives a power state change", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, true, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp},
-		{"already consistent", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, false, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady},
+		{"startingup is owned by the state machine", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting, false, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting},
+		{"shuttingdown is owned by the state machine", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining, false, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining},
+		{"startingup survives a power state change", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting, true, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting},
+		{"already consistent", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, false, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady},
 	}
 
 	for _, tc := range tests {
@@ -393,7 +393,7 @@ func TestApplyObservedPowerState(t *testing.T) {
 
 			assert.Equal(t, tc.wantChange, changed)
 			assert.Equal(t, tc.wantPower, node.Status.PowerState)
-			assert.Equal(t, tc.wantProgress, node.Status.Progress)
+			assert.Equal(t, tc.wantProgress, node.Status.Phase)
 			assert.Equal(t, tc.desired, node.Spec.DesiredPowerState, "the request must never touch spec.desiredPowerState")
 		})
 	}
@@ -429,7 +429,7 @@ func TestK8sNodeReconcilerRecordsTheAutoscalerMarkerOnce(t *testing.T) {
 
 	node := markNode(managedNode("omni-remote-7", true), true, poolRoleTaint, hardMarker)
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-7", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slot("omni-remote-7", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		node,
 	)
 	r.EventRecorder = recorder
@@ -472,7 +472,7 @@ func TestK8sNodeReconcilerMarkerTransitionsAreAllRecorded(t *testing.T) {
 
 	node := markNode(managedNode("omni-remote-8", true), false, poolRoleTaint, softMarker)
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-8", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slot("omni-remote-8", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		node,
 	)
 	r.EventRecorder = recorder
@@ -531,7 +531,7 @@ func TestK8sNodeReconcilerRecordsNothingForACleanNode(t *testing.T) {
 	recorder := events.NewFakeRecorder(16)
 
 	r := newK8sNodeReconciler(t,
-		slot("omni-remote-9", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slot("omni-remote-9", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		markNode(managedNode("omni-remote-9", true), false, poolRoleTaint),
 	)
 	r.EventRecorder = recorder
@@ -570,7 +570,7 @@ type statusConflictClient struct {
 	statusWrites int
 	// stampOnReread is applied to the Node CR handed back by the second Get, which is the read
 	// inside the retry loop.
-	stampOnReread func(*infrav1alpha1.Node)
+	stampOnReread func(*infrav2alpha1.Node)
 	gets          int
 }
 
@@ -579,7 +579,7 @@ func (c *statusConflictClient) Get(ctx context.Context, key client.ObjectKey, ob
 		return err
 	}
 
-	if slot, isSlot := obj.(*infrav1alpha1.Node); isSlot {
+	if slot, isSlot := obj.(*infrav2alpha1.Node); isSlot {
 		c.gets++
 
 		if c.stampOnReread != nil && c.gets >= 2 {
@@ -607,7 +607,7 @@ func (w *conflictStatusWriter) Update(_ context.Context, _ client.Object, _ ...c
 	w.owner.statusWrites++
 
 	return apierrors.NewConflict(
-		schema.GroupResource{Group: infrav1alpha1.GroupVersion.Group, Resource: "nodes"},
+		schema.GroupResource{Group: infrav2alpha1.GroupVersion.Group, Resource: "nodes"},
 		"omni-remote-12", fmt.Errorf("the slot moved under the write"))
 }
 
@@ -628,7 +628,7 @@ func (w *conflictStatusWriter) Apply(_ context.Context, _ runtime.ApplyConfigura
 func TestK8sNodeReconcilerEmitsNothingWhenTheWriteDoesNotLand(t *testing.T) {
 	recorder := events.NewFakeRecorder(16)
 
-	slotCR := slot("omni-remote-12", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	slotCR := slot("omni-remote-12", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	node := markNode(managedNode("omni-remote-12", true), true, poolRoleTaint, hardMarker)
 
 	base := newK8sNodeReconciler(t, slotCR, node)
@@ -664,13 +664,13 @@ func TestK8sNodeReconcilerEmitsNothingWhenTheWriteDoesNotLand(t *testing.T) {
 func TestK8sNodeReconcilerSilentWhenAnotherWriterGotThereFirst(t *testing.T) {
 	recorder := events.NewFakeRecorder(16)
 
-	slotCR := slot("omni-remote-13", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	slotCR := slot("omni-remote-13", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	node := markNode(managedNode("omni-remote-13", true), true, poolRoleTaint, hardMarker)
 
 	base := newK8sNodeReconciler(t, slotCR, node)
 	c := &statusConflictClient{
 		Client: base.Client,
-		stampOnReread: func(fresh *infrav1alpha1.Node) {
+		stampOnReread: func(fresh *infrav2alpha1.Node) {
 			meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 				Type:               autoscalerpkg.ConditionMarkedForDeletion,
 				Status:             metav1.ConditionTrue,

@@ -24,7 +24,6 @@ import (
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,7 +33,8 @@ import (
 
 	"github.com/looplab/fsm"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
@@ -45,7 +45,7 @@ import (
 // WithEventRecorder(mgr.GetEventRecorder(...)) to have the lifecycle transitions
 // recorded on the Node CR.
 func NewNodeStateMachine(
-	node *infrav1alpha1.Node,
+	node *infrav2alpha1.Node,
 	k8sClient client.Client,
 	scheme *runtime.Scheme,
 	coordMgr CoordinationManager,
@@ -65,8 +65,11 @@ func NewNodeStateMachine(
 		opt(nm)
 	}
 
-	// Initialize FSM with current state from node progress
-	initialState := nm.getCurrentState()
+	// Initialize the FSM with the state the input law derives: (live claim phase, observed power,
+	// node usability). The v1alpha1 machine seeded itself from status.progress, i.e. from a record
+	// of what it last did, and every rule about which writers outrank which is a consequence of
+	// that; the record is gone as an input.
+	initialState := phase.State(nm.input)
 
 	nm.fsm = fsm.NewFSM(
 		initialState,
@@ -77,21 +80,11 @@ func NewNodeStateMachine(
 	return nm
 }
 
-// GetCurrentState returns the current FSM state based on node progress
+// getCurrentState is the state the input law puts this machine in. It reads the input triple, and
+// the only field of Node.status it consults is status.powerState, the observation. It never reads
+// a record of a previous transition.
 func (nm *NodeStateMachine) getCurrentState() string {
-	switch nm.node.Status.Progress {
-	case infrav1alpha1.ProgressShutdown:
-		return StateShutdown
-	case infrav1alpha1.ProgressStartingUp:
-		return StateStartingUp
-	case infrav1alpha1.ProgressReady:
-		return StateReady
-	case infrav1alpha1.ProgressShuttingDown:
-		return StateShuttingDown
-	default:
-		// Default to shutdown if progress is empty or unknown
-		return StateShutdown
-	}
+	return phase.State(nm.input)
 }
 
 // GetCurrentState returns the current FSM state
@@ -117,42 +110,10 @@ func (nm *NodeStateMachine) StartNode() error {
 
 	logger.Info("Triggering StartNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
 
-	// The startup-attempt bound, checked before the transition and therefore before the coordination
-	// lock, before the Job cleanup and before the Job: a slot that has used its attempts must not
-	// power a machine again, and it must not touch the slot of the operation that owns it either.
-	//
-	// This is the check that closes the loud loop. A startup Job that exits non-zero drives
-	// startingup -> JobFailed -> shutdown, afterJobFailed writes the *progress* only, and the next
-	// pass of the node controller sees desired on && powerState off && CanTransition(StartNode) and
-	// builds another Job and another machine. Unbounded, that is one machine per pass, forever, with
-	// no counter and no event. Bounded, this refusal is the end of it: the slot keeps the stable
-	// off/shutdown pair the rollback wrote, keeps its claim, and records one Warning naming the
-	// attempts it spent. The loop the progress watchdog re-arms (a startup whose Job completed with
-	// no node behind it) is the same counter, incremented by the same enterStartingUp hook and
-	// enforced by the same check - see internal/fsm/startup_attempts.go.
-	if attempts, exhausted := nm.StartupAttemptsSpent(); exhausted {
-		cause := startupAttemptRefusalCause(nm.node)
-
-		// The note is the deduplication: exactly one Warning per claim episode, whoever wrote the note
-		// (the watchdog's limit pass and this refusal share the record, so a slot is reported once).
-		_, noted := nm.noteStartupAttemptLimit(cause)
-		if noted {
-			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonStartupAttemptLimitReached, ActionPowerOn,
-				startupAttemptLimitNote(nm.node, attempts, cause))
-		}
-
-		// Info, not Error: the controller has stopped buying machines for a slot that cannot boot, and
-		// the refusal is the fix working. The attempts are in the line, because the question an
-		// operator asks next is "how many times did it try".
-		logger.Info("Refusing to start a slot that has used its startup attempts",
-			"node", nm.node.Name,
-			"attempts", attempts,
-			"limit", StartupAttemptLimit,
-			"evidence", cause,
-			"warning", "recorded on the slot"+notedSuffix(noted))
-
-		return &StartupAttemptLimitError{Node: nm.node.Name, Attempts: attempts, Limit: StartupAttemptLimit}
-	}
+	// The attempt bound of the model lives on the claim, not on the slot: a claim whose
+	// status.attempt is past claim.MaxConsecutiveAttempts is failed by the claim controller before it
+	// buys a machine, so this call is never reached for an exhausted slot, and the counter that ends
+	// with the episode needs no reset heuristic (docs/design/nodeclaim.md §4).
 
 	// Trigger FSM event. A cancellation from the coordination lock leaves status.progress on
 	// the stable state the transition started from (see beforeStartNode) and returns a
@@ -194,6 +155,12 @@ func (nm *NodeStateMachine) StartNode() error {
 	nm.currentJob = job.Name
 	nm.jobStartTime = time.Now()
 
+	// The pending -> booting edge of the claim, on the same path that created the startup Job: an
+	// attempt is a machine bought, not a reconcile pass, and from here the boot is committed -
+	// nothing cancels it (docs/design/nodeclaim.md §3).
+	nm.commitAttempt("")
+	nm.reportPhase()
+
 	// Start async job monitoring
 	go nm.monitorJobCompletion(job.Name)
 
@@ -223,44 +190,9 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 
 	logger.Info("Triggering ShutdownNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
 
-	// The shutdown-attempt bound, checked before the transition and therefore before the coordination
-	// lock, the pending-Job cleanup and the cordon: a slot that has used its shutdown attempts must not
-	// cordon a node and start another shutdown Job, and it must not touch the state of an operation that
-	// owns the slot on the way out.
-	//
-	// This is the check that closes the loop the shutdown-completion guard opens
-	// (internal/fsm/shutdown_completion.go). A shutdown Job that exits 0 on a machine the observation
-	// reports up is refused: the slot is recorded ready, the claim is off, and the next pass fires this
-	// transition again - one shutdown Job, one cordon of a node that is serving pods, and one power
-	// operation on a real machine, per pass, forever. Unbounded that is a regression against the pre-PR
-	// behaviour (the same broken script left a *frozen* slot and no Job); bounded, it is three attempts,
-	// an exponentially growing gap between them (progress.observedPowerRetryBackoff), one
-	// ShutdownAttemptLimitReached Warning, and a slot that rests at the pair the observation says -
-	// ready, on, claimed off - which is healable the moment the pool's script is fixed. See
-	// internal/fsm/shutdown_attempts.go for the counter, its reset rule, and the hole it leaves.
-	if attempts, exhausted := nm.ShutdownAttemptsSpent(); exhausted {
-		cause := shutdownAttemptRefusalCause(nm.node)
-
-		// The note is the deduplication: exactly one Warning per scale-down episode, and the record the
-		// refusal stamps is the one the count reads.
-		_, noted := nm.noteShutdownAttemptLimit(cause)
-		if noted {
-			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonShutdownAttemptLimitReached, ActionPowerOff,
-				shutdownAttemptLimitNote(nm.node, attempts, cause))
-		}
-
-		// Info, not Error: the controller has stopped hammering a machine it cannot power off, and the
-		// refusal is the bound working. The attempts are in the line, because the question an operator
-		// asks next is "how many times did it try".
-		logger.Info("Refusing to shut down a slot that has used its shutdown attempts",
-			"node", nm.node.Name,
-			"attempts", attempts,
-			"limit", ShutdownAttemptLimit,
-			"evidence", cause,
-			"warning", "recorded on the slot"+notedSuffix(noted))
-
-		return &ShutdownAttemptLimitError{Node: nm.node.Name, Attempts: attempts, Limit: ShutdownAttemptLimit}
-	}
+	// A scale-down is a claim (request.call: DeleteNodes), and its attempts are counted on that
+	// claim and end when it ends: the v1alpha1 ShutdownAttempts condition on the long-lived slot,
+	// with its two reset sites, is gone (§4).
 
 	// Trigger FSM event, taking the coordination lock. See StartNode for what a cancellation
 	// does and does not leave behind.
@@ -706,7 +638,7 @@ func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 
 // setOwnerReference sets the owner reference for a job
 func (nm *NodeStateMachine) setOwnerReference(job *batchv1.Job) {
-	gvk := infrav1alpha1.GroupVersion.WithKind("Node")
+	gvk := infrav2alpha1.GroupVersion.WithKind("Node")
 	job.SetOwnerReferences([]metav1.OwnerReference{
 		{
 			APIVersion: gvk.GroupVersion().String(),
@@ -716,133 +648,6 @@ func (nm *NodeStateMachine) setOwnerReference(job *batchv1.Job) {
 			Controller: &[]bool{true}[0],
 		},
 	})
-}
-
-// updateNodeProgress persists the progress of the state this machine is in.
-//
-// The parameter is the progress the caller believes it is writing - every hook passes
-// Progress(e.Dst) - and it is checked against the machine's own state, with a mismatch
-// refused. That is the second half of the rule that keeps a slot from being stranded in a
-// transitional progress, and it is written for the two racers this controller has: the async
-// job monitor goroutine an earlier reconcile started, and a state machine built from a Node
-// read before a transition ran. Either of them writing the progress it remembers is how a slot
-// ends up in shuttingdown with nothing driving it: excluded from the provider's target size,
-// gated out of every further transition by validateStateTransition, and left there - the
-// stuck-transition cleanup runs on the machine's own backoff record, which a reconciler builds
-// fresh every pass, so no reconcile reaches ForceCleanup for it. Only the operation that wrote
-// the transitional progress moves it again.
-//
-// The guard covers the writes that go through it, i.e. the FSM's own. status.progress has
-// writers outside the FSM - the gRPC server and the core node controllers - and none of them
-// is a state machine this check can consult; see docs/architecture/state.md.
-//
-// What the guard cannot cover is the field it does not write. updateNodeProgress persists
-// status.progress and never status.powerState, so a progress written here is recorded against the
-// power state the last observation left behind, and the pair is only as true as that observation:
-// the completion of a shutdown Job writes shutdown while the machine it powered off keeps its
-// corev1.Node Ready for node-monitor-grace-period (~40s), and the observation controller writes the
-// off when it sees the node go NotReady. A pair {powerState: on, progress: shutdown} that outlives
-// that window is a machine that outlived its record, and it is the state of the live 40-minute stuck
-// slot: the FSM derives StateShutdown from the progress, so ShutdownNode - the operation the claim
-// wants - is unreachable. Two rules close it: the completion of a shutdown Job refuses to write the
-// pair at all when the machine is observed up (fsm.refuseUnobservedShutdown, in
-// internal/fsm/shutdown_completion.go), and progress.ReconcileObservedPower corrects a pair that
-// rested, on the far side of the settle grace. Both read the observation; neither invents one.
-//
-// The check is free on every legitimate path: looplab/fsm applies the state change before it
-// runs the enter_ and after_ callbacks, so the progress a hook passes is the state the machine
-// is in, and this writes exactly what it used to.
-func (nm *NodeStateMachine) updateNodeProgress(progress infrav1alpha1.Progress) {
-	ctx := context.TODO()
-	logger := log.Log.WithName("fsm")
-
-	if current := infrav1alpha1.Progress(nm.GetCurrentState()); current != progress {
-		logger.Info("Refusing to record a progress the state machine is not in",
-			"node", nm.node.Name,
-			"attempted", string(progress),
-			"currentState", string(current),
-			"recordedProgress", string(nm.node.Status.Progress))
-
-		return
-	}
-
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
-		if err := nm.client.Get(ctx, client.ObjectKeyFromObject(nm.node), fresh); err != nil {
-			return err
-		}
-
-		// Update progress
-		fresh.Status.Progress = progress
-
-		// Update timestamps based on progress
-		now := metav1.Now()
-		switch progress {
-		case infrav1alpha1.ProgressStartingUp:
-			fresh.Status.LastStartupTime = &now
-		case infrav1alpha1.ProgressShuttingDown:
-			fresh.Status.LastShutdownTime = &now
-		}
-
-		// Update the node status
-		if err := nm.client.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-
-		// Update our local copy
-		nm.node = fresh
-		return nil
-	}); err != nil {
-		logger.Error(err, "Failed to update node progress", "node", nm.node.Name, "progress", progress)
-	}
-}
-
-// startupAttemptRefusalCause renders the evidence a startup-attempt refusal quotes, read off the
-// slot itself. The two shapes the loop leaves behind are recorded on the slot - the JobFailed
-// condition afterJobFailed stamps, and the progress the attempt died at - so the Warning names what
-// happened to this slot's machines instead of guessing at a generic cause.
-func startupAttemptRefusalCause(node *infrav1alpha1.Node) string {
-	if condition := meta.FindStatusCondition(node.Status.Conditions, "JobFailed"); condition != nil &&
-		condition.Status == metav1.ConditionTrue {
-		return "the startup Jobs of those attempts exited non-zero, and the slot rolled back to status.progress " +
-			string(node.Status.Progress) + " each time"
-	}
-
-	if node.Spec.KubernetesNodeName != "" {
-		return fmt.Sprintf("no Kubernetes node %q ever registered for the machines those attempts started",
-			node.Spec.KubernetesNodeName)
-	}
-
-	return "each attempt ended back at status.powerState off with no Kubernetes node behind it"
-}
-
-// startupAttemptLimitNote renders the Warning of a refusal: the attempts, the evidence, what the
-// controller stopped doing, and the two things an operator can do about it. The condition the
-// refusal stamps carries the same facts for `kubectl describe`; this is the one-liner that shows up
-// in the event stream, where a pool that stopped booting has to be visible without opening an object.
-func startupAttemptLimitNote(node *infrav1alpha1.Node, attempts int, cause string) string {
-	return fmt.Sprintf(
-		"Scale up refused for %s: %d of %d startup attempts used (%s). The controller will not start "+
-			"another machine for this slot, so it stays at status.progress %q with status.powerState %q while "+
-			"spec.desiredPowerState stays %q - the request stands and the slot keeps being counted as requested "+
-			"capacity. Scale the group down to drop the claim, or fix what keeps the machine from booting (startup "+
-			"command, image, power API credentials): a boot that passes the readiness gate clears the record and the "+
-			"%d attempts with it.",
-		startupAttemptTarget(node), attempts, StartupAttemptLimit, cause,
-		string(node.Status.Progress), string(node.Status.PowerState), string(node.Spec.DesiredPowerState),
-		StartupAttemptLimit)
-}
-
-// notedSuffix says, for the log line, whether the Warning went out with this refusal. The note is
-// written once per claim episode, so every later refusal logs the refusal and records nothing, and
-// the log has to say which of the two happened.
-func notedSuffix(noted bool) string {
-	if noted {
-		return " on the slot"
-	}
-
-	return ", already recorded on the slot"
 }
 
 // setNodeUnschedulable cordons the Kubernetes node to prevent new pods from being scheduled
@@ -1263,7 +1068,7 @@ func (nm *NodeStateMachine) addNodeCondition(condition metav1.Condition) {
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := nm.client.Get(ctx, client.ObjectKeyFromObject(nm.node), fresh); err != nil {
 			return err
 		}

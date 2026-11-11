@@ -33,11 +33,11 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	infrahomeclusterdevv1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrahomeclusterdevv2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	corecontroller "github.com/homecluster-dev/homelab-autoscaler/internal/controller/core"
 	controller "github.com/homecluster-dev/homelab-autoscaler/internal/controller/infra"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
-	webhookinfrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/internal/webhook/infra/v1alpha1"
+	webhookinfrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/internal/webhook/infra/v2alpha1"
 )
 
 var (
@@ -48,7 +48,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
-	utilruntime.Must(infrahomeclusterdevv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(infrahomeclusterdevv2alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -238,10 +238,26 @@ func main() {
 		setupLog.Error(err, "unable to create node slot controller", "controller", "NodeSlot")
 		os.Exit(1)
 	}
+	if err := (&controller.NodeClaimReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// The claim controller publishes the two endings an operator acts on - the deadline that
+		// closed an attempt, the attempt bound that stopped one - on the NodeClaim itself, so
+		// `kubectl describe nodeclaim <name>` shows why a scale-up ended.
+		EventRecorder: mgr.GetEventRecorder("homelab-autoscaler"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NodeClaim")
+		os.Exit(1)
+	}
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := webhookinfrav1alpha1.SetupNodeWebhookWithManager(mgr); err != nil {
+		if err := webhookinfrav2alpha1.SetupNodeWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "Node")
+			os.Exit(1)
+		}
+
+		if err := webhookinfrav2alpha1.SetupNodeClaimWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "NodeClaim")
 			os.Exit(1)
 		}
 	}

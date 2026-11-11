@@ -30,7 +30,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/grpcserver"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
@@ -255,10 +255,10 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(resp).NotTo(BeNil())
 
 				// Verify node was updated to desired power state on
-				node := &infrav1alpha1.Node{}
+				node := &infrav2alpha1.Node{}
 				err = mockClient.Get(testCtx, client.ObjectKey{Name: "gpu-node-2", Namespace: namespace.Get()}, node)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(node.Spec.DesiredPowerState).To(Equal(infrav1alpha1.PowerStateOn))
+				Expect(node.Spec.DesiredPowerState).To(Equal(infrav2alpha1.PowerStateOn))
 			})
 		})
 
@@ -329,10 +329,10 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(resp).NotTo(BeNil())
 
 				// Verify node was updated to desired power state off
-				node := &infrav1alpha1.Node{}
+				node := &infrav2alpha1.Node{}
 				err = mockClient.Get(testCtx, client.ObjectKey{Name: "test-node-1", Namespace: namespace.Get()}, node)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(node.Spec.DesiredPowerState).To(Equal(infrav1alpha1.PowerStateOff))
+				Expect(node.Spec.DesiredPowerState).To(Equal(infrav2alpha1.PowerStateOff))
 			})
 		})
 
@@ -532,7 +532,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
 						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
 					WithNode("test-node-2", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff)).
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff)).
 					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group")).
 					Build()
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
@@ -556,7 +556,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff),
 						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
 					Build()
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
@@ -594,7 +594,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff),
 						mocks.WithNodeCapacity("1950m", "3.2Gi")).
 					Build()
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
@@ -627,7 +627,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn),
 						mocks.WithNodeCapacity("1950m", "3.2Gi")).
 					// the builder's node reports 3.8 CPU / 7.5 GiB allocatable
 					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group")).
@@ -662,7 +662,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
-						mocks.WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
+						mocks.WithNodePowerState(infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn),
 						mocks.WithNodeTaints([]corev1.Taint{role})).
 					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group"),
 						mocks.WithKubernetesNodeTaint("node.kubernetes.io/role", "agent", corev1.TaintEffectNoSchedule),

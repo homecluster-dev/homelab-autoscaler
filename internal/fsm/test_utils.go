@@ -27,7 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // MockCoordinationManager implements CoordinationManager for testing
@@ -46,27 +46,27 @@ type MockCoordinationManager struct {
 }
 
 type AcquireCall struct {
-	Node      *infrav1alpha1.Node
+	Node      *infrav2alpha1.Node
 	Operation string
 	Timeout   time.Duration
 }
 
 type ReleaseCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 type CheckCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 type ForceCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 // RenewCall records a re-stamp of the coordination lock, which is how a test asserts that the
 // readiness gate keeps the lock it holds alive (see NodeStateMachine.renewOperationLock).
 type RenewCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 // NewMockCoordinationManager creates a new mock coordination manager
@@ -81,7 +81,7 @@ func NewMockCoordinationManager() *MockCoordinationManager {
 	}
 }
 
-func (m *MockCoordinationManager) AcquireLock(ctx context.Context, node *infrav1alpha1.Node, operation string, timeout time.Duration) error {
+func (m *MockCoordinationManager) AcquireLock(ctx context.Context, node *infrav2alpha1.Node, operation string, timeout time.Duration) error {
 	m.acquireCalls = append(m.acquireCalls, AcquireCall{
 		Node:      node,
 		Operation: operation,
@@ -103,7 +103,7 @@ func (m *MockCoordinationManager) AcquireLock(ctx context.Context, node *infrav1
 	return nil
 }
 
-func (m *MockCoordinationManager) ReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
+func (m *MockCoordinationManager) ReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error {
 	m.releaseCalls = append(m.releaseCalls, ReleaseCall{Node: node})
 
 	if m.releaseError != nil {
@@ -115,7 +115,7 @@ func (m *MockCoordinationManager) ReleaseLock(ctx context.Context, node *infrav1
 	return nil
 }
 
-func (m *MockCoordinationManager) CheckLock(ctx context.Context, node *infrav1alpha1.Node) (*OperationLock, bool) {
+func (m *MockCoordinationManager) CheckLock(ctx context.Context, node *infrav2alpha1.Node) (*OperationLock, bool) {
 	m.checkCalls = append(m.checkCalls, CheckCall{Node: node})
 
 	if m.checkError != nil {
@@ -134,7 +134,7 @@ func (m *MockCoordinationManager) IsLockExpired(lock *OperationLock) bool {
 }
 
 // ForceReleaseLock forcibly removes lock annotations from a node, regardless of ownership
-func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
+func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error {
 	m.forceCalls = append(m.forceCalls, ForceCall{Node: node})
 
 	if m.forceError != nil {
@@ -149,7 +149,7 @@ func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *in
 // RenewLock re-stamps the timestamp of the mock's lock, mirroring the real manager's rules: no
 // lock, a lock owned by someone else, or an expired lock is left alone and reported as not
 // renewed.
-func (m *MockCoordinationManager) RenewLock(ctx context.Context, node *infrav1alpha1.Node) (bool, error) {
+func (m *MockCoordinationManager) RenewLock(ctx context.Context, node *infrav2alpha1.Node) (bool, error) {
 	m.renewCalls = append(m.renewCalls, RenewCall{Node: node})
 
 	if m.renewError != nil {
@@ -234,9 +234,13 @@ func (m *MockCoordinationManager) Reset() {
 	m.renewCalls = make([]RenewCall, 0)
 }
 
-// CreateTestNode creates a test node with the given parameters
-func CreateTestNode(name, namespace string, powerState infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+// CreateTestNode creates a test node with the given observed power and reported phase.
+//
+// The phase argument is the report the slot carries, and it is NOT the input of the state machine:
+// v2alpha1 derives the state from (live claim, observed power, node usability), so a test that needs
+// a transitional state passes a live claim, or the input itself, with WithClaim / WithInput.
+func CreateTestNode(name, namespace string, powerState infrav2alpha1.PowerState, nodePhase infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
@@ -244,23 +248,22 @@ func CreateTestNode(name, namespace string, powerState infrav1alpha1.PowerState,
 				"group": "test-group",
 			},
 		},
-		Spec: infrav1alpha1.NodeSpec{
-			DesiredPowerState:  powerState,
+		Spec: infrav2alpha1.NodeSpec{
 			KubernetesNodeName: name + "-k8s",
-			StartupPodSpec: infrav1alpha1.MinimalPodSpec{
+			StartupPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/startup:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'starting node'"},
 			},
-			ShutdownPodSpec: infrav1alpha1.MinimalPodSpec{
+			ShutdownPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/shutdown:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'shutting down node'"},
 			},
 		},
-		Status: infrav1alpha1.NodeStatus{
+		Status: infrav2alpha1.NodeStatus{
 			PowerState: powerState,
-			Progress:   progress,
+			Phase:      nodePhase,
 		},
 	}
 }
@@ -338,7 +341,7 @@ func CreateFakeClient(scheme *runtime.Scheme, objects ...client.Object) client.C
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).
-		WithStatusSubresource(&infrav1alpha1.Node{}).
+		WithStatusSubresource(&infrav2alpha1.Node{}).
 		Build()
 }
 

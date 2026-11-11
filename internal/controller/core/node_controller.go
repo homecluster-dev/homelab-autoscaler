@@ -29,9 +29,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 // Namespace configuration instance
@@ -75,7 +77,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// Get the corresponding Node CR
-	nodeCR := &infrav1alpha1.Node{}
+	nodeCR := &infrav2alpha1.Node{}
 	if err := r.Get(ctx, client.ObjectKey{Name: nodeLabel, Namespace: namespaceConfig.Get()}, nodeCR); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			logger.Info("Node CR not found for Kubernetes node", "nodeName", node.Name, "nodeCR", nodeLabel)
@@ -100,11 +102,14 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// marker that is already recorded is no change, and a pass that records nothing writes nothing.
 	_, markerChanged := autoscaler.ApplyMarker(nodeCR.DeepCopy(), node, observedAt)
 
+	// The live claim of the slot is an input of the report, and is read here: the report of a slot
+	// is (live claim, observed power, node usability), and this is the path that sees the machine.
+	input := r.observationInput(ctx, nodeCR, node, nodeStatus)
+
 	// Only update when the recorded status disagrees with what is observed. A status
 	// write on every reconcile would keep this controller hot, so the fast path covers
-	// "power state unchanged AND progress needing no correction (consistent, or
-	// transitional and owned by the state machine)", and no new autoscaler marker.
-	if !applyObservedPowerState(nodeCR.DeepCopy(), nodeStatus) && !markerChanged {
+	// "power state and derived phase unchanged, and no new autoscaler marker".
+	if !applyObservation(nodeCR.DeepCopy(), nodeStatus, input) && !markerChanged {
 		logger.V(1).Info("Node status unchanged, skipping update", "node", node.Name, "status", nodeStatus)
 		return ctrl.Result{}, nil
 	}
@@ -118,12 +123,12 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	)
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(nodeCR), fresh); err != nil {
 			return err
 		}
 
-		powerChanged := applyObservedPowerState(fresh, nodeStatus)
+		powerChanged := applyObservation(fresh, nodeStatus, input)
 
 		decision, markerChanged := autoscaler.ApplyMarker(fresh, node, observedAt)
 		if !powerChanged && !markerChanged {
@@ -179,96 +184,70 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 }
 
-// expectedProgress returns the progress value that corresponds to an observed power
-// state, and reports whether such a value exists. Only the steady states have one:
-// startingup and shuttingdown are transitional values owned by the state machine and
-// are never derived from an observation.
-func expectedProgress(powerState infrav1alpha1.PowerState) (infrav1alpha1.Progress, bool) {
-	switch powerState {
-	case infrav1alpha1.PowerStateOn:
-		return infrav1alpha1.ProgressReady, true
-	case infrav1alpha1.PowerStateOff:
-		return infrav1alpha1.ProgressShutdown, true
-	default:
-		return "", false
-	}
-}
-
-// applyObservedPowerState records the observed power state on the Node CR and corrects
-// status.progress to the value that corresponds to it. It returns true when the object
-// was changed, so the caller can skip the status write when there is nothing to do.
+// applyObservation records what the cluster observes about a slot: the power of its machine
+// (status.powerState) and the derived report of the slot (status.phase).
 //
-// The two observations are not equally trustworthy, so they are not gated the same way.
+// powerState keeps its meaning: on when the corev1.Node reports NodeReady=True, off otherwise. It is
+// the observation half of the state machine's input, and the strongest evidence in the system about
+// a machine - which is what the 0.1.22 precedence rule said, and what the NodeClaim model makes the
+// general law instead of a tie-break between writers of one field.
 //
-// An observed on (the node reports NodeReady=True) on a slot that is desired on is
-// positive evidence that the machine is up, and the progress correction runs whether or
-// not the power state changed. That is the live bug: a slot that was shut down and
-// started again through a path this controller did not observe (desiredPowerState flipped
-// back to on, machine booted) keeps status.powerState: on while status.progress stays
-// "shutdown". That stale progress is not cosmetic: NodeGroupTargetSize excludes slots
-// whose progress is shutdown/shuttingdown, so a group with one Ready node reports
-// targetSize 0 and cluster-autoscaler refuses to scale.
+// phase is computed, not decided: phase.Derive over (the live claim of the slot, the power state
+// observed here, the usability of the node object). That is why this path can write it without
+// knowing anything about a transition: the same formula runs in internal/fsm, so the two writers of
+// the report cannot produce different values from the same inputs, and "an observed on outranks a
+// recorded shutdown" is no longer a rule - the record is not an input.
 //
-// spec.desiredPowerState is part of that gate because the mirror of the same bug is
-// reachable on the way down: fsm.hooks.enterShutdown writes progress=shutdown when the
-// shutdown Job submits the power-off, while the corev1.Node stays NodeReady=True for the
-// node-monitor-grace-period (~40s). A Node event in that window observes
-// {desired: off, status.powerState: on, progress: shutdown}, which is an "on"
-// observation with no power state change, and correcting it to ready makes the FSM derive
-// StateReady, so internal/controller/infra fires a second ShutdownNode and a duplicate
-// shutdown Job. A shutdown always carries desiredPowerState: off, the boot window and the
-// live bug both carry on, so requiring on makes both directions unambiguous.
-//
-// An observed off (the node does not report NodeReady=True) is not evidence that the
-// machine is off, so the shutdown correction only runs on an actual power state change,
-// which is the ordering this controller had before the progress correction existed.
-// enterReady is written by the state machine when the startup Job finishes
-// (fsm.hooks.enterReady), the Job being only the power-on command, and the node object
-// appears later, when the kubelet registers: fsm.setNodeSchedulableWithRetry retries for
-// 90s precisely because the node is not Ready yet, and it holds the transition open past
-// Ready until Cilium's bootstrap taint clears (fsm.TaintCiliumAgentNotReady), because a
-// node that cannot take the pool's pods is not a ready slot. So {desired: on,
-// status.powerState: off, progress: ready} plus a NotReady node object is the normal state
-// of every boot window, and writing shutdown there would restart the state machine (the FSM
-// reads its state from progress): a second startup Job, a second scale-up event, the
-// cluster-autoscaler taint removed from a node that has not joined, targetSize dipping
-// to 0.
-//
-// The transitional progress values (startingup/shuttingdown) are never overwritten: they
-// are owned by the state machine, which is the only one that knows a power operation is
-// in flight.
-func applyObservedPowerState(node *infrav1alpha1.Node, powerState infrav1alpha1.PowerState) bool {
+// It returns true when the object changed, so the caller skips the status write when there is
+// nothing to do.
+func applyObservation(node *infrav2alpha1.Node, powerState infrav2alpha1.PowerState, in phase.Input) bool {
 	changed := false
 
-	powerStateChanged := node.Status.PowerState != powerState
-	if powerStateChanged {
+	if node.Status.PowerState != powerState {
 		node.Status.PowerState = powerState
 		changed = true
 	}
 
-	desiredProgress, derived := expectedProgress(powerState)
-	if !derived {
-		return changed
-	}
+	in.ObservedPower = powerState
 
-	switch node.Status.Progress {
-	case infrav1alpha1.ProgressStartingUp, infrav1alpha1.ProgressShuttingDown:
-		// Transition in flight, the state machine owns status.progress.
-		return changed
-	}
-
-	// Both directions have to be unambiguous: an observed on only proves the machine is up
-	// for a slot that is meant to be up, and an observed off is only a change when the
-	// recorded power state says otherwise. See the doc comment for the two windows.
-	if (node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn && powerState == infrav1alpha1.PowerStateOn) ||
-		powerStateChanged {
-		if node.Status.Progress != desiredProgress {
-			node.Status.Progress = desiredProgress
-			changed = true
-		}
+	derived := phase.Derive(in)
+	if node.Status.Phase != derived {
+		node.Status.Phase = derived
+		changed = true
 	}
 
 	return changed
+}
+
+// nodeUsable reports whether the corev1.Node of a slot can take the pool's work, and is the third
+// input of the state machine: the node is Ready, carries none of the readiness taints the slot's
+// Group declares, and is not cordoned. The slot's own record of the taint keys
+// (autoscalerpkg.ReadinessTaintKeysOfSlot) is read, so this path needs no Group: the infra
+// reconciler stamps the keys on the slot from the Group it reads.
+func nodeUsable(k8sNode *corev1.Node, nodeCR *infrav2alpha1.Node) bool {
+	return phase.Unusable(k8sNode, autoscaler.ReadinessTaintKeysOfSlot(nodeCR)) == ""
+}
+
+// observationInput assembles the state machine's input for one observation of one slot: the live
+// claim the slot carries, the power the node object shows, and whether the node can take work.
+//
+// A claim list that fails is not fatal: a slot with no claim read is a slot reported from the
+// observation alone, which is the value of the report before any claim existed, and the next pass
+// re-reads. Failing the observation of a machine because a claim could not be listed would leave
+// the report of a whole pool stale.
+func (r *KubernetesNodeReconciler) observationInput(ctx context.Context, nodeCR *infrav2alpha1.Node, k8sNode *corev1.Node, powerState infrav2alpha1.PowerState) phase.Input {
+	claims, err := claim.ListOfSlot(ctx, r.Client, nodeCR.Namespace, nodeCR.Name)
+	live := (*infrav2alpha1.NodeClaim)(nil)
+
+	if err == nil {
+		live = claim.LiveOfSlot(claims)
+	}
+
+	return phase.Input{
+		Claim:         live,
+		ObservedPower: powerState,
+		NodeUsable:    nodeUsable(k8sNode, nodeCR),
+	}
 }
 
 // getNodeStatus maps the Ready condition of the Kubernetes node onto a power state. A
@@ -276,13 +255,13 @@ func applyObservedPowerState(node *infrav1alpha1.Node, powerState infrav1alpha1.
 // machine boots and the object is left behind, NotReady, when it is powered off. NotReady
 // is therefore a weak observation, which is why applyObservedPowerState only corrects
 // progress for it when the recorded power state actually changes.
-func (r *KubernetesNodeReconciler) getNodeStatus(node *corev1.Node) infrav1alpha1.PowerState {
+func (r *KubernetesNodeReconciler) getNodeStatus(node *corev1.Node) infrav2alpha1.PowerState {
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-			return infrav1alpha1.PowerStateOn
+			return infrav2alpha1.PowerStateOn
 		}
 	}
-	return infrav1alpha1.PowerStateOff
+	return infrav2alpha1.PowerStateOff
 }
 
 // SetupWithManager sets up the controller with the Manager.

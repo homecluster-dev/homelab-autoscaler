@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1
+package v2alpha1
 
 import (
 	"context"
@@ -35,7 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 const (
@@ -47,17 +47,17 @@ const (
 // nodeUnderTest returns a Node CR for a slot of the given power state. The referenced
 // Kubernetes node is deliberately one that does not exist in the fake cluster, which is
 // the state of a powered off slot that has never been provisioned.
-func nodeUnderTest(powerState infrav1alpha1.PowerState, labels map[string]string) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+func nodeUnderTest(powerState infrav2alpha1.PowerState, labels map[string]string) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testNodeName,
 			Namespace: testNamespace,
 			Labels:    labels,
 		},
-		Spec: infrav1alpha1.NodeSpec{
+		Spec: infrav2alpha1.NodeSpec{
 			DesiredPowerState:  powerState,
 			KubernetesNodeName: testNodeName,
-			Pricing: infrav1alpha1.PricingSpec{
+			Pricing: infrav2alpha1.PricingSpec{
 				HourlyRate: "0",
 				PodRate:    "0",
 			},
@@ -71,22 +71,22 @@ func groupLabels() map[string]string {
 
 var _ = Describe("Node Webhook", func() {
 	var (
-		obj          *infrav1alpha1.Node
-		oldObj       *infrav1alpha1.Node
+		obj          *infrav2alpha1.Node
+		oldObj       *infrav2alpha1.Node
 		validator    NodeCustomValidator
 		k8sClient    client.Client
 		testScheme   *runtime.Scheme
-		clusterGroup *infrav1alpha1.Group
+		clusterGroup *infrav2alpha1.Group
 	)
 
 	BeforeEach(func() {
 		testScheme = runtime.NewScheme()
-		Expect(infrav1alpha1.AddToScheme(testScheme)).To(Succeed())
+		Expect(infrav2alpha1.AddToScheme(testScheme)).To(Succeed())
 		Expect(corev1.AddToScheme(testScheme)).To(Succeed())
 
 		// The cluster contains the Group CR and a Kubernetes node for a slot that is
 		// already running, but no Kubernetes node for the slot under test.
-		clusterGroup = &infrav1alpha1.Group{
+		clusterGroup = &infrav2alpha1.Group{
 			ObjectMeta: metav1.ObjectMeta{Name: testGroup, Namespace: testNamespace},
 		}
 		runningNode := &corev1.Node{
@@ -100,7 +100,7 @@ var _ = Describe("Node Webhook", func() {
 		validator = NodeCustomValidator{Client: k8sClient}
 		Expect(validator.Client).NotTo(BeNil(), "Expected validator client to be initialized")
 
-		obj = nodeUnderTest(infrav1alpha1.PowerStateOff, groupLabels())
+		obj = nodeUnderTest(infrav2alpha1.PowerStateOff, groupLabels())
 		oldObj = obj.DeepCopy()
 	})
 
@@ -130,7 +130,7 @@ var _ = Describe("Node Webhook", func() {
 
 	Context("When creating a Node with a power state of on", func() {
 		It("Should admit a slot whose Kubernetes node does not exist, warning about it", func() {
-			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+			obj.Spec.DesiredPowerState = infrav2alpha1.PowerStateOn
 
 			warnings, err := validator.ValidateCreate(context.Background(), obj)
 			Expect(err).NotTo(HaveOccurred(),
@@ -144,7 +144,7 @@ var _ = Describe("Node Webhook", func() {
 		// The guarantee behind the fix: a webhook that cannot read the cluster must not turn
 		// that into a denial, otherwise every power-on write fails with a transport error.
 		It("Should admit a slot whose node lookup fails, without warnings", func() {
-			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+			obj.Spec.DesiredPowerState = infrav2alpha1.PowerStateOn
 
 			lookupFailed := false
 			failingClient := fake.NewClientBuilder().
@@ -177,7 +177,7 @@ var _ = Describe("Node Webhook", func() {
 		})
 
 		It("Should admit a slot whose Kubernetes node exists, without warnings", func() {
-			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+			obj.Spec.DesiredPowerState = infrav2alpha1.PowerStateOn
 			obj.Spec.KubernetesNodeName = "omni-remote-1"
 
 			warnings, err := validator.ValidateCreate(context.Background(), obj)
@@ -194,8 +194,8 @@ var _ = Describe("Node Webhook", func() {
 		})
 
 		It("Should admit powering off a slot whose Kubernetes node is gone", func() {
-			oldObj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
-			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
+			oldObj.Spec.DesiredPowerState = infrav2alpha1.PowerStateOn
+			obj.Spec.DesiredPowerState = infrav2alpha1.PowerStateOff
 
 			_, err := validator.ValidateUpdate(context.Background(), oldObj, obj)
 			Expect(err).NotTo(HaveOccurred())
@@ -210,8 +210,8 @@ var _ = Describe("Node Webhook", func() {
 		})
 
 		It("Should admit powering on a slot whose Kubernetes node does not exist, warning about it", func() {
-			oldObj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
-			obj.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+			oldObj.Spec.DesiredPowerState = infrav2alpha1.PowerStateOff
+			obj.Spec.DesiredPowerState = infrav2alpha1.PowerStateOn
 
 			warnings, err := validator.ValidateUpdate(context.Background(), oldObj, obj)
 			Expect(err).NotTo(HaveOccurred(),
@@ -281,9 +281,9 @@ var _ = Describe("Node Webhook through the API server", Ordered, func() {
 		advClient, err = newWarningCapturingClient(rec)
 		Expect(err).NotTo(HaveOccurred())
 
-		group := &infrav1alpha1.Group{
+		group := &infrav2alpha1.Group{
 			ObjectMeta: metav1.ObjectMeta{Name: envtestGroup, Namespace: envtestNamespace},
-			Spec: infrav1alpha1.GroupSpec{
+			Spec: infrav2alpha1.GroupSpec{
 				ScaleDownUtilizationThreshold:    "0.5",
 				ScaleDownGpuUtilizationThreshold: "0.5",
 				ScaleDownUnneededTime:            &metav1.Duration{Duration: 10 * time.Minute},
@@ -297,16 +297,16 @@ var _ = Describe("Node Webhook through the API server", Ordered, func() {
 	})
 
 	It("admits a never-provisioned slot powered off, without warnings", func() {
-		node := &infrav1alpha1.Node{
+		node := &infrav2alpha1.Node{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      envtestSlot,
 				Namespace: envtestNamespace,
 				Labels:    map[string]string{"group": envtestGroup},
 			},
-			Spec: infrav1alpha1.NodeSpec{
-				DesiredPowerState:  infrav1alpha1.PowerStateOff,
+			Spec: infrav2alpha1.NodeSpec{
+				DesiredPowerState:  infrav2alpha1.PowerStateOff,
 				KubernetesNodeName: envtestSlot,
-				Pricing: infrav1alpha1.PricingSpec{
+				Pricing: infrav2alpha1.PricingSpec{
 					HourlyRate: "0",
 					PodRate:    "0",
 				},
@@ -333,20 +333,20 @@ var _ = Describe("Node Webhook through the API server", Ordered, func() {
 		// This drives the real admission path: k8sClient -> API server -> deployed validating
 		// webhook. Denying this write is what blocked the operator power-on path.
 		Eventually(func() error {
-			fresh := &infrav1alpha1.Node{}
+			fresh := &infrav2alpha1.Node{}
 			if err := advClient.Get(ctx, nodeKey, fresh); err != nil {
 				return err
 			}
 
-			fresh.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
+			fresh.Spec.DesiredPowerState = infrav2alpha1.PowerStateOn
 
 			return advClient.Update(ctx, fresh)
 		}).WithTimeout(30 * time.Second).WithPolling(500 * time.Millisecond).Should(Succeed())
 
 		// Confirm the slot really is powered on and no corev1.Node exists for it.
-		updated := &infrav1alpha1.Node{}
+		updated := &infrav2alpha1.Node{}
 		Expect(advClient.Get(ctx, nodeKey, updated)).To(Succeed())
-		Expect(updated.Spec.DesiredPowerState).To(Equal(infrav1alpha1.PowerStateOn))
+		Expect(updated.Spec.DesiredPowerState).To(Equal(infrav2alpha1.PowerStateOn))
 
 		k8sNode := &corev1.Node{}
 		Expect(apierrors.IsNotFound(advClient.Get(ctx, client.ObjectKey{Name: envtestSlot}, k8sNode))).To(BeTrue())

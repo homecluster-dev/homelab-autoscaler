@@ -24,6 +24,9 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/events"
+
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 // Reasons recorded on the Node CR, so that `kubectl describe node.infra.homecluster.dev
@@ -107,6 +110,33 @@ func WithReadinessGateTimeout(timeout time.Duration) Option {
 // that stamps no bootstrap taint, and the explicit way to turn the gate off.
 func WithReadinessTaintKeys(keys []string) Option {
 	return func(nm *NodeStateMachine) { nm.readinessTaintKeys = keys }
+}
+
+// WithInput is the input law: the triple (live claim phase, observed power, node usability) the
+// state machine starts a pass in. A caller that passes none gets the observation alone - the slot's
+// status.powerState, and no live claim - which is what a pass over a slot with no claim is.
+//
+// The input is never seeded from Node.status.phase. The report is this package's output, and reading
+// it back as an input is the v1alpha1 ambiguity (a field that is both the machine's state and the
+// world's report) the 0.1.20 watchdog and the 0.1.22 precedence rule existed to patch.
+func WithInput(in phase.Input) Option {
+	return func(nm *NodeStateMachine) {
+		nm.input = in
+		if in.Claim != nil {
+			nm.claim = in.Claim
+		}
+	}
+}
+
+// WithClaim binds a lifecycle transition to the NodeClaim it is buying a machine for, and the writer
+// that records the claim's phase moves. The claim is part of the input (the FSM's state is derived
+// from it), so this option implies the claim half of WithInput.
+func WithClaim(nodeClaim *infrav2alpha1.NodeClaim, writer ClaimWriter) Option {
+	return func(nm *NodeStateMachine) {
+		nm.claim = nodeClaim
+		nm.claimWriter = writer
+		nm.input.Claim = nodeClaim
+	}
 }
 
 // recordLifecycleEvent attaches an Event to the Node CR. It is a no-op without a recorder.

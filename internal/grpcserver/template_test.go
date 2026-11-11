@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
@@ -116,7 +116,7 @@ func nodeWithResources(name string, ready bool, resources corev1.ResourceList, n
 }
 
 // slotWithTaints builds a Node CR of the test group that declares spec.nodeTaints.
-func slotWithTaints(name string, desired, actual infrav1alpha1.PowerState, progress infrav1alpha1.Progress, nodeTaints ...corev1.Taint) *infrav1alpha1.Node {
+func slotWithTaints(name string, desired, actual infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase, nodeTaints ...corev1.Taint) *infrav2alpha1.Node {
 	node := nodeCR(name, desired, actual, progress)
 	node.Spec.NodeTaints = nodeTaints
 
@@ -126,7 +126,7 @@ func slotWithTaints(name string, desired, actual infrav1alpha1.PowerState, progr
 // slotWithCapacity builds a Node CR of the test group that declares spec.nodeCapacity: the shape
 // the slot's machine boots, as the kubelet reports it. The declaration names cpu and memory only,
 // which is the documented shape and the one a real operator writes.
-func slotWithCapacity(name string, desired, actual infrav1alpha1.PowerState, progress infrav1alpha1.Progress, cpu, memory string) *infrav1alpha1.Node {
+func slotWithCapacity(name string, desired, actual infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase, cpu, memory string) *infrav2alpha1.Node {
 	return slotWithCapacityList(name, desired, actual, progress, corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(cpu),
 		corev1.ResourceMemory: resource.MustParse(memory),
@@ -135,7 +135,7 @@ func slotWithCapacity(name string, desired, actual infrav1alpha1.PowerState, pro
 
 // slotWithCapacityList builds a Node CR of the test group that declares an exact spec.nodeCapacity,
 // the fixture for a declaration that names more, or fewer, resources than cpu and memory.
-func slotWithCapacityList(name string, desired, actual infrav1alpha1.PowerState, progress infrav1alpha1.Progress, declared corev1.ResourceList) *infrav1alpha1.Node {
+func slotWithCapacityList(name string, desired, actual infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase, declared corev1.ResourceList) *infrav2alpha1.Node {
 	node := nodeCR(name, desired, actual, progress)
 	node.Spec.NodeCapacity = declared
 
@@ -170,9 +170,9 @@ func TestNodeGroupTemplateBuiltFromSlotWithRealNode(t *testing.T) {
 	unschedulable := corev1.Taint{Key: "node.kubernetes.io/unschedulable", Effect: corev1.TaintEffectNoSchedule}
 
 	server := newServer(t,
-		nodeCR("slot-off-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		nodeCR("slot-off-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
-		slotWithTaints("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, dedicated),
+		nodeCR("slot-off-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		nodeCR("slot-off-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+		slotWithTaints("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, dedicated),
 		nodeWithShape("slot-on", true, "8", "16Gi", storage, unschedulable),
 	)
 
@@ -202,9 +202,9 @@ func TestNodeGroupTemplateBuiltFromSlotWithRealNode(t *testing.T) {
 // Ready one is a better estimate of the shape of a machine that carries work.
 func TestNodeGroupTemplatePrefersReadyNode(t *testing.T) {
 	server := newServer(t,
-		nodeCR("slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCR("slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 		nodeWithShape("slot-off", false, "1", "1Gi"),
-		nodeCR("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCR("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		nodeWithShape("slot-on", true, "16", "32Gi"),
 	)
 
@@ -224,8 +224,8 @@ func TestNodeGroupTemplateWithoutAnyNodeSynthesizesPlaceholder(t *testing.T) {
 	dedicated := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
 
 	server := newServer(t,
-		slotWithTaints("slot-off-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, dedicated),
-		nodeCR("slot-off-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotWithTaints("slot-off-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff, dedicated),
+		nodeCR("slot-off-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 
 	template := templateFor(t, server)
@@ -254,10 +254,10 @@ func TestNodeGroupTemplatePlaceholderCarriesDeclaredCapacity(t *testing.T) {
 	dedicated := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
 
 	server := newServer(t,
-		slotWithCapacity("slot-off-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
-			infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi"),
-		slotWithTaints("slot-off-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
-			infrav1alpha1.ProgressShutdown, dedicated),
+		slotWithCapacity("slot-off-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff,
+			infrav2alpha1.NodePhaseOff, "1950m", "3.2Gi"),
+		slotWithTaints("slot-off-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff,
+			infrav2alpha1.NodePhaseOff, dedicated),
 	)
 
 	template := templateFor(t, server)
@@ -286,8 +286,8 @@ func TestNodeGroupTemplatePlaceholderCarriesDeclaredCapacity(t *testing.T) {
 // pool still cannot scale from zero. The provider fills the kubelet's default pod ceiling in.
 func TestNodeGroupTemplateDeclaredCapacityWithoutPodsStillAcceptsPods(t *testing.T) {
 	server := newServer(t,
-		slotWithCapacity("slot-off-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
-			infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi"),
+		slotWithCapacity("slot-off-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff,
+			infrav2alpha1.NodePhaseOff, "1950m", "3.2Gi"),
 	)
 
 	template := templateFor(t, server)
@@ -308,8 +308,8 @@ func TestNodeGroupTemplateDeclaredCapacityWithoutPodsStillAcceptsPods(t *testing
 // hands the estimator a different machine per call.
 func TestNodeGroupTemplateDeclaredCapacityWinsOverTheLiveNode(t *testing.T) {
 	server := newServer(t,
-		slotWithCapacity("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn,
-			infrav1alpha1.ProgressReady, "1950m", "3.2Gi"),
+		slotWithCapacity("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn,
+			infrav2alpha1.NodePhaseReady, "1950m", "3.2Gi"),
 		nodeWithShape("slot-on", true, "8", "16Gi"),
 	)
 
@@ -337,8 +337,8 @@ func TestNodeGroupTemplateLiveNodeResourcesSurviveTheDeclaration(t *testing.T) {
 	hugepages := corev1.ResourceName(corev1.ResourceHugePagesPrefix + "2Mi")
 
 	server := newServer(t,
-		slotWithCapacity("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn,
-			infrav1alpha1.ProgressReady, "1950m", "3.2Gi"),
+		slotWithCapacity("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn,
+			infrav2alpha1.NodePhaseReady, "1950m", "3.2Gi"),
 		nodeWithResources("slot-on", true, corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("8"),
 			corev1.ResourceMemory:           resource.MustParse("16Gi"),
@@ -375,7 +375,7 @@ func TestNodeGroupTemplateLiveNodeResourcesSurviveTheDeclaration(t *testing.T) {
 // and no existing pool is asked to write the field to keep working.
 func TestNodeGroupTemplateFallsBackToTheLiveNodeAllocatable(t *testing.T) {
 	server := newServer(t,
-		nodeCR("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCR("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
 		nodeWithShape("slot-on", true, "8", "16Gi"),
 	)
 
@@ -393,8 +393,8 @@ func TestNodeGroupTemplateFallsBackToTheLiveNodeAllocatable(t *testing.T) {
 // template would hand every later reader a template-shaped object, and capacity and allocatable
 // would be one map: clearing one in a later step would clear the other.
 func TestApplyTemplateCapacityDoesNotAliasTheDeclaration(t *testing.T) {
-	slotCR := slotWithCapacity("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
-		infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi")
+	slotCR := slotWithCapacity("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff,
+		infrav2alpha1.NodePhaseOff, "1950m", "3.2Gi")
 	template := &corev1.Node{}
 
 	applyTemplateCapacity(template, slotCR)
@@ -412,7 +412,7 @@ func TestApplyTemplateCapacityDoesNotAliasTheDeclaration(t *testing.T) {
 // TestApplyTemplateCapacityLeavesAnUndeclaredSlotAlone covers the fallback half of the precedence
 // at the unit level: the numbers the copy carried, from the live node, survive untouched.
 func TestApplyTemplateCapacityLeavesAnUndeclaredSlotAlone(t *testing.T) {
-	slotCR := nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	slotCR := nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	template := nodeWithShape("slot-1", true, "8", "16Gi")
 
 	applyTemplateCapacity(template, slotCR)
@@ -428,8 +428,8 @@ func TestApplyTemplateCapacityLeavesAnUndeclaredSlotAlone(t *testing.T) {
 // declaration is applied to capacity as well as allocatable.
 func TestApplyTemplateCapacityOverlaysTheDeclarationPerResource(t *testing.T) {
 	gpu := corev1.ResourceName("nvidia.com/gpu")
-	slotCR := slotWithCapacity("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
-		infrav1alpha1.ProgressShutdown, "3900m", "7.8Gi")
+	slotCR := slotWithCapacity("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff,
+		infrav2alpha1.NodePhaseOff, "3900m", "7.8Gi")
 	template := nodeWithResources("slot-1", true, corev1.ResourceList{
 		corev1.ResourceCPU:              resource.MustParse("8"),
 		corev1.ResourceMemory:           resource.MustParse("16Gi"),
@@ -454,8 +454,8 @@ func TestApplyTemplateCapacityOverlaysTheDeclarationPerResource(t *testing.T) {
 // added. This is the shape the documented cpu/memory declaration lands on, and the one the
 // scheduler can place a pod on at all.
 func TestApplyTemplateCapacityDefaultsThePodCeilingOnAnEmptyTemplate(t *testing.T) {
-	slotCR := slotWithCapacity("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
-		infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi")
+	slotCR := slotWithCapacity("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff,
+		infrav2alpha1.NodePhaseOff, "1950m", "3.2Gi")
 	template := &corev1.Node{}
 
 	applyTemplateCapacity(template, slotCR)
@@ -472,7 +472,7 @@ func TestApplyTemplateCapacityDefaultsThePodCeilingOnAnEmptyTemplate(t *testing.
 // internal representation: putting the default value into a template, and letting a caller (or the
 // protobuf round trip) touch it, would rewrite the default for every later pool.
 func TestApplyTemplateCapacityDoesNotAliasTheDefaults(t *testing.T) {
-	slotCR := nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	slotCR := nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	template := &corev1.Node{}
 
 	applyTemplateCapacity(template, slotCR)
@@ -505,7 +505,7 @@ func TestNodeGroupTemplateDeclaredTaintsWin(t *testing.T) {
 	kept := corev1.Taint{Key: "storage", Value: "slow", Effect: corev1.TaintEffectNoSchedule}
 
 	server := newServer(t,
-		slotWithTaints("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, declared),
+		slotWithTaints("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, declared),
 		nodeWithShape("slot-on", true, "8", "16Gi", stale, kept),
 	)
 
@@ -522,7 +522,7 @@ func TestNodeGroupTemplateKeepsTheTwoTaintFieldsApart(t *testing.T) {
 	declared := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
 	filtered := corev1.Taint{Key: "temp", Value: "gone", Effect: corev1.TaintEffectNoSchedule}
 
-	slotCR := slotWithTaints("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, declared)
+	slotCR := slotWithTaints("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, declared)
 	slotCR.Spec.TaintsToRemove = []corev1.Taint{filtered, declared}
 
 	server := newServer(t, slotCR, nodeWithShape("slot-on", true, "8", "16Gi", filtered))
@@ -539,7 +539,7 @@ func TestNodeGroupTemplateKeepsTheTwoTaintFieldsApart(t *testing.T) {
 // spec.kubernetesNodeName is the name of the machine, the Node CR name is only the fallback,
 // the same rule NodeGroupNodes uses.
 func TestNodeGroupTemplateUsesKubernetesNodeName(t *testing.T) {
-	slotCR := nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	slotCR := nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	slotCR.Spec.KubernetesNodeName = "worker-9"
 
 	server := newServer(t, slotCR, nodeWithShape("worker-9", true, "12", "24Gi"))
@@ -575,7 +575,7 @@ func TestNodeGroupTemplateKeepsThePoolsOwnRoleTaint(t *testing.T) {
 	unschedulable := corev1.Taint{Key: "node.kubernetes.io/unschedulable", Effect: corev1.TaintEffectNoSchedule}
 
 	server := newServer(t,
-		slotWithTaints("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, role),
+		slotWithTaints("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, role),
 		nodeWithShape("slot-on", true, "8", "16Gi", role, unschedulable),
 	)
 
@@ -594,7 +594,7 @@ func TestNodeGroupTemplatePlaceholderKeepsThePoolsOwnRoleTaint(t *testing.T) {
 	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
 
 	server := newServer(t,
-		slotWithTaints("slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, role),
+		slotWithTaints("slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff, role),
 	)
 
 	template := templateFor(t, server)
@@ -616,7 +616,7 @@ func TestNodeGroupTemplateDropsClusterAutoscalerScaleDownTaints(t *testing.T) {
 	unreachable := corev1.Taint{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}
 
 	server := newServer(t,
-		slotWithTaints("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, role),
+		slotWithTaints("slot-on", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, role),
 		nodeWithShape("slot-on", true, "8", "16Gi", role, deletionCandidate, toBeDeleted, notReady, unreachable),
 	)
 
@@ -654,8 +654,8 @@ func (c *nodeGetFailureClient) Get(ctx context.Context, key client.ObjectKey, ob
 // not a good answer for "the provider cannot talk to the API".
 func TestNodeGroupTemplateRealFailureSurvivesANotFoundSlot(t *testing.T) {
 	base := newServer(t,
-		nodeCR("a-slot", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-		nodeCR("z-slot", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		nodeCR("a-slot", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+		nodeCR("z-slot", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 	)
 	server := NewHomeClusterProviderServer(
 		&nodeGetFailureClient{Client: base.Client, failFor: "a-slot", err: errors.New("connection refused")},
@@ -672,7 +672,7 @@ func TestNodeGroupTemplateRealFailureSurvivesANotFoundSlot(t *testing.T) {
 // placeholder exists for "no machine is up", not for "the provider cannot read the cluster",
 // which is what the old single Get reported as Internal.
 func TestNodeGroupTemplateSurfacesLookupFailures(t *testing.T) {
-	base := newServer(t, nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady))
+	base := newServer(t, nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady))
 	server := NewHomeClusterProviderServer(
 		&failingNodeClient{Client: base.Client, err: errors.New("connection refused")},
 		base.Scheme,

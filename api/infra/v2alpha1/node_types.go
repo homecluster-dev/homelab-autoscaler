@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1
+package v2alpha1
 
 import (
 	"encoding/json"
@@ -77,38 +77,38 @@ func (p PowerState) MarshalYAML() (interface{}, error) {
 	return string(p), nil
 }
 
-type Progress string
+// NodePhase is the derived, reported phase of a slot: a summary of (the live NodeClaim of the
+// slot, the power the provider observes, the liveness of the kubelet). It is written by the
+// observation path and by the lifecycle transition path, both of which compute it from those three
+// inputs with the one function phase.Derive, and it is never read to decide an action: the state
+// machine's input is the live claim and the observation, not this record. See
+// docs/design/nodeclaim.md §6 and docs/architecture/state.md.
+type NodePhase string
 
 const (
-	ProgressShuttingDown Progress = "shuttingdown"
-	ProgressShutdown     Progress = "shutdown"
-	ProgressStartingUp   Progress = "startingup"
-	ProgressReady        Progress = "ready"
+	// NodePhaseOff: no live claim, no observed machine.
+	NodePhaseOff NodePhase = "off"
+	// NodePhasePending: a live claim in pending, and no lifecycle Job for it yet.
+	NodePhasePending NodePhase = "pending"
+	// NodePhaseBooting: a live claim whose startup operation is in flight.
+	NodePhaseBooting NodePhase = "booting"
+	// NodePhaseReady: a live claim in ready, and a node that is observed Ready and gate-clear.
+	NodePhaseReady NodePhase = "ready"
+	// NodePhaseDraining: a claim marked for scale-down, or a machine the pool no longer wants,
+	// with the node cordoned and the machine still observed up.
+	NodePhaseDraining NodePhase = "draining"
 )
 
-// NodeSpec defines the desired state of Node
+// NodeSpec defines the desired state of Node: what a slot *is*, and nothing about what anyone
+// wants it to do next.
+//
+// In v1alpha1 this struct carried spec.powerState, a scalar that served as the scale-up request,
+// the lock, the target-size arithmetic and the history at once. It is gone in v2alpha1, and there is
+// no field in the spec for any of that: desired power is derived, never stored, and a slot is
+// wanted exactly when a live NodeClaim names it (docs/design/nodeclaim.md §2). Git is
+// the only writer of this spec, so an apply can never contradict a scale-up, and a scale-up can
+// never overwrite a declaration.
 type NodeSpec struct {
-	// DesiredPowerState is the desired *claim* for this slot: "on" asks the operator to bring the
-	// machine up, "off" asks it to shut the machine down. "off" is the CRD default, so a Node that
-	// is created, or applied, without the field is claimed off by the API server.
-	//
-	// The autoscaler owns the write. Scale-up claims a slot "on", scale-down and slot cleanup drop
-	// the claim to "off". The Node controller never writes it, it only acts on it: claim "on" with
-	// the machine off boots the machine, claim "off" with the machine on shuts it down. Nobody else
-	// writes the field, and nothing in Git declares it.
-	//
-	// A GitOps manifest must not carry this field. Argo CD with selfHeal re-applies the value that
-	// is in git every sync (~2-3 minutes), so a manifest that says powerState: off reverts the
-	// autoscaler's claim ~2.5 minutes after it was written: the FSM shuts the machine down while a
-	// pod is using it, the pending pod triggers the next scale-up, and the slot churns forever. An
-	// applied field is a claim the autoscaler can never win, which is why the field is optional and
-	// defaulted rather than Required: a Node that omits it gets "off" from the API server, git stops
-	// being a writer, and the last claim stands.
-	// +kubebuilder:validation:Enum=on;off
-	// +kubebuilder:default=off
-	// +optional
-	DesiredPowerState PowerState `json:"powerState,omitempty"` // "on" or "off"; "off" is the CRD default. This is the desired claim, and the autoscaler is its only writer: do not mark the field Required, and do not declare it in a GitOps manifest.
-
 	StartupPodSpec     MinimalPodSpec `json:"startupPodSpec"`
 	ShutdownPodSpec    MinimalPodSpec `json:"shutdownPodSpec"`
 	KubernetesNodeName string         `json:"kubernetesNodeName"`
@@ -262,8 +262,28 @@ type NodeStatus struct {
 	// +optional
 	Health string `json:"health,omitempty"`
 
-	PowerState PowerState `json:"powerState"` // "on" or "off"
-	Progress   Progress   `json:"progress"`
+	// PowerState is the power the provider observes for this slot's machine: on when the
+	// corev1.Node reports NodeReady=True, off otherwise. It is an observation, not an intent, and
+	// it is the input the state machine reads ("observed power") next to the live claim.
+	// +kubebuilder:validation:Enum=on;off
+	// +optional
+	PowerState PowerState `json:"powerState,omitempty"` // "on" or "off"
+
+	// Phase is the derived report of the slot: see NodePhase. Written from
+	// (live claim, observed power, node usability), read by nobody in the operator, and
+	// present so that `kubectl get nodes.infra.homecluster.dev` keeps one column that tells an
+	// operator what the slot is doing.
+	// +kubebuilder:validation:Enum=off;pending;booting;ready;draining
+	// +optional
+	Phase NodePhase `json:"phase,omitempty"`
+
+	// LastClaim is the digest of the most recent NodeClaim of this slot. Claims are collected
+	// after they land (TTL), and this is what survives the collection, so that
+	// `kubectl describe node.infra.homecluster.dev <slot>` still answers "who asked, when, how
+	// many attempts, why did it end". Written by the claim controller, read by nobody to decide
+	// an action; the next claim's status.attempt is seeded from it.
+	// +optional
+	LastClaim *LastClaimSummary `json:"lastClaim,omitempty"`
 
 	// LastStartupTime is the last time the node was successfully started up.
 	// +optional
@@ -274,10 +294,56 @@ type NodeStatus struct {
 	LastShutdownTime *metav1.Time `json:"lastShutdownTime,omitempty"`
 }
 
+// LastClaimSummary is the digest of the last NodeClaim of a slot. Its field set is the design's
+// (docs/design/nodeclaim.md §8): the story of the episode that ended, without a second command.
+type LastClaimSummary struct {
+	// Name is the name of the claim, so an operator can find it while it still exists.
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Phase is the phase the claim ended in: failed and completed are terminal, and this is the
+	// sentence "the last attempt of this slot ended like this".
+	// +kubebuilder:validation:Enum=pending;booting;ready;failed;completed
+	// +optional
+	Phase NodeClaimPhase `json:"phase,omitempty"`
+
+	// Attempt is the attempt number the claim carried (1..N for the slot). Seeding the next
+	// claim reads it; see the reset rule in internal/controller/infra/nodeclaim_controller.go.
+	// +optional
+	Attempt int32 `json:"attempt,omitempty"`
+
+	// Call is the gRPC entry point that created the claim (IncreaseSize, DecreaseTargetSize,
+	// DeleteNodes) - the attribution of the request that owned this slot.
+	// +optional
+	Call string `json:"call,omitempty"`
+
+	// Group is the node group the request was for.
+	// +optional
+	Group string `json:"group,omitempty"`
+
+	// Reason is the one-line outcome: DeadlineExceeded, StartupJobFailed, ReadinessGateTimeout,
+	// CancelledByDecreaseTargetSize, NodeDeleted, AttemptLimitExceeded.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// RequestedAt is when the request was made.
+	// +optional
+	RequestedAt *metav1.Time `json:"requestedAt,omitempty"`
+
+	// DeadlineAt is the budget the claim carried.
+	// +optional
+	DeadlineAt *metav1.Time `json:"deadlineAt,omitempty"`
+
+	// FinishedAt is when the claim reached its terminal phase.
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:storageversion
 // +kubebuilder:printcolumn:name="Powerstate",type=string,JSONPath=".status.powerState",description="Current power state"
-// +kubebuilder:printcolumn:name="Progress",type=string,JSONPath=".status.progress",description="Current power progress"
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=".status.phase",description="Derived phase of the slot (live claim + observed power + node usability)"
 
 // Node is the Schema for the nodes API
 type Node struct {

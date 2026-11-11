@@ -16,11 +16,11 @@ limitations under the License.
 
 package fsm
 
-// The completion of a shutdown Job is the one write of status.progress: shutdown that this package
+// The completion of a shutdown Job is the one write of status.phase: shutdown that this package
 // does not verify, and it is how a slot comes to say it is shut down while its machine is up and
 // serving pods. This file is the audit of that path, and the guard it produced.
 //
-// Every writer of status.progress: shutdown, and what each one is built on:
+// Every writer of status.phase: shutdown, and what each one is built on:
 //
 //  1. enterShutdown, on the JobCompleted transition shuttingdown -> shutdown (hooks.go). The
 //     evidence is the exit code of the pod the slot's spec.shutdownPodSpec ran - a script the
@@ -41,20 +41,20 @@ package fsm
 //     the observation controller writes the off when the machine is gone.
 //  3. core.applyObservedPowerState, on an observed off (a node that stopped reporting Ready). That
 //     is an observation and cannot contradict one.
-//  4. NodeGroupDecreaseTargetSize used to write status.progress: shuttingdown directly - no
+//  4. NodeGroupDecreaseTargetSize used to write status.phase: shuttingdown directly - no
 //     transition, no Job, no lock - and no longer does (see
 //     docs/architecture/state.md). A writer outside the FSM is the shape this audit has to keep out
 //     of the completion path, not a cause it can fix here.
 //
 // What turns one of those writes into a slot that cannot heal is the pair, not the write:
 //
-//   - updateNodeProgress writes status.progress and never status.powerState, so every writer above
-//     leaves {status.powerState: on, status.progress: shutdown} standing until an observation lands;
+//   - updateNodeProgress writes status.phase and never status.powerState, so every writer above
+//     leaves {status.powerState: on, status.phase: shutdown} standing until an observation lands;
 //   - core.applyObservedPowerState, the writer that owns a slot with a node object, refuses to
 //     correct a progress from an observed on unless spec.desiredPowerState is on - the
 //     duplicate-shutdown race in the node-monitor-grace window is what that gate buys, and it is
 //     the right trade - so on a slot claimed off the pair is stable;
-//   - the FSM reads its state from status.progress, so from that pair the only legal event is
+//   - the FSM reads its state from status.phase, so from that pair the only legal event is
 //     StartNode, and the claim is off: the reconcile logs "Node is in desired state or
 //     transitioning" and does nothing, on a machine that is up, for as long as the slot lives.
 //
@@ -121,7 +121,7 @@ import (
 
 	"github.com/looplab/fsm"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // shutdownObservationFreshness is the fallback window: how much newer than the *start* of the
@@ -178,15 +178,18 @@ const ReasonShutdownNotObserved = "ShutdownNotObserved"
 // attempts of one slot are counted by enterShuttingDown, and ShutdownNode refuses past the bound with
 // one Warning), and progress.ReconcileObservedPower backs the precedence up with the horizon a hook
 // does not have.
-func (nm *NodeStateMachine) refuseUnobservedShutdown(ctx context.Context, job *batchv1.Job) infrav1alpha1.Progress {
+func (nm *NodeStateMachine) refuseUnobservedShutdown(ctx context.Context, job *batchv1.Job) bool {
 	if !nm.machineObservedUp(ctx, job) {
-		return ""
+		return false
 	}
 
+	// The machine is up, so the state the machine is in is ready: the looplab state is moved to
+	// match the observation, and the report the inputs derive from there is draining - the pool does
+	// not want this machine and it is standing.
 	nm.fsm.SetState(StateReady)
-	nm.updateNodeProgress(infrav1alpha1.ProgressReady)
+	nm.reportPhase()
 
-	return infrav1alpha1.ProgressReady
+	return true
 }
 
 // machineObservedUp reports whether the machine of the slot is observed up, by an observation current
@@ -208,7 +211,7 @@ func (nm *NodeStateMachine) refuseUnobservedShutdown(ctx context.Context, job *b
 // scale-down that removes the machine) tears the node object down, so requiring the node object is
 // what keeps this guard off the shape the progress watchdog exists for.
 func (nm *NodeStateMachine) machineObservedUp(ctx context.Context, job *batchv1.Job) bool {
-	if nm.node.Status.PowerState != infrav1alpha1.PowerStateOn {
+	if nm.node.Status.PowerState != infrav2alpha1.PowerStateOn {
 		return false
 	}
 
@@ -252,7 +255,7 @@ func (nm *NodeStateMachine) machineObservedUp(ctx context.Context, job *batchv1.
 // rests: by the time the Job's grace has aged out, the machine is off, its node object is gone or
 // NotReady, and there is nothing left to correct. The asymmetry is deliberate - a false "up" costs a
 // bounded retry, a false "off" is the frozen slot this file exists to keep out of the record.
-func shutdownObservationBound(node *infrav1alpha1.Node, job *batchv1.Job) (time.Time, string) {
+func shutdownObservationBound(node *infrav2alpha1.Node, job *batchv1.Job) (time.Time, string) {
 	if job != nil && job.Status.CompletionTime != nil {
 		completed := job.Status.CompletionTime.Time
 
@@ -308,24 +311,19 @@ func kubeletIsLive(kubeNode *corev1.Node, observedAfter time.Time) bool {
 // shutdownNotObservedNote renders the Warning: the Job that "succeeded", the machine that is up, the
 // evidence the refusal was measured against, the progress the slot was recorded at, and what the
 // controller will do next.
-func shutdownNotObservedNote(nm *NodeStateMachine, job *batchv1.Job, boundNote string, attempts int) string {
+func shutdownNotObservedNote(nm *NodeStateMachine, job *batchv1.Job, boundNote string) string {
 	jobName := unknownField
 	if job != nil {
 		jobName = job.Name
 	}
 
-	retry := fmt.Sprintf(" This slot has spent %d of %d shutdown attempts; the controller stops firing the "+
-		"shutdown at the limit and records ShutdownAttemptLimitReached, because a shutdown Job that keeps "+
-		"exiting 0 on a machine that stays up is the pool's script, not the controller.",
-		attempts, ShutdownAttemptLimit)
-
 	return "Scale down of " + nm.lifecycleTarget() + " is NOT recorded as completed: shutdown Job " + jobName +
 		" exited 0 while the machine is observed up (status.powerState on, Kubernetes node " + kubernetesNodeTarget(nm.node) +
-		" Ready; measured against " + boundNote + "). The slot is recorded status.progress ready, not shutdown, because from " +
+		" Ready; measured against " + boundNote + "). The slot is recorded status.phase ready, not shutdown, because from " +
 		"shutdown no operation on this slot is reachable - the FSM derives its state from the progress, so the pair " +
 		"{powerState: on, progress: shutdown} is a slot that can only be healed by hand. The next reconcile runs the " +
 		"shutdown again, on the backoff that refusal sets. Check that the Job's power-off call is the provider's own and " +
-		"reports its failure: a script that exits 0 without the machine going off is the whole cause of this." + retry
+		"reports its failure: a script that exits 0 without the machine going off is the whole cause of this."
 }
 
 // jobFromArgs returns the lifecycle Job a JobCompleted transition carried (the monitor passes the Job
@@ -354,7 +352,7 @@ func jobNameFromArgs(e *fsm.Event) string {
 }
 
 // kubernetesNodeTarget names the corev1.Node a slot maps to, spelled out when it has none.
-func kubernetesNodeTarget(node *infrav1alpha1.Node) string {
+func kubernetesNodeTarget(node *infrav2alpha1.Node) string {
 	if node.Spec.KubernetesNodeName == "" {
 		return "none"
 	}

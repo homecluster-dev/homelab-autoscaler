@@ -1,9 +1,11 @@
 # Comprehensive Node CR test data for integration tests
-# This file contains various Node configurations covering all power states, progress states, and pricing scenarios
+# This file contains various Node configurations covering the observed power states, the derived
+# slot phase, and the pricing scenarios. v2alpha1 specs carry no runtime intent: there is no
+# spec.powerState here, and a slot is wanted only while a NodeClaim names it.
 
 ---
 # Basic test node - healthy and ready
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: test-node-1
@@ -13,7 +15,6 @@ metadata:
     group: test-group
     test-scenario: basic
 spec:
-  powerState: "on"
   kubernetesNodeName: test-node-1
   startupPodSpec:
     image: homelab/node-startup:v1.0.0
@@ -39,7 +40,7 @@ spec:
 status:
   health: healthy
   powerState: "on"
-  progress: ready
+  phase: ready
   lastStartupTime: "2024-01-15T09:30:00Z"
   conditions:
   - type: Available
@@ -50,7 +51,7 @@ status:
 
 ---
 # Second test node - also healthy and ready
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: test-node-2
@@ -60,7 +61,6 @@ metadata:
     group: test-group
     test-scenario: basic
 spec:
-  powerState: "on"
   kubernetesNodeName: test-node-2
   startupPodSpec:
     image: homelab/node-startup:v1.0.0
@@ -86,7 +86,7 @@ spec:
 status:
   health: healthy
   powerState: "on"
-  progress: ready
+  phase: ready
   lastStartupTime: "2024-01-15T09:35:00Z"
   conditions:
   - type: Available
@@ -97,7 +97,7 @@ status:
 
 ---
 # GPU node - high-performance with expensive pricing
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: gpu-node-1
@@ -108,7 +108,6 @@ metadata:
     test-scenario: gpu-workload
     node-type: gpu
 spec:
-  powerState: "on"
   kubernetesNodeName: gpu-node-1
   startupPodSpec:
     image: homelab/gpu-startup:v1.0.0
@@ -137,7 +136,7 @@ spec:
 status:
   health: healthy
   powerState: "on"
-  progress: ready
+  phase: ready
   lastStartupTime: "2024-01-15T08:45:00Z"
   conditions:
   - type: Available
@@ -148,7 +147,7 @@ status:
 
 ---
 # GPU node that's powered off
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: gpu-node-2
@@ -159,7 +158,6 @@ metadata:
     test-scenario: scale-up-candidate
     node-type: gpu
 spec:
-  powerState: "off"
   kubernetesNodeName: gpu-node-2
   startupPodSpec:
     image: homelab/gpu-startup:v1.0.0
@@ -185,7 +183,7 @@ spec:
 status:
   health: offline
   powerState: "off"
-  progress: shutdown
+  phase: off
   lastShutdownTime: "2024-01-15T02:15:00Z"
   conditions:
   - type: Available
@@ -196,7 +194,7 @@ status:
 
 ---
 # CPU node - standard configuration
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: cpu-node-1
@@ -207,7 +205,6 @@ metadata:
     test-scenario: cpu-workload
     node-type: cpu
 spec:
-  powerState: "on"
   kubernetesNodeName: cpu-node-1
   startupPodSpec:
     image: homelab/node-startup:v1.0.0
@@ -229,7 +226,7 @@ spec:
 status:
   health: healthy
   powerState: "on"
-  progress: ready
+  phase: ready
   lastStartupTime: "2024-01-15T07:20:00Z"
   conditions:
   - type: Available
@@ -240,7 +237,7 @@ status:
 
 ---
 # CPU node that's currently shutting down
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: cpu-node-2
@@ -251,7 +248,6 @@ metadata:
     test-scenario: shutting-down
     node-type: cpu
 spec:
-  powerState: "off"
   kubernetesNodeName: cpu-node-2
   startupPodSpec:
     image: homelab/node-startup:v1.0.0
@@ -273,7 +269,7 @@ spec:
 status:
   health: unknown
   powerState: "on"
-  progress: shuttingdown
+  phase: draining
   conditions:
   - type: Available
     status: "Unknown"
@@ -288,7 +284,7 @@ status:
 
 ---
 # Node that's currently starting up
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: startup-node-1
@@ -298,7 +294,6 @@ metadata:
     group: unknown-group
     test-scenario: starting-up
 spec:
-  powerState: "on"
   kubernetesNodeName: startup-node-1
   startupPodSpec:
     image: homelab/node-startup:v1.0.0
@@ -320,7 +315,7 @@ spec:
 status:
   health: unknown
   powerState: "off"
-  progress: startingup
+  phase: booting
   lastStartupTime: "2024-01-15T10:10:00Z"
   conditions:
   - type: Available
@@ -336,7 +331,7 @@ status:
 
 ---
 # Offline node in offline-group
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: offline-node-1
@@ -346,7 +341,6 @@ metadata:
     group: offline-group
     test-scenario: offline-nodes
 spec:
-  powerState: "on"
   kubernetesNodeName: offline-node-1
   startupPodSpec:
     image: homelab/node-startup:v1.0.0
@@ -368,7 +362,7 @@ spec:
 status:
   health: offline
   powerState: "on"
-  progress: ready
+  phase: ready
   conditions:
   - type: Available
     status: "False"
@@ -383,7 +377,7 @@ status:
 
 ---
 # High-performance node for fast scaling
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: fast-node-1
@@ -394,7 +388,6 @@ metadata:
     test-scenario: fast-scaling
     performance: high
 spec:
-  powerState: "on"
   kubernetesNodeName: fast-node-1
   startupPodSpec:
     image: homelab/fast-startup:v1.0.0
@@ -416,7 +409,7 @@ spec:
 status:
   health: healthy
   powerState: "on"
-  progress: ready
+  phase: ready
   lastStartupTime: "2024-01-15T08:00:00Z"
   conditions:
   - type: Available
@@ -427,7 +420,7 @@ status:
 
 ---
 # Development node with budget pricing
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: dev-node-1
@@ -438,7 +431,6 @@ metadata:
     test-scenario: development
     environment: dev
 spec:
-  powerState: "on"
   kubernetesNodeName: dev-node-1
   startupPodSpec:
     image: homelab/dev-startup:v1.0.0
@@ -460,7 +452,7 @@ spec:
 status:
   health: healthy
   powerState: "on"
-  progress: ready
+  phase: ready
   lastStartupTime: "2024-01-15T06:00:00Z"
   conditions:
   - type: Available
@@ -471,7 +463,7 @@ status:
 
 ---
 # Node without group assignment (orphaned node)
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: orphaned-node-1
@@ -480,7 +472,6 @@ metadata:
     app.kubernetes.io/name: homelab-autoscaler
     test-scenario: orphaned-node
 spec:
-  powerState: "off"
   kubernetesNodeName: orphaned-node-1
   startupPodSpec:
     image: homelab/node-startup:v1.0.0
@@ -502,7 +493,7 @@ spec:
 status:
   health: offline
   powerState: "off"
-  progress: shutdown
+  phase: off
   lastShutdownTime: "2024-01-14T22:00:00Z"
   conditions:
   - type: Available

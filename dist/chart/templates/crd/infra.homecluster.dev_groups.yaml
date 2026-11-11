@@ -25,7 +25,7 @@ spec:
     singular: group
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - name: v2alpha1
     schema:
       openAPIV3Schema:
         description: Group is the Schema for the groups API

@@ -26,7 +26,7 @@ import (
     "k8s.io/apimachinery/pkg/util/yaml"
     "sigs.k8s.io/controller-runtime/pkg/client"
 
-    infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+    infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
     "github.com/homecluster-dev/homelab-autoscaler/internal/config"
     "github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
 )
@@ -47,7 +47,7 @@ func NewTestDataLoader(scheme *runtime.Scheme) *TestDataLoader {
 }
 
 // LoadGroups loads all Group CRs from groups.yaml
-func (l *TestDataLoader) LoadGroups() ([]*infrav1alpha1.Group, error) {
+func (l *TestDataLoader) LoadGroups() ([]*infrav2alpha1.Group, error) {
     data, err := testDataFiles.ReadFile("groups.yaml")
     if err != nil {
         return nil, fmt.Errorf("failed to read groups.yaml: %w", err)
@@ -56,11 +56,11 @@ func (l *TestDataLoader) LoadGroups() ([]*infrav1alpha1.Group, error) {
     ns := config.NewNamespaceConfig().Get()
     data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
-	var groups []*infrav1alpha1.Group
+	var groups []*infrav2alpha1.Group
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
 
 	for {
-		var group infrav1alpha1.Group
+		var group infrav2alpha1.Group
 		if err := decoder.Decode(&group); err != nil {
 			if err.Error() == "EOF" {
 				break
@@ -80,7 +80,7 @@ func (l *TestDataLoader) LoadGroups() ([]*infrav1alpha1.Group, error) {
 }
 
 // LoadNodes loads all Node CRs from nodes.yaml
-func (l *TestDataLoader) LoadNodes() ([]*infrav1alpha1.Node, error) {
+func (l *TestDataLoader) LoadNodes() ([]*infrav2alpha1.Node, error) {
     data, err := testDataFiles.ReadFile("nodes.yaml")
     if err != nil {
         return nil, fmt.Errorf("failed to read nodes.yaml: %w", err)
@@ -88,11 +88,11 @@ func (l *TestDataLoader) LoadNodes() ([]*infrav1alpha1.Node, error) {
     ns := config.NewNamespaceConfig().Get()
     data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
-	var nodes []*infrav1alpha1.Node
+	var nodes []*infrav2alpha1.Node
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
 
 	for {
-		var node infrav1alpha1.Node
+		var node infrav2alpha1.Node
 		if err := decoder.Decode(&node); err != nil {
 			if err.Error() == "EOF" {
 				break
@@ -144,7 +144,7 @@ func (l *TestDataLoader) LoadKubernetesNodes() ([]*corev1.Node, error) {
 }
 
 // LoadAllTestData loads all test data (Groups, Nodes, and Kubernetes Nodes)
-func (l *TestDataLoader) LoadAllTestData() ([]*infrav1alpha1.Group, []*infrav1alpha1.Node, []*corev1.Node, error) {
+func (l *TestDataLoader) LoadAllTestData() ([]*infrav2alpha1.Group, []*infrav2alpha1.Node, []*corev1.Node, error) {
 	groups, err := l.LoadGroups()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load groups: %w", err)
@@ -283,12 +283,12 @@ func (l *TestDataLoader) ValidateDataConsistency() error {
 	}
 
 	// Create maps for efficient lookup
-	groupMap := make(map[string]*infrav1alpha1.Group)
+	groupMap := make(map[string]*infrav2alpha1.Group)
 	for _, group := range groups {
 		groupMap[group.Name] = group
 	}
 
-	nodeMap := make(map[string]*infrav1alpha1.Node)
+	nodeMap := make(map[string]*infrav2alpha1.Node)
 	for _, node := range nodes {
 		nodeMap[node.Spec.KubernetesNodeName] = node
 	}

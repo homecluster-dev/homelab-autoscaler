@@ -10,6 +10,26 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-infra-homecluster-dev-v2alpha1-nodeclaim
+  failurePolicy: Fail
+  name: nodeclaim-v2alpha1.kb.io
+  rules:
+  - apiGroups:
+    - infra.homecluster.dev
+    apiVersions:
+    - v2alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - nodeclaims
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-infra-homecluster-dev-v1alpha1-node
   failurePolicy: Fail
   name: vnode-v1alpha1.kb.io

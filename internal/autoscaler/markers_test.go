@@ -31,7 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // observedAt is the clock the marker tests hand to ApplyMarker. The observation time is a parameter
@@ -40,16 +40,16 @@ import (
 var observedAt = time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
 
 // slotCR is the Node CR of a running machine of a pool.
-func slotCR() *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+func slotCR() *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "worker-1", Namespace: "homelab-autoscaler-system"},
-		Spec: infrav1alpha1.NodeSpec{
-			DesiredPowerState:  infrav1alpha1.PowerStateOn,
+		Spec: infrav2alpha1.NodeSpec{
+			DesiredPowerState:  infrav2alpha1.PowerStateOn,
 			KubernetesNodeName: "worker-1",
 		},
-		Status: infrav1alpha1.NodeStatus{
-			PowerState: infrav1alpha1.PowerStateOn,
-			Progress:   infrav1alpha1.ProgressReady,
+		Status: infrav2alpha1.NodeStatus{
+			PowerState: infrav2alpha1.PowerStateOn,
+			Progress:   infrav2alpha1.NodePhaseReady,
 		},
 	}
 }
@@ -76,7 +76,7 @@ var (
 )
 
 // recordedCondition reads the marker condition back off the slot.
-func recordedCondition(t *testing.T, slot *infrav1alpha1.Node) *metav1.Condition {
+func recordedCondition(t *testing.T, slot *infrav2alpha1.Node) *metav1.Condition {
 	t.Helper()
 
 	condition := meta.FindStatusCondition(slot.Status.Conditions, ConditionMarkedForDeletion)
@@ -344,10 +344,10 @@ func poolCordon() corev1.Taint {
 // dropped. An empty list is the gate off (Ready only) and is returned as empty, not as a default:
 // turning the gate off has to be expressible.
 func TestReadinessTaintKeysIsTheGroupsListAndNothingElse(t *testing.T) {
-	group := func(taints ...corev1.Taint) *infrav1alpha1.Group {
-		return &infrav1alpha1.Group{
+	group := func(taints ...corev1.Taint) *infrav2alpha1.Group {
+		return &infrav2alpha1.Group{
 			ObjectMeta: metav1.ObjectMeta{Name: "remote-workers"},
-			Spec:       infrav1alpha1.GroupSpec{NodeReadinessTaints: taints},
+			Spec:       infrav2alpha1.GroupSpec{NodeReadinessTaints: taints},
 		}
 	}
 
@@ -403,7 +403,7 @@ func TestStampReadinessTaintsRecordsTheGateOnTheSlotOnce(t *testing.T) {
 }
 
 // recordedReadiness returns the readiness condition's message.
-func recordedReadiness(slot *infrav1alpha1.Node) string {
+func recordedReadiness(slot *infrav2alpha1.Node) string {
 	condition := meta.FindStatusCondition(slot.Status.Conditions, ConditionReadinessTaints)
 	if condition == nil {
 		return ""

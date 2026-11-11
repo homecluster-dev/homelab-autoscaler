@@ -35,16 +35,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 func TestBeforeStartNode(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock acquisition", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -74,7 +74,7 @@ func TestBeforeStartNode(t *testing.T) {
 	})
 
 	t.Run("lock acquisition failure cancels event", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -97,10 +97,10 @@ func TestBeforeStartNode(t *testing.T) {
 func TestBeforeShutdownNode(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock acquisition", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -130,7 +130,7 @@ func TestBeforeShutdownNode(t *testing.T) {
 	})
 
 	t.Run("lock acquisition failure cancels event", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetAcquireError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -153,10 +153,10 @@ func TestBeforeShutdownNode(t *testing.T) {
 func TestAfterJobCompleted(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock release and status update", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 		mockCoord := NewMockCoordinationManager()
 
 		// Create a Kubernetes node that is Ready but unschedulable (cordoned)
@@ -192,10 +192,10 @@ func TestAfterJobCompleted(t *testing.T) {
 		assert.Equal(t, node, releaseCalls[0].Node)
 
 		// Verify node status was updated
-		updatedNode := &infrav1alpha1.Node{}
+		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.Progress(StateReady), updatedNode.Status.Progress)
+		assert.Equal(t, infrav2alpha1.NodePhase(StateReady), updatedNode.Status.Phase)
 
 		// Verify Kubernetes node was uncordoned
 		updatedKubeNode := &corev1.Node{}
@@ -205,7 +205,7 @@ func TestAfterJobCompleted(t *testing.T) {
 	})
 
 	t.Run("lock release failure is logged but doesn't fail", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseDraining)
 		mockCoord := NewMockCoordinationManager()
 		mockCoord.SetReleaseError(assert.AnError)
 		fakeClient := CreateFakeClient(scheme, node)
@@ -237,10 +237,10 @@ func TestAfterJobCompleted(t *testing.T) {
 		assert.Len(t, releaseCalls, 1)
 
 		// Verify node status was still updated despite lock release failure
-		updatedNode := &infrav1alpha1.Node{}
+		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.Progress(StateShutdown), updatedNode.Status.Progress)
+		assert.Equal(t, infrav2alpha1.NodePhase(StateShutdown), updatedNode.Status.Phase)
 	})
 }
 
@@ -289,11 +289,11 @@ func (c *writeOrderClient) Update(ctx context.Context, obj client.Object, opts .
 func TestAfterJobCompletedStampsDeclaredTaintsBeforeUncordon(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 	node.Spec.NodeTaints = []corev1.Taint{role}
 
 	// Ready and cordoned, the state of a machine that has just registered after startup
@@ -337,10 +337,10 @@ func TestAfterJobCompletedStampsDeclaredTaintsBeforeUncordon(t *testing.T) {
 func TestAfterJobFailed(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("successful lock release and failure condition added", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -368,10 +368,10 @@ func TestAfterJobFailed(t *testing.T) {
 		assert.Equal(t, node, releaseCalls[0].Node)
 
 		// Verify node status was updated
-		updatedNode := &infrav1alpha1.Node{}
+		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.Progress(StateShutdown), updatedNode.Status.Progress)
+		assert.Equal(t, infrav2alpha1.NodePhase(StateShutdown), updatedNode.Status.Phase)
 
 		// Verify failure condition was added
 		assert.Len(t, updatedNode.Status.Conditions, 1)
@@ -386,10 +386,10 @@ func TestAfterJobFailed(t *testing.T) {
 func TestAfterForceCleanup(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("successful force lock release and cleanup condition added", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 		mockCoord := NewMockCoordinationManager()
 		fakeClient := CreateFakeClient(scheme, node)
 
@@ -417,10 +417,10 @@ func TestAfterForceCleanup(t *testing.T) {
 		assert.Equal(t, node, forceCalls[0].Node)
 
 		// Verify node status was updated
-		updatedNode := &infrav1alpha1.Node{}
+		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.Progress(StateShutdown), updatedNode.Status.Progress)
+		assert.Equal(t, infrav2alpha1.NodePhase(StateShutdown), updatedNode.Status.Phase)
 
 		// Verify cleanup condition was added
 		assert.Len(t, updatedNode.Status.Conditions, 1)
@@ -435,9 +435,9 @@ func TestAfterForceCleanup(t *testing.T) {
 func TestEnterStartingUp(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -466,10 +466,10 @@ func TestEnterStartingUp(t *testing.T) {
 	assert.False(t, nm.backoff.transitionStart.IsZero())
 
 	// Verify node status was updated
-	updatedNode := &infrav1alpha1.Node{}
+	updatedNode := &infrav2alpha1.Node{}
 	err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 	assert.NoError(t, err)
-	assert.Equal(t, infrav1alpha1.ProgressStartingUp, updatedNode.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, updatedNode.Status.Phase)
 	assert.NotNil(t, updatedNode.Status.LastStartupTime)
 
 	// Verify the progressing condition was added, and that the transition itself counted the startup
@@ -491,9 +491,9 @@ func TestEnterStartingUp(t *testing.T) {
 func TestEnterShuttingDown(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -522,10 +522,10 @@ func TestEnterShuttingDown(t *testing.T) {
 	assert.False(t, nm.backoff.transitionStart.IsZero())
 
 	// Verify node status was updated
-	updatedNode := &infrav1alpha1.Node{}
+	updatedNode := &infrav2alpha1.Node{}
 	err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 	assert.NoError(t, err)
-	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, updatedNode.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updatedNode.Status.Phase)
 	assert.NotNil(t, updatedNode.Status.LastShutdownTime)
 
 	// Verify the progressing condition was added, and that the transition itself counted the shutdown
@@ -547,9 +547,9 @@ func TestEnterShuttingDown(t *testing.T) {
 func TestEnterReady(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -582,10 +582,10 @@ func TestEnterReady(t *testing.T) {
 	assert.Nil(t, nm.backoff)
 
 	// Verify node status was updated
-	updatedNode := &infrav1alpha1.Node{}
+	updatedNode := &infrav2alpha1.Node{}
 	err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 	assert.NoError(t, err)
-	assert.Equal(t, infrav1alpha1.ProgressReady, updatedNode.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, updatedNode.Status.Phase)
 
 	// Verify ready condition was added
 	assert.Len(t, updatedNode.Status.Conditions, 1)
@@ -598,9 +598,9 @@ func TestEnterReady(t *testing.T) {
 func TestEnterShutdown(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -633,10 +633,10 @@ func TestEnterShutdown(t *testing.T) {
 	assert.Nil(t, nm.backoff)
 
 	// Verify node status was updated
-	updatedNode := &infrav1alpha1.Node{}
+	updatedNode := &infrav2alpha1.Node{}
 	err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 	assert.NoError(t, err)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, updatedNode.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, updatedNode.Status.Phase)
 
 	// Verify shutdown condition was added
 	assert.Len(t, updatedNode.Status.Conditions, 1)
@@ -650,9 +650,9 @@ func TestHooksIntegration(t *testing.T) {
 	// This test verifies that hooks are properly integrated with the FSM
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 	fakeClient := CreateFakeClient(scheme, node)
 
@@ -730,7 +730,7 @@ func TestHooksIntegration(t *testing.T) {
 		mockCoord.Reset()
 
 		// Create a new node with a different name to avoid job conflicts
-		freshNode := CreateTestNode("test-node-2", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		freshNode := CreateTestNode("test-node-2", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		fakeClient2 := CreateFakeClient(scheme, freshNode)
 		nm2 := NewNodeStateMachine(freshNode, fakeClient2, scheme, mockCoord)
 
@@ -755,7 +755,7 @@ func TestHooksIntegration(t *testing.T) {
 
 // TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut is the bound on the
 // readiness gate. The transition is held open until the node can take the pool's pods (Ready plus
-// Cilium's bootstrap taint gone), because completing it writes status.progress: ready and the
+// Cilium's bootstrap taint gone), because completing it writes status.phase: ready and the
 // autoscaler reads that as usable capacity. A CNI that never finishes must not wedge the slot:
 // the hook releases the coordination lock and writes the progress it would have written, so the
 // slot is not left transitional with a lock nothing is running under, and the node ends up
@@ -763,11 +763,11 @@ func TestHooksIntegration(t *testing.T) {
 func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	bootstrap := corev1.Taint{Key: TaintCiliumAgentNotReady, Value: "true", Effect: corev1.TaintEffectNoExecute}
 
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	kubeNode := CreateTestKubernetesNode("test-node-k8s", true)
 	kubeNode.Spec.Taints = []corev1.Taint{bootstrap}
 
@@ -792,9 +792,9 @@ func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *
 
 	assert.Len(t, mockCoord.GetReleaseCalls(), 1, "the lock of a completed operation is released whatever the gate decided")
 
-	updated := &infrav1alpha1.Node{}
+	updated := &infrav2alpha1.Node{}
 	require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updated))
-	assert.Equal(t, infrav1alpha1.ProgressReady, updated.Status.Progress,
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, updated.Status.Phase,
 		"the transition completes: a slot is never left transitional by a readiness gate that timed out")
 
 	updatedKubeNode := &corev1.Node{}

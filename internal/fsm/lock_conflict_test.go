@@ -36,7 +36,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
@@ -74,7 +74,7 @@ func newConflictTestEnv(t *testing.T, objects ...client.Object) *conflictTestEnv
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	fakeClient := CreateFakeClient(scheme, objects...)
 
@@ -88,7 +88,7 @@ func newConflictTestEnv(t *testing.T, objects ...client.Object) *conflictTestEnv
 
 // machine returns a state machine reading the slot through the env's client, primed from the
 // slot as it is stored, with the test-sized uncordon timeout the uncordon paths need.
-func (e *conflictTestEnv) machine(t *testing.T, node *infrav1alpha1.Node) *NodeStateMachine {
+func (e *conflictTestEnv) machine(t *testing.T, node *infrav2alpha1.Node) *NodeStateMachine {
 	t.Helper()
 
 	nm := NewNodeStateMachine(node, e.fakeClient, e.scheme, e.coordMgr, WithEventRecorder(e.recorder))
@@ -100,10 +100,10 @@ func (e *conflictTestEnv) machine(t *testing.T, node *infrav1alpha1.Node) *NodeS
 
 // stored reads the slot back from the API, so the assertions are about what is persisted and
 // not about the copy a state machine happens to hold.
-func (e *conflictTestEnv) stored(t *testing.T, node *infrav1alpha1.Node) *infrav1alpha1.Node {
+func (e *conflictTestEnv) stored(t *testing.T, node *infrav2alpha1.Node) *infrav2alpha1.Node {
 	t.Helper()
 
-	fresh := &infrav1alpha1.Node{}
+	fresh := &infrav2alpha1.Node{}
 	require.NoError(t, e.fakeClient.Get(context.TODO(), client.ObjectKeyFromObject(node), fresh))
 
 	return fresh
@@ -112,7 +112,7 @@ func (e *conflictTestEnv) stored(t *testing.T, node *infrav1alpha1.Node) *infrav
 // heldScaleUpLock takes the coordination lock of a scale-up on the slot, the way the startup
 // path does, and returns the slot as it is stored with that lock on it. age is written into
 // the lock timestamp: the live trace shows a lock 4m0s old, inside its 5m timeout.
-func (e *conflictTestEnv) heldLock(t *testing.T, node *infrav1alpha1.Node, operation string, age time.Duration) *infrav1alpha1.Node {
+func (e *conflictTestEnv) heldLock(t *testing.T, node *infrav2alpha1.Node, operation string, age time.Duration) *infrav2alpha1.Node {
 	t.Helper()
 
 	ctx := context.TODO()
@@ -133,9 +133,9 @@ func (e *conflictTestEnv) heldLock(t *testing.T, node *infrav1alpha1.Node, opera
 // it back, the machine up, the progress ready, and the scale-up lock of the startup that
 // brought it up still 4 minutes old on the slot. The name is a parameter so a test can state
 // which slot it drives; the coordination tests read it back under the same name.
-func bootingSlot(name string) *infrav1alpha1.Node {
-	node := CreateTestNode(name, config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+func bootingSlot(name string) *infrav2alpha1.Node {
+	node := CreateTestNode(name, config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 
 	return node
 }
@@ -144,7 +144,7 @@ func bootingSlot(name string) *infrav1alpha1.Node {
 // shutdown arrives while the scale-up owns the slot, loses the acquisition, and must leave the
 // slot exactly as it was:
 //
-//   - status.progress is not left shuttingdown (a). A transitional progress is excluded from
+//   - status.phase is not left shuttingdown (a). A transitional progress is excluded from
 //     the provider's target size, validateStateTransition refuses to start a transition from
 //     one, and nothing in the controller heals it: the stuck-transition cleanup the docs
 //     promised runs on the machine's own backoff record, which the reconciler builds fresh on
@@ -183,7 +183,7 @@ func TestShutdownNodeLockConflictLeavesNoTransitionalProgress(t *testing.T) {
 
 	// (a) nothing transitional was written, in the cluster or in the machine
 	stored := env.stored(t, node)
-	assert.Equal(t, infrav1alpha1.ProgressReady, stored.Status.Progress,
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, stored.Status.Phase,
 		"a cancelled transition must not leave the slot in a transitional progress")
 	assert.Equal(t, StateReady, nm.GetCurrentState())
 	assert.Nil(t, nm.backoff, "a transition that never ran has no backoff to track")
@@ -236,20 +236,20 @@ func TestShutdownNodeCompletesAfterTheScaleUpReleasesTheLock(t *testing.T) {
 	err := first.ShutdownNode()
 	require.Error(t, err)
 	require.NotNil(t, AsLockConflict(err))
-	require.Equal(t, infrav1alpha1.ProgressReady, env.stored(t, node).Status.Progress)
+	require.Equal(t, infrav2alpha1.NodePhaseReady, env.stored(t, node).Status.Phase)
 
 	// 2. the startup finishes. The job monitor of the scale-up is a state machine primed from
 	// the progress it started from - startingup - and reporting its Job completed is what
 	// releases the coordination lock and records ready.
 	monitorNode := env.stored(t, node).DeepCopy()
-	monitorNode.Status.Progress = infrav1alpha1.ProgressStartingUp
+	monitorNode.Status.Phase = infrav2alpha1.NodePhaseBooting
 	monitor := env.machine(t, monitorNode)
 
 	startupJob := CreateTestJobWithNodeLabel("test-node-startup-1", node.Namespace, PhaseStartup, "test-node-k8s")
 	require.NoError(t, monitor.JobCompleted(startupJob))
 
 	stored := env.stored(t, node)
-	assert.Equal(t, infrav1alpha1.ProgressReady, stored.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, stored.Status.Phase)
 	_, locked := env.coordMgr.CheckLock(context.TODO(), stored)
 	assert.False(t, locked, "the completed scale-up must not leave its lock on the slot")
 
@@ -259,9 +259,9 @@ func TestShutdownNodeCompletesAfterTheScaleUpReleasesTheLock(t *testing.T) {
 	require.NoError(t, retry.ShutdownNode())
 
 	stored = env.stored(t, node)
-	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, stored.Status.Progress,
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, stored.Status.Phase,
 		"the retried shutdown runs, so the transitional progress it writes is driven by a real operation")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, stored.Spec.DesiredPowerState)
+	assert.Equal(t, infrav2alpha1.PowerStateOff, stored.Spec.DesiredPowerState)
 
 	jobs := &batchv1.JobList{}
 	require.NoError(t, env.fakeClient.List(ctx, jobs))
@@ -277,8 +277,8 @@ func TestShutdownNodeCompletesAfterTheScaleUpReleasesTheLock(t *testing.T) {
 	require.NoError(t, retry.JobCompleted(&shutdownJob))
 
 	stored = env.stored(t, node)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, stored.Status.Progress, "the slot ends shut down")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, stored.Spec.DesiredPowerState)
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, stored.Status.Phase, "the slot ends shut down")
+	assert.Equal(t, infrav2alpha1.PowerStateOff, stored.Spec.DesiredPowerState)
 	_, locked = env.coordMgr.CheckLock(context.TODO(), stored)
 	assert.False(t, locked, "a completed shutdown releases its lock")
 
@@ -298,8 +298,8 @@ func TestShutdownNodeCompletesAfterTheScaleUpReleasesTheLock(t *testing.T) {
 // of its side effects on a machine it does not own - the startup Job, and clearing the
 // ToBeDeletedByClusterAutoscaler taint off a node the shutdown is draining.
 func TestStartNodeLockConflictLeavesSlotUntouched(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-	node.Status.PowerState = infrav1alpha1.PowerStateOff
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff)
+	node.Status.PowerState = infrav2alpha1.PowerStateOff
 
 	kubeNode := CreateTestKubernetesNode("test-node-k8s", true)
 	kubeNode.Spec.Taints = []corev1.Taint{{
@@ -320,7 +320,7 @@ func TestStartNodeLockConflictLeavesSlotUntouched(t *testing.T) {
 	assert.Equal(t, OperationScaleDown, conflict.HolderOperation())
 
 	stored := env.stored(t, node)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, stored.Status.Progress,
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, stored.Status.Phase,
 		"a cancelled scale-up must not leave the slot in startingup")
 	assert.Equal(t, StateShutdown, nm.GetCurrentState())
 
@@ -346,8 +346,8 @@ func TestStartNodeLockConflictLeavesSlotUntouched(t *testing.T) {
 // lifecycle operation on that slot then lost the acquisition to a lock nothing was running
 // under, which is the shape of the live trace.
 func TestJobTimeoutReleasesCoordinationLock(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
-	node.Status.PowerState = infrav1alpha1.PowerStateOff
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+	node.Status.PowerState = infrav2alpha1.PowerStateOff
 
 	env := newConflictTestEnv(t, node)
 	booting := env.heldLock(t, node, OperationScaleUp, 0)
@@ -356,7 +356,7 @@ func TestJobTimeoutReleasesCoordinationLock(t *testing.T) {
 	require.NoError(t, nm.JobTimeout())
 
 	stored := env.stored(t, node)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, stored.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, stored.Status.Phase)
 	assert.Equal(t, StateShutdown, nm.GetCurrentState())
 
 	_, locked := env.coordMgr.CheckLock(context.TODO(), stored)
@@ -369,28 +369,28 @@ func TestJobTimeoutReleasesCoordinationLock(t *testing.T) {
 }
 
 // TestUpdateNodeProgressPersistsOnlyTheCurrentState pins the guard that keeps a state machine
-// from writing a progress it is not in. Inside the FSM the writers of status.progress are the
+// from writing a progress it is not in. Inside the FSM the writers of status.phase are the
 // enter_ and after_ hooks, which looplab/fsm runs after applying the state change, so on every
 // legitimate path the two agree; a disagreement can only come from a machine that is stale -
 // the job monitor of an earlier reconcile, or one built from a Node read before a transition -
 // and that is precisely how a slot ends up in a transitional progress nothing is driving.
 // The guard only covers writes that go through it: the gRPC server and the core controllers
-// write status.progress too, and they are not state machines (see docs/architecture/state.md).
+// write status.phase too, and they are not state machines (see docs/architecture/state.md).
 func TestUpdateNodeProgressPersistsOnlyTheCurrentState(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseDraining)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 
 	env := newConflictTestEnv(t, node)
 	nm := env.machine(t, env.stored(t, node))
 
 	// a machine in shuttingdown cannot record ready: that write is not its transition to make
-	nm.updateNodeProgress(infrav1alpha1.ProgressReady)
-	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, env.stored(t, node).Status.Progress)
+	nm.updateNodeProgress(infrav2alpha1.NodePhaseReady)
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, env.stored(t, node).Status.Phase)
 
 	// the same machine, moved to the state a hook is entering, writes its own state
 	nm.PrimeEnterState(StateShutdown)
-	nm.updateNodeProgress(infrav1alpha1.ProgressShutdown)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, env.stored(t, node).Status.Progress)
+	nm.updateNodeProgress(infrav2alpha1.NodePhaseOff)
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, env.stored(t, node).Status.Phase)
 }
 
 // TestShutdownJobCreationFailureRollsTheSlotBackOutOfShuttingDown covers the other half of the
@@ -404,7 +404,7 @@ func TestShutdownJobCreationFailureRollsTheSlotBackOutOfShuttingDown(t *testing.
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	fake := CreateFakeClient(scheme, node)
 	failing := &createJobFailingClient{Client: fake, err: assert.AnError}
@@ -419,9 +419,9 @@ func TestShutdownJobCreationFailureRollsTheSlotBackOutOfShuttingDown(t *testing.
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to create shutdown job")
 
-	stored := &infrav1alpha1.Node{}
+	stored := &infrav2alpha1.Node{}
 	require.NoError(t, fake.Get(context.TODO(), client.ObjectKeyFromObject(node), stored))
-	assert.Equal(t, infrav1alpha1.ProgressReady, stored.Status.Progress,
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, stored.Status.Phase,
 		"a shutdown whose job could not be created leaves the slot ready, not shuttingdown")
 	assert.Equal(t, StateReady, nm.GetCurrentState())
 	assert.False(t, mockCoord.HasLock("test-node"), "the lock of a failed operation is released")
@@ -453,7 +453,7 @@ type slotWriteRace struct {
 }
 
 func (c *slotWriteRace) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
-	if _, isNode := obj.(*infrav1alpha1.Node); !isNode {
+	if _, isNode := obj.(*infrav2alpha1.Node); !isNode {
 		return c.Client.Update(ctx, obj, opts...)
 	}
 
@@ -472,7 +472,7 @@ func (c *slotWriteRace) Update(ctx context.Context, obj client.Object, opts ...c
 		}
 
 		return apierrors.NewConflict(
-			schema.GroupResource{Group: infrav1alpha1.GroupVersion.Group, Resource: "nodes"},
+			schema.GroupResource{Group: infrav2alpha1.GroupVersion.Group, Resource: "nodes"},
 			obj.GetName(),
 			errors.New("the object has been modified; please apply your changes to the latest version and try again"),
 		)
@@ -495,7 +495,7 @@ func (c *slotWriteRace) slotUpdates() int {
 // asserts on the lock it wrote, so a racer that failed is caught by those assertions.
 func (c *slotWriteRace) foreignLockRacer(operation, owner string, age time.Duration) func() error {
 	return func() error {
-		live := &infrav1alpha1.Node{}
+		live := &infrav2alpha1.Node{}
 		if err := c.Get(context.TODO(), client.ObjectKey{Name: "test-node", Namespace: config.NewNamespaceConfig().Get()}, live); err != nil {
 			return err
 		}
@@ -525,8 +525,8 @@ func (c *slotWriteRace) foreignLockRacer(operation, owner string, age time.Durat
 //	coordination lock changed during retry: operation=scale-up, owner=node-controller, age=335ms
 //	retryAfter=4m59.66s   lock really present in API: false
 func TestAcquireLockPlainWriteConflictIsRetried(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 	env := newConflictTestEnv(t, node)
 
 	racy := &slotWriteRace{Client: env.fakeClient, conflicts: 1}
@@ -547,8 +547,8 @@ func TestAcquireLockPlainWriteConflictIsRetried(t *testing.T) {
 // That is a deferral, and it has to name the holder that is actually in the slot - operation,
 // owner, and the remaining time of that lock - because the caller schedules the retry from it.
 func TestAcquireLockWriteConflictNamesTheLockThatWon(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 	env := newConflictTestEnv(t, node)
 
 	racy := &slotWriteRace{Client: env.fakeClient, conflicts: 1}
@@ -581,8 +581,8 @@ func TestAcquireLockWriteConflictNamesTheLockThatWon(t *testing.T) {
 // retried. The startup runs, and the slot records no lock event at all - pre-fix this is a
 // ScaleUpFailed Warning, a startup that never happened, and a requeue at the lock timeout.
 func TestStartNodeSurvivesAPlainWriteConflictOnTheLock(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-	node.Status.PowerState = infrav1alpha1.PowerStateOff
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseOff)
+	node.Status.PowerState = infrav2alpha1.PowerStateOff
 	kubeNode := CreateTestKubernetesNode("test-node-k8s", false)
 
 	env := newConflictTestEnv(t, node, kubeNode)
@@ -600,7 +600,7 @@ func TestStartNodeSurvivesAPlainWriteConflictOnTheLock(t *testing.T) {
 	assert.Greater(t, racy.slotUpdates(), 1, "the acquisition ran again after the lost write")
 
 	stored := env.stored(t, node)
-	assert.Equal(t, infrav1alpha1.ProgressStartingUp, stored.Status.Progress, "the startup ran")
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, stored.Status.Phase, "the startup ran")
 
 	lock, exists := coord.CheckLock(context.TODO(), stored)
 	require.True(t, exists, "the startup owns the slot while its job runs")

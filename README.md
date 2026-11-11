@@ -40,7 +40,7 @@ make run
 ### Basic Configuration
 ```yaml
 # Example Group CRD - manages physical node autoscaling
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: worker-nodes
@@ -53,14 +53,13 @@ spec:
 
 ```yaml
 # Example Node CRD - represents a physical machine
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: node-1
   labels:
     group: worker-nodes
 spec:
-  powerState: off        # Desired state (on/off)
   startupJob:
     template:
       spec:
