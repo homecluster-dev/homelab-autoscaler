@@ -18,8 +18,8 @@ package grpcserver
 
 import (
 	"context"
-	"slices"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,10 +32,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
 
 const testGroup = "remote-workers"
+
+// testNamespace is the namespace the gRPC server resolves Group and NodeClaim CRs in
+// (internal/config.NamespaceConfig default). Slots of the test group live in "default", the
+// fixtures that exercise a Group CR live here, because that is where the provider looks.
+const testNamespace = "homelab-autoscaler-system"
 
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -47,23 +53,123 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
-// nodeCR builds a Node CR (a slot) of the given group and power state.
-func nodeCR(name string, desired infrav2alpha1.PowerState, status infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+// nodeCR builds a Node CR: a slot, and a slot only.
+//
+// The signature is the model. In v2alpha1 the spec has no runtime intent in it, so the two
+// power-ish arguments a fixture can name are the observation (status.powerState) and the report
+// (status.phase), and neither is what an RPC acts on: what makes a machine wanted is the
+// NodeClaim next to it (see claimCR).
+func nodeCR(name string, observed infrav2alpha1.PowerState, report infrav2alpha1.NodePhase) *infrav2alpha1.Node {
 	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: "default",
+			Namespace: testNamespace,
 			Labels:    map[string]string{"group": testGroup},
 		},
 		Spec: infrav2alpha1.NodeSpec{
-			DesiredPowerState:  desired,
 			KubernetesNodeName: name,
 		},
 		Status: infrav2alpha1.NodeStatus{
-			PowerState: status,
-			Phase:      progress,
+			PowerState: observed,
+			Phase:      report,
 		},
 	}
+}
+
+// nodeCRInGroup builds a slot of an arbitrary group.
+func nodeCRInGroup(group, name string, observed infrav2alpha1.PowerState, report infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	node := nodeCR(name, observed, report)
+	node.Labels["group"] = group
+
+	return node
+}
+
+// slotWithoutKubernetesNodeName builds a slot whose spec.kubernetesNodeName is empty: a slot
+// that has never been provisioned.
+func slotWithoutKubernetesNodeName(name string) *infrav2alpha1.Node {
+	node := nodeCR(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+	node.Spec.KubernetesNodeName = ""
+
+	return node
+}
+
+// claimCR is the claim of a slot: the object the autoscaler's request becomes. It carries the
+// labels the provider lists on, and the attribution IncreaseSize stamps.
+func claimCR(slotName string, claimPhase infrav2alpha1.NodeClaimPhase, mutate func(*infrav2alpha1.NodeClaim)) *infrav2alpha1.NodeClaim {
+	nodeClaim := &infrav2alpha1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "claim-" + slotName,
+			Namespace: testNamespace,
+			Labels: map[string]string{
+				claim.LabelSlot:  slotName,
+				claim.LabelGroup: testGroup,
+			},
+		},
+		Spec: infrav2alpha1.NodeClaimSpec{
+			SlotRef: corev1.ObjectReference{
+				APIVersion: infrav2alpha1.GroupVersion.String(),
+				Kind:       "Node",
+				Name:       slotName,
+			},
+			RequestedBy: claim.RequestedByAutoscaler,
+			Request: infrav2alpha1.ClaimRequest{
+				Call:  infrav2alpha1.ClaimCallIncreaseSize,
+				Delta: 1,
+				Group: testGroup,
+			},
+		},
+		Status: infrav2alpha1.NodeClaimStatus{
+			Phase:   claimPhase,
+			Attempt: 1,
+		},
+	}
+
+	// A live claim carries the controller's finalizer from the moment its boot starts: deleting it
+	// is then the scale-down request, not an abandonment (docs/design/nodeclaim.md §3). A pending
+	// claim carries none, which is what makes cancelling it a plain delete.
+	if claimPhase == infrav2alpha1.NodeClaimBooting || claimPhase == infrav2alpha1.NodeClaimReady {
+		nodeClaim.Finalizers = append(nodeClaim.Finalizers, claimFinalizer)
+	}
+
+	if mutate != nil {
+		mutate(nodeClaim)
+	}
+
+	return nodeClaim
+}
+
+// claimFinalizer is the finalizer the claim controller stamps on a committed boot.
+const claimFinalizer = "infra.homecluster.dev/nodeclaim-finalizer"
+
+// runningSlot is a slot whose machine is up and takes work: the observation says on, and a live
+// claim in ready is the request that put it there. The pair is what a v1alpha1 fixture wrote as
+// one scalar.
+func runningSlot(t *testing.T, name string) []client.Object {
+	t.Helper()
+
+	return []client.Object{nodeCR(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady), claimCR(name, infrav2alpha1.NodeClaimReady, nil)}
+}
+
+// bootingSlot is a slot whose startup has started: a live claim in booting, the machine not up
+// yet. It is capacity, it is counted, and it is committed: no caller cancels it.
+func bootingSlot(name string) []client.Object {
+	return []client.Object{
+		nodeCR(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+		claimCR(name, infrav2alpha1.NodeClaimBooting, nil),
+	}
+}
+
+// pendingSlot is a slot a request has claimed and nothing has started: the cancelable shape.
+func pendingSlot(name string) []client.Object {
+	return []client.Object{
+		nodeCR(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhasePending),
+		claimCR(name, infrav2alpha1.NodeClaimPending, nil),
+	}
+}
+
+// idleSlot is a free slot: no claim names it, its machine is off.
+func idleSlot(name string) []client.Object {
+	return []client.Object{nodeCR(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)}
 }
 
 // k8sNode builds a Kubernetes node, optionally with a providerID set by a
@@ -75,25 +181,101 @@ func k8sNode(name, providerID string) *corev1.Node {
 	}
 }
 
-// slotWithoutKubernetesNodeName builds a Node CR whose spec.kubernetesNodeName is empty.
-func slotWithoutKubernetesNodeName(name string, desired infrav2alpha1.PowerState) *infrav2alpha1.Node {
-	node := nodeCR(name, desired, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
-	node.Spec.KubernetesNodeName = ""
+// groupCR builds a Group CR with a per-group minimum size.
+func groupCR(name string, minSize int32) *infrav2alpha1.Group {
+	return &infrav2alpha1.Group{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+		Spec:       infrav2alpha1.GroupSpec{MinSize: minSize},
+	}
+}
 
-	return node
+// groupWithMaxProvision builds a Group CR that also declares spec.maxNodeProvisionTime, the
+// floor of a claim's deadline.
+func groupWithMaxProvision(name string, minSize int32, maxNodeProvisionTime time.Duration) *infrav2alpha1.Group {
+	group := groupCR(name, minSize)
+	group.Spec.MaxNodeProvisionTime = &metav1.Duration{Duration: maxNodeProvisionTime}
+
+	return group
+}
+
+func externalNodes(names ...string) []*pb.ExternalGrpcNode {
+	nodes := make([]*pb.ExternalGrpcNode, 0, len(names))
+	for _, name := range names {
+		nodes = append(nodes, &pb.ExternalGrpcNode{Name: name})
+	}
+
+	return nodes
 }
 
 func newServer(t *testing.T, objects ...client.Object) *HomeClusterProviderServer {
+	t.Helper()
+
 	scheme := testScheme(t)
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).
-		WithStatusSubresource(&infrav2alpha1.Node{}).
+		WithStatusSubresource(&infrav2alpha1.Node{}, &infrav2alpha1.NodeClaim{}).
 		Build()
 
 	return NewHomeClusterProviderServer(k8sClient, scheme)
 }
 
+// flatten is the fixtures' way of seeding a pool out of slot shapes.
+func flatten(groups ...[]client.Object) []client.Object {
+	out := make([]client.Object, 0, len(groups))
+	for _, group := range groups {
+		out = append(out, group...)
+	}
+
+	return out
+}
+
+// claimsOf lists the claims the provider has produced, by name.
+func claimsOf(t *testing.T, server *HomeClusterProviderServer) []infrav2alpha1.NodeClaim {
+	t.Helper()
+
+	list := &infrav2alpha1.NodeClaimList{}
+	require.NoError(t, server.Client.List(context.Background(), list))
+
+	return list.Items
+}
+
+// slotsOf reads the slots the provider has, by name, so a test can assert what an RPC left
+// behind on a slot.
+func slotsOf(t *testing.T, server *HomeClusterProviderServer, names ...string) map[string]*infrav2alpha1.Node {
+	t.Helper()
+
+	got := make(map[string]*infrav2alpha1.Node, len(names))
+
+	for _, name := range names {
+		node := &infrav2alpha1.Node{}
+		require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
+		got[name] = node
+	}
+
+	return got
+}
+
+// cancelClaim is the provider's own write: DeleteNodes marks a claim, and the finalizer the claim
+// controller stamped is what keeps a marked claim on its slot. The fake client sets the deletion
+// timestamp on a delete of an object that carries a finalizer, which is the shape the real
+// handler produces.
+func cancelClaim(t *testing.T, server *HomeClusterProviderServer, name string) {
+	t.Helper()
+
+	nodeClaim := &infrav2alpha1.NodeClaim{}
+	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: "claim-" + name, Namespace: testNamespace}, nodeClaim))
+
+	nodeClaim.Finalizers = append(nodeClaim.Finalizers, "infra.homecluster.dev/nodeclaim-finalizer")
+	require.NoError(t, server.Client.Update(context.Background(), nodeClaim))
+	require.NoError(t, server.Client.Delete(context.Background(), nodeClaim))
+}
+
+// TestNodeGroupNodes is the instance contract of §5 of the design, unchanged in its shape and
+// moved in its input: a slot is "wanted" when a live claim names it, not when a spec field says
+// so. The rows are the ones cluster-autoscaler's registration and scale-down loops depend on:
+// every corev1.Node maps to exactly one instance, and an instance exists exactly when a machine
+// exists or is on its way.
 func TestNodeGroupNodes(t *testing.T) {
 	tests := []struct {
 		name string
@@ -103,21 +285,22 @@ func TestNodeGroupNodes(t *testing.T) {
 		expected map[string]pb.InstanceStatus_InstanceState
 	}{
 		{
-			// A slot with no machine and no node object is spare capacity, not an instance.
-			// Reporting it is what made the autoscaler provision extra machines.
-			name: "off slot without a kubernetes node is skipped",
+			// A slot with no machine, no node object and no claim is spare capacity, not an
+			// instance. Reporting it inflates the current size of the group, which makes the
+			// autoscaler provision extra machines.
+			name: "a free slot without a kubernetes node is skipped",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{},
 		},
 		{
-			// The machine is off but the kubelet node object is still there (NotReady), so the
-			// slot is an instance that is going away. Cluster-autoscaler matches the node to it
-			// by spec.providerID, so it must not look like an unregistered node.
-			name: "off slot with a kubernetes node is deleting",
+			// The machine is off, the kubelet's node object is left behind NotReady, and no
+			// claim wants it: the instance is going away. Cluster-autoscaler matches the node
+			// to it by spec.providerID, so it must not look like an unregistered node.
+			name: "an unclaimed slot with a kubernetes node is deleting",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 				k8sNode("slot-1", "homelab://slot-1"),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -125,9 +308,9 @@ func TestNodeGroupNodes(t *testing.T) {
 			},
 		},
 		{
-			name: "off slot with a kubernetes node without providerID falls back to the node CR identity",
+			name: "an unclaimed slot whose kubernetes node has no providerID falls back to the slot identity",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
 				k8sNode("slot-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -135,25 +318,41 @@ func TestNodeGroupNodes(t *testing.T) {
 			},
 		},
 		{
-			name: "off slot whose kubernetes node name is empty is skipped",
+			name: "a slot with an empty kubernetesNodeName is skipped",
 			objects: []client.Object{
-				slotWithoutKubernetesNodeName("slot-1", infrav2alpha1.PowerStateOff),
+				slotWithoutKubernetesNodeName("slot-1"),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{},
 		},
 		{
-			name: "slot that is on without a kubernetes node is provisioning",
+			// creating: a live claim in the boot window, and no node object yet.
+			name: "a booting claim with no kubernetes node is creating",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+				claimCR("slot-1", infrav2alpha1.NodeClaimBooting, nil),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
 				"homelab://slot-1": pb.InstanceStatus_instanceCreating,
 			},
 		},
 		{
-			name: "slot that is on with a kubernetes node is running",
+			// A pending claim names a machine that is wanted and has not started: the same
+			// creating state, and the row v1alpha1 could not express at all (the shape was
+			// {desired: on, progress: shutdown}, indistinguishable from a free slot).
+			name: "a pending claim with no kubernetes node is creating",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhasePending),
+				claimCR("slot-1", infrav2alpha1.NodeClaimPending, nil),
+			},
+			expected: map[string]pb.InstanceStatus_InstanceState{
+				"homelab://slot-1": pb.InstanceStatus_instanceCreating,
+			},
+		},
+		{
+			name: "a ready claim with a kubernetes node is running",
+			objects: []client.Object{
+				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+				claimCR("slot-1", infrav2alpha1.NodeClaimReady, nil),
 				k8sNode("slot-1", "homelab://slot-1"),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -161,9 +360,10 @@ func TestNodeGroupNodes(t *testing.T) {
 			},
 		},
 		{
-			name: "empty providerID falls back to the provider id the operator writes",
+			name: "a ready claim and an empty providerID keep the id the operator writes",
 			objects: []client.Object{
-				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+				claimCR("slot-1", infrav2alpha1.NodeClaimReady, nil),
 				k8sNode("slot-1", ""),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
@@ -171,28 +371,37 @@ func TestNodeGroupNodes(t *testing.T) {
 			},
 		},
 		{
-			name: "slot without a kubernetes node name is provisioning and keeps an id",
+			// A slot a claim ended (failed) with its node object left behind: the machine is
+			// not wanted, so the instance is deleting, and the claim is not counted by
+			// TargetSize. The two readings are the same fact about the same object.
+			name: "a failed claim with a kubernetes node is deleting",
 			objects: []client.Object{
-				slotWithoutKubernetesNodeName("slot-1", infrav2alpha1.PowerStateOn),
+				nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
+				claimCR("slot-1", infrav2alpha1.NodeClaimFailed, nil),
+				k8sNode("slot-1", "homelab://slot-1"),
 			},
 			expected: map[string]pb.InstanceStatus_InstanceState{
-				"homelab://slot-1": pb.InstanceStatus_instanceCreating,
+				"homelab://slot-1": pb.InstanceStatus_instanceDeleting,
 			},
 		},
 		{
-			name: "mixed pool reports every slot with a machine and skips spare capacity",
-			objects: []client.Object{
-				// fresh, never provisioned slot of a 15 slot pool, no machine and no node object
-				nodeCR("slot-seeded", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-				// scaled down slot, the machine is off and the node object is left over
-				nodeCR("slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-				k8sNode("slot-off", "homelab://slot-off"),
-				// slot requested by IncreaseSize, machine not joined yet
-				nodeCR("slot-new", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-				// running slot without a cloud-controller-manager
-				nodeCR("omni-remote-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-				k8sNode("omni-remote-1", ""),
-			},
+			name: "a mixed pool reports every machine and skips spare capacity",
+			objects: flatten(
+				idleSlot("slot-seeded"),
+				[]client.Object{
+					nodeCR("slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+					k8sNode("slot-off", "homelab://slot-off"),
+				},
+				[]client.Object{
+					nodeCR("slot-new", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+					claimCR("slot-new", infrav2alpha1.NodeClaimBooting, nil),
+				},
+				[]client.Object{
+					nodeCR("omni-remote-1", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+					claimCR("omni-remote-1", infrav2alpha1.NodeClaimReady, nil),
+					k8sNode("omni-remote-1", ""),
+				},
+			),
 			expected: map[string]pb.InstanceStatus_InstanceState{
 				"homelab://slot-off":      pb.InstanceStatus_instanceDeleting,
 				"homelab://slot-new":      pb.InstanceStatus_instanceCreating,
@@ -222,13 +431,16 @@ func TestNodeGroupNodes(t *testing.T) {
 	}
 }
 
-// TestNodeGroupNodesStableIdentityAcrossProvisioning covers the identity of a slot while it
-// crosses the provisioning boundary. Cluster-autoscaler keys instances by id, and the
-// operator stamps the Kubernetes node with providerID "homelab://<Node CR name>" when the
-// machine joins. The id reported before the node exists must be the same, otherwise the
-// in-flight instance is invisible and a single pending pod produces two scale ups.
+// TestNodeGroupNodesStableIdentityAcrossProvisioning: cluster-autoscaler keys instances by id,
+// and the operator stamps providerID "homelab://<slot>" when the machine joins. The id reported
+// before the node object exists must be the same, or a single pending pod produces two scale-ups.
+// The identity crosses the boundary while the claim moves pending -> booting -> ready, which is
+// the sequence a scale-up now writes.
 func TestNodeGroupNodesStableIdentityAcrossProvisioning(t *testing.T) {
-	server := newServer(t, nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting))
+	server := newServer(t,
+		nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhasePending),
+		claimCR("slot-1", infrav2alpha1.NodeClaimPending, nil),
+	)
 
 	ctx := context.Background()
 
@@ -238,21 +450,24 @@ func TestNodeGroupNodesStableIdentityAcrossProvisioning(t *testing.T) {
 	provisioningID := resp.Instances[0].Id
 	assert.Equal(t, pb.InstanceStatus_instanceCreating, resp.Instances[0].Status.InstanceState)
 
-	// The machine joins and the operator patches the providerID onto the Kubernetes node.
+	// The boot is committed, the machine joins, the providerID is stamped.
+	setClaimPhase(t, server, "slot-1", infrav2alpha1.NodeClaimBooting)
 	require.NoError(t, server.Client.Create(ctx, k8sNode("slot-1", "homelab://slot-1")))
 
 	resp, err = server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
 	require.NoError(t, err)
 	require.Len(t, resp.Instances, 1)
-	assert.Equal(t, pb.InstanceStatus_instanceRunning, resp.Instances[0].Status.InstanceState)
+	assert.Equal(t, pb.InstanceStatus_instanceRunning, resp.Instances[0].Status.InstanceState,
+		"the node object is the machine: while the claim is still booting the instance is reported running, which is the contract unchanged from v1alpha1 (every corev1.Node maps to exactly one instance)")
 	assert.Equal(t, provisioningID, resp.Instances[0].Id, "instance id must not change once the node joins")
 }
 
-// TestNodeGroupNodesIgnoresEmptyKubernetesNodeName covers a slot that has no
-// spec.kubernetesNodeName yet: the Get must be skipped so the call keeps returning a
-// stable provisioning instance instead of a non-NotFound error every time.
+// TestNodeGroupNodesIgnoresEmptyKubernetesNodeName: a slot with no spec.kubernetesNodeName has
+// never been provisioned, so the Get is skipped and the call keeps returning one stable
+// provisioning instance instead of a non-NotFound error every time.
 func TestNodeGroupNodesIgnoresEmptyKubernetesNodeName(t *testing.T) {
-	server := newServer(t, slotWithoutKubernetesNodeName("slot-1", infrav2alpha1.PowerStateOn))
+	slot := slotWithoutKubernetesNodeName("slot-1")
+	server := newServer(t, slot, claimCR("slot-1", infrav2alpha1.NodeClaimPending, nil))
 
 	for range 3 {
 		resp, err := server.NodeGroupNodes(context.Background(), &pb.NodeGroupNodesRequest{Id: testGroup})
@@ -263,20 +478,26 @@ func TestNodeGroupNodesIgnoresEmptyKubernetesNodeName(t *testing.T) {
 	}
 }
 
-// TestNodeGroupNodesInstancePerMachine covers the contract the autoscaler relies on: one
-// instance per slot that has a machine, and the state of that instance follows the desired power
-// state. Cluster-autoscaler keys Kubernetes nodes to instances by spec.providerID, so the row
-// that matters is the shut down slot - its node object is still there and must map to an
-// instance, marked deleting, while a never provisioned slot must stay invisible.
+// TestNodeGroupNodesInstancePerMachine is the contract one instance per machine, told by the
+// claims: running (a live claim, node present), creating (a live claim, no node yet), deleting
+// (a machine no live claim wants), and nothing at all for a free slot.
 func TestNodeGroupNodesInstancePerMachine(t *testing.T) {
-	server := newServer(t,
-		nodeCR("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		k8sNode("slot-running", "homelab://slot-running"),
-		nodeCR("slot-creating", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-		nodeCR("slot-deleting", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		k8sNode("slot-deleting", "homelab://slot-deleting"),
-		nodeCR("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
+	server := newServer(t, flatten(
+		[]client.Object{
+			nodeCR("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+			claimCR("slot-running", infrav2alpha1.NodeClaimReady, nil),
+			k8sNode("slot-running", "homelab://slot-running"),
+		},
+		[]client.Object{
+			nodeCR("slot-creating", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+			claimCR("slot-creating", infrav2alpha1.NodeClaimBooting, nil),
+		},
+		[]client.Object{
+			nodeCR("slot-deleting", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+			k8sNode("slot-deleting", "homelab://slot-deleting"),
+		},
+		idleSlot("slot-spare"),
+	)...)
 
 	resp, err := server.NodeGroupNodes(context.Background(), &pb.NodeGroupNodesRequest{Id: testGroup})
 	require.NoError(t, err)
@@ -294,128 +515,25 @@ func TestNodeGroupNodesInstancePerMachine(t *testing.T) {
 		"homelab://slot-running":  pb.InstanceStatus_instanceRunning,
 		"homelab://slot-creating": pb.InstanceStatus_instanceCreating,
 		"homelab://slot-deleting": pb.InstanceStatus_instanceDeleting,
-	}, got, "a slot with no machine must not be reported")
+	}, got, "a slot with no machine and no claim must not be reported")
 }
 
-// TestNodeGroupNodesStableIdentityAcrossShutdown covers the identity of a slot while it is
-// scaled down. The instance id is the providerID cluster-autoscaler matches the Kubernetes node
-// against, so the id must not change when the slot moves from running to deleting.
-func TestNodeGroupNodesStableIdentityAcrossShutdown(t *testing.T) {
-	server := newServer(t,
-		nodeCR("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		k8sNode("slot-1", "homelab://slot-1"),
-	)
-
-	ctx := context.Background()
-
-	resp, err := server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
-	require.NoError(t, err)
-	require.Len(t, resp.Instances, 1)
-	assert.Equal(t, pb.InstanceStatus_instanceRunning, resp.Instances[0].Status.InstanceState)
-
-	// NodeGroupDeleteNodes sets the desired state to off; the machine powers off and the node
-	// object stays behind, NotReady.
-	slot := &infrav2alpha1.Node{}
-	require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: "slot-1", Namespace: "default"}, slot))
-	slot.Spec.DesiredPowerState = infrav2alpha1.PowerStateOff
-	require.NoError(t, server.Client.Update(ctx, slot))
-
-	resp, err = server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
-	require.NoError(t, err)
-	require.Len(t, resp.Instances, 1)
-	assert.Equal(t, pb.InstanceStatus_instanceDeleting, resp.Instances[0].Status.InstanceState)
-	assert.Equal(t, "homelab://slot-1", resp.Instances[0].Id, "instance id must not change when the slot is scaled down")
-}
-
-func TestNodeGroupTargetSizeIgnoresSeededSlots(t *testing.T) {
-	server := newServer(t,
-		nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		nodeCR("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		nodeCR("slot-3", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		nodeCR("slot-4", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-		nodeCR("slot-5", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
-	)
-
-	resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-	require.NoError(t, err)
-	// only the ready and the starting up slot count towards the target size
-	assert.Equal(t, int32(2), resp.TargetSize)
-}
-
-func TestNodeGroupIncreaseSizePicksSeededOffSlot(t *testing.T) {
-	server := newServer(t,
-		nodeCR("slot-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		nodeCR("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
-	)
-
-	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
-	require.NoError(t, err)
-
-	updated := &infrav2alpha1.Node{}
-	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: "slot-1", Namespace: "default"}, updated))
-	assert.Equal(t, infrav2alpha1.PowerStateOn, updated.Spec.DesiredPowerState)
-
-	// the shutting down slot must not be touched
-	stillOff := &infrav2alpha1.Node{}
-	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: "slot-2", Namespace: "default"}, stillOff))
-	assert.Equal(t, infrav2alpha1.PowerStateOff, stillOff.Spec.DesiredPowerState)
-}
-
-func TestNodeGroupIncreaseSizeFailsWithoutFreeSlot(t *testing.T) {
-	// Two slots, so the max size check does not fire: the only spare slot is mid-shutdown
-	// (progress shuttingdown) and cannot be started, and running slots are not free.
-	server := newServer(t,
-		nodeCRInGroup(testGroup, "slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		nodeCRInGroup(testGroup, "slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
-	)
-
-	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no powered off nodes found")
-}
-
-// testNamespace is the namespace the gRPC server resolves Group CRs in
-// (internal/config.NamespaceConfig default).
-const testNamespace = "homelab-autoscaler-system"
-
-// groupCR builds a Group CR with a per-group minimum size.
-func groupCR(name string, minSize int32) *infrav2alpha1.Group {
-	return &infrav2alpha1.Group{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
-		Spec:       infrav2alpha1.GroupSpec{MinSize: minSize},
-	}
-}
-
-// nodeCRInGroup builds a Node CR (a slot) of an arbitrary group.
-func nodeCRInGroup(group, name string, desired, status infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase) *infrav2alpha1.Node {
-	node := nodeCR(name, desired, status, progress)
-	node.Labels["group"] = group
-
-	return node
-}
-
-// TestNodeGroupsReportsGroupMinSize: the provider used to hardcode MinSize 0, so a pool
-// could never express "keep at least one node" and cluster-autoscaler was free to
-// reclaim the always-on slot (the gitops repo worked around that with a keepalive pod).
-// The Group CR is now the source of the floor, and a floor above the number of slots the
-// provider has is clamped to it: maxSize is derived from the Node CR count, so the CRD
-// cannot assert minSize <= maxSize.
+// TestNodeGroupsReportsGroupMinSize: the Group CR is the source of the floor, and a floor above
+// the number of slots the provider has is clamped to it: maxSize is derived from the Node CR
+// count, so the CRD cannot assert minSize <= maxSize.
 func TestNodeGroupsReportsGroupMinSize(t *testing.T) {
-	server := newServer(t,
-		groupCR(testGroup, 1),
-		nodeCRInGroup(testGroup, "slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		nodeCRInGroup(testGroup, "slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		nodeCRInGroup(testGroup, "slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-
-		groupCR("group-no-min", 0),
-		nodeCRInGroup("group-no-min", "spare-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-
-		groupCR("group-over-min", 5),
-		nodeCRInGroup("group-over-min", "only-1", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		nodeCRInGroup("group-over-min", "only-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-
-		groupCR("group-empty", 1),
-	)
+	server := newServer(t, flatten(
+		[]client.Object{groupCR(testGroup, 1)},
+		runningSlot(t, "slot-running"),
+		idleSlot("slot-spare"),
+		idleSlot("slot-off"),
+		[]client.Object{groupCR("group-no-min", 0)},
+		[]client.Object{nodeCRInGroup("group-no-min", "spare-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)},
+		[]client.Object{groupCR("group-over-min", 5)},
+		[]client.Object{nodeCRInGroup("group-over-min", "only-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)},
+		[]client.Object{nodeCRInGroup("group-over-min", "only-2", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)},
+		[]client.Object{groupCR("group-empty", 1)},
+	)...)
 
 	resp, err := server.NodeGroups(context.Background(), &pb.NodeGroupsRequest{})
 	require.NoError(t, err)
@@ -435,15 +553,15 @@ func TestNodeGroupsReportsGroupMinSize(t *testing.T) {
 
 // TestNodeGroupForNodeReportsGroupMinSize covers the same floor on the per-node path.
 func TestNodeGroupForNodeReportsGroupMinSize(t *testing.T) {
-	server := newServer(t,
-		groupCR(testGroup, 2),
-		&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+	server := newServer(t, flatten(
+		[]client.Object{groupCR(testGroup, 2)},
+		[]client.Object{&corev1.Node{ObjectMeta: metav1.ObjectMeta{
 			Name:   "slot-off",
 			Labels: map[string]string{"infra.homecluster.dev/group": testGroup},
-		}},
-		nodeCRInGroup(testGroup, "slot-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		nodeCRInGroup(testGroup, "slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
+		}}},
+		idleSlot("slot-off"),
+		idleSlot("slot-spare"),
+	)...)
 
 	resp, err := server.NodeGroupForNode(context.Background(), &pb.NodeGroupForNodeRequest{
 		Node: &pb.ExternalGrpcNode{Name: "slot-off"},
@@ -456,47 +574,469 @@ func TestNodeGroupForNodeReportsGroupMinSize(t *testing.T) {
 	assert.Equal(t, int32(2), resp.NodeGroup.MaxSize)
 }
 
-// slotInSystemNamespace builds a slot of the test group in the namespace the server
-// resolves Node CRs in, which is what NodeGroupDeleteNodes looks the slot up by.
-func slotInSystemNamespace(name string, desired, status infrav2alpha1.PowerState, progress infrav2alpha1.NodePhase) *infrav2alpha1.Node {
-	node := nodeCRInGroup(testGroup, name, desired, status, progress)
-	node.Namespace = testNamespace
-
-	return node
-}
-
-func externalNodes(names ...string) []*pb.ExternalGrpcNode {
-	nodes := make([]*pb.ExternalGrpcNode, 0, len(names))
-	for _, name := range names {
-		nodes = append(nodes, &pb.ExternalGrpcNode{Name: name})
-	}
-
-	return nodes
-}
-
-func desiredPowerStates(t *testing.T, server *HomeClusterProviderServer, names ...string) map[string]infrav2alpha1.PowerState {
+// setClaimPhase moves a claim's phase on the status subresource, the way the claim controller and
+// the lifecycle transitions do. A fixture that needs a pool in a shape writes the shape, and the
+// phase table itself is internal/claim's own test subject.
+func setClaimPhase(t *testing.T, server *HomeClusterProviderServer, slotName string, to infrav2alpha1.NodeClaimPhase) {
 	t.Helper()
 
-	got := make(map[string]infrav2alpha1.PowerState, len(names))
-	for _, name := range names {
-		node := &infrav2alpha1.Node{}
-		require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
-		got[name] = node.Spec.DesiredPowerState
+	nodeClaim := &infrav2alpha1.NodeClaim{}
+	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: "claim-" + slotName, Namespace: testNamespace}, nodeClaim))
+
+	nodeClaim.Status.Phase = to
+	require.NoError(t, server.Client.Status().Update(context.Background(), nodeClaim))
+}
+
+// TestTargetSizeOfCountsLiveClaims is the arithmetic of §5 as a unit: the target size is the
+// count of live claims, and the only rows that count are pending, booting and ready. No progress
+// value, and no slot spec field, appears in it.
+func TestTargetSizeOfCountsLiveClaims(t *testing.T) {
+	claims := []infrav2alpha1.NodeClaim{
+		*claimCR("slot-pending", infrav2alpha1.NodeClaimPending, nil),
+		*claimCR("slot-booting", infrav2alpha1.NodeClaimBooting, nil),
+		*claimCR("slot-ready", infrav2alpha1.NodeClaimReady, nil),
+		*claimCR("slot-failed", infrav2alpha1.NodeClaimFailed, nil),
+		*claimCR("slot-completed", infrav2alpha1.NodeClaimCompleted, nil),
+	}
+
+	assert.Equal(t, int32(3), targetSizeOf(claims))
+	assert.Equal(t, int32(0), targetSizeOf(nil))
+
+	// A claim a scale-down marked is capacity that is going away: it comes off the number on the
+	// write that names it, the same instant a pending claim's deletion does.
+	marked := claimCR("slot-marked", infrav2alpha1.NodeClaimReady, nil)
+	now := metav1.Now()
+	marked.DeletionTimestamp = &now
+
+	assert.Equal(t, int32(1), targetSizeOf([]infrav2alpha1.NodeClaim{*claimCR("slot-ready", infrav2alpha1.NodeClaimReady, nil), *marked}))
+}
+
+// TestNodeGroupTargetSizeCountsLiveClaims is the same rule at the gRPC boundary, and the two
+// states the v1alpha1 arithmetic could not express: a machine that never arrived is not paid for
+// once its claim is failed, and a cancelled startup is off the number on the write that cancels
+// it.
+func TestNodeGroupTargetSizeCountsLiveClaims(t *testing.T) {
+	server := newServer(t, flatten(
+		pendingSlot("slot-1"),
+		bootingSlot("slot-2"),
+		runningSlot(t, "slot-3"),
+		// The machine that never arrived: {desired: on, progress: ready} counted forever under
+		// v1alpha1, and off the number the moment its claim is recorded failed.
+		[]client.Object{
+			nodeCR("slot-4", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+			claimCR("slot-4", infrav2alpha1.NodeClaimFailed, nil),
+		},
+		// The episode that landed and was released: not capacity, and not counted.
+		[]client.Object{
+			nodeCR("slot-5", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+			claimCR("slot-5", infrav2alpha1.NodeClaimCompleted, nil),
+		},
+		// A free slot of the pool: no claim, no machine, nothing counted.
+		idleSlot("slot-6"),
+	)...)
+
+	resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), resp.TargetSize, "pending + booting + ready; failed, completed and free slots are not counted")
+}
+
+// TestNodeGroupIncreaseSizeCreatesClaimsWithTheAttributionFilledIn is the point of the whole
+// model at the provider boundary: a delta of N creates N claims on N free slots, and each one
+// carries the request - who asked (requestedBy), which call, with what delta, for which group -
+// with a deadline and an attempt seeded by the claim controller. The v1alpha1 handler claimed the
+// first slot a three-field scan found and returned, one slot per call whatever delta said, and
+// the entire record of the request was the scalar it wrote.
+func TestNodeGroupIncreaseSizeCreatesClaimsWithTheAttributionFilledIn(t *testing.T) {
+	server := newServer(t, flatten(
+		[]client.Object{groupWithMaxProvision(testGroup, 0, 15*time.Minute)},
+		idleSlot("slot-1"),
+		idleSlot("slot-2"),
+		idleSlot("slot-3"),
+	)...)
+
+	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 2})
+	require.NoError(t, err)
+
+	claims := claimsOf(t, server)
+	require.Len(t, claims, 2, "delta 2 creates two claims, one per free slot")
+
+	slots := make([]string, 0, len(claims))
+	for _, nodeClaim := range claims {
+		assert.Equal(t, claim.RequestedByAutoscaler, nodeClaim.Spec.RequestedBy, "the caller's identity is on the claim")
+		assert.Equal(t, infrav2alpha1.ClaimCallIncreaseSize, nodeClaim.Spec.Request.Call, "the RPC that created it")
+		assert.Equal(t, int32(2), nodeClaim.Spec.Request.Delta, "the request's own delta, signed")
+		assert.Equal(t, testGroup, nodeClaim.Spec.Request.Group, "the group the request was for")
+		assert.Equal(t, testGroup, nodeClaim.Labels[claim.LabelGroup], "the label the pool's claims are listed by")
+		assert.NotEmpty(t, nodeClaim.Spec.SlotRef.Name)
+		assert.NotEmpty(t, nodeClaim.Spec.RequestedAt.Time, "the deadline budget is measured from it")
+		assert.Empty(t, nodeClaim.Spec.Request.Nodes, "IncreaseSize names no nodes")
+
+		require.NotNil(t, nodeClaim.Spec.DeadlineAt, "a claim is born with a budget")
+		budget := nodeClaim.Spec.DeadlineAt.Time.Sub(nodeClaim.Spec.RequestedAt.Time)
+		assert.Equal(t, 15*time.Minute, budget,
+			"the deadline is the operator's budget floored by the group's spec.maxNodeProvisionTime, which is the number cluster-autoscaler is told as its own termination deadline")
+		require.NotNil(t, nodeClaim.Spec.MaxNodeProvisionTime, "the claim records the budget that was in force when it was created")
+		assert.Equal(t, 15*time.Minute, nodeClaim.Spec.MaxNodeProvisionTime.Duration)
+		assert.GreaterOrEqual(t, len(nodeClaim.OwnerReferences), 1, "the claim is owned by its slot: deleting a slot takes its claims")
+		assert.Zero(t, nodeClaim.Status.Attempt, "the attempt is seeded by the claim controller, not baked in at creation")
+
+		slots = append(slots, nodeClaim.Spec.SlotRef.Name)
+	}
+
+	assert.ElementsMatch(t, []string{"slot-1", "slot-2"}, slots, "the free slots are claimed in a stable order")
+
+	// The slots themselves are untouched: no field of a slot spec carries an intent in v2alpha1,
+	// so there is nothing for the handler to write.
+	for _, name := range []string{"slot-1", "slot-2", "slot-3"} {
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, slotsOf(t, server, name)[name].Status.Phase,
+			"the report of a slot is not a provider's to write")
+	}
+}
+
+// TestNodeGroupIncreaseSizeClaimsOnlyFreeSlots: a slot with a live claim is not free, whatever
+// its observation says, and the max-size check counts the live claims, so a burst of IncreaseSize
+// calls in one autoscaler loop stops at the ceiling.
+func TestNodeGroupIncreaseSizeClaimsOnlyFreeSlots(t *testing.T) {
+	server := newServer(t, flatten(
+		bootingSlot("slot-1"),
+		runningSlot(t, "slot-2"),
+		idleSlot("slot-3"),
+		idleSlot("slot-4"),
+	)...)
+
+	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 2})
+	require.NoError(t, err)
+
+	claims := claimsOf(t, server)
+	require.Len(t, claims, 4, "two claims existed, two more were created")
+
+	newSlots := make([]string, 0, 2)
+	for _, nodeClaim := range claims {
+		if nodeClaim.Status.Phase == "" {
+			newSlots = append(newSlots, nodeClaim.Spec.SlotRef.Name)
+		}
+	}
+
+	assert.ElementsMatch(t, []string{"slot-3", "slot-4"}, newSlots,
+		"the slots a live claim already names are not claimed a second time")
+
+	landCreatedClaims(t, server)
+
+	// 4 slots, 4 live claims: the pool is at its max size, and the next request is refused.
+	_, err = server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+	require.Error(t, err)
+
+	st, ok := grpcstatus.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.FailedPrecondition, st.Code())
+	assert.Contains(t, st.Message(), "max size")
+}
+
+// TestNodeGroupIncreaseSizeFailsWithoutFreeSlot keeps the provider's own refusal legible: a pool
+// whose every slot carries a live claim cannot grow, and the message says so in the terms the
+// operator reads (free slots of the group). A slot whose claim is only draining is not free
+// either: the episode has not ended, so the same slot is not claimed twice while its machine is
+// being powered off, and the max-size arithmetic does not count it (a scale-down has taken its
+// unit off the number).
+func TestNodeGroupIncreaseSizeFailsWithoutFreeSlot(t *testing.T) {
+	server := newServer(t, flatten(
+		runningSlot(t, "slot-1"),
+		[]client.Object{
+			nodeCR("slot-2", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
+			claimCR("slot-2", infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+				now := metav1.Now()
+				c.DeletionTimestamp = &now
+			}),
+		},
+		bootingSlot("slot-3"),
+	)...)
+
+	ctx := context.Background()
+
+	size, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), size.TargetSize, "the draining claim is not counted")
+
+	_, err = server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "free node slot")
+	assert.Contains(t, err.Error(), "0 of 3 slots are free")
+}
+
+// landCreatedClaims lands the claims a handler just created on their pending phase. The phase is
+// declared with a +kubebuilder:default on the status in the CRD, so the API server stamps a
+// created claim live at once; the fake client applies no CRD defaults, so a fixture seeds the
+// phase the claim controller's first pass (and the schema default) produce.
+func landCreatedClaims(t *testing.T, server *HomeClusterProviderServer) {
+	t.Helper()
+
+	for _, nodeClaim := range claimsOf(t, server) {
+		if nodeClaim.Status.Phase != "" {
+			continue
+		}
+
+		fresh := nodeClaim.DeepCopy()
+		fresh.Status.Phase = infrav2alpha1.NodeClaimPending
+		require.NoError(t, server.Client.Status().Update(context.Background(), fresh))
+	}
+}
+
+// TestNodeGroupIncreaseSizeRefusesNonPositiveDelta: delta is the request, and a request that
+// asks for nothing is a client bug, not a write to be carried out.
+func TestNodeGroupIncreaseSizeRefusesNonPositiveDelta(t *testing.T) {
+	server := newServer(t, idleSlot("slot-1")...)
+
+	for _, delta := range []int32{0, -1} {
+		_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: delta})
+		require.Error(t, err)
+
+		st, ok := grpcstatus.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.InvalidArgument, st.Code())
+	}
+
+	assert.Empty(t, claimsOf(t, server), "a refused request creates nothing")
+}
+
+// TestNodeGroupDecreaseTargetSizeCancelsOnlyPendingClaims is §3 and §5 at the boundary: pending
+// is the only cancelable phase, a booting claim is committed, and the number the provider ends up
+// reporting is the size the request actually produced.
+//
+// "No silent lying" is the property under test. The response of the RPC carries no size
+// (NodeGroupDecreaseTargetSizeResponse is intentionally empty), and cluster-autoscaler reads the
+// group's size back from NodeGroupTargetSize, so the provider has to leave the two in agreement:
+// a request for -3 that can cancel 2 units takes 2 units away and reports success for exactly
+// that, and a request that can cancel nothing takes nothing away and is answered as the no-op it
+// is, because a FailedPrecondition the autoscaler retries forever never corrects its own stale
+// view of the target size.
+func TestNodeGroupDecreaseTargetSizeCancelsOnlyPendingClaims(t *testing.T) {
+	server := newServer(t, flatten(
+		pendingSlot("slot-pending-1"),
+		pendingSlot("slot-pending-2"),
+		bootingSlot("slot-booting"),
+		runningSlot(t, "slot-ready"),
+		idleSlot("slot-free"),
+	)...)
+
+	ctx := context.Background()
+
+	before, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	require.Equal(t, int32(4), before.TargetSize, "two pending, one booting, one ready")
+
+	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -3})
+	require.NoError(t, err, "the provider carries out what it can, and reports success for exactly that")
+
+	phases := claimPhases(t, server)
+	assert.Empty(t, phases["claim-slot-pending-1"], "the oldest pending claim is cancelled: the object goes, nothing is in flight")
+	assert.Empty(t, phases["claim-slot-pending-2"], "and the second, until the request runs out of cancelable claims")
+	assert.Equal(t, infrav2alpha1.NodeClaimBooting, phases["claim-slot-booting"],
+		"a booting claim is never a cancel target: the startup Job, the lock, the cordon and the machine are in flight, and a cancel leaves the Job in a state nothing owns")
+	assert.Equal(t, infrav2alpha1.NodeClaimReady, phases["claim-slot-ready"],
+		"a ready claim's machine runs work: cluster-autoscaler scales that path with DeleteNodes")
+
+	after, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), after.TargetSize,
+		"the achievable resulting size is what the provider reports: the two cancelled units are off the number, the committed boot is not")
+}
+
+// TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsANoOpSuccess: a group whose every live
+// claim is committed cannot be decreased by this entry point, and the autoscaler is not stuck
+// retrying a request the provider can never carry out.
+func TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsANoOpSuccess(t *testing.T) {
+	server := newServer(t, flatten(
+		bootingSlot("slot-booting"),
+		runningSlot(t, "slot-ready"),
+		// A terminal claim is not a live one, and there is nothing to cancel there either.
+		[]client.Object{
+			nodeCR("slot-failed", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
+			claimCR("slot-failed", infrav2alpha1.NodeClaimFailed, nil),
+		},
+	)...)
+
+	ctx := context.Background()
+
+	_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
+	require.NoError(t, err)
+
+	phases := claimPhases(t, server)
+	assert.Len(t, phases, 3, "nothing was cancelled, so no claim disappeared")
+	assert.Equal(t, infrav2alpha1.NodeClaimBooting, phases["claim-slot-booting"])
+	assert.Equal(t, infrav2alpha1.NodeClaimReady, phases["claim-slot-ready"])
+
+	after, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), after.TargetSize, "the size the provider reports is unchanged, because the request changed nothing")
+}
+
+// TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize: the floor is judged against the target
+// size the request can actually produce - the current size minus the pending claims it is able
+// to cancel, capped to what exists - and a refusal cancels nothing.
+func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
+	tests := []struct {
+		name    string
+		objects []client.Object
+		delta   int32
+		refuse  bool
+	}{
+		{
+			name: "a decrease that would take the group under its floor is refused",
+			objects: flatten([]client.Object{groupCR(testGroup, 2)},
+				runningSlot(t, "slot-running"), pendingSlot("slot-pending")),
+			delta:  -1,
+			refuse: true,
+		},
+		{
+			name: "landing exactly on the floor is allowed",
+			objects: flatten([]client.Object{groupCR(testGroup, 1)},
+				runningSlot(t, "slot-running"), pendingSlot("slot-pending-1"), pendingSlot("slot-pending-2")),
+			delta: -1,
+		},
+		{
+			// The cap is the point: the request asks for -2, one of the two claims it names is
+			// booting, so the achievable result is the floor, and refusing it is the arithmetic
+			// bug this handler has had twice.
+			name: "a request that can only reach the floor is allowed",
+			objects: flatten([]client.Object{groupCR(testGroup, 1)},
+				runningSlot(t, "slot-running"), pendingSlot("slot-pending"), bootingSlot("slot-booting")),
+			delta: -2,
+		},
+		{
+			name: "a group with no Group CR keeps the old, unbounded behaviour",
+			objects: flatten(
+				runningSlot(t, "slot-running"), pendingSlot("slot-pending")),
+			delta: -1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newServer(t, tc.objects...)
+
+			ctx := context.Background()
+
+			_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: tc.delta})
+
+			if tc.refuse {
+				require.Error(t, err)
+
+				st, ok := grpcstatus.FromError(err)
+				require.True(t, ok)
+				assert.Equal(t, codes.FailedPrecondition, st.Code())
+				assert.Contains(t, st.Message(), "minSize")
+
+				phases := claimPhases(t, server)
+				assert.Equal(t, infrav2alpha1.NodeClaimPending, phases["claim-slot-pending"], "a refused decrease cancels nothing")
+
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestNodeGroupDecreaseTargetSizeRejectsNonNegativeDelta: the entry point is a decrease, and a
+// delta that is not one is a client bug.
+func TestNodeGroupDecreaseTargetSizeRejectsNonNegativeDelta(t *testing.T) {
+	server := newServer(t, flatten(pendingSlot("slot-pending"))...)
+
+	for _, delta := range []int32{0, 1} {
+		_, err := server.NodeGroupDecreaseTargetSize(context.Background(), &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: delta})
+		require.Error(t, err)
+
+		st, ok := grpcstatus.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.InvalidArgument, st.Code())
+	}
+}
+
+// claimPhases is the pool's inventory as a map from claim name to phase: the shape after a
+// request, read back from the API. A claim that is gone has no entry.
+func claimPhases(t *testing.T, server *HomeClusterProviderServer) map[string]infrav2alpha1.NodeClaimPhase {
+	t.Helper()
+
+	got := make(map[string]infrav2alpha1.NodeClaimPhase)
+
+	for _, nodeClaim := range claimsOf(t, server) {
+		got[nodeClaim.Name] = nodeClaim.Status.Phase
 	}
 
 	return got
 }
 
-// TestNodeGroupDeleteNodesRefusesBelowMinSize: the provider must not power machines off
-// below the floor of the group. The refusal is explicit and logged, not a silent accept
-// that leaves the always-on slot destroyed. A request that deletes nothing takes no
-// capacity away, so it is a no-op success even when the group is already at or below its
-// floor.
-func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
-	running := func(name string) *infrav2alpha1.Node {
-		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+// TestNodeGroupDeleteNodesRecordsTheRequestAndCancelsTheClaim is DeleteNodes as the model
+// defines it: the request is written onto the claim that owns the machine (call, nodes, caller),
+// and the claim is cancelled. The machine is not the provider's to evict - cluster-autoscaler
+// drains before it calls - and no field of a slot is written.
+func TestNodeGroupDeleteNodesRecordsTheRequestAndCancelsTheClaim(t *testing.T) {
+	server := newServer(t, flatten(
+		runningSlot(t, "slot-ready"),
+		bootingSlot("slot-booting"),
+		pendingSlot("slot-pending"),
+		idleSlot("slot-free"),
+	)...)
+
+	ctx := context.Background()
+
+	_, err := server.NodeGroupDeleteNodes(ctx, &pb.NodeGroupDeleteNodesRequest{
+		Id:    testGroup,
+		Nodes: externalNodes("slot-ready", "slot-booting", "slot-pending", "slot-free", "node-the-provider-has-no-slot-for"),
+	})
+	require.NoError(t, err)
+
+	phases := claimPhases(t, server)
+	assert.Equal(t, infrav2alpha1.NodeClaimReady, phases["claim-slot-ready"],
+		"a ready claim's cancel runs through its finalizer: the shutdown is asked for, and the claim ends when the machine is observed off")
+	assert.Equal(t, infrav2alpha1.NodeClaimBooting, phases["claim-slot-booting"],
+		"a booting claim is cancelled the same way: the boot is reversed, never interrupted")
+	assert.NotContains(t, phases, "claim-slot-pending",
+		"a pending claim has nothing in flight, so cancelling it is deleting it, and its unit comes off the target size on that write")
+
+	recorded := claimByName(t, server, "claim-slot-ready")
+	assert.Equal(t, infrav2alpha1.ClaimCallDeleteNodes, recorded.Spec.Request.Call, "the request that ended this claim is on the claim")
+	assert.Equal(t, []string{"slot-ready", "slot-booting", "slot-pending", "slot-free", "node-the-provider-has-no-slot-for"}, recorded.Spec.Request.Nodes)
+	assert.Equal(t, claim.RequestedByAutoscaler, recorded.Spec.RequestedBy)
+	assert.False(t, recorded.DeletionTimestamp.IsZero(), "the claim is marked: its finalizer is the record that a scale-down is running")
+
+	booting := claimByName(t, server, "claim-slot-booting")
+	assert.Equal(t, infrav2alpha1.ClaimCallDeleteNodes, booting.Spec.Request.Call)
+	assert.False(t, booting.DeletionTimestamp.IsZero())
+
+	// The number the autoscaler reads back falls on the write that asked for it: all three live
+	// claims were named, the free slot had nothing to cancel.
+	after, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), after.TargetSize, "a marked claim is not counted, and a deleted claim is gone")
+}
+
+// TestNodeGroupDeleteNodesIsIdempotent: a claim the request already marked is the state the
+// request asked for, so the handler does not write over an object that is on its way out.
+func TestNodeGroupDeleteNodesIsIdempotent(t *testing.T) {
+	server := newServer(t, flatten(runningSlot(t, "slot-ready"))...)
+
+	ctx := context.Background()
+
+	for range 3 {
+		_, err := server.NodeGroupDeleteNodes(ctx, &pb.NodeGroupDeleteNodesRequest{
+			Id:    testGroup,
+			Nodes: externalNodes("slot-ready"),
+		})
+		require.NoError(t, err)
 	}
 
+	recorded := claimByName(t, server, "claim-slot-ready")
+	assert.Equal(t, infrav2alpha1.ClaimCallDeleteNodes, recorded.Spec.Request.Call)
+	assert.False(t, recorded.DeletionTimestamp.IsZero())
+	assert.Len(t, claimsOf(t, server), 1, "no second claim, no extra write")
+}
+
+// TestNodeGroupDeleteNodesRefusesBelowMinSize: the provider must not power machines off below the
+// floor of the group. A request that deletes nothing takes no capacity away, so it is a no-op
+// success even when the group is at or below its floor: a FailedPrecondition there is a refusal
+// the autoscaler retries forever for an operation that changes nothing.
+func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 	tests := []struct {
 		name    string
 		objects []client.Object
@@ -505,51 +1045,48 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 	}{
 		{
 			name:    "deleting the last node of a minSize 1 group is refused",
-			objects: []client.Object{groupCR(testGroup, 1), running("slot-1")},
+			objects: flatten([]client.Object{groupCR(testGroup, 1)}, runningSlot(t, "slot-1")),
 			nodes:   []string{"slot-1"},
 			refuse:  true,
 		},
 		{
 			name:    "deleting both nodes of a minSize 1 group is refused",
-			objects: []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2")},
+			objects: flatten([]client.Object{groupCR(testGroup, 1)}, runningSlot(t, "slot-1"), runningSlot(t, "slot-2")),
 			nodes:   []string{"slot-1", "slot-2"},
 			refuse:  true,
 		},
 		{
 			name:    "deleting one of two nodes of a minSize 1 group is allowed",
-			objects: []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2")},
+			objects: flatten([]client.Object{groupCR(testGroup, 1)}, runningSlot(t, "slot-1"), runningSlot(t, "slot-2")),
 			nodes:   []string{"slot-2"},
-			refuse:  false,
 		},
 		{
 			// The group is below its floor while a shutdown from an earlier request is still
-			// in flight, and this request deletes a slot that is already shut down, so it
-			// takes no capacity away. Refusing it asks the autoscaler to do something the
-			// provider cannot act on and locks the delete loop on a no-op.
+			// draining, and this request names a slot that has nothing live to cancel.
 			name: "a request that deletes nothing is allowed while the group is below its floor",
-			objects: []client.Object{
-				groupCR(testGroup, 2),
-				slotInSystemNamespace("slot-powering-off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-				slotInSystemNamespace("slot-shut", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-			},
+			objects: flatten([]client.Object{groupCR(testGroup, 2)},
+				[]client.Object{
+					nodeCR("slot-powering-off", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
+					claimCR("slot-powering-off", infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+						now := metav1.Now()
+						c.DeletionTimestamp = &now
+					}),
+				},
+				idleSlot("slot-shut")),
 			nodes:  []string{"slot-shut"},
 			refuse: false,
 		},
 		{
 			name:    "a group without a Group CR keeps the old, unbounded behaviour",
-			objects: []client.Object{running("slot-1")},
+			objects: flatten(runningSlot(t, "slot-1")),
 			nodes:   []string{"slot-1"},
-			refuse:  false,
 		},
 		{
 			name: "slots that are already shut down do not count against the floor",
-			objects: []client.Object{
-				groupCR(testGroup, 1),
-				running("slot-1"),
-				slotInSystemNamespace("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-			},
-			nodes:  []string{"slot-2"},
-			refuse: false,
+			objects: flatten([]client.Object{groupCR(testGroup, 1)},
+				runningSlot(t, "slot-1"),
+				idleSlot("slot-2")),
+			nodes: []string{"slot-2"},
 		},
 	}
 
@@ -564,263 +1101,158 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 
 			if tc.refuse {
 				require.Error(t, err)
+
 				st, ok := grpcstatus.FromError(err)
 				require.True(t, ok)
 				assert.Equal(t, codes.FailedPrecondition, st.Code())
 				assert.Contains(t, st.Message(), "minSize")
 
-				// nothing was touched
 				for _, name := range tc.nodes {
-					assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, name)[name],
-						"a refused delete must leave %s desired on", name)
+					claimOfSlot := claimByName(t, server, "claim-"+name)
+					assert.True(t, claimOfSlot.DeletionTimestamp.IsZero(),
+						"a refused delete marks nothing: %s keeps its live unmarked claim", name)
+					assert.Equal(t, infrav2alpha1.ClaimCallIncreaseSize, claimOfSlot.Spec.Request.Call,
+						"a refused delete records nothing on the claim either")
 				}
 
 				return
 			}
 
 			require.NoError(t, err)
-			for _, name := range tc.nodes {
-				assert.Equal(t, infrav2alpha1.PowerStateOff, desiredPowerStates(t, server, name)[name])
-			}
 		})
 	}
 }
 
-// TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize mirrors the same floor on the
-// decrease path: cancelling slots that are still starting must not take the group below
-// its minimum size. The floor is judged against the target size the request can actually
-// produce (targetSizeOf minus the slots it is able to cancel), and a request that cannot
-// take any capacity away is a no-op success, because cluster-autoscaler retries a refusal
-// forever.
-func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
-	startingUp := func(name string) *infrav2alpha1.Node {
-		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
-	}
-	running := func(name string) *infrav2alpha1.Node {
-		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
-	}
-	// midShutdown is a slot being powered off: desired off, the machine still on, progress
-	// not yet a shutdown, so it still counts towards the target size.
-	midShutdown := func(name string) *infrav2alpha1.Node {
-		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
-	}
+// TestNodeGroupDeleteNodesNamesTheKubernetesNodeName: a DeleteNodes request carries Kubernetes
+// node names, and the slot is found by its name (the identity the providerID homelab://<slot> is
+// built from) or by spec.kubernetesNodeName, which can differ.
+func TestNodeGroupDeleteNodesNamesTheKubernetesNodeName(t *testing.T) {
+	slot := nodeCR("slot-cr-name", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+	slot.Spec.KubernetesNodeName = "worker-9"
 
-	tests := []struct {
-		name     string
-		objects  []client.Object
-		delta    int32
-		refuse   bool
-		wantSize int32    // what NodeGroupTargetSize reports after the request
-		wantShed []string // slots the request must cancel: spec off, progress left to the FSM
-		wantKeep []string // slots this request must not cancel
-	}{
-		{
-			// The reported bug: the floor has to be judged against the target size that
-			// results from the request. Cancelling the starting slot takes the target size
-			// from 2 to 1, which is the floor, not below it, and refusing that leaves
-			// cluster-autoscaler retrying the refusal forever with a target size it can
-			// never correct (the pre-fix arithmetic counted the running slots only, so it
-			// compared 1 + (-1) = 0 against the floor).
-			name:     "minSize 1, one running + one starting: delta -1 lands on the floor and is carried out",
-			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2")},
-			delta:    -1,
-			refuse:   false,
-			wantSize: 1,
-			wantShed: []string{"slot-2"},
-			wantKeep: []string{"slot-1"},
-		},
-		{
-			// Nothing to cancel means no capacity goes away, so there is nothing to refuse:
-			// a FailedPrecondition here is retried forever.
-			name:     "minSize 1 with one running node and nothing to cancel is a no-op success",
-			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1")},
-			delta:    -1,
-			refuse:   false,
-			wantSize: 1,
-			wantKeep: []string{"slot-1"},
-		},
-		{
-			// The only capacity this entry point owns is the starting slot, so a delta that is
-			// bigger than the slots it can cancel cannot cross the floor either: cancelling the
-			// one starting slot takes the target size from 3 to 2, which is the floor.
-			name:     "minSize 2, two running + one starting: delta -2 cancels the one starting slot and lands on the floor",
-			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
-			delta:    -2,
-			refuse:   false,
-			wantSize: 2,
-			wantShed: []string{"slot-3"},
-			wantKeep: []string{"slot-1", "slot-2"},
-		},
-		{
-			// The case that genuinely crosses the floor: one running slot and one starting
-			// slot, so the only cancellation this request can carry out takes the target size
-			// from 2 to 1, below the floor. It is refused, nothing is cancelled.
-			name:     "minSize 2, one running + one starting: delta -2 crosses the floor and is refused",
-			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2")},
-			delta:    -2,
-			refuse:   true,
-			wantSize: 2,
-			wantKeep: []string{"slot-1", "slot-2"},
-		},
-		{
-			name:     "minSize 2, two running + one starting: delta -1 lands on the floor",
-			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
-			delta:    -1,
-			refuse:   false,
-			wantSize: 2,
-			wantShed: []string{"slot-3"},
-			wantKeep: []string{"slot-1", "slot-2"},
-		},
-		{
-			// The floor is compared against targetSizeOf, the number NodeGroupTargetSize
-			// reports, not against a count of the running slots. A slot that is mid shutdown
-			// is still part of the target size, so cancelling the starting slot here lands on
-			// the floor; counting only the running slots would refuse it.
-			name:     "minSize 2, one running + one starting + one mid shutdown: delta -1 lands on the floor",
-			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2"), midShutdown("slot-3")},
-			delta:    -1,
-			refuse:   false,
-			wantSize: 2,
-			wantShed: []string{"slot-2"},
-			wantKeep: []string{"slot-1", "slot-3"},
-		},
-		{
-			// The floor has to be judged against the size the request can actually produce,
-			// not against the uncapped delta: the target size is 3 (one running + two starting),
-			// two slots can be cancelled, so the achievable result is 1, exactly the floor. The
-			// uncapped arithmetic compared 3 - 3 = 0 against the floor and refused it, the same
-			// class of unrecoverable FailedPrecondition as the case above, one level down.
-			name:     "minSize 1, one running + two starting: delta -3 cancels both starting slots and lands on the floor",
-			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2"), startingUp("slot-3")},
-			delta:    -3,
-			refuse:   false,
-			wantSize: 1,
-			wantShed: []string{"slot-2", "slot-3"},
-			wantKeep: []string{"slot-1"},
-		},
-		{
-			// Cancelling one starting slot is one unit off the target size, so the delta is
-			// carried out on the slots that can be cancelled and the running machines, which
-			// this entry point does not own, stay up.
-			name:     "minSize 1 with two running nodes and one starting cancels the starting slot",
-			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2"), startingUp("slot-3")},
-			delta:    -1,
-			refuse:   false,
-			wantSize: 2,
-			wantShed: []string{"slot-3"},
-			wantKeep: []string{"slot-1", "slot-2"},
-		},
-		{
-			// A delta larger than the slots that can be cancelled cancels all of them and
-			// still succeeds: cluster-autoscaler reads the resulting target size back from
-			// NodeGroupTargetSize, it does not track the arithmetic itself.
-			name:     "no floor, delta larger than the starting slots cancels all of them",
-			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
-			delta:    -2,
-			refuse:   false,
-			wantSize: 1,
-			wantShed: []string{"slot-2"},
-			wantKeep: []string{"slot-1"},
-		},
-		{
-			name:     "no floor keeps the old behaviour",
-			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
-			delta:    -1,
-			refuse:   false,
-			wantSize: 1,
-			wantShed: []string{"slot-2"},
-			wantKeep: []string{"slot-1"},
-		},
-	}
+	nodeClaim := claimCR("slot-cr-name", infrav2alpha1.NodeClaimReady, nil)
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			server := newServer(t, tc.objects...)
+	server := newServer(t, slot, nodeClaim)
 
-			_, err := server.NodeGroupDecreaseTargetSize(context.Background(), &pb.NodeGroupDecreaseTargetSizeRequest{
-				Id:    testGroup,
-				Delta: tc.delta,
-			})
+	_, err := server.NodeGroupDeleteNodes(context.Background(), &pb.NodeGroupDeleteNodesRequest{
+		Id:    testGroup,
+		Nodes: externalNodes("worker-9"),
+	})
+	require.NoError(t, err)
 
-			if tc.refuse {
-				require.Error(t, err)
-				st, ok := grpcstatus.FromError(err)
-				require.True(t, ok)
-				assert.Equal(t, codes.FailedPrecondition, st.Code())
-				assert.Contains(t, st.Message(), "minSize")
-			} else {
-				require.NoError(t, err)
-			}
-
-			all := append(append([]string{}, tc.wantShed...), tc.wantKeep...)
-			for _, name := range all {
-				if slices.Contains(tc.wantShed, name) {
-					desired, progress := slotState(t, server, name)
-					assert.Equal(t, infrav2alpha1.PowerStateOff, desired, "cancelled slot %s must be desired off", name)
-					// The progress is the FSM's to write. The cancellation is the spec write,
-					// and countsTowardsTargetSize excludes the desired-off + startingup shape it
-					// produces, so the slot leaves the target size on that write alone - the
-					// node controller's ShutdownNode, with its Job and its lock, lands the
-					// progress on shuttingdown afterwards.
-					assert.Equal(t, infrav2alpha1.NodePhaseBooting, progress,
-						"cancelled slot %s keeps the progress the FSM wrote", name)
-
-					continue
-				}
-
-				_, progress := slotState(t, server, name)
-				assert.NotEqual(t, infrav2alpha1.NodePhaseDraining, progress, "slot %s must not be cancelled", name)
-			}
-
-			// The request lands exactly on the size it asked for, judged by the number
-			// cluster-autoscaler reads back: current target size minus the cancellations the
-			// request carried out.
-			resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-			require.NoError(t, err)
-			assert.Equal(t, tc.wantSize, resp.TargetSize, "the target size that lands is the one NodeGroupTargetSize reports")
-		})
-	}
+	recorded := claimByName(t, server, "claim-slot-cr-name")
+	assert.Equal(t, infrav2alpha1.ClaimCallDeleteNodes, recorded.Spec.Request.Call)
+	assert.Equal(t, []string{"worker-9"}, recorded.Spec.Request.Nodes)
+	assert.False(t, recorded.DeletionTimestamp.IsZero(), "the slot named by its Kubernetes node name is the slot whose claim is cancelled")
 }
 
-// slotState reads the desired power state and the recorded progress of a slot.
-func slotState(t *testing.T, server *HomeClusterProviderServer, name string) (infrav2alpha1.PowerState, infrav2alpha1.NodePhase) {
+// claimByName reads one claim back from the provider's inventory by name. A claim marked for
+// deletion is read like any other: the finalizer is what keeps it readable, and that is the
+// record a scale-down leaves behind.
+func claimByName(t *testing.T, server *HomeClusterProviderServer, name string) *infrav2alpha1.NodeClaim {
 	t.Helper()
 
-	node := &infrav2alpha1.Node{}
-	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, node))
+	nodeClaim := &infrav2alpha1.NodeClaim{}
+	require.NoError(t, server.Client.Get(context.Background(), client.ObjectKey{Name: name, Namespace: testNamespace}, nodeClaim),
+		"no claim with that name in the provider's inventory")
 
-	return node.Spec.DesiredPowerState, node.Status.Phase
+	return nodeClaim
 }
 
-// TestNodeGroupIncreaseSizeRefusesBeyondMaxSize: maxSize is the number of slots committed
-// to the group, so a scale up that would exceed it is refused by the provider too.
-func TestNodeGroupIncreaseSizeRefusesBeyondMaxSize(t *testing.T) {
-	server := newServer(t,
-		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-	)
+// slotSpecOf is a slot's whole spec: the field set an RPC must never touch, because in v2alpha1
+// a slot spec is Git-owned configuration and carries no runtime intent.
+func slotSpecOf(t *testing.T, server *HomeClusterProviderServer, names ...string) map[string]infrav2alpha1.NodeSpec {
+	t.Helper()
 
-	_, err := server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
-	require.Error(t, err)
+	got := make(map[string]infrav2alpha1.NodeSpec, len(names))
+	for _, name := range names {
+		got[name] = *slotsOf(t, server, name)[name].Spec.DeepCopy()
+	}
 
-	st, ok := grpcstatus.FromError(err)
-	require.True(t, ok)
-	assert.Equal(t, codes.FailedPrecondition, st.Code())
-	assert.Contains(t, st.Message(), "max size")
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-1")["slot-1"])
-
-	// within the max size, the scale up still powers a spare slot on
-	server = newServer(t,
-		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-1", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		slotInSystemNamespace("slot-2", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
-
-	_, err = server.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
-	require.NoError(t, err)
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-2")["slot-2"])
+	return got
 }
 
+// TestNoRPCWritesASlotSpec is the law of §2 asserted on all four entry points at once: the
+// provider expresses intent by creating, recording and cancelling claims, and never by writing a
+// field of a slot. That is the whole reason GitOps stopped reverting scale-ups - an apply can no
+// longer contradict a request, because no request lives in an applied field.
+func TestNoRPCWritesASlotSpec(t *testing.T) {
+	names := []string{"slot-pending", "slot-booting", "slot-ready", "slot-free"}
+
+	seed := func() *HomeClusterProviderServer {
+		return newServer(t, flatten(
+			[]client.Object{groupCR(testGroup, 0)},
+			pendingSlot("slot-pending"),
+			bootingSlot("slot-booting"),
+			runningSlot(t, "slot-ready"),
+			idleSlot("slot-free"),
+		)...)
+	}
+
+	rpcs := map[string]func(ctx context.Context, server *HomeClusterProviderServer) error{
+		"NodeGroupTargetSize": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+
+			return err
+		},
+		"NodeGroupIncreaseSize": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+
+			return err
+		},
+		"NodeGroupDecreaseTargetSize": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
+
+			return err
+		},
+		"NodeGroupDeleteNodes": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroupDeleteNodes(ctx, &pb.NodeGroupDeleteNodesRequest{Id: testGroup, Nodes: externalNames(names...)})
+
+			return err
+		},
+		"NodeGroupNodes": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroupNodes(ctx, &pb.NodeGroupNodesRequest{Id: testGroup})
+
+			return err
+		},
+		"NodeGroupTemplateNodeInfo": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroupTemplateNodeInfo(ctx, &pb.NodeGroupTemplateNodeInfoRequest{Id: testGroup})
+
+			return err
+		},
+		"NodeGroups": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroups(ctx, &pb.NodeGroupsRequest{})
+
+			return err
+		},
+		"NodeGroupForNode": func(ctx context.Context, server *HomeClusterProviderServer) error {
+			_, err := server.NodeGroupForNode(ctx, &pb.NodeGroupForNodeRequest{Node: &pb.ExternalGrpcNode{Name: "slot-ready"}})
+
+			return err
+		},
+	}
+
+	for name, run := range rpcs {
+		t.Run(name, func(t *testing.T) {
+			server := seed()
+			ctx := context.Background()
+
+			before := slotSpecOf(t, server, names...)
+
+			require.NoError(t, run(ctx, server))
+
+			assert.Equal(t, before, slotSpecOf(t, server, names...),
+				"%s wrote a field of a slot spec: the spec of a slot is configuration, and intent lives in the claims", name)
+		})
+	}
+}
+
+// externalNames is the request's node list, spelled from slot names.
+func externalNames(names ...string) []*pb.ExternalGrpcNode {
+	return externalNodes(names...)
+}
+
+// TestEffectiveMinSize keeps the clamp of a floor the provider cannot fill.
 func TestEffectiveMinSize(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -847,315 +1279,28 @@ func TestEffectiveMinSize(t *testing.T) {
 	}
 }
 
-func TestTargetSizeOf(t *testing.T) {
-	nodes := []infrav2alpha1.Node{
-		*nodeCRInGroup(testGroup, "ready", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		*nodeCRInGroup(testGroup, "starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-		*nodeCRInGroup(testGroup, "stopping", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
-		*nodeCRInGroup(testGroup, "off", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		*nodeCRInGroup(testGroup, "seeded", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	}
+// TestGetOptionsReportsTheGroupBudget: cluster-autoscaler is told the group's
+// spec.maxNodeProvisionTime as its own scale-up termination deadline, and that number floors a
+// claim's deadline. The two have to stay the same number, or the provider declares a claim dead
+// while the autoscaler is still waiting for it - and the autoscaler's answer to a group that
+// stopped growing is another IncreaseSize.
+func TestGetOptionsReportsTheGroupBudget(t *testing.T) {
+	server := newServer(t, flatten(
+		[]client.Object{groupWithMaxProvision(testGroup, 0, 15*time.Minute)},
+		idleSlot("slot-1"),
+	)...)
 
-	assert.Equal(t, int32(2), targetSizeOf(nodes))
-	assert.Equal(t, int32(0), targetSizeOf(nil))
-}
-
-// TestCountsTowardsTargetSize pins the definition of a slot the provider is committed to
-// serve. The claimed rows are the burst fix: NodeGroupIncreaseSize claims a slot by writing
-// spec.desiredPowerState = on, and status.phase - owned by the FSM - keeps saying
-// "shutdown" until the node controller picks the slot up seconds later and the machine then
-// takes minutes to boot. A target size read off progress alone reports the slot as gone for
-// that whole window, so cluster-autoscaler asks for the same slot again in the same loop.
-func TestCountsTowardsTargetSize(t *testing.T) {
-	tests := []struct {
-		name     string
-		desired  infrav2alpha1.PowerState
-		status   infrav2alpha1.PowerState
-		progress infrav2alpha1.NodePhase
-		want     bool
-	}{
-		{"a running slot counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, true},
-		{"a slot that is starting up counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting, true},
-		// (a) the claimed slot: this is the row the pre-fix helper got wrong.
-		{"a claimed slot whose FSM has not moved yet counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff, true},
-		{"a claimed slot with no progress recorded yet counts", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, "", true},
-		// (b) a slot that is genuinely being torn down stays excluded, the exclusion the
-		// autoscaler needs for its headroom.
-		{"a slot mid shutdown does not count", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining, false},
-		{"a shut down slot does not count", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff, false},
-		// A machine that is up and desired off is capacity the provider is serving: only
-		// NodeGroupDeleteNodes owns it, and the autoscaler must keep seeing it until the
-		// shutdown job has run.
-		{"a machine still running while desired off counts", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady, true},
-		// The shape a cancelled startup lands in: NodeGroupDecreaseTargetSize cleared the spec
-		// and left the progress to the FSM. The request is off and the machine never came up, so
-		// it is not capacity - and this is the row that keeps the target size drop immediate now
-		// that the handler no longer writes progress: shuttingdown itself.
-		{"a cancelled startup does not count", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting, false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			node := nodeCRInGroup(testGroup, "slot-1", tc.desired, tc.status, tc.progress)
-			assert.Equal(t, tc.want, countsTowardsTargetSize(*node))
-		})
-	}
-}
-
-// TestNodeGroupTargetSizeCountsClaimedSlot is the same rule at the gRPC boundary, where
-// cluster-autoscaler reads it: the two slots the operator committed are 1 running machine and
-// 1 claim that has not been picked up by the FSM yet, and the target size has to be 2, not 1.
-// With 1 the autoscaler concludes the group did not grow and calls IncreaseSize again.
-func TestNodeGroupTargetSizeCountsClaimedSlot(t *testing.T) {
-	server := newServer(t,
-		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		slotInSystemNamespace("slot-stopping", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
-		slotInSystemNamespace("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
-
-	resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	resp, err := server.NodeGroupGetOptions(context.Background(), &pb.NodeGroupAutoscalingOptionsRequest{Id: testGroup})
 	require.NoError(t, err)
-	// the running machine and the claim; the slot that is being torn down and the spare do not
-	assert.Equal(t, int32(2), resp.TargetSize)
-}
+	require.NotNil(t, resp.NodeGroupAutoscalingOptions)
+	require.NotNil(t, resp.NodeGroupAutoscalingOptions.MaxNodeProvisionDuration)
 
-// TestNodeGroupIncreaseSizeRefusesWhenClaimsReachMaxSize is the burst itself (test c): one
-// pending pod made cluster-autoscaler call IncreaseSize 5 times in 15 minutes, because every
-// call was answered with a target size that ignored the slot it had just claimed. Once claims
-// count, the group is at its max size as soon as its slots are claimed, and the repeat
-// requests are refused instead of powering on machines over what the operator committed.
-func TestNodeGroupIncreaseSizeRefusesWhenClaimsReachMaxSize(t *testing.T) {
-	server := newServer(t,
-		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		slotInSystemNamespace("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
+	told := resp.NodeGroupAutoscalingOptions.MaxNodeProvisionDuration.AsDuration()
+	assert.Equal(t, 15*time.Minute, told, "the number the autoscaler is told is the group's spec.maxNodeProvisionTime")
 
-	ctx := context.Background()
-
-	// The first scale up is served: the group is at 1 of 2 slots.
-	_, err := server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
-	require.NoError(t, err)
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-spare")["slot-spare"])
-
-	// The claim is capacity now, so the group reads full at the max size. Pre-fix this
-	// answered 1 - the running machine only - which is the number that made the autoscaler
-	// ask for the slot it had just claimed, over and over in the same loop.
-	resp, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-	require.NoError(t, err)
-	assert.Equal(t, int32(2), resp.TargetSize, "a claimed slot is part of the target size")
-
-	// cluster-autoscaler has not refreshed its view yet and asks again, and again: every
-	// repeat is refused, and it is refused as a max size refusal, not as "no powered off
-	// nodes found" reached by walking past the max size check.
-	for i := 0; i < 3; i++ {
-		_, err = server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
-		require.Error(t, err, "a scale up that crosses the max size must be refused")
-
-		st, ok := grpcstatus.FromError(err)
-		require.True(t, ok)
-		assert.Equal(t, codes.FailedPrecondition, st.Code())
-		assert.Contains(t, st.Message(), "max size")
-	}
-
-	// Nothing changed on the way: the group is still at 2 of 2, and the second slot stayed
-	// the only claimed one.
-	resp, err = server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-	require.NoError(t, err)
-	assert.Equal(t, int32(2), resp.TargetSize)
-}
-
-// TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget is the knock-on on the decrease path
-// (test d). A claim in flight is a scale-up the provider has not started, not a startup to
-// abort, and it does count towards the target size. The floor arithmetic has to land on the
-// floor with the claim counted: the target size here is 3 (running + starting + claimed) and
-// the only cancellable slot is the starting one, so delta -1 produces exactly the floor of 2
-// and must be carried out.
-func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
-	server := newServer(t,
-		groupCR(testGroup, 2),
-		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		slotInSystemNamespace("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
-
-	ctx := context.Background()
-
-	_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
-	require.NoError(t, err)
-
-	// the starting slot is the one that is cancelled: the spec write is the whole cancellation,
-	// and a cancelled startup (desired off, progress still the startingup the FSM wrote) is off
-	// the target size, while a claimed slot counts on spec alone
-	desired, progress := slotState(t, server, "slot-starting")
-	assert.Equal(t, infrav2alpha1.PowerStateOff, desired)
-	assert.Equal(t, infrav2alpha1.NodePhaseBooting, progress, "the cancellation does not write status.phase")
-
-	// the claim is untouched: cancelling it is not this entry point's, and a claim whose spec
-	// was cleared would silently drop out of the target size
-	desired, progress = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "a claim in flight is not a cancel target")
-	assert.Equal(t, infrav2alpha1.NodePhaseOff, progress)
-
-	desired, progress = slotState(t, server, "slot-running")
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desired)
-	assert.Equal(t, infrav2alpha1.NodePhaseReady, progress)
-
-	// the size that landed on the floor is the one NodeGroupTargetSize reports: running + claim
-	resp, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-	require.NoError(t, err)
-	assert.Equal(t, int32(2), resp.TargetSize)
-
-	// With the claim counted, the group sits exactly on its floor and has one unit of
-	// headroom, which is the truth about the pool: the next decrease has nothing left to
-	// cancel, so it is a no-op success and the claim survives. A FailedPrecondition here is
-	// the refusal cluster-autoscaler retries forever.
-	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
-	require.NoError(t, err)
-	desired, _ = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "the claim is not a cancel target")
-
-	// and a request that asks for more than the cancellable slots cannot cross the floor
-	// either: 3 of them, of which one is cancellable, produce 2, exactly the floor.
-	server = newServer(t,
-		groupCR(testGroup, 2),
-		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		slotInSystemNamespace("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
-
-	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
-	require.NoError(t, err)
-	desired, progress = slotState(t, server, "slot-starting")
-	assert.Equal(t, infrav2alpha1.PowerStateOff, desired)
-	assert.Equal(t, infrav2alpha1.NodePhaseBooting, progress)
-	desired, _ = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desired)
-
-	// A decrease that would take the pool under the floor is still refused with the claim
-	// counted: the target size is 4, the two starting slots are all this entry point can
-	// cancel, so delta -3 produces 2, below the floor of 3. The floor is judged on the same
-	// number NodeGroupTargetSize reports, on both sides of the fix.
-	server = newServer(t,
-		groupCR(testGroup, 3),
-		slotInSystemNamespace("slot-running", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
-		slotInSystemNamespace("slot-starting", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-		slotInSystemNamespace("slot-starting-2", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
-		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
-
-	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -3})
-	require.Error(t, err)
-	st, ok := grpcstatus.FromError(err)
-	require.True(t, ok)
-	assert.Equal(t, codes.FailedPrecondition, st.Code())
-	assert.Contains(t, st.Message(), "minSize")
-	desired, _ = slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "a refused decrease cancels nothing")
-}
-
-// TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress is the behaviour change on
-// the cancel path. Cancelling a starting slot is a spec write, the shape NodeGroupDeleteNodes
-// produces, and never a write of status.phase. The handler used to set
-// progress: shuttingdown itself - no transition, no lifecycle Job, no coordination lock, no
-// lastShutdownTime - which makes it the one writer of a transitional progress that is not a
-// transition: the slot is excluded from the target size, validateStateTransition gates every
-// further transition out of it, and no reconcile heals it, because the stuck-transition
-// cleanup runs on the state machine's own backoff record and the reconciler builds that
-// machine fresh on every pass. The only writer left is the job monitor of the startup the
-// cancel collided with, and a manager restart takes that goroutine away.
-//
-// What the call is asked to do is unchanged: cancelling N starting slots takes exactly N units
-// off the target size, on the write that asks for it, and the shutdown runs through
-// ShutdownNode with its Job and its lock.
-func TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress(t *testing.T) {
-	startingUp := func(name string) *infrav2alpha1.Node {
-		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
-	}
-	running := func(name string) *infrav2alpha1.Node {
-		return slotInSystemNamespace(name, infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
-	}
-
-	server := newServer(t,
-		groupCR(testGroup, 1),
-		running("slot-1"), running("slot-2"),
-		startingUp("slot-3"), startingUp("slot-4"),
-	)
-
-	ctx := context.Background()
-
-	resp, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-	require.NoError(t, err)
-	require.Equal(t, int32(4), resp.TargetSize, "two running + two starting")
-
-	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
-	require.NoError(t, err)
-
-	for _, name := range []string{"slot-3", "slot-4"} {
-		node := &infrav2alpha1.Node{}
-		require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: testNamespace}, node))
-
-		assert.Equal(t, infrav2alpha1.PowerStateOff, node.Spec.DesiredPowerState, "cancelled slot %s is desired off", name)
-		assert.Equal(t, infrav2alpha1.NodePhaseBooting, node.Status.Phase,
-			"cancelled slot %s keeps the progress the FSM wrote: this handler does not own status.phase", name)
-		assert.Nil(t, node.Status.LastShutdownTime,
-			"cancelled slot %s records no shutdown: the FSM stamps it when its ShutdownNode runs", name)
-	}
-
-	for _, name := range []string{"slot-1", "slot-2"} {
-		desired, progress := slotState(t, server, name)
-		assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "running machine %s is left to NodeGroupDeleteNodes", name)
-		assert.Equal(t, infrav2alpha1.NodePhaseReady, progress)
-	}
-
-	// The size lands exactly on what the request asked for, on the spec write alone: 4 - 2,
-	// read back from the endpoint cluster-autoscaler queries.
-	resp, err = server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-	require.NoError(t, err)
-	assert.Equal(t, int32(2), resp.TargetSize, "cancelling N starting slots takes exactly N off the target size")
-
-	// The shutdown the FSM runs on the next reconcile keeps the slot off the target size: the
-	// progress moves to shuttingdown with its timestamp, and the number does not move again.
-	for _, name := range []string{"slot-3", "slot-4"} {
-		node := &infrav2alpha1.Node{}
-		require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: testNamespace}, node))
-
-		node.Status.Phase = infrav2alpha1.NodePhaseDraining
-		now := metav1.Now()
-		node.Status.LastShutdownTime = &now
-		require.NoError(t, server.Client.Status().Update(ctx, node))
-	}
-
-	resp, err = server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
-	require.NoError(t, err)
-	assert.Equal(t, int32(2), resp.TargetSize, "the FSM-driven shutdown lands on the same target size")
-}
-
-// TestNodeGroupDeleteNodesCountsClaimedSlotAsCapacity covers the floor arithmetic on the
-// delete path: a claim is capacity the group is committed to, so deleting the only claimed
-// slot of a minSize 1 group crosses the floor and is refused. Before the fix the claim was
-// invisible to the floor as well, and the delete silently cancelled a scale-up that the pool
-// needs to reach its minimum.
-func TestNodeGroupDeleteNodesCountsClaimedSlotAsCapacity(t *testing.T) {
-	server := newServer(t,
-		groupCR(testGroup, 1),
-		slotInSystemNamespace("slot-claimed", infrav2alpha1.PowerStateOn, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-		slotInSystemNamespace("slot-spare", infrav2alpha1.PowerStateOff, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff),
-	)
-
-	_, err := server.NodeGroupDeleteNodes(context.Background(), &pb.NodeGroupDeleteNodesRequest{
-		Id:    testGroup,
-		Nodes: externalNodes("slot-claimed"),
-	})
-	require.Error(t, err)
-
-	st, ok := grpcstatus.FromError(err)
-	require.True(t, ok)
-	assert.Equal(t, codes.FailedPrecondition, st.Code())
-	assert.Contains(t, st.Message(), "minSize")
-
-	desired, progress := slotState(t, server, "slot-claimed")
-	assert.Equal(t, infrav2alpha1.PowerStateOn, desired, "a refused delete must leave the claim in place")
-	assert.Equal(t, infrav2alpha1.NodePhaseOff, progress)
+	requestedAt := time.Now()
+	deadline := claim.DeadlineAt(requestedAt, &metav1.Duration{Duration: told})
+	assert.Equal(t, told, deadline.Sub(requestedAt),
+		"the claim's deadline is floored by that same number, so a claim never dies before the autoscaler gives up on it")
+	assert.Greater(t, told, claim.AttemptBudget(), "the group's floor is above the operator's budget in this fixture, which is the case the floor exists for")
 }
