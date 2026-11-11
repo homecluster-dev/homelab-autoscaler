@@ -833,6 +833,11 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	// Create template node by copying the representative node
 	templateNode := k8sNode.DeepCopy()
 
+	// Put the capacity cluster-autoscaler will judge the pod's requests against into the template.
+	// The declaration is read here, after the copy and before the marshal, so that the rule below
+	// is the same for the node copied from a live slot and for the synthesized placeholder.
+	applyTemplateCapacity(templateNode, representativeNodeCR)
+
 	// Generate a unique template name
 	templateNode.Name = fmt.Sprintf("%s-template-%d", req.Id, time.Now().Unix())
 	templateNode.UID = ""
@@ -947,7 +952,8 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 //     object its powered off machine left behind) is the next best thing.
 //  2. no slot has a corev1.Node at all, i.e. the whole pool is powered off: keep the previous
 //     pick (prefer a powered off slot, then the first slot) and return a nil node, so the
-//     caller synthesizes a placeholder. Capacity is not invented there, and a lookup that
+//     caller synthesizes a placeholder. Capacity is not invented there - the placeholder carries
+//     the shape the slot declares in spec.nodeCapacity, and nothing else - and a lookup that
 //     failed for a reason other than "the node does not exist" is reported instead of being
 //     turned into an empty template.
 //
@@ -1035,14 +1041,47 @@ func kubernetesNodeIsReady(node *corev1.Node) bool {
 	return false
 }
 
+// applyTemplateCapacity stamps the machine size of the template from the slot's declaration.
+//
+// Precedence, spelled out because it is the whole point of the field:
+//
+//   - spec.nodeCapacity, when the slot declares it, wins over the live node's
+//     status.capacity and status.allocatable. The template is the shape of the machine the
+//     autoscaler is about to boot, and the declaration is that shape on purpose; what a slot
+//     happens to report right now is an accident of which slot is Ready. A group whose slots
+//     are not identical (a mixed pool, a slot mid-replacement, a node object its powered off
+//     machine left behind) would otherwise hand the estimator a different capacity per call,
+//     and a pool at zero has no live node at all, which is the case the field exists for;
+//   - with no declaration, the live node's own numbers stay in the template: the kubelet
+//     measured them, and that is today's behaviour for every pool that declares nothing. On the
+//     placeholder path there is no live node, so an undeclared pool gets an empty capacity, and
+//     the autoscaler is told "this machine has no known size" rather than being handed a guess.
+//
+// Both status.capacity and status.allocatable get the same list, each its own copy: the
+// autoscaler reads allocatable, and a template machine has no system daemons to subtract from
+// capacity, so the two are the same number. Declaring the pair, not one of them, is why the
+// field is a single ResourceList.
+func applyTemplateCapacity(templateNode *corev1.Node, slot *infrav1alpha1.Node) {
+	if len(slot.Spec.NodeCapacity) == 0 {
+		return
+	}
+
+	// DeepCopy, so the Node CR's own map is never aliased into the template: the caller marshals
+	// the template, and a shared map is a mutation of the cached API object waiting to happen.
+	templateNode.Status.Capacity = slot.Spec.NodeCapacity.DeepCopy()
+	templateNode.Status.Allocatable = slot.Spec.NodeCapacity.DeepCopy()
+}
+
 // placeholderTemplateNode builds the object the template is derived from when no slot of the
 // group has a corev1.Node: a fully powered off pool. It carries everything that can be read
-// from the Node CR, the group label and the taints the slot declares, and deliberately
-// nothing about capacity. status.allocatable of a machine that has never registered cannot be
-// read, and inventing it would let the autoscaler place work the real machine cannot take. An
-// honest "I do not know the size of this machine" is what a placeholder may say.
+// from the Node CR, the group label, the taints the slot declares, and the capacity the slot
+// declares. Nothing about capacity is invented: status.allocatable of a machine that has never
+// registered cannot be read, so an undeclared placeholder says "I do not know the size of this
+// machine" with an empty list, and the pool that declared spec.nodeCapacity is answering the
+// question from Git. applyTemplateCapacity applies the declaration to both paths; the call here
+// is what makes the placeholder a complete object on its own.
 func placeholderTemplateNode(slot *infrav1alpha1.Node) *corev1.Node {
-	return &corev1.Node{
+	placeholder := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: slot.Name,
 			Labels: map[string]string{
@@ -1058,6 +1097,10 @@ func placeholderTemplateNode(slot *infrav1alpha1.Node) *corev1.Node {
 			Reason: "KubeletReady",
 		}}},
 	}
+
+	applyTemplateCapacity(placeholder, slot)
+
+	return placeholder
 }
 
 // NodeGroupGetOptions returns NodeGroupAutoscalingOptions for the node group

@@ -60,6 +60,20 @@ func taintStrings(items []corev1.Taint) []string {
 	return out
 }
 
+// assertResource compares a resource the template must carry against the quantity it should hold.
+// Cmp, not assert.Equal on the Quantity: the template makes a round trip through protobuf, which
+// re-renders a BinarySI number (3.2Gi) as its milli-decimal equivalent (3435973836800m), and the
+// two Quantity values are the same number in two representations.
+func assertResource(t *testing.T, list corev1.ResourceList, name corev1.ResourceName, want string) {
+	t.Helper()
+
+	got, ok := list[name]
+	require.Truef(t, ok, "%s is missing from the template", name)
+
+	expected := resource.MustParse(want)
+	assert.Equalf(t, 0, expected.Cmp(got), "%s: want %s, got %s", name, want, got.String())
+}
+
 // nodeWithShape builds a Kubernetes node the way a machine that joined looks: the allocatable
 // the kubelet reported, a Ready condition, and the taints the node carries.
 func nodeWithShape(name string, ready bool, cpu, memory string, nodeTaints ...corev1.Taint) *corev1.Node {
@@ -96,6 +110,18 @@ func nodeWithShape(name string, ready bool, cpu, memory string, nodeTaints ...co
 func slotWithTaints(name string, desired, actual infrav1alpha1.PowerState, progress infrav1alpha1.Progress, nodeTaints ...corev1.Taint) *infrav1alpha1.Node {
 	node := nodeCR(name, desired, actual, progress)
 	node.Spec.NodeTaints = nodeTaints
+
+	return node
+}
+
+// slotWithCapacity builds a Node CR of the test group that declares spec.nodeCapacity: the shape
+// the slot's machine boots, as the kubelet reports it.
+func slotWithCapacity(name string, desired, actual infrav1alpha1.PowerState, progress infrav1alpha1.Progress, cpu, memory string) *infrav1alpha1.Node {
+	node := nodeCR(name, desired, actual, progress)
+	node.Spec.NodeCapacity = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpu),
+		corev1.ResourceMemory: resource.MustParse(memory),
+	}
 
 	return node
 }
@@ -171,10 +197,111 @@ func TestNodeGroupTemplateWithoutAnyNodeSynthesizesPlaceholder(t *testing.T) {
 	template := templateFor(t, server)
 
 	assert.Empty(t, template.Status.Allocatable, "a placeholder must not invent capacity")
+	assert.Empty(t, template.Status.Capacity, "a placeholder must not invent capacity")
 	assert.Equal(t, []string{dedicated.ToString()}, taintStrings(template.Spec.Taints),
 		"the placeholder carries the taints the slot declares")
 	assert.Equal(t, testGroup, template.Labels["infra.homecluster.dev/group"])
 	assert.Contains(t, template.Name, testGroup+"-template-")
+}
+
+// TestNodeGroupTemplatePlaceholderCarriesDeclaredCapacity is the scale-from-zero case the field
+// exists for. A pool in which no slot has ever booted has no corev1.Node, so its placeholder had
+// an empty status.allocatable: cluster-autoscaler found no pod that fits and never called
+// IncreaseGroupInSize, which is why a minSize: 0 pool stays at zero and the workaround is a
+// machine that never sleeps. The declaration is the shape the placeholder can honestly carry,
+// because it is written in Git next to the taints of the same machine.
+func TestNodeGroupTemplatePlaceholderCarriesDeclaredCapacity(t *testing.T) {
+	dedicated := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
+
+	server := newServer(t,
+		slotWithCapacity("slot-off-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+			infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi"),
+		slotWithTaints("slot-off-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+			infrav1alpha1.ProgressShutdown, dedicated),
+	)
+
+	template := templateFor(t, server)
+
+	// a pod with cpu requests must fit the template, that is what makes the pool scale from zero
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")
+	assertResource(t, template.Status.Capacity, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Capacity, corev1.ResourceMemory, "3.2Gi")
+	assert.Len(t, template.Status.Allocatable, 2, "only the declared resources are in the template")
+	assert.Equal(t, template.Status.Allocatable, template.Status.Capacity,
+		"a template machine has no system daemons to subtract, so capacity and allocatable are the same list")
+}
+
+// TestNodeGroupTemplateDeclaredCapacityWinsOverTheLiveNode covers the precedence on the path that
+// copies a registered node: the declaration is the shape of the machine the autoscaler is about
+// to boot, the live node is what one slot happens to report right now. Reading the live node
+// would make the whole group's template change with which slot is Ready, in a mixed pool it
+// hands the estimator a different machine per call.
+func TestNodeGroupTemplateDeclaredCapacityWinsOverTheLiveNode(t *testing.T) {
+	server := newServer(t,
+		slotWithCapacity("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn,
+			infrav1alpha1.ProgressReady, "1950m", "3.2Gi"),
+		nodeWithShape("slot-on", true, "8", "16Gi"),
+	)
+
+	template := templateFor(t, server)
+
+	// the declaration wins over the 8 CPU / 16 GiB the representative slot reports
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")
+	assertResource(t, template.Status.Capacity, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Capacity, corev1.ResourceMemory, "3.2Gi")
+}
+
+// TestNodeGroupTemplateFallsBackToTheLiveNodeAllocatable keeps the today-behaviour for a pool that
+// declares nothing: the kubelet's measured numbers are a better estimate than an empty template,
+// and no existing pool is asked to write the field to keep working.
+func TestNodeGroupTemplateFallsBackToTheLiveNodeAllocatable(t *testing.T) {
+	server := newServer(t,
+		nodeCR("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeWithShape("slot-on", true, "8", "16Gi"),
+	)
+
+	template := templateFor(t, server)
+
+	// with no declaration the live node's allocatable is used
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "8")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceMemory, "16Gi")
+	assertResource(t, template.Status.Capacity, corev1.ResourceCPU, "8")
+	assertResource(t, template.Status.Capacity, corev1.ResourceMemory, "16Gi")
+}
+
+// TestApplyTemplateCapacityDoesNotAliasTheDeclaration guards the copy the precedence needs. The
+// Node CR the provider reads comes out of the manager's cache, so putting its map into the
+// template would hand every later reader a template-shaped object, and capacity and allocatable
+// would be one map: clearing one in a later step would clear the other.
+func TestApplyTemplateCapacityDoesNotAliasTheDeclaration(t *testing.T) {
+	slotCR := slotWithCapacity("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+		infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi")
+	template := &corev1.Node{}
+
+	applyTemplateCapacity(template, slotCR)
+
+	template.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("1")
+	template.Status.Capacity[corev1.ResourceMemory] = resource.MustParse("16Gi")
+
+	assert.Equal(t, resource.MustParse("1950m"), slotCR.Spec.NodeCapacity[corev1.ResourceCPU],
+		"the declaration is copied, not shared with the template")
+	assert.Equal(t, resource.MustParse("3.2Gi"), slotCR.Spec.NodeCapacity[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("3.2Gi"), template.Status.Allocatable[corev1.ResourceMemory],
+		"capacity and allocatable are two lists, not one map under two names")
+}
+
+// TestApplyTemplateCapacityLeavesAnUndeclaredSlotAlone covers the fallback half of the precedence
+// at the unit level: the numbers the copy carried, from the live node, survive untouched.
+func TestApplyTemplateCapacityLeavesAnUndeclaredSlotAlone(t *testing.T) {
+	slotCR := nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	template := nodeWithShape("slot-1", true, "8", "16Gi")
+
+	applyTemplateCapacity(template, slotCR)
+
+	assert.Equal(t, resource.MustParse("8"), template.Status.Allocatable[corev1.ResourceCPU])
+	assert.Equal(t, resource.MustParse("16Gi"), template.Status.Capacity[corev1.ResourceMemory])
 }
 
 // TestNodeGroupTemplateDeclaredTaintsWin covers the overlay on the node copied from a live

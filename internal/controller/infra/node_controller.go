@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
@@ -141,6 +142,13 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Stamp the taints the slot declares (spec.nodeTaints) onto the Kubernetes node
 	if err := r.applyNodeTaintsToKubernetesNode(ctx, node); err != nil {
 		logger.Error(err, "Failed to apply declared taints", "node", node.Name)
+		// Don't fail reconciliation, just log and continue
+	}
+
+	// Compare the machine that registered with the shape the slot declares (spec.nodeCapacity),
+	// and warn when they disagree
+	if err := r.checkDeclaredNodeCapacity(ctx, node); err != nil {
+		logger.Error(err, "Failed to check the declared node capacity", "node", node.Name)
 		// Don't fail reconciliation, just log and continue
 	}
 
@@ -334,6 +342,25 @@ func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, nod
 // them.
 func (r *NodeReconciler) applyNodeTaintsToKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
 	return taints.ApplyToKubernetesNode(ctx, r.Client, node, r.EventRecorder)
+}
+
+// checkDeclaredNodeCapacity compares the Kubernetes node of a Ready slot with the capacity that
+// slot declares (spec.nodeCapacity), and records a Warning event on the Node CR when the
+// allocatable the kubelet reports is more than five percent away from the declaration on any
+// declared resource. The event names the resource and both values, so a declaration that went
+// stale - the VM was resized, the system reservation moved, the numbers came from the datasheet
+// instead of from a booted machine - is visible from `kubectl describe` instead of showing up as
+// a pool that never scales up.
+//
+// It is a check, not a reconcile. The node is never patched: the kubelet owns
+// status.allocatable, and a running machine is the truth about what booted. Nothing is written on
+// the Node CR to remember that the warning fired; the API server's event aggregation folds the
+// repeats of an identical reason into a count.
+//
+// Thin wrapper over capacity.CheckDeclaredCapacity, which holds the rules (no declaration, no
+// node object, and a node that is not Ready all record nothing).
+func (r *NodeReconciler) checkDeclaredNodeCapacity(ctx context.Context, node *infrav1alpha1.Node) error {
+	return capacity.CheckDeclaredCapacity(ctx, r.Client, node, r.EventRecorder)
 }
 
 // validateStateTransition validates that a state transition is valid and implements smart backoff strategy

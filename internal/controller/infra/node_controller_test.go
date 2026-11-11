@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
@@ -295,4 +298,167 @@ func TestApplyNodeTaintsRecordsNoEventWhenNothingIsSkipped(t *testing.T) {
 	require.NoError(t, reconciler.applyNodeTaintsToKubernetesNode(context.Background(), node))
 	assert.Equal(t, []corev1.Taint{dedicated}, getK8sNode(t, reconciler.Client).Spec.Taints)
 	assert.Zero(t, len(recorder.Events), "nothing was skipped, so nothing was recorded")
+}
+
+// capacityNodeCR returns the shared test Node CR that declares spec.nodeCapacity: the shape a
+// 2 vCPU / 4 GiB machine reports once the kubelet subtracted its system reservation, 1950m of cpu
+// and 3.2Gi of memory.
+func capacityNodeCR() *infrav1alpha1.Node {
+	node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node.Status.PowerState = infrav1alpha1.PowerStateOn
+	node.Spec.NodeCapacity = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("1950m"),
+		corev1.ResourceMemory: resource.MustParse("3.2Gi"),
+	}
+
+	return node
+}
+
+// capacityK8sNode returns the shared test Kubernetes node with the allocatable a kubelet reported,
+// Ready unless ready is false.
+func capacityK8sNode(cpu, memory string, ready bool) *corev1.Node {
+	node := createTestKubernetesNode()
+	node.Status.Allocatable = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpu),
+		corev1.ResourceMemory: resource.MustParse(memory),
+	}
+
+	if !ready {
+		node.Status.Conditions[0].Status = corev1.ConditionFalse
+		node.Status.Conditions[0].Reason = "KubeletNotReady"
+	}
+
+	return node
+}
+
+// TestDeclaredNodeCapacityDriftWarns covers a declaration that stopped matching the machine: the
+// VM was resized, the system reservation moved, the numbers came off the datasheet instead of off
+// a booted node. A stale declaration makes the pool unplaceable, cluster-autoscaler simulates a
+// machine the pool does not boot, and nothing in the cluster says so. The check is a Warning event
+// naming the drifted resource and both values, and nothing else.
+func TestDeclaredNodeCapacityDriftWarns(t *testing.T) {
+	recorder := events.NewFakeRecorder(8)
+
+	node := capacityNodeCR()
+	reconciler := newTaintReconciler(t, node, createTestGroup(), capacityK8sNode("1", "3.2Gi", true))
+	reconciler.EventRecorder = recorder
+
+	require.NoError(t, reconciler.checkDeclaredNodeCapacity(context.Background(), node))
+
+	require.Equal(t, 1, len(recorder.Events), "one reconcile records one event for the drift it saw")
+
+	event := <-recorder.Events
+	assert.Contains(t, event, "Warning", "a stale declaration stops the pool from scaling, so it is not a Normal event")
+	assert.Contains(t, event, capacity.ReasonCapacityMismatch)
+	assert.Contains(t, event, "cpu", "the event names the resource that drifted")
+	assert.Contains(t, event, "1950m", "the event carries the declared value")
+	assert.Contains(t, event, "spec.nodeCapacity", "the event says which field to fix")
+	assert.Contains(t, event, "test-node", "the event says which slot declares it")
+	assert.NotContains(t, event, "memory", "the resource that matches is not named")
+
+	// the node keeps the kubelet's numbers: the declaration is a warning, never a write
+	allocatable := getK8sNode(t, reconciler.Client).Status.Allocatable
+	require.Len(t, allocatable, 2)
+
+	reported := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("1"),
+		corev1.ResourceMemory: resource.MustParse("3.2Gi"),
+	}
+
+	for name, want := range reported {
+		got, ok := allocatable[name]
+		require.Truef(t, ok, "%s is still reported by the kubelet", name)
+		assert.Equalf(t, 0, want.Cmp(got), "%s: the drift is warned about, not written away", name)
+	}
+}
+
+// TestDeclaredNodeCapacityRecordsNothing covers the passes that must not put an Event on the Node
+// CR: the healthy declaration, the pool that declares nothing, and the machine whose kubelet has
+// not reported allocatable yet.
+func TestDeclaredNodeCapacityRecordsNothing(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared *infrav1alpha1.Node
+		live     *corev1.Node
+	}{
+		{
+			name:     "allocatable matches the declaration",
+			declared: capacityNodeCR(),
+			live:     capacityK8sNode("1950m", "3.2Gi", true),
+		},
+		{
+			name:     "allocatable is within the tolerance of the declaration",
+			declared: capacityNodeCR(),
+			live:     capacityK8sNode("2", "3.1Gi", true),
+		},
+		{
+			name:     "the slot declares nothing, so nothing can be stale",
+			declared: createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+			live:     capacityK8sNode("1", "1Gi", true),
+		},
+		{
+			name:     "the node is not Ready, so its allocatable is not a measurement",
+			declared: capacityNodeCR(),
+			live:     capacityK8sNode("1", "1Gi", false),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := events.NewFakeRecorder(8)
+
+			reconciler := newTaintReconciler(t, tc.declared, createTestGroup(), tc.live)
+			reconciler.EventRecorder = recorder
+
+			require.NoError(t, reconciler.checkDeclaredNodeCapacity(context.Background(), tc.declared))
+			assert.Zero(t, len(recorder.Events), "no drift, no event")
+		})
+	}
+}
+
+// TestNodeReconcileChecksDeclaredCapacity wires the check through Reconcile, so the drift is
+// reported on the same pass that stamps the providerID and the declared taints: an operator
+// reading `kubectl describe node.infra.homecluster.dev <name>` sees the shape the autoscaler is
+// simulating, the taints it simulates, and the reason the pool does not scale, in one place.
+func TestNodeReconcileChecksDeclaredCapacity(t *testing.T) {
+	recorder := events.NewFakeRecorder(16)
+
+	node := capacityNodeCR()
+	reconciler := newTaintReconciler(t, node, createTestGroup(), capacityK8sNode("1", "3.2Gi", true))
+	reconciler.EventRecorder = recorder
+
+	result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueFiveMinutes}, result)
+
+	require.NotEmpty(t, recorder.Events, "Reconcile must run the capacity check, not only the taint one")
+
+	var found bool
+
+	for _, event := range drainEvents(recorder) {
+		if strings.Contains(event, capacity.ReasonCapacityMismatch) {
+			assert.Contains(t, event, "Warning")
+			assert.Contains(t, event, "cpu")
+			found = true
+		}
+	}
+
+	assert.True(t, found, "the reconcile pass records the drift between spec.nodeCapacity and the node")
+}
+
+// drainEvents empties the fake recorder's channel and returns everything it buffered. The fake
+// recorder is a fixed-size channel, so a test that reads one event has to leave the rest.
+func drainEvents(recorder *events.FakeRecorder) []string {
+	var collected []string
+
+	for {
+		select {
+		case event := <-recorder.Events:
+			collected = append(collected, event)
+		default:
+			return collected
+		}
+	}
 }

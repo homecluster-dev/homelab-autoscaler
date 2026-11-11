@@ -61,6 +61,51 @@ spec:
             properties:
               kubernetesNodeName:
                 type: string
+              nodeCapacity:
+                additionalProperties:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+                description: |-
+                  NodeCapacity is the shape of the machine this slot boots: the resources the kubelet reports
+                  as allocatable once the machine joins, not the nominal numbers the hardware is sold as.
+
+                  What the field gives you: a pool whose every slot is powered off can scale up. The node
+                  template cluster-autoscaler simulates a placement on is built from a corev1.Node, and a pool
+                  at zero has none, so the provider synthesizes a placeholder. Capacity is the one part of the
+                  machine's shape a Node CR can supply for that placeholder: with the field unset the template
+                  carries an empty status.allocatable, no pod with resource requests fits on it, and the
+                  autoscaler never calls IncreaseGroupInSize, which is why a minSize: 0 pool never comes back
+                  up and the workaround is minSize: 1 with a machine that never sleeps.
+
+                  It is declared in the spec rather than copied into the status because the template is needed
+                  before a slot has ever booted: a status field fed from a live node is empty in exactly the
+                  case it would be read for, and keeping it filled means a pipeline that watches nodes and
+                  writes status. One field next to the taints of the same machine is reviewable in Git, and it
+                  describes a machine that does not exist yet.
+
+                  Precedence: the declaration wins over the live node's status.capacity and
+                  status.allocatable, on the path that copies a registered node as well as on the placeholder,
+                  so the shape the autoscaler simulates does not change with which slot of the group happens
+                  to be Ready. When the field is unset the live node's own numbers are used, which is the
+                  behaviour of every pool that declares nothing.
+
+                  The values must match what the kubelet reports, which is not what the datasheet says: system
+                  reservations make a 2 vCPU / 4 GiB machine, a Hetzner CX23 for instance, report 1950m and
+                  3.2Gi. Declare what the node reports, not what the box is sold as. The autoscaler judges pod
+                  requests against this list, so a declaration larger than reality places work the machine
+                  cannot take and a smaller one leaves capacity unused.
+
+                  The controller compares the declaration with the machine once it registers: a
+                  status.allocatable that differs from spec.nodeCapacity by more than five percent on any
+                  resource puts a Warning event on the Node CR, reason NodeCapacityMismatch, naming the
+                  resource and both values. It warns only. The node is never reconciled to the declared
+                  values, because the kubelet owns them and a registered machine is the truth about what
+                  booted, and a declaration you stopped maintaining stays visible instead of rewriting the
+                  node under you.
+                type: object
               nodeTaints:
                 description: |-
                   NodeTaints are the taints this slot's machine must carry.

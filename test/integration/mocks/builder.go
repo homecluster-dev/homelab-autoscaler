@@ -273,6 +273,18 @@ func WithNodeTaints(taints []corev1.Taint) NodeOption {
 	}
 }
 
+// WithNodeCapacity declares the shape of the machine a slot boots (spec.nodeCapacity), as the
+// kubelet reports it: the capacity cluster-autoscaler simulates a scale-up on when no slot of the
+// group has a registered node.
+func WithNodeCapacity(cpu, memory string) NodeOption {
+	return func(n *infrav1alpha1.Node) {
+		n.Spec.NodeCapacity = corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpu),
+			corev1.ResourceMemory: resource.MustParse(memory),
+		}
+	}
+}
+
 // WithNodeLastStartupTime sets the last startup time
 func WithNodeLastStartupTime(t time.Time) NodeOption {
 	return func(n *infrav1alpha1.Node) {
