@@ -13,7 +13,7 @@ The Node Custom Resource Definition (CRD) represents individual physical machine
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `powerState` | `PowerState` | Yes | Desired power state: `on` or `off` (see [FSM Architecture](../../architecture/state.md) for formal state management) |
+| `powerState` | `PowerState` | No | The desired power *claim*: `on` or `off`, defaulted to `off` by the API server. The autoscaler is the writer (scale-up claims `on`, scale-down drops it to `off`), so a GitOps manifest must not declare it: an applied value is re-written over the claim on every sync, which shuts a machine down mid-use. See [FSM Architecture](../../architecture/state.md) for formal state management |
 | `startupPodSpec` | `MinimalPodSpec` | Yes | Pod specification for startup operations |
 | `shutdownPodSpec` | `MinimalPodSpec` | Yes | Pod specification for shutdown operations |
 | `kubernetesNodeName` | `string` | Yes | Name of the corresponding Kubernetes node |
