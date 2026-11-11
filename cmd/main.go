@@ -212,8 +212,10 @@ func main() {
 		Scheme: mgr.GetScheme(),
 		// One recorder for the whole manager: the FSM records the scale up/down
 		// transitions on the Node CR, so `kubectl describe node.infra.homecluster.dev
-		// <name>` shows why a machine was started or stopped.
-		EventRecorder: mgr.GetEventRecorderFor("homelab-autoscaler"),
+		// <name>` shows why a machine was started or stopped. GetEventRecorder is the new
+		// events API (events.k8s.io); the recorder the deprecated *For variant builds writes
+		// the old core/v1 events objects.
+		EventRecorder: mgr.GetEventRecorder("homelab-autoscaler"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Node")
 		os.Exit(1)

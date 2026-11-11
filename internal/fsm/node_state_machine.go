@@ -39,7 +39,7 @@ import (
 //
 // Options are optional: with none the FSM behaves exactly as it did before the event
 // recorder existed, which keeps every existing caller and test working. Pass
-// WithEventRecorder(mgr.GetEventRecorderFor(...)) to have the lifecycle transitions
+// WithEventRecorder(mgr.GetEventRecorder(...)) to have the lifecycle transitions
 // recorded on the Node CR.
 func NewNodeStateMachine(
 	node *infrav1alpha1.Node,
