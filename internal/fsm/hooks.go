@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -31,18 +32,29 @@ import (
 )
 
 // Before hooks - executed before state transitions for lock acquisition
+//
+// The hooks are the only place a transition takes the coordination lock, and they run before
+// looplab/fsm applies the state change and calls the enter_ hooks, the writers of
+// status.progress inside the FSM. That ordering is the invariant the lifecycle rests on: a
+// transition refused by the lock never reaches a writer, so status.progress keeps the stable
+// value it had (ready for a scale-down that lost to a scale-up, shutdown for a scale-up that
+// lost to a scale-down). A progress left in startingup/shuttingdown is not cosmetic: it is
+// excluded from the provider's target size, validateStateTransition gates every transition of
+// the slot out, and nothing in a reconcile heals it - the stuck-transition cleanup the docs
+// used to promise runs on the machine's own backoff record, which a reconciler builds fresh on
+// every pass, so ForceCleanup is never reached from there. The progress of a transitional slot
+// is moved by the operation that put it there, from its own job monitor, and by no one else.
+// That is why a refusal has to happen before a writer, not after it. See
+// cancelLockedTransition and docs/architecture/state.md.
 
 func (nm *NodeStateMachine) beforeStartNode(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
 
-	logger.Info("Acquiring coordination lock for node startup", "node", nm.node.Name)
+	logger.V(1).Info("Acquiring coordination lock for node startup", "node", nm.node.Name)
 
 	// Acquire coordination lock for scale-up operation
 	if err := nm.coordinationManager.AcquireLock(ctx, nm.node, OperationScaleUp, DefaultLockTimeout); err != nil {
-		logger.Error(err, "Failed to acquire coordination lock for startup", "node", nm.node.Name)
-		if e != nil {
-			e.Cancel(err)
-		}
+		nm.cancelLockedTransition(logger, e, OperationScaleUp, err)
 		return
 	}
 
@@ -52,18 +64,58 @@ func (nm *NodeStateMachine) beforeStartNode(ctx context.Context, e *fsm.Event) {
 func (nm *NodeStateMachine) beforeShutdownNode(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
 
-	logger.Info("Acquiring coordination lock for node shutdown", "node", nm.node.Name)
+	logger.V(1).Info("Acquiring coordination lock for node shutdown", "node", nm.node.Name)
 
 	// Acquire coordination lock for scale-down operation
 	if err := nm.coordinationManager.AcquireLock(ctx, nm.node, OperationScaleDown, DefaultLockTimeout); err != nil {
-		logger.Error(err, "Failed to acquire coordination lock for shutdown", "node", nm.node.Name)
-		if e != nil {
-			e.Cancel(err)
-		}
+		nm.cancelLockedTransition(logger, e, OperationScaleDown, err)
 		return
 	}
 
 	logger.Info("Successfully acquired coordination lock for node shutdown", "node", nm.node.Name)
+}
+
+// cancelLockedTransition cancels a transition that failed to take the coordination lock.
+//
+// It writes nothing, and the caller has already touched nothing. That is the fix for a
+// shutdown colliding with a scale-up in flight: pre-fix the lifecycle entry points cleaned up
+// the pending Job of the slot, cordoned the Kubernetes node and cleared the
+// ToBeDeletedByClusterAutoscaler taint before the acquisition ran, so the operation that was
+// about to be refused tore the state of the operation that owns the slot apart on the way out,
+// and the refusal was an anonymous error the autoscaler treated as a failed scale down: the
+// live trace
+//
+//	ScaleDownFailed ... FSM transition failed: transition canceled with error:
+//	  coordination lock already exists: operation=scale-up, owner=node-controller, age=4m0s
+//
+// Cancelling in the before_ hook, where no enter_ hook has run, keeps the progress on the
+// stable state the transition started from, so the same reconcile path can ask for the
+// shutdown again as soon as the lock is free.
+//
+// A lock conflict is that case and is reported as a deferral, not as an error: the opposite
+// operation owns the slot for a bounded time, the caller learns how long from
+// LockConflictError.RetryAfter, and the request is not lost because the intent it carries
+// (spec.desiredPowerState) was written before the transition and stays there. Any other
+// acquisition failure - the API server is unreachable, the lock annotations are unreadable -
+// is a real failure and is logged as one, with the same cancellation semantics.
+func (nm *NodeStateMachine) cancelLockedTransition(logger logr.Logger, e *fsm.Event, operation string, err error) {
+	if conflict := AsLockConflict(err); conflict != nil {
+		logger.V(1).Info("Deferring transition, the coordination lock is held by the operation in flight",
+			"node", nm.node.Name,
+			"operation", operation,
+			"heldOperation", conflict.HolderOperation(),
+			"heldOwner", conflict.HolderOwner(),
+			"heldAge", conflict.HolderAge().String(),
+			"reason", conflict.Reason,
+			"retryAfter", conflict.RetryAfter().String(),
+			"detail", err.Error())
+	} else {
+		logger.Error(err, "Failed to acquire coordination lock", "node", nm.node.Name, "operation", operation)
+	}
+
+	if e != nil {
+		e.Cancel(err)
+	}
 }
 
 // After hooks - executed after state transitions for lock release and status updates
@@ -102,6 +154,30 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
 
 	// Jobs are cleaned up automatically via TTL - no manual cleanup needed
+}
+
+// afterJobTimeout releases the coordination lock of an operation whose lifecycle Job ran out
+// of time. JobTimeout moves the slot back to a stable state (ready for a shutdown that timed
+// out, shutdown for a startup that timed out) and the enter_ hook records the failed scale
+// up/down, so the operation is over - and the lock is the one thing that must not outlive it.
+// With no hook here, the lock stayed on the slot for the rest of its timeout, the next
+// lifecycle operation on that slot lost the acquisition, and that is the shape of the live
+// trace this fix starts from: a scale-down cancelled by a scale-up lock that nothing was
+// running any more.
+//
+// The lock is force-released: the operation it names has ended, whoever wrote it. Releasing
+// only an owned lock would leave a lock written by an earlier state machine on a slot that is
+// now stable, which is exactly what blocks the next transition. No event is recorded: the
+// enter_ hook of the state the slot landed in records the failure of the timed-out operation,
+// so this hook adds nothing the operator has to see.
+func (nm *NodeStateMachine) afterJobTimeout(ctx context.Context, e *fsm.Event) {
+	logger := log.Log.WithName("fsm")
+
+	logger.Info("Lifecycle job timed out, releasing the coordination lock", "node", nm.node.Name, "state", e.Dst)
+
+	if err := nm.coordinationManager.ForceReleaseLock(ctx, nm.node); err != nil {
+		logger.Error(err, "Failed to release coordination lock after job timeout", "node", nm.node.Name)
+	}
 }
 
 func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {

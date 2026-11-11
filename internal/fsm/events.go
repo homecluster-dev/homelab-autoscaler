@@ -53,9 +53,13 @@ func GetFSMCallbacks(nm *NodeStateMachine) fsm.Callbacks {
 		"before_" + EventStartNode:    nm.beforeStartNode,
 		"before_" + EventShutdownNode: nm.beforeShutdownNode,
 
-		// After hooks for lock release and status updates
+		// After hooks for lock release and status updates. Every hook here closes an
+		// operation: the coordination lock of the slot must not outlive the transition that
+		// ended it, or the next lifecycle operation on the slot is cancelled by a lock nothing
+		// is running under.
 		"after_" + EventJobCompleted: nm.afterJobCompleted,
 		"after_" + EventJobFailed:    nm.afterJobFailed,
+		"after_" + EventJobTimeout:   nm.afterJobTimeout,
 		"after_" + EventForceCleanup: nm.afterForceCleanup,
 
 		// State entry hooks

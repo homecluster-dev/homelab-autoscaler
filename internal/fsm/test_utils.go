@@ -337,3 +337,16 @@ func CreateTestKubernetesNode(name string, unschedulable bool) *corev1.Node {
 		},
 	}
 }
+
+// PrimeEnterState moves the machine to the state an enter_ hook is about to run for, without
+// firing any callback.
+//
+// looplab/fsm applies the state change before it calls the enter_ callbacks, so a test that
+// invokes a hook out of band has to put the machine in the state the hook is entering:
+// updateNodeProgress persists only the progress of the state the machine is in, and that guard
+// is what keeps a stale state machine - the async job monitor of an earlier reconcile, or one
+// built from a Node read before a transition - from stranding a slot in a transitional
+// progress.
+func (nm *NodeStateMachine) PrimeEnterState(state string) {
+	nm.fsm.SetState(state)
+}

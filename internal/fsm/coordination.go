@@ -18,10 +18,12 @@ package fsm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -40,6 +42,135 @@ const (
 	LockTimeoutAnnotation   = "homelab-autoscaler.dev/lock-timeout"
 	NodeControllerOwner     = "node-controller"
 )
+
+// Retry bounds applied to a transition that lost the coordination lock. RetryAfter never
+// returns more than the lock timeout, because a lock older than its timeout is treated as
+// expired and is taken over by the next acquisition.
+const (
+	MinLockRetryDelay = 5 * time.Second
+	MaxLockRetryDelay = DefaultLockTimeout
+)
+
+// unknownLockValue is what a conflict reports for a lock that could not be read (the slot
+// moved under a retry), so the log line keeps its shape instead of printing an empty field.
+const unknownLockValue = "unknown"
+
+// Why an acquisition was refused. Both checks are kept, and the message of the older
+// one is preserved verbatim: it is what the operators grep for.
+const (
+	lockReasonAlreadyExists  = "already exists"
+	lockReasonStolenByOther  = "acquired by another process"
+	lockReasonChangedOnRetry = "changed during retry"
+)
+
+// LockConflictError reports that an operation lost the coordination lock of a slot to the
+// operation that holds it. It is a typed error because a conflict is not a failed
+// transition: nothing about the slot is wrong, the opposite lifecycle operation is in flight
+// on the same slot and the lock is doing its job. The caller that sees it must defer the
+// request (the intent it acts on is already recorded in spec.desiredPowerState, written by
+// cluster-autoscaler's NodeGroupDeleteNodes / NodeGroupDecreaseTargetSize) and come back
+// once the lock is free; treating it as a terminal failure is what strands a slot.
+//
+// The conflict is reported by AcquireLock only. The lock itself is never weakened by it: a
+// refused operation takes nothing, writes nothing, and leaves the holder's lock in place,
+// so scale-up and scale-down of one slot stay mutually exclusive.
+type LockConflictError struct {
+	// Operation is the operation that was refused (OperationScaleUp / OperationScaleDown).
+	Operation string
+	// Holder is the lock that is in the way, as it was read from the slot.
+	Holder *OperationLock
+	// Reason distinguishes the checks: the pre-check on the object in hand, the re-check
+	// under optimistic concurrency, and a lock that moved between retries.
+	Reason string
+}
+
+func (e *LockConflictError) Error() string {
+	if e.Holder == nil {
+		return fmt.Sprintf("coordination lock %s: operation=%s, owner=unknown, age=unknown",
+			e.Reason, e.Operation)
+	}
+
+	return fmt.Sprintf("coordination lock %s: operation=%s, owner=%s, age=%v",
+		e.Reason, e.Holder.Operation, e.Holder.Owner, time.Since(e.Holder.Timestamp))
+}
+
+// RetryAfter is how long the caller should wait before asking again: the remaining lifetime
+// of the lock that holds the slot, clamped into [MinLockRetryDelay, MaxLockRetryDelay].
+// Coming back earlier is a guaranteed conflict, coming back later than the timeout is
+// pointless because an expired lock is taken over on the next acquisition.
+func (e *LockConflictError) RetryAfter() time.Duration {
+	if e.Holder == nil {
+		return MinLockRetryDelay
+	}
+
+	remaining := e.Holder.Timeout - time.Since(e.Holder.Timestamp)
+	if remaining < MinLockRetryDelay {
+		return MinLockRetryDelay
+	}
+	if remaining > MaxLockRetryDelay {
+		return MaxLockRetryDelay
+	}
+
+	return remaining
+}
+
+// Deferral renders the refusal for an operator: who owns the slot, and when this operation
+// comes back. It is the message of the Scale*Deferred event, so it says in one line that
+// nothing is wrong with the slot and that the request is not lost.
+func (e *LockConflictError) Deferral() string {
+	return fmt.Sprintf("%s, the opposite operation owns the slot, retrying in %v", e.Error(), e.RetryAfter())
+}
+
+// IsLockConflict reports whether err is, or wraps, a LockConflictError: a transition that
+// lost the coordination lock and has to be retried once the operation holding it is done.
+func IsLockConflict(err error) bool {
+	return AsLockConflict(err) != nil
+}
+
+// AsLockConflict returns the LockConflictError err is, or wraps, and nil for anything else.
+// The caller that defers a transition needs the remaining lifetime of the lock to schedule
+// the retry, which is what the typed error carries.
+func AsLockConflict(err error) *LockConflictError {
+	var conflict *LockConflictError
+	if !errors.As(err, &conflict) {
+		return nil
+	}
+
+	return conflict
+}
+
+// HolderOperation, HolderOwner and HolderAge describe the lock in the way, nil safely, for
+// logs and events. They say which operation owns the slot, which is the half of a conflict an
+// operator needs to follow: scale-up means the slot is booting, and the caller that defers the
+// transition schedules the retry from HolderAge.
+func (e *LockConflictError) HolderOperation() string {
+	if e.Holder == nil {
+		return unknownLockValue
+	}
+
+	return e.Holder.Operation
+}
+
+func (e *LockConflictError) HolderOwner() string {
+	if e.Holder == nil {
+		return unknownLockValue
+	}
+
+	return e.Holder.Owner
+}
+
+func (e *LockConflictError) HolderAge() time.Duration {
+	if e.Holder == nil {
+		return 0
+	}
+
+	return time.Since(e.Holder.Timestamp)
+}
+
+// newLockConflict builds the conflict error for a lock read off a slot.
+func newLockConflict(operation string, holder *OperationLock, reason string) *LockConflictError {
+	return &LockConflictError{Operation: operation, Holder: holder, Reason: reason}
+}
 
 // DefaultCoordinationManager implements the CoordinationManager interface
 type DefaultCoordinationManager struct {
@@ -66,8 +197,7 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 	// Check if lock already exists and is not expired
 	if existingLock, exists := cm.CheckLock(ctx, node); exists {
 		if !cm.IsLockExpired(existingLock) {
-			return fmt.Errorf("coordination lock already exists: operation=%s, owner=%s, age=%v",
-				existingLock.Operation, existingLock.Owner, time.Since(existingLock.Timestamp))
+			return newLockConflict(operation, existingLock, lockReasonAlreadyExists)
 		}
 		logger.Info("Existing lock expired, proceeding with acquisition",
 			"node", node.Name,
@@ -87,8 +217,7 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 		// Double-check lock doesn't exist on fresh copy
 		if existingLock, exists := cm.CheckLock(ctx, fresh); exists {
 			if !cm.IsLockExpired(existingLock) {
-				return fmt.Errorf("coordination lock acquired by another process: operation=%s, owner=%s",
-					existingLock.Operation, existingLock.Owner)
+				return newLockConflict(operation, existingLock, lockReasonStolenByOther)
 			}
 		}
 
@@ -105,6 +234,50 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 
 		// Attempt to update with optimistic locking
 		if err := cm.client.Update(ctx, fresh); err != nil {
+			if !apierrors.IsConflict(err) {
+				return err
+			}
+
+			// The write lost a race. Decide from what the API server holds, never from
+			// `fresh`: this attempt has already stamped our own lock annotations onto that
+			// copy, so a lock read off it is this acquisition reported as the holder, aged
+			// 0s. The retry loop stops on it too, because the error returned is no longer a
+			// conflict. A benign status/spec write race - no lock in the API at all - therefore
+			// cost a failure event and a defer of nearly the whole lock timeout, verified live:
+			//
+			//   coordination lock changed during retry: operation=scale-up,
+			//   owner=node-controller, age=335ms     ->  retryAfter=4m59.66s
+			//   lock really present in the API: false
+			//
+			// Re-reading the slot is the only way to tell the two shapes apart.
+			live := &infrav1alpha1.Node{}
+			if getErr := cm.client.Get(ctx, client.ObjectKeyFromObject(node), live); getErr != nil {
+				// Nothing is known about the lock and the fact in hand is the lost write, so
+				// return it: RetryOnConflict retries a conflict, and anything else - the slot
+				// is gone, the API server is unreachable - surfaces as the error it is.
+				logger.V(1).Info("Lost the lock write and cannot re-read the slot, retrying the acquisition",
+					"node", node.Name, "error", getErr.Error())
+
+				return err
+			}
+
+			if holder := cm.lockOn(live); holder != nil {
+				// The racer took the lock: report the real holder, so the caller defers and
+				// comes back on the deadline that lock actually has left.
+				return newLockConflict(operation, holder, lockReasonChangedOnRetry)
+			}
+
+			// No lock in the API. The slot moved under this attempt - a status write from
+			// the core controller, a resync, a spec write from the provider - which is all a
+			// resourceVersion conflict says. Return the original conflict and let
+			// RetryOnConflict run the acquisition again against the new object.
+			//
+			// A read that goes through a cache can lag behind the API and miss a lock the
+			// racer wrote milliseconds ago; the cost is one more pass of this loop, and the
+			// double-check at its top reports the lock as stolen on the next one.
+			logger.V(1).Info("Lost the lock write to a plain update, retrying the acquisition",
+				"node", node.Name, "operation", operation)
+
 			return err
 		}
 
@@ -116,6 +289,20 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 
 		return nil
 	})
+}
+
+// lockOn reports the live lock a slot carries, if any, and nil for an expired one. It is
+// the read behind a conflict reported from the update path, where the lock is discovered by
+// losing the write, so it takes the object re-read from the API: the copy an acquisition
+// attempt stamped with its own annotations is not evidence about the lock, it is the
+// acquisition.
+func (cm *DefaultCoordinationManager) lockOn(node *infrav1alpha1.Node) *OperationLock {
+	lock, exists := cm.CheckLock(context.TODO(), node)
+	if !exists || cm.IsLockExpired(lock) {
+		return nil
+	}
+
+	return lock
 }
 
 // ReleaseLock releases an operation lock from a node

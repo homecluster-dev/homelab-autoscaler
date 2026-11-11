@@ -610,7 +610,8 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 		objects  []client.Object
 		delta    int32
 		refuse   bool
-		wantShed []string // slots the request must cancel: desired off, progress shuttingdown
+		wantSize int32    // what NodeGroupTargetSize reports after the request
+		wantShed []string // slots the request must cancel: spec off, progress left to the FSM
 		wantKeep []string // slots this request must not cancel
 	}{
 		{
@@ -624,6 +625,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2")},
 			delta:    -1,
 			refuse:   false,
+			wantSize: 1,
 			wantShed: []string{"slot-2"},
 			wantKeep: []string{"slot-1"},
 		},
@@ -634,6 +636,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1")},
 			delta:    -1,
 			refuse:   false,
+			wantSize: 1,
 			wantKeep: []string{"slot-1"},
 		},
 		{
@@ -644,6 +647,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
 			delta:    -2,
 			refuse:   false,
+			wantSize: 2,
 			wantShed: []string{"slot-3"},
 			wantKeep: []string{"slot-1", "slot-2"},
 		},
@@ -655,6 +659,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2")},
 			delta:    -2,
 			refuse:   true,
+			wantSize: 2,
 			wantKeep: []string{"slot-1", "slot-2"},
 		},
 		{
@@ -662,6 +667,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), running("slot-2"), startingUp("slot-3")},
 			delta:    -1,
 			refuse:   false,
+			wantSize: 2,
 			wantShed: []string{"slot-3"},
 			wantKeep: []string{"slot-1", "slot-2"},
 		},
@@ -674,6 +680,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 2), running("slot-1"), startingUp("slot-2"), midShutdown("slot-3")},
 			delta:    -1,
 			refuse:   false,
+			wantSize: 2,
 			wantShed: []string{"slot-2"},
 			wantKeep: []string{"slot-1", "slot-3"},
 		},
@@ -687,6 +694,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), startingUp("slot-2"), startingUp("slot-3")},
 			delta:    -3,
 			refuse:   false,
+			wantSize: 1,
 			wantShed: []string{"slot-2", "slot-3"},
 			wantKeep: []string{"slot-1"},
 		},
@@ -698,6 +706,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2"), startingUp("slot-3")},
 			delta:    -1,
 			refuse:   false,
+			wantSize: 2,
 			wantShed: []string{"slot-3"},
 			wantKeep: []string{"slot-1", "slot-2"},
 		},
@@ -709,6 +718,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
 			delta:    -2,
 			refuse:   false,
+			wantSize: 1,
 			wantShed: []string{"slot-2"},
 			wantKeep: []string{"slot-1"},
 		},
@@ -717,6 +727,7 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 			objects:  []client.Object{groupCR(testGroup, 0), running("slot-1"), startingUp("slot-2")},
 			delta:    -1,
 			refuse:   false,
+			wantSize: 1,
 			wantShed: []string{"slot-2"},
 			wantKeep: []string{"slot-1"},
 		},
@@ -746,7 +757,13 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 				if slices.Contains(tc.wantShed, name) {
 					desired, progress := slotState(t, server, name)
 					assert.Equal(t, infrav1alpha1.PowerStateOff, desired, "cancelled slot %s must be desired off", name)
-					assert.Equal(t, infrav1alpha1.ProgressShuttingDown, progress, "cancelled slot %s leaves the target size", name)
+					// The progress is the FSM's to write. The cancellation is the spec write,
+					// and countsTowardsTargetSize excludes the desired-off + startingup shape it
+					// produces, so the slot leaves the target size on that write alone - the
+					// node controller's ShutdownNode, with its Job and its lock, lands the
+					// progress on shuttingdown afterwards.
+					assert.Equal(t, infrav1alpha1.ProgressStartingUp, progress,
+						"cancelled slot %s keeps the progress the FSM wrote", name)
 
 					continue
 				}
@@ -754,6 +771,13 @@ func TestNodeGroupDecreaseTargetSizeRefusesBelowMinSize(t *testing.T) {
 				_, progress := slotState(t, server, name)
 				assert.NotEqual(t, infrav1alpha1.ProgressShuttingDown, progress, "slot %s must not be cancelled", name)
 			}
+
+			// The request lands exactly on the size it asked for, judged by the number
+			// cluster-autoscaler reads back: current target size minus the cancellations the
+			// request carried out.
+			resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantSize, resp.TargetSize, "the target size that lands is the one NodeGroupTargetSize reports")
 		})
 	}
 }
@@ -834,4 +858,304 @@ func TestTargetSizeOf(t *testing.T) {
 
 	assert.Equal(t, int32(2), targetSizeOf(nodes))
 	assert.Equal(t, int32(0), targetSizeOf(nil))
+}
+
+// TestCountsTowardsTargetSize pins the definition of a slot the provider is committed to
+// serve. The claimed rows are the burst fix: NodeGroupIncreaseSize claims a slot by writing
+// spec.desiredPowerState = on, and status.progress - owned by the FSM - keeps saying
+// "shutdown" until the node controller picks the slot up seconds later and the machine then
+// takes minutes to boot. A target size read off progress alone reports the slot as gone for
+// that whole window, so cluster-autoscaler asks for the same slot again in the same loop.
+func TestCountsTowardsTargetSize(t *testing.T) {
+	tests := []struct {
+		name     string
+		desired  infrav1alpha1.PowerState
+		status   infrav1alpha1.PowerState
+		progress infrav1alpha1.Progress
+		want     bool
+	}{
+		{"a running slot counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, true},
+		{"a slot that is starting up counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, true},
+		// (a) the claimed slot: this is the row the pre-fix helper got wrong.
+		{"a claimed slot whose FSM has not moved yet counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, true},
+		{"a claimed slot with no progress recorded yet counts", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, "", true},
+		// (b) a slot that is genuinely being torn down stays excluded, the exclusion the
+		// autoscaler needs for its headroom.
+		{"a slot mid shutdown does not count", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown, false},
+		{"a shut down slot does not count", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, false},
+		// A machine that is up and desired off is capacity the provider is serving: only
+		// NodeGroupDeleteNodes owns it, and the autoscaler must keep seeing it until the
+		// shutdown job has run.
+		{"a machine still running while desired off counts", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, true},
+		// The shape a cancelled startup lands in: NodeGroupDecreaseTargetSize cleared the spec
+		// and left the progress to the FSM. The request is off and the machine never came up, so
+		// it is not capacity - and this is the row that keeps the target size drop immediate now
+		// that the handler no longer writes progress: shuttingdown itself.
+		{"a cancelled startup does not count", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := nodeCRInGroup(testGroup, "slot-1", tc.desired, tc.status, tc.progress)
+			assert.Equal(t, tc.want, countsTowardsTargetSize(*node))
+		})
+	}
+}
+
+// TestNodeGroupTargetSizeCountsClaimedSlot is the same rule at the gRPC boundary, where
+// cluster-autoscaler reads it: the two slots the operator committed are 1 running machine and
+// 1 claim that has not been picked up by the FSM yet, and the target size has to be 2, not 1.
+// With 1 the autoscaler concludes the group did not grow and calls IncreaseSize again.
+func TestNodeGroupTargetSizeCountsClaimedSlot(t *testing.T) {
+	server := newServer(t,
+		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-stopping", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
+		slotInSystemNamespace("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	resp, err := server.NodeGroupTargetSize(context.Background(), &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	// the running machine and the claim; the slot that is being torn down and the spare do not
+	assert.Equal(t, int32(2), resp.TargetSize)
+}
+
+// TestNodeGroupIncreaseSizeRefusesWhenClaimsReachMaxSize is the burst itself (test c): one
+// pending pod made cluster-autoscaler call IncreaseSize 5 times in 15 minutes, because every
+// call was answered with a target size that ignored the slot it had just claimed. Once claims
+// count, the group is at its max size as soon as its slots are claimed, and the repeat
+// requests are refused instead of powering on machines over what the operator committed.
+func TestNodeGroupIncreaseSizeRefusesWhenClaimsReachMaxSize(t *testing.T) {
+	server := newServer(t,
+		groupCR(testGroup, 1),
+		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slotInSystemNamespace("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	ctx := context.Background()
+
+	// The first scale up is served: the group is at 1 of 2 slots.
+	_, err := server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+	require.NoError(t, err)
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desiredPowerStates(t, server, "slot-spare")["slot-spare"])
+
+	// The claim is capacity now, so the group reads full at the max size. Pre-fix this
+	// answered 1 - the running machine only - which is the number that made the autoscaler
+	// ask for the slot it had just claimed, over and over in the same loop.
+	resp, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), resp.TargetSize, "a claimed slot is part of the target size")
+
+	// cluster-autoscaler has not refreshed its view yet and asks again, and again: every
+	// repeat is refused, and it is refused as a max size refusal, not as "no powered off
+	// nodes found" reached by walking past the max size check.
+	for i := 0; i < 3; i++ {
+		_, err = server.NodeGroupIncreaseSize(ctx, &pb.NodeGroupIncreaseSizeRequest{Id: testGroup, Delta: 1})
+		require.Error(t, err, "a scale up that crosses the max size must be refused")
+
+		st, ok := grpcstatus.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.FailedPrecondition, st.Code())
+		assert.Contains(t, st.Message(), "max size")
+	}
+
+	// Nothing changed on the way: the group is still at 2 of 2, and the second slot stayed
+	// the only claimed one.
+	resp, err = server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), resp.TargetSize)
+}
+
+// TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget is the knock-on on the decrease path
+// (test d). A claim in flight is a scale-up the provider has not started, not a startup to
+// abort, and it does count towards the target size. The floor arithmetic has to land on the
+// floor with the claim counted: the target size here is 3 (running + starting + claimed) and
+// the only cancellable slot is the starting one, so delta -1 produces exactly the floor of 2
+// and must be carried out.
+func TestNodeGroupDecreaseTargetSizeClaimIsNotACancelTarget(t *testing.T) {
+	server := newServer(t,
+		groupCR(testGroup, 2),
+		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slotInSystemNamespace("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	ctx := context.Background()
+
+	_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
+	require.NoError(t, err)
+
+	// the starting slot is the one that is cancelled: the spec write is the whole cancellation,
+	// and a cancelled startup (desired off, progress still the startingup the FSM wrote) is off
+	// the target size, while a claimed slot counts on spec alone
+	desired, progress := slotState(t, server, "slot-starting")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, desired)
+	assert.Equal(t, infrav1alpha1.ProgressStartingUp, progress, "the cancellation does not write status.progress")
+
+	// the claim is untouched: cancelling it is not this entry point's, and a claim whose spec
+	// was cleared would silently drop out of the target size
+	desired, progress = slotState(t, server, "slot-claimed")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "a claim in flight is not a cancel target")
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, progress)
+
+	desired, progress = slotState(t, server, "slot-running")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desired)
+	assert.Equal(t, infrav1alpha1.ProgressReady, progress)
+
+	// the size that landed on the floor is the one NodeGroupTargetSize reports: running + claim
+	resp, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), resp.TargetSize)
+
+	// With the claim counted, the group sits exactly on its floor and has one unit of
+	// headroom, which is the truth about the pool: the next decrease has nothing left to
+	// cancel, so it is a no-op success and the claim survives. A FailedPrecondition here is
+	// the refusal cluster-autoscaler retries forever.
+	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
+	require.NoError(t, err)
+	desired, _ = slotState(t, server, "slot-claimed")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "the claim is not a cancel target")
+
+	// and a request that asks for more than the cancellable slots cannot cross the floor
+	// either: 3 of them, of which one is cancellable, produce 2, exactly the floor.
+	server = newServer(t,
+		groupCR(testGroup, 2),
+		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slotInSystemNamespace("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
+	require.NoError(t, err)
+	desired, progress = slotState(t, server, "slot-starting")
+	assert.Equal(t, infrav1alpha1.PowerStateOff, desired)
+	assert.Equal(t, infrav1alpha1.ProgressStartingUp, progress)
+	desired, _ = slotState(t, server, "slot-claimed")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desired)
+
+	// A decrease that would take the pool under the floor is still refused with the claim
+	// counted: the target size is 4, the two starting slots are all this entry point can
+	// cancel, so delta -3 produces 2, below the floor of 3. The floor is judged on the same
+	// number NodeGroupTargetSize reports, on both sides of the fix.
+	server = newServer(t,
+		groupCR(testGroup, 3),
+		slotInSystemNamespace("slot-running", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		slotInSystemNamespace("slot-starting", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+		slotInSystemNamespace("slot-starting-2", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
+		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -3})
+	require.Error(t, err)
+	st, ok := grpcstatus.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.FailedPrecondition, st.Code())
+	assert.Contains(t, st.Message(), "minSize")
+	desired, _ = slotState(t, server, "slot-claimed")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "a refused decrease cancels nothing")
+}
+
+// TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress is the behaviour change on
+// the cancel path. Cancelling a starting slot is a spec write, the shape NodeGroupDeleteNodes
+// produces, and never a write of status.progress. The handler used to set
+// progress: shuttingdown itself - no transition, no lifecycle Job, no coordination lock, no
+// lastShutdownTime - which makes it the one writer of a transitional progress that is not a
+// transition: the slot is excluded from the target size, validateStateTransition gates every
+// further transition out of it, and no reconcile heals it, because the stuck-transition
+// cleanup runs on the state machine's own backoff record and the reconciler builds that
+// machine fresh on every pass. The only writer left is the job monitor of the startup the
+// cancel collided with, and a manager restart takes that goroutine away.
+//
+// What the call is asked to do is unchanged: cancelling N starting slots takes exactly N units
+// off the target size, on the write that asks for it, and the shutdown runs through
+// ShutdownNode with its Job and its lock.
+func TestNodeGroupDecreaseTargetSizeCancelsWithTheSpecNotTheProgress(t *testing.T) {
+	startingUp := func(name string) *infrav1alpha1.Node {
+		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	}
+	running := func(name string) *infrav1alpha1.Node {
+		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	}
+
+	server := newServer(t,
+		groupCR(testGroup, 1),
+		running("slot-1"), running("slot-2"),
+		startingUp("slot-3"), startingUp("slot-4"),
+	)
+
+	ctx := context.Background()
+
+	resp, err := server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	require.Equal(t, int32(4), resp.TargetSize, "two running + two starting")
+
+	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -2})
+	require.NoError(t, err)
+
+	for _, name := range []string{"slot-3", "slot-4"} {
+		node := &infrav1alpha1.Node{}
+		require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: testNamespace}, node))
+
+		assert.Equal(t, infrav1alpha1.PowerStateOff, node.Spec.DesiredPowerState, "cancelled slot %s is desired off", name)
+		assert.Equal(t, infrav1alpha1.ProgressStartingUp, node.Status.Progress,
+			"cancelled slot %s keeps the progress the FSM wrote: this handler does not own status.progress", name)
+		assert.Nil(t, node.Status.LastShutdownTime,
+			"cancelled slot %s records no shutdown: the FSM stamps it when its ShutdownNode runs", name)
+	}
+
+	for _, name := range []string{"slot-1", "slot-2"} {
+		desired, progress := slotState(t, server, name)
+		assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "running machine %s is left to NodeGroupDeleteNodes", name)
+		assert.Equal(t, infrav1alpha1.ProgressReady, progress)
+	}
+
+	// The size lands exactly on what the request asked for, on the spec write alone: 4 - 2,
+	// read back from the endpoint cluster-autoscaler queries.
+	resp, err = server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), resp.TargetSize, "cancelling N starting slots takes exactly N off the target size")
+
+	// The shutdown the FSM runs on the next reconcile keeps the slot off the target size: the
+	// progress moves to shuttingdown with its timestamp, and the number does not move again.
+	for _, name := range []string{"slot-3", "slot-4"} {
+		node := &infrav1alpha1.Node{}
+		require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: testNamespace}, node))
+
+		node.Status.Progress = infrav1alpha1.ProgressShuttingDown
+		now := metav1.Now()
+		node.Status.LastShutdownTime = &now
+		require.NoError(t, server.Client.Status().Update(ctx, node))
+	}
+
+	resp, err = server.NodeGroupTargetSize(ctx, &pb.NodeGroupTargetSizeRequest{Id: testGroup})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), resp.TargetSize, "the FSM-driven shutdown lands on the same target size")
+}
+
+// TestNodeGroupDeleteNodesCountsClaimedSlotAsCapacity covers the floor arithmetic on the
+// delete path: a claim is capacity the group is committed to, so deleting the only claimed
+// slot of a minSize 1 group crosses the floor and is refused. Before the fix the claim was
+// invisible to the floor as well, and the delete silently cancelled a scale-up that the pool
+// needs to reach its minimum.
+func TestNodeGroupDeleteNodesCountsClaimedSlotAsCapacity(t *testing.T) {
+	server := newServer(t,
+		groupCR(testGroup, 1),
+		slotInSystemNamespace("slot-claimed", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+		slotInSystemNamespace("slot-spare", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+
+	_, err := server.NodeGroupDeleteNodes(context.Background(), &pb.NodeGroupDeleteNodesRequest{
+		Id:    testGroup,
+		Nodes: externalNodes("slot-claimed"),
+	})
+	require.Error(t, err)
+
+	st, ok := grpcstatus.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.FailedPrecondition, st.Code())
+	assert.Contains(t, st.Message(), "minSize")
+
+	desired, progress := slotState(t, server, "slot-claimed")
+	assert.Equal(t, infrav1alpha1.PowerStateOn, desired, "a refused delete must leave the claim in place")
+	assert.Equal(t, infrav1alpha1.ProgressShutdown, progress)
 }

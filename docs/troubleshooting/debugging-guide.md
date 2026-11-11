@@ -147,7 +147,9 @@ kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system
 
 # Why a machine was powered on or off: the controller records every scale up/down
 # transition on the Node CR (ScaleUpRequested, ScaleUpCompleted, ScaleDownRequested,
-# ScaleDownCompleted, and ScaleUpFailed / ScaleDownFailed as warnings)
+# ScaleDownCompleted; ScaleUpFailed / ScaleDownFailed as warnings; and a slot that lost
+# the coordination lock to the opposite operation, which is a scheduled retry and not a
+# failure, as ScaleUpDeferred / ScaleDownDeferred)
 kubectl describe nodes.infra.homecluster.dev -n homelab-autoscaler-system <node-cr-name>
 kubectl get events -n homelab-autoscaler-system --field-selector involvedObject.name=<node-cr-name>
 

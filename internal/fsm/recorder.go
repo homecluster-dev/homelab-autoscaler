@@ -32,9 +32,11 @@ const (
 	ReasonScaleUpRequested   = "ScaleUpRequested"
 	ReasonScaleUpCompleted   = "ScaleUpCompleted"
 	ReasonScaleUpFailed      = "ScaleUpFailed"
+	ReasonScaleUpDeferred    = "ScaleUpDeferred"
 	ReasonScaleDownRequested = "ScaleDownRequested"
 	ReasonScaleDownCompleted = "ScaleDownCompleted"
 	ReasonScaleDownFailed    = "ScaleDownFailed"
+	ReasonScaleDownDeferred  = "ScaleDownDeferred"
 )
 
 // Actions recorded on the Node CR. The new events API keeps `reason` (what happened,
@@ -94,6 +96,9 @@ func (nm *NodeStateMachine) recordLifecycleEvent(eventType, reason, action, mess
 // underlying failure in the message. isScaleDown says which operation died: a scale down
 // (ready -> shuttingdown) that dies rolls the slot back to ready, a scale up that dies
 // rolls it back to shutdown, so the caller - not the resulting state - decides.
+//
+// A transition that lost the coordination lock is not a failure and does not come here: the
+// caller reports it with recordScaleDeferral (see recordTransitionRefusal).
 func (nm *NodeStateMachine) recordScaleFailure(isScaleDown bool, detail string) {
 	if isScaleDown {
 		nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonScaleDownFailed, ActionPowerOff,
@@ -103,6 +108,41 @@ func (nm *NodeStateMachine) recordScaleFailure(isScaleDown bool, detail string) 
 
 	nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonScaleUpFailed, ActionPowerOn,
 		fmt.Sprintf("Scale up failed for %s: %s", nm.lifecycleTarget(), detail))
+}
+
+// recordScaleDeferral records a Normal event for a lifecycle operation that lost the
+// coordination lock to the opposite operation on the same slot, and says when it comes back.
+//
+// It is not a Warning. Two operations colliding on one slot is the coordination lock doing
+// what it is for: the slot is fine, the refused request is recorded in
+// spec.desiredPowerState, and the controller requeues at the deadline the lock names. A
+// Warning on that path is what a homelab drowns in - the live trace of this bug starts with
+// one - and it tells the operator nothing the deferred operation has not already done.
+// Real failures keep their Warning (see recordScaleFailure).
+func (nm *NodeStateMachine) recordScaleDeferral(isScaleDown bool, detail string) {
+	if isScaleDown {
+		nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleDownDeferred, ActionPowerOff,
+			fmt.Sprintf("Scale down deferred for %s: %s", nm.lifecycleTarget(), detail))
+		return
+	}
+
+	nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleUpDeferred, ActionPowerOn,
+		fmt.Sprintf("Scale up deferred for %s: %s", nm.lifecycleTarget(), detail))
+}
+
+// recordTransitionRefusal records a lifecycle transition that did not run, and it is the only
+// writer of its event: the state of the slot says nothing about which operation was refused,
+// so the caller says. A lost coordination lock is a deferral - the slot is fine, the request
+// is in spec.desiredPowerState and the controller requeues at the lock's deadline - and is
+// recorded as one. Everything else (the API server is unreachable, the lock annotations are
+// unreadable) is a failure.
+func (nm *NodeStateMachine) recordTransitionRefusal(isScaleDown bool, err error) {
+	if conflict := AsLockConflict(err); conflict != nil {
+		nm.recordScaleDeferral(isScaleDown, conflict.Deferral())
+		return
+	}
+
+	nm.recordScaleFailure(isScaleDown, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
 }
 
 // recordObservedJobFailure records the Warning for a lifecycle Job that the monitor saw

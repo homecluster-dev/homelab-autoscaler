@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -294,7 +295,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		assert.Len(t, jobs.Items, 0)
 	})
 
-	t.Run("coordination lock conflict", func(t *testing.T) {
+	t.Run("coordination lock conflict defers the transition instead of failing it", func(t *testing.T) {
 		// Create test objects with existing coordination lock
 		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
 		node.Status.PowerState = infrav1alpha1.PowerStateOff
@@ -330,17 +331,36 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		}
 
 		result, err := reconciler.Reconcile(ctx, req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "FSM transition failed")
-		// A failed transition is returned as an error only: controller-runtime ignores the
-		// Result when the error is non-nil and requeues with its own backoff.
-		assert.Equal(t, ctrl.Result{}, result)
+		// A transition that lost the coordination lock is a deferral, not a terminal failure.
+		// The lock is held by the opposite operation on the same slot; the request is retried
+		// on the deadline the lock itself names, and the intent that produced it -
+		// spec.desiredPowerState, written by cluster-autoscaler - is left in place, so nothing
+		// has to be asked for again. Returning the error instead handed the retry to
+		// controller-runtime's rate-limited queue, with only a ScaleDownDeferred event as the
+		// record that a shutdown was requested at all.
+		require.NoError(t, err)
+		assert.Greater(t, result.RequeueAfter, time.Duration(0), "the deferred transition is requeued")
+		assert.LessOrEqual(t, result.RequeueAfter, 5*time.Minute, "never later than the lock timeout")
 
 		// Verify no job was created due to lock conflict
 		jobs := &batchv1.JobList{}
 		err = fakeClient.List(ctx, jobs)
 		assert.NoError(t, err)
 		assert.Len(t, jobs.Items, 0)
+
+		// ...and the slot is untouched: a refused transition leaves no transitional progress
+		// behind, which is what keeps the next reconcile from being gated out of the slot by
+		// validateStateTransition - nothing in a reconcile undoes a transitional progress, only
+		// the operation that wrote it does.
+		updated := &infrav1alpha1.Node{}
+		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "test-node", Namespace: "default"}, updated))
+		assert.Equal(t, infrav1alpha1.ProgressShutdown, updated.Status.Progress)
+		assert.Equal(t, infrav1alpha1.PowerStateOn, updated.Spec.DesiredPowerState)
+
+		// The lock of the operation in flight survived the refusal: scale-up and scale-down of
+		// one slot stay mutually exclusive.
+		assert.Equal(t, "scale-up", updated.Annotations[fsm.OperationLockAnnotation])
+		assert.Equal(t, "cluster-autoscaler", updated.Annotations[fsm.LockOwnerAnnotation])
 	})
 
 	t.Run("invalid transition", func(t *testing.T) {

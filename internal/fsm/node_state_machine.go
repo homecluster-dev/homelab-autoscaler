@@ -101,14 +101,29 @@ func (nm *NodeStateMachine) CanTransition(event string) bool {
 	return nm.fsm.Can(event)
 }
 
-// StartNode triggers the StartNode event to begin node startup
+// StartNode triggers the StartNode event to begin node startup.
+//
+// The FSM event runs first, because taking the coordination lock is the first thing a
+// lifecycle operation does: cleanupPendingJobs deletes the pending lifecycle Job of the slot
+// and the taint removal touches the Kubernetes node, and a startup that is about to be
+// refused by a scale-down holding the slot has no business doing either. Everything after
+// the event runs on a slot this operation owns.
 func (nm *NodeStateMachine) StartNode() error {
 	logger := log.Log.WithName("fsm")
 	ctx := context.TODO()
 
 	logger.Info("Triggering StartNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
 
-	// Clean up any existing pending jobs before starting new operation
+	// Trigger FSM event. A cancellation from the coordination lock leaves status.progress on
+	// the stable state the transition started from (see beforeStartNode) and returns a
+	// LockConflictError, which the caller defers: the intent this call carries is in
+	// spec.desiredPowerState already, so the request is retried, not dropped.
+	if err := nm.fsm.Event(ctx, EventStartNode); err != nil {
+		nm.recordTransitionRefusal(false, err)
+		return fmt.Errorf("FSM transition failed: %w", err)
+	}
+
+	// Clean up any existing pending jobs now that this operation owns the slot
 	if err := nm.cleanupPendingJobs(nm.node.Spec.KubernetesNodeName); err != nil {
 		logger.Error(err, "Failed to cleanup pending jobs, continuing with startup", "node", nm.node.Name)
 		// Continue with startup even if cleanup fails
@@ -120,12 +135,6 @@ func (nm *NodeStateMachine) StartNode() error {
 		// Continue with startup even if taint removal fails
 	}
 
-	// Trigger FSM event
-	if err := nm.fsm.Event(ctx, EventStartNode); err != nil {
-		nm.recordScaleFailure(false, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
-		return fmt.Errorf("FSM transition failed: %w", err)
-	}
-
 	// Create and start Kubernetes Job
 	job, err := nm.createStartupJob()
 	if err != nil {
@@ -133,7 +142,9 @@ func (nm *NodeStateMachine) StartNode() error {
 		// JobFailed transition into shutdown suppresses its completion event, so a
 		// failed scale up produces exactly one Warning.
 		nm.recordScaleFailure(false, fmt.Sprintf("failed to create startup job: %s", errorDetail(err)))
-		// Trigger failure event to rollback
+		// Trigger failure event to rollback. The rollback moves the slot out of startingup,
+		// and afterJobFailed releases the coordination lock: a failed operation never leaves
+		// a transitional progress or a lock behind.
 		if err := nm.fsm.Event(ctx, EventJobFailed); err != nil {
 			logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
 		}
@@ -150,14 +161,36 @@ func (nm *NodeStateMachine) StartNode() error {
 	return nil
 }
 
-// ShutdownNode triggers the ShutdownNode event to begin node shutdown
+// ShutdownNode triggers the ShutdownNode event to begin node shutdown.
+//
+// The FSM event runs first, for the same reason as StartNode: cordoning the Kubernetes node
+// and deleting the pending lifecycle Job of the slot are side effects this operation only
+// owns once the coordination lock is taken. A shutdown requested while a scale-up holds the
+// slot is refused by the lock, and the refusal now leaves the slot exactly as it was - the
+// startup Job of the operation in flight is not deleted, the node is not cordoned, and
+// status.progress is not moved to shuttingdown.
+//
+// The refused shutdown is not lost: spec.desiredPowerState (off, written by
+// NodeGroupDeleteNodes) is the intent, and it is what the node controller reconciles from,
+// so the next pass calls this method again and the shutdown runs when the scale-up releases
+// the lock. The returned error wraps a LockConflictError carrying the remaining lifetime of
+// that lock, so the caller can requeue for that deadline (see
+// handleStateTransitionsWithFSM) instead of letting controller-runtime rate-limit a request
+// that is known to be valid.
 func (nm *NodeStateMachine) ShutdownNode() error {
 	logger := log.Log.WithName("fsm")
 	ctx := context.TODO()
 
 	logger.Info("Triggering ShutdownNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
 
-	// Clean up any existing pending jobs before starting new operation
+	// Trigger FSM event, taking the coordination lock. See StartNode for what a cancellation
+	// does and does not leave behind.
+	if err := nm.fsm.Event(ctx, EventShutdownNode); err != nil {
+		nm.recordTransitionRefusal(true, err)
+		return fmt.Errorf("FSM transition failed: %w", err)
+	}
+
+	// Clean up any existing pending jobs now that this operation owns the slot
 	if err := nm.cleanupPendingJobs(nm.node.Spec.KubernetesNodeName); err != nil {
 		logger.Error(err, "Failed to cleanup pending jobs, continuing with shutdown", "node", nm.node.Name)
 		// Continue with shutdown even if cleanup fails
@@ -169,19 +202,15 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 		// Continue with shutdown even if cordoning fails
 	}
 
-	// Trigger FSM event
-	if err := nm.fsm.Event(ctx, EventShutdownNode); err != nil {
-		nm.recordScaleFailure(true, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
-		return fmt.Errorf("FSM transition failed: %w", err)
-	}
-
 	// Create and start Kubernetes Job
 	job, err := nm.createShutdownJob()
 	if err != nil {
 		// See StartNode: the failure is recorded once, here, and the rollback
 		// transition suppresses its completion event.
 		nm.recordScaleFailure(true, fmt.Sprintf("failed to create shutdown job: %s", errorDetail(err)))
-		// Trigger failure event to rollback
+		// Trigger failure event to rollback. The rollback moves the slot out of shuttingdown
+		// and afterJobFailed releases the lock, so a shutdown that never got a Job leaves a
+		// stable progress and no lock behind, ready for the next attempt.
 		if err := nm.fsm.Event(ctx, EventJobFailed); err != nil {
 			logger.Error(err, "Failed to trigger JobFailed event", "node", nm.node.Name)
 		}
@@ -610,9 +639,40 @@ func (nm *NodeStateMachine) setOwnerReference(job *batchv1.Job) {
 	})
 }
 
-// updateNodeProgress updates the node progress status
+// updateNodeProgress persists the progress of the state this machine is in.
+//
+// The parameter is the progress the caller believes it is writing - every hook passes
+// Progress(e.Dst) - and it is checked against the machine's own state, with a mismatch
+// refused. That is the second half of the rule that keeps a slot from being stranded in a
+// transitional progress, and it is written for the two racers this controller has: the async
+// job monitor goroutine an earlier reconcile started, and a state machine built from a Node
+// read before a transition ran. Either of them writing the progress it remembers is how a slot
+// ends up in shuttingdown with nothing driving it: excluded from the provider's target size,
+// gated out of every further transition by validateStateTransition, and left there - the
+// stuck-transition cleanup runs on the machine's own backoff record, which a reconciler builds
+// fresh every pass, so no reconcile reaches ForceCleanup for it. Only the operation that wrote
+// the transitional progress moves it again.
+//
+// The guard covers the writes that go through it, i.e. the FSM's own. status.progress has
+// writers outside the FSM - the gRPC server and the core node controllers - and none of them
+// is a state machine this check can consult; see docs/architecture/state.md.
+//
+// The check is free on every legitimate path: looplab/fsm applies the state change before it
+// runs the enter_ and after_ callbacks, so the progress a hook passes is the state the machine
+// is in, and this writes exactly what it used to.
 func (nm *NodeStateMachine) updateNodeProgress(progress infrav1alpha1.Progress) {
 	ctx := context.TODO()
+	logger := log.Log.WithName("fsm")
+
+	if current := infrav1alpha1.Progress(nm.GetCurrentState()); current != progress {
+		logger.Info("Refusing to record a progress the state machine is not in",
+			"node", nm.node.Name,
+			"attempted", string(progress),
+			"currentState", string(current),
+			"recordedProgress", string(nm.node.Status.Progress))
+
+		return
+	}
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get fresh copy of the node
@@ -642,7 +702,6 @@ func (nm *NodeStateMachine) updateNodeProgress(progress infrav1alpha1.Progress) 
 		nm.node = fresh
 		return nil
 	}); err != nil {
-		logger := log.Log.WithName("fsm")
 		logger.Error(err, "Failed to update node progress", "node", nm.node.Name, "progress", progress)
 	}
 }

@@ -92,17 +92,54 @@ func (s *HomeClusterProviderServer) groupNodes(ctx context.Context, groupName st
 }
 
 // countsTowardsTargetSize reports whether a slot counts as capacity the provider is
-// serving: a slot whose progress is a shutdown (shutdown/shuttingdown) is not counted,
-// which is what leaves the group headroom for cluster-autoscaler.
+// serving: a slot that is claimed (spec.desiredPowerState on) or running counts, a slot
+// that is genuinely being torn down (desired off plus a progress of shuttingdown, shutdown
+// or startingup) does not, which is what leaves the group headroom for cluster-autoscaler.
+//
+// The claimed half of that rule is what stops cluster-autoscaler from provisioning the
+// pool over its max size, and it is subtle, so here is the whole reason it is here:
+// NodeGroupIncreaseSize claims a slot by writing spec.desiredPowerState = on, and that
+// write is the entire record of the request. status.progress is owned by the FSM and
+// stays shutdown until the node controller gets to the slot - seconds later, and the
+// machine then takes minutes to boot. If the target size were read off status.progress
+// alone, the slot the autoscaler just asked for would keep reporting "shut down" for that
+// whole window, NodeGroupTargetSize would keep answering with the old number, the
+// autoscaler would conclude the group never grew and call IncreaseSize again in the same
+// loop. Live trace, one pending pod, one group:
+//
+//	09:38:15  Scale-up: setting group remote-workers size to 1
+//	09:38:15  Scale-up: setting group remote-workers size to 2   (250ms later)
+//	09:42:35  size to 1 -> size to 2 -> size to 3
+//
+// spec.desiredPowerState is the request, status.progress is what the machine is doing: a
+// slot is capacity the moment it is requested. Slots really going away stay excluded
+// because a shutdown always sets desired off before (NodeGroupDeleteNodes,
+// NodeGroupDecreaseTargetSize) the FSM moves progress into shuttingdown, so the
+// exclusions below keep their full effect for them.
+//
+// A desired-off slot that is mid startup (the third exclusion) is a startup that was
+// cancelled: the request is off and the machine never came up, so it is not capacity. The
+// exclusion has to live here, because NodeGroupDecreaseTargetSize no longer writes
+// progress: shuttingdown itself to take a cancelled slot off the target size - it writes the
+// spec only, and the FSM moves the progress when its ShutdownNode runs. The unit comes off
+// the number on the write that asks for it, the same instant it used to, with no progress
+// written outside a transition.
 func countsTowardsTargetSize(node infrav1alpha1.Node) bool {
+	if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn {
+		return true
+	}
+
 	return node.Status.Progress != infrav1alpha1.ProgressShuttingDown &&
-		node.Status.Progress != infrav1alpha1.ProgressShutdown
+		node.Status.Progress != infrav1alpha1.ProgressShutdown &&
+		node.Status.Progress != infrav1alpha1.ProgressStartingUp
 }
 
-// targetSizeOf counts the slots that make up the target size of a group. This is the one
-// definition of "target size" in the provider: it is what NodeGroupTargetSize reports to
-// cluster-autoscaler, and every minSize/maxSize check must be compared against this same
-// number, because the autoscaler sizes the group from it. Do not derive the size from a
+// targetSizeOf counts the slots that make up the target size of a group: the slots that
+// are claimed (spec.desiredPowerState on, running or booting) plus the machines the
+// provider is still serving. This is the one definition of "target size" in the provider:
+// it is what NodeGroupTargetSize reports to cluster-autoscaler, and every minSize/maxSize
+// check must be compared against this same number, because the autoscaler sizes the group
+// from it. Do not derive the size from a
 // subset of the slots (powered on plus starting up, say): that is a different quantity and
 // a floor judged against it refuses requests that do not cross the floor, which
 // cluster-autoscaler then retries forever.
@@ -119,8 +156,18 @@ func targetSizeOf(nodes []infrav1alpha1.Node) int32 {
 
 // isStartingUpSlot reports the one slot shape NodeGroupDecreaseTargetSize can cancel: a
 // slot that is desired on, has not powered on yet and is mid startup. Cancelling it takes
-// it out of the target size (its progress becomes shuttingdown), which is what makes
-// starting up slots the only capacity this entry point can decrease.
+// it out of the target size, which is what makes starting up slots the only capacity this
+// entry point can decrease. Two consequences of the target size counting claimed slots
+// (see countsTowardsTargetSize), both honoured by the cancellation below:
+//   - a claim that has not been picked up by the FSM yet (desired on, progress still
+//     shutdown) is not a cancel target: it is a scale-up in flight, not a startup to abort,
+//     and the autoscaler's own min-size / DeleteNodes paths own it from there on;
+//   - cancelling has to clear spec.desiredPowerState, and must not touch status.progress.
+//     The spec is the request: with it left on, the slot keeps counting towards the target
+//     size whatever its progress says, and the desired-off + startingup shape it lands in is
+//     excluded from the target size, so one unit comes off the number the autoscaler reads.
+//     The progress belongs to the FSM, which powers the slot off through ShutdownNode - with
+//     its lifecycle Job, its coordination lock and its timestamps - on the next reconcile.
 func isStartingUpSlot(node infrav1alpha1.Node) bool {
 	return node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
 		node.Status.PowerState == infrav1alpha1.PowerStateOff &&
@@ -416,8 +463,11 @@ func (s *HomeClusterProviderServer) NodeGroupTargetSize(ctx context.Context, req
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
 	}
 
-	// Count nodes that should be running (target size = nodes not shutting down or shutdown)
-	// This represents the desired number of active nodes in the group
+	// The target size is the slots the provider is committed to serve: the claimed ones
+	// (spec.desiredPowerState on, including the ones whose machine has not been picked up by
+	// the FSM yet) and the machines still running. See countsTowardsTargetSize - counting
+	// only what status.progress reports as up is what made cluster-autoscaler ask for the
+	// same slot over and over.
 	targetSize := targetSizeOf(nodes)
 
 	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id, "targetSize", targetSize, "totalNodes", len(nodes))
@@ -450,7 +500,10 @@ func (s *HomeClusterProviderServer) NodeGroupIncreaseSize(ctx context.Context, r
 	// The max size of the group is the number of slots committed to it. Refuse a scale up
 	// that would exceed it explicitly: cluster-autoscaler sizes the group from this same
 	// count, so a request that crosses it means its view is stale and powering a slot on
-	// anyway would take the pool over the machines the operator committed.
+	// anyway would take the pool over the machines the operator committed. currentSize is
+	// targetSizeOf, so slots that are claimed and not booted yet are already spent against
+	// the max: that is what makes a burst of IncreaseSize calls in one autoscaler loop stop
+	// at the max instead of running past it (see countsTowardsTargetSize).
 	maxSize := int32(len(nodes))
 	currentSize := targetSizeOf(nodes)
 	if currentSize+req.Delta > maxSize {
@@ -531,7 +584,10 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 	}
 
 	// Only the slots that count towards the target size are capacity that goes away; a slot
-	// that is already shut down is off the books and can be "deleted" again.
+	// that is already shut down is off the books and can be "deleted" again. A claimed slot
+	// (desired on, machine not up yet) is capacity that goes away, so a delete that cancels a
+	// claim is judged against the floor like any other: the claim counts on both sides of the
+	// arithmetic, which is the point of counting it in targetSizeOf at all.
 	var deleting int32
 	for _, node := range nodes {
 		if requested[node.Name] && countsTowardsTargetSize(node) {
@@ -588,6 +644,14 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 // targetSizeOf that NodeGroupTargetSize reports, and a request that cannot take any
 // capacity away is a no-op success: cluster-autoscaler retries a FailedPrecondition
 // forever and never corrects its own view of the target size.
+//
+// A cancellation writes spec.desiredPowerState and nothing else, exactly like
+// NodeGroupDeleteNodes. status.progress belongs to the FSM: the cancelled slot is powered
+// off by the node controller's ShutdownNode, with its lifecycle Job, its coordination lock
+// and its timestamps, on the next reconcile. This handler used to write progress:
+// shuttingdown itself, and that is the one out-of-band writer of a transitional progress:
+// with no transition, no Job and no lock behind it, the slot is only healed by the state
+// machine it collided with, and a manager restart takes that writer away with it.
 func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.NodeGroupDecreaseTargetSizeRequest) (*pb.NodeGroupDecreaseTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDecreaseTargetSize called", "nodeGroup", req.Id, "delta", req.Delta)
@@ -609,9 +673,11 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 	}
 
 	// The only capacity this entry point can take away is slots that are still starting:
-	// a running machine is left to NodeGroupDeleteNodes, and a slot whose progress is
-	// already a shutdown is off the target size. Cancelling one moves its progress to
-	// shuttingdown, which is exactly one unit off targetSizeOf.
+	// a running machine is left to NodeGroupDeleteNodes, a slot that is already going away is
+	// off the target size, and a claim the FSM has not picked up yet is not a startup to
+	// abort (see isStartingUpSlot). Cancelling one clears spec.desiredPowerState, and a
+	// cancelled startup is not capacity (see countsTowardsTargetSize): exactly one unit off
+	// targetSizeOf, on the write that asks for it.
 	var startingUpNodes []infrav1alpha1.Node
 	for _, node := range nodes {
 		if isStartingUpSlot(node) {
@@ -681,25 +747,22 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 	for i := 0; i < int(nodesToShutdown) && i < len(startingUpNodes); i++ {
 		node := &startingUpNodes[i]
 
-		// Update spec (desired state)
+		// Update spec (desired state). This is the whole cancellation: the request is the
+		// spec, the progress is the FSM's, and the shutdown that moves it runs under the
+		// coordination lock with its lifecycle Job behind it. See the entry point doc.
 		node.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
 		if err := s.Client.Update(ctx, node); err != nil {
 			logger.Error(err, "failed to update node spec", "node", node.Name)
 			return nil, status.Errorf(codes.Internal, "failed to update node %s spec: %v", node.Name, err)
 		}
 
-		// Update status separately
-		node.Status.Progress = infrav1alpha1.ProgressShuttingDown
-		if err := s.Client.Status().Update(ctx, node); err != nil {
-			logger.Error(err, "failed to update node status", "node", node.Name)
-			return nil, status.Errorf(codes.Internal, "failed to update node %s status: %v", node.Name, err)
-		}
-
 		logger.Info("Successfully marked node for shutdown", "node", node.Name, "group", req.Id)
 	}
 
 	// The size reported here is the target size after the cancellations that were actually
-	// carried out (the cap above), not the one the delta asked for.
+	// carried out (the cap above), not the one the delta asked for. Each cancellation is one
+	// unit off targetSizeOf from the spec write on, so a request that cancels N slots lands
+	// on currentSize - N, which is what cluster-autoscaler reads back from NodeGroupTargetSize.
 	logger.Info("NodeGroupDecreaseTargetSize completed", "nodeGroup", req.Id, "delta", req.Delta,
 		"nodesShutdown", nodesToShutdown, "currentSize", currentSize, "newSize", currentSize-nodesToShutdown)
 
