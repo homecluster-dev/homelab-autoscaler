@@ -146,14 +146,8 @@ func (b *MockClientBuilder) WithKubernetesNode(name string, opts ...KubernetesNo
 			ProviderID: fmt.Sprintf("homelab://%s", name),
 		},
 		Status: corev1.NodeStatus{
-			Capacity: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("4"),
-				corev1.ResourceMemory: resource.MustParse("8Gi"),
-			},
-			Allocatable: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("3.8"),
-				corev1.ResourceMemory: resource.MustParse("7.5Gi"),
-			},
+			Capacity:    kubeletCapacity("4", "8Gi"),
+			Allocatable: kubeletAllocatable("4", "8Gi"),
 			Conditions: []corev1.NodeCondition{
 				{
 					Type:   corev1.NodeReady,
@@ -273,15 +267,60 @@ func WithNodeTaints(taints []corev1.Taint) NodeOption {
 	}
 }
 
+// The shape of a machine a fixture pretends to be: a small homelab box, described the way a
+// kubelet describes one. cpu and memory are what a caller varies; pods is the kubelet's --max-pods
+// ceiling and ephemeral-storage its disk, and a real node reports both. Fixtures used to carry
+// cpu and memory only, which is why the provider handing cluster-autoscaler a template with no
+// pods in its allocatable went unseen: the scheduler derives AllowedPodNumber from v1.ResourcePods
+// alone and rejects every pod with "Too many pods" before it looks at a request, so the estimator
+// finds no placement and never calls NodeGroupIncreaseSize.
+//
+// The allocatable numbers sit 5% under capacity, which is the tolerance the declared-capacity drift
+// check applies, so a fixture whose declaration matches its node stays quiet.
+const (
+	MockNodeMaxPods          = "110"
+	MockNodeEphemeralStorage = "40Gi"
+	// MockNodeAllocatableEphemeralStorage is the 40Gi disk minus the kubelet's eviction reserve.
+	MockNodeAllocatableEphemeralStorage = "38Gi"
+)
+
+// kubeletCapacity is what a kubelet reports in status.capacity for a machine of this size: the
+// cpu and memory it has, the pod ceiling it was configured with, and the disk it boots on.
+func kubeletCapacity(cpu, memory string) corev1.ResourceList {
+	return corev1.ResourceList{
+		corev1.ResourceCPU:              resource.MustParse(cpu),
+		corev1.ResourceMemory:           resource.MustParse(memory),
+		corev1.ResourcePods:             resource.MustParse(MockNodeMaxPods),
+		corev1.ResourceEphemeralStorage: resource.MustParse(MockNodeEphemeralStorage),
+	}
+}
+
+// kubeletAllocatable is the same machine as reported in status.allocatable: capacity minus the
+// system reservation the kubelet subtracts, here a flat 5% on cpu and memory and the eviction
+// reserve on the disk, with the pod ceiling unchanged.
+func kubeletAllocatable(cpu, memory string) corev1.ResourceList {
+	cpuQuantity := resource.MustParse(cpu)
+	memQuantity := resource.MustParse(memory)
+
+	// Reduce cpu and memory by 5% for allocatable, the way a kubelet's system reservation does.
+	return corev1.ResourceList{
+		corev1.ResourceCPU:              *resource.NewMilliQuantity(cpuQuantity.MilliValue()*95/100, resource.DecimalSI),
+		corev1.ResourceMemory:           *resource.NewQuantity(memQuantity.Value()*95/100, resource.BinarySI),
+		corev1.ResourcePods:             resource.MustParse(MockNodeMaxPods),
+		corev1.ResourceEphemeralStorage: resource.MustParse(MockNodeAllocatableEphemeralStorage),
+	}
+}
+
 // WithNodeCapacity declares the shape of the machine a slot boots (spec.nodeCapacity), as the
 // kubelet reports it: the capacity cluster-autoscaler simulates a scale-up on when no slot of the
 // group has a registered node.
+//
+// The declaration names pods and ephemeral-storage next to the cpu and memory the caller passes,
+// because that is the list a kubelet reports and the list the drift check compares: a fixture that
+// declares two resources on a node that reports four describes a machine no real slot boots.
 func WithNodeCapacity(cpu, memory string) NodeOption {
 	return func(n *infrav1alpha1.Node) {
-		n.Spec.NodeCapacity = corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(cpu),
-			corev1.ResourceMemory: resource.MustParse(memory),
-		}
+		n.Spec.NodeCapacity = kubeletCapacity(cpu, memory)
 	}
 }
 
@@ -340,25 +379,13 @@ func WithKubernetesNodeCondition(conditionType corev1.NodeConditionType, status 
 	}
 }
 
-// WithKubernetesNodeResources sets the capacity and allocatable resources
+// WithKubernetesNodeResources sets the capacity and allocatable resources of a Kubernetes node,
+// the way a kubelet fills them in: cpu, memory, the pod ceiling and the local disk. The
+// allocatable numbers are 5% under capacity, the reservation a real machine subtracts.
 func WithKubernetesNodeResources(cpu, memory string) KubernetesNodeOption {
 	return func(n *corev1.Node) {
-		n.Status.Capacity = corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(cpu),
-			corev1.ResourceMemory: resource.MustParse(memory),
-		}
-		// Set allocatable to slightly less than capacity
-		cpuQuantity := resource.MustParse(cpu)
-		memQuantity := resource.MustParse(memory)
-
-		// Reduce by 5% for allocatable
-		cpuMillis := cpuQuantity.MilliValue() * 95 / 100
-		memBytes := memQuantity.Value() * 95 / 100
-
-		n.Status.Allocatable = corev1.ResourceList{
-			corev1.ResourceCPU:    *resource.NewMilliQuantity(cpuMillis, resource.DecimalSI),
-			corev1.ResourceMemory: *resource.NewQuantity(memBytes, resource.BinarySI),
-		}
+		n.Status.Capacity = kubeletCapacity(cpu, memory)
+		n.Status.Allocatable = kubeletAllocatable(cpu, memory)
 	}
 }
 

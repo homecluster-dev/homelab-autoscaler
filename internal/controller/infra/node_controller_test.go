@@ -333,9 +333,10 @@ func capacityK8sNode(cpu, memory string, ready bool) *corev1.Node {
 
 // TestDeclaredNodeCapacityDriftWarns covers a declaration that stopped matching the machine: the
 // VM was resized, the system reservation moved, the numbers came off the datasheet instead of off
-// a booted node. A stale declaration makes the pool unplaceable, cluster-autoscaler simulates a
-// machine the pool does not boot, and nothing in the cluster says so. The check is a Warning event
-// naming the drifted resource and both values, and nothing else.
+// a booted node. A stale declaration silently sizes the estimator's simulated machine wrong, so the
+// pool over-provisions work the booted node cannot take or leaves it idle, and nothing in the
+// cluster says so. The check is a Warning event naming the drifted resource and both values, and
+// nothing else.
 func TestDeclaredNodeCapacityDriftWarns(t *testing.T) {
 	recorder := events.NewFakeRecorder(8)
 

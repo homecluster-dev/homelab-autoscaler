@@ -103,6 +103,12 @@ Two things to know:
   boundary does, clamping a `minSize` above the number of slots to that count and refusing
   a scale up that would exceed it.
 
+`minSize: 0` is a supported floor, and a pool that uses it answers one more question: with no slot
+registered, cluster-autoscaler sizes the group's node template from
+[`spec.nodeCapacity` on the Node CRs](node.md#node-capacity). A pool at zero that declares nothing
+has a template with no cpu and no memory, no pod with requests fits it, and `NodeGroupIncreaseSize`
+is never called, so the group stays at zero and the floor that works is `minSize: 1`.
+
 ### Timing Parameters
 
 | Parameter | Purpose | Typical Value |

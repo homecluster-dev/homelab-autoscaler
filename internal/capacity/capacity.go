@@ -222,7 +222,8 @@ func nodeIsReady(node *corev1.Node) bool {
 // do about it.
 func mismatchNote(nodeName, details string) string {
 	return fmt.Sprintf("status.allocatable of node %s disagrees with spec.nodeCapacity by more than %d%%: %s. "+
-		"The declaration is the shape cluster-autoscaler simulates a scale-up on, so a stale one makes the pool "+
-		"unplaceable. The kubelet owns the reported values: update spec.nodeCapacity to what the machine really "+
-		"reports, or fix the machine.", nodeName, driftTolerancePercent, details)
+		"The declaration is the shape cluster-autoscaler simulates a scale-up on, so a stale one sizes the "+
+		"machine wrong: you over-provision work the booted node cannot take, or leave it idle. The kubelet "+
+		"owns the reported values: update spec.nodeCapacity to what the machine really reports, or fix the "+
+		"machine.", nodeName, driftTolerancePercent, details)
 }

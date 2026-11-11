@@ -552,7 +552,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 		})
 
 		Context("when no slot of the group has a Kubernetes node", func() {
-			It("answers with a placeholder that carries the declared taints and no capacity", func() {
+			It("answers with a placeholder that carries the declared taints and no machine size", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
@@ -567,8 +567,16 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				templateNode := &corev1.Node{}
 				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
 
-				// capacity of a machine that never registered cannot be read, so it is not invented
-				Expect(templateNode.Status.Allocatable).To(BeEmpty())
+				// the cpu, memory and disk of a machine that never registered cannot be read, so they
+				// are not invented. The pod ceiling is the kubelet's own default and is not a fact about
+				// the hardware, and a template without it is a node the scheduler answers "Too many
+				// pods" for, so the estimator never calls NodeGroupIncreaseSize.
+				Expect(templateNode.Status.Allocatable).NotTo(HaveKey(corev1.ResourceCPU))
+				Expect(templateNode.Status.Allocatable).NotTo(HaveKey(corev1.ResourceMemory))
+				Expect(templateNode.Status.Allocatable).NotTo(HaveKey(corev1.ResourceEphemeralStorage))
+				Expect(templateNode.Status.Allocatable).To(HaveKey(corev1.ResourcePods))
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourcePods, "110")).To(BeZero())
+				Expect(templateNode.Status.Capacity).To(Equal(templateNode.Status.Allocatable))
 				Expect(templateNode.Spec.Taints).To(ConsistOf(corev1.Taint{
 					Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule,
 				}))
@@ -581,7 +589,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				// The template is the machine cluster-autoscaler simulates a placement on, and a
 				// pool at zero has no corev1.Node to read its shape from. With no declaration the
 				// placeholder carries an empty allocatable, no pod with requests fits, and
-				// IncreaseGroupInSize is never called: the pool stays at zero. The declaration is
+				// NodeGroupIncreaseSize is never called: the pool stays at zero. The declaration is
 				// the shape the placeholder can honestly carry, because it is in Git.
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
@@ -604,6 +612,10 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")).To(BeZero())
 				Expect(cmpResource(templateNode.Status.Capacity, corev1.ResourceCPU, "1950m")).To(BeZero(),
 					"capacity and allocatable are the same list on a template machine")
+				// the pod ceiling of the template is what lets the scheduler place a pod on it at all:
+				// NodeResourcesFit checks "Too many pods" before it looks at any request
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourcePods, "110")).To(BeZero())
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceEphemeralStorage, "40Gi")).To(BeZero())
 			})
 		})
 
@@ -631,6 +643,10 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceCPU, "1950m")).To(BeZero(),
 					"the declaration wins over the 3.8 CPU the representative slot reports")
 				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")).To(BeZero())
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceEphemeralStorage, "40Gi")).To(BeZero(),
+					"the declaration wins for the resources it names, over the 38Gi the node reports")
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourcePods, "110")).To(BeZero(),
+					"the template keeps a pod ceiling: the scheduler rejects every pod without one")
 			})
 		})
 
