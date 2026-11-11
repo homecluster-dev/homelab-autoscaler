@@ -223,6 +223,45 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 
 	logger.Info("Triggering ShutdownNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
 
+	// The shutdown-attempt bound, checked before the transition and therefore before the coordination
+	// lock, the pending-Job cleanup and the cordon: a slot that has used its shutdown attempts must not
+	// cordon a node and start another shutdown Job, and it must not touch the state of an operation that
+	// owns the slot on the way out.
+	//
+	// This is the check that closes the loop the shutdown-completion guard opens
+	// (internal/fsm/shutdown_completion.go). A shutdown Job that exits 0 on a machine the observation
+	// reports up is refused: the slot is recorded ready, the claim is off, and the next pass fires this
+	// transition again - one shutdown Job, one cordon of a node that is serving pods, and one power
+	// operation on a real machine, per pass, forever. Unbounded that is a regression against the pre-PR
+	// behaviour (the same broken script left a *frozen* slot and no Job); bounded, it is three attempts,
+	// an exponentially growing gap between them (progress.observedPowerRetryBackoff), one
+	// ShutdownAttemptLimitReached Warning, and a slot that rests at the pair the observation says -
+	// ready, on, claimed off - which is healable the moment the pool's script is fixed. See
+	// internal/fsm/shutdown_attempts.go for the counter, its reset rule, and the hole it leaves.
+	if attempts, exhausted := nm.ShutdownAttemptsSpent(); exhausted {
+		cause := shutdownAttemptRefusalCause(nm.node)
+
+		// The note is the deduplication: exactly one Warning per scale-down episode, and the record the
+		// refusal stamps is the one the count reads.
+		_, noted := nm.noteShutdownAttemptLimit(cause)
+		if noted {
+			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonShutdownAttemptLimitReached, ActionPowerOff,
+				shutdownAttemptLimitNote(nm.node, attempts, cause))
+		}
+
+		// Info, not Error: the controller has stopped hammering a machine it cannot power off, and the
+		// refusal is the bound working. The attempts are in the line, because the question an operator
+		// asks next is "how many times did it try".
+		logger.Info("Refusing to shut down a slot that has used its shutdown attempts",
+			"node", nm.node.Name,
+			"attempts", attempts,
+			"limit", ShutdownAttemptLimit,
+			"evidence", cause,
+			"warning", "recorded on the slot"+notedSuffix(noted))
+
+		return &ShutdownAttemptLimitError{Node: nm.node.Name, Attempts: attempts, Limit: ShutdownAttemptLimit}
+	}
+
 	// Trigger FSM event, taking the coordination lock. See StartNode for what a cancellation
 	// does and does not leave behind.
 	if err := nm.fsm.Event(ctx, EventShutdownNode); err != nil {
@@ -696,6 +735,19 @@ func (nm *NodeStateMachine) setOwnerReference(job *batchv1.Job) {
 // The guard covers the writes that go through it, i.e. the FSM's own. status.progress has
 // writers outside the FSM - the gRPC server and the core node controllers - and none of them
 // is a state machine this check can consult; see docs/architecture/state.md.
+//
+// What the guard cannot cover is the field it does not write. updateNodeProgress persists
+// status.progress and never status.powerState, so a progress written here is recorded against the
+// power state the last observation left behind, and the pair is only as true as that observation:
+// the completion of a shutdown Job writes shutdown while the machine it powered off keeps its
+// corev1.Node Ready for node-monitor-grace-period (~40s), and the observation controller writes the
+// off when it sees the node go NotReady. A pair {powerState: on, progress: shutdown} that outlives
+// that window is a machine that outlived its record, and it is the state of the live 40-minute stuck
+// slot: the FSM derives StateShutdown from the progress, so ShutdownNode - the operation the claim
+// wants - is unreachable. Two rules close it: the completion of a shutdown Job refuses to write the
+// pair at all when the machine is observed up (fsm.refuseUnobservedShutdown, in
+// internal/fsm/shutdown_completion.go), and progress.ReconcileObservedPower corrects a pair that
+// rested, on the far side of the settle grace. Both read the observation; neither invents one.
 //
 // The check is free on every legitimate path: looplab/fsm applies the state change before it
 // runs the enter_ and after_ callbacks, so the progress a hook passes is the state the machine
