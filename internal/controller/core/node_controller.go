@@ -20,7 +20,9 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -78,39 +80,102 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	nodeStatus := r.getNodeStatus(node)
 	logger.Info("Node status retrieved", "name", node.Name, "status", nodeStatus)
 
-	// Only update if the status has actually changed to avoid conflicts
-	if nodeCR.Status.PowerState == nodeStatus {
+	// Only update when the recorded status disagrees with what is observed. A status
+	// write on every reconcile would keep this controller hot, so the fast path covers
+	// "power state unchanged AND progress already consistent with it".
+	if !applyObservedPowerState(nodeCR.DeepCopy(), nodeStatus) {
 		logger.V(1).Info("Node status unchanged, skipping update", "node", node.Name, "status", nodeStatus)
 		return ctrl.Result{}, nil
 	}
 
-	// Create a copy for status update to avoid race conditions
-	nodeCRCopy := nodeCR.DeepCopy()
-	nodeCRCopy.Status.PowerState = nodeStatus
-
-	// Update progress based on power state, but only if not already in a transitional state
-	if nodeCRCopy.Status.Progress != infrav1alpha1.ProgressStartingUp &&
-		nodeCRCopy.Status.Progress != infrav1alpha1.ProgressShuttingDown {
-		switch nodeStatus {
-		case infrav1alpha1.PowerStateOff:
-			nodeCRCopy.Status.Progress = infrav1alpha1.ProgressShutdown
-		case infrav1alpha1.PowerStateOn:
-			nodeCRCopy.Status.Progress = infrav1alpha1.ProgressReady
+	// The state machine writes the transitional progress values concurrently, so re-read
+	// the CR and re-derive the correction on every attempt. Same status-update and
+	// conflict-retry pattern as fsm.NodeStateMachine.updateNodeProgress.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1alpha1.Node{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(nodeCR), fresh); err != nil {
+			return err
 		}
-	}
 
-	// Use status subresource to avoid conflicts with spec updates
-	if err := r.Status().Update(ctx, nodeCRCopy); err != nil {
-		logger.Error(err, "Failed to update Node status", "node", node.Name, "powerstate", nodeCRCopy.Status.PowerState)
+		if !applyObservedPowerState(fresh, nodeStatus) {
+			// Someone (usually the state machine) already recorded what we observed.
+			return nil
+		}
+
+		// Use status subresource to avoid conflicts with spec updates
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The Node CR disappeared underneath us, nothing left to record.
+			logger.V(1).Info("Node CR not found, skipping status update", "node", node.Name, "nodeCR", nodeCR.Name)
+			return ctrl.Result{}, nil
+		}
+
+		logger.Error(err, "Failed to update Node status", "node", node.Name, "powerstate", nodeStatus)
 		// controller-runtime discards the Result when the error is non-nil, the requeue
 		// backoff is decided by the controller, so only the error is returned here.
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully updated Node status", "node", node.Name, "powerstate", nodeCRCopy.Status.PowerState, "progress", nodeCRCopy.Status.Progress)
+	logger.Info("Successfully updated Node status", "node", node.Name, "powerstate", nodeStatus)
 
 	return ctrl.Result{}, nil
 
+}
+
+// expectedProgress returns the progress value that corresponds to an observed power
+// state, and reports whether such a value exists. Only the steady states have one:
+// startingup and shuttingdown are transitional values owned by the state machine and
+// are never derived from an observation.
+func expectedProgress(powerState infrav1alpha1.PowerState) (infrav1alpha1.Progress, bool) {
+	switch powerState {
+	case infrav1alpha1.PowerStateOn:
+		return infrav1alpha1.ProgressReady, true
+	case infrav1alpha1.PowerStateOff:
+		return infrav1alpha1.ProgressShutdown, true
+	default:
+		return "", false
+	}
+}
+
+// applyObservedPowerState records the observed power state on the Node CR and corrects
+// status.progress to the value that corresponds to it. It returns true when the object
+// was changed, so the caller can skip the status write when there is nothing to do.
+//
+// The progress correction is deliberately not gated on the power state changing. A slot
+// that was shut down and started again through a path this controller did not observe
+// (desiredPowerState flipped back to on, machine booted) keeps status.powerState: on
+// while status.progress stays "shutdown". That stale progress is not cosmetic:
+// NodeGroupTargetSize excludes slots whose progress is shutdown/shuttingdown, so a group
+// with one Ready node reports targetSize 0 and cluster-autoscaler refuses to scale.
+//
+// The transitional progress values (startingup/shuttingdown) are never overwritten: they
+// are owned by the state machine, which is the only one that knows a power operation is
+// in flight.
+func applyObservedPowerState(node *infrav1alpha1.Node, powerState infrav1alpha1.PowerState) bool {
+	changed := false
+
+	if node.Status.PowerState != powerState {
+		node.Status.PowerState = powerState
+		changed = true
+	}
+
+	desiredProgress, derived := expectedProgress(powerState)
+	if !derived {
+		return changed
+	}
+
+	switch node.Status.Progress {
+	case infrav1alpha1.ProgressStartingUp, infrav1alpha1.ProgressShuttingDown:
+		// Transition in flight, the state machine owns status.progress.
+	default:
+		if node.Status.Progress != desiredProgress {
+			node.Status.Progress = desiredProgress
+			changed = true
+		}
+	}
+
+	return changed
 }
 
 func (r *KubernetesNodeReconciler) getNodeStatus(node *corev1.Node) infrav1alpha1.PowerState {
