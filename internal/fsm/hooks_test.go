@@ -178,6 +178,10 @@ func TestAfterJobCompleted(t *testing.T) {
 			Args:  []interface{}{job},
 		}
 
+		// looplab/fsm applies the state change before the after_ callback runs, so the
+		// machine has to be in the state the transition entered (see PrimeEnterState).
+		nm.PrimeEnterState(StateReady)
+
 		// Call the after hook
 		nm.afterJobCompleted(ctx, event)
 
@@ -219,6 +223,10 @@ func TestAfterJobCompleted(t *testing.T) {
 			Dst:   StateShutdown,
 			Args:  []interface{}{job},
 		}
+
+		// looplab/fsm applies the state change before the after_ callback runs, so the
+		// machine has to be in the state the transition entered (see PrimeEnterState).
+		nm.PrimeEnterState(StateShutdown)
 
 		// Call the after hook - should not panic or fail
 		nm.afterJobCompleted(ctx, event)
@@ -346,6 +354,10 @@ func TestAfterJobFailed(t *testing.T) {
 			Dst:   StateShutdown,
 		}
 
+		// looplab/fsm applies the state change before the after_ callback runs, so the
+		// machine has to be in the state the transition entered (see PrimeEnterState).
+		nm.PrimeEnterState(StateShutdown)
+
 		// Call the after hook
 		nm.afterJobFailed(ctx, event)
 
@@ -391,6 +403,10 @@ func TestAfterForceCleanup(t *testing.T) {
 			Dst:   StateShutdown,
 		}
 
+		// looplab/fsm applies the state change before the after_ callback runs, so the
+		// machine has to be in the state the transition entered (see PrimeEnterState).
+		nm.PrimeEnterState(StateShutdown)
+
 		// Call the after hook
 		nm.afterForceCleanup(ctx, event)
 
@@ -435,6 +451,10 @@ func TestEnterStartingUp(t *testing.T) {
 		Dst:   StateStartingUp,
 	}
 
+	// looplab/fsm applies the state change before the enter_ callback runs, so the machine
+	// has to be in the state this hook is entering (see PrimeEnterState).
+	nm.PrimeEnterState(StateStartingUp)
+
 	// Call the enter hook
 	nm.enterStartingUp(ctx, event)
 
@@ -478,6 +498,10 @@ func TestEnterShuttingDown(t *testing.T) {
 		Src:   StateReady,
 		Dst:   StateShuttingDown,
 	}
+
+	// looplab/fsm applies the state change before the enter_ callback runs, so the machine
+	// has to be in the state this hook is entering (see PrimeEnterState).
+	nm.PrimeEnterState(StateShuttingDown)
 
 	// Call the enter hook
 	nm.enterShuttingDown(ctx, event)
@@ -530,6 +554,10 @@ func TestEnterReady(t *testing.T) {
 		Dst:   StateReady,
 	}
 
+	// looplab/fsm applies the state change before the enter_ callback runs, so the machine
+	// has to be in the state this hook is entering (see PrimeEnterState).
+	nm.PrimeEnterState(StateReady)
+
 	// Call the enter hook
 	nm.enterReady(ctx, event)
 
@@ -576,6 +604,10 @@ func TestEnterShutdown(t *testing.T) {
 		Src:   StateShuttingDown,
 		Dst:   StateShutdown,
 	}
+
+	// looplab/fsm applies the state change before the enter_ callback runs, so the machine
+	// has to be in the state this hook is entering (see PrimeEnterState).
+	nm.PrimeEnterState(StateShutdown)
 
 	// Call the enter hook
 	nm.enterShutdown(ctx, event)

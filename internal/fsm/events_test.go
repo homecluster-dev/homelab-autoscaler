@@ -583,6 +583,7 @@ func TestGetFSMCallbacks(t *testing.T) {
 		"before_" + EventShutdownNode,
 		"after_" + EventJobCompleted,
 		"after_" + EventJobFailed,
+		"after_" + EventJobTimeout,
 		"after_" + EventForceCleanup,
 		"enter_" + StateStartingUp,
 		"enter_" + StateShuttingDown,
