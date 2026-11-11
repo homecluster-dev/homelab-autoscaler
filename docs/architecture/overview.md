@@ -44,11 +44,48 @@ Homelab Autoscaler is a Kubernetes operator with gRPC integration for physical n
 - Finite State Machine architecture
 - Coordination locking for race prevention
 - Power operation integration (in development)
+- Progress watchdog (`internal/progress`): reconciles a `status.progress` that names a machine the
+  cluster does not have (no `corev1.Node`, no lifecycle Job in flight, no such Job finished inside the
+  ~7 minute settle grace, no live lock). A slot desired `off` is settled to `off`/`shutdown`
+  (`ProgressReconciled` Warning). A **claim** - `spec.desiredPowerState: on`, the autoscaler asked for
+  the machine - is never settled: it is **re-armed** to `shutdown` with the claim left on, so the FSM
+  can start it again (`ClaimRearmed`). The retries are bounded by **one startup-attempt counter**
+  (3 per claim episode, counted by the `StartNode` transition and cleared when a boot passes the
+  readiness gate) that both failure loops pay into - the watchdog's re-arm, and a startup Job that
+  exits non-zero and rolls the slot back to `shutdown`, which the watchdog never sees. Past the bound
+  the watchdog settles the slot and `StartNode` refuses to start it, with one
+  `ClaimRearmLimitReached` Warning. A ready, claimed slot whose node is cordoned with nothing running
+  on it is uncordoned (`CordonReconciled`). It runs at the top of every pass, before any transition
 
 **Core Controller** (`internal/controller/core/node_controller.go`)
 - Bridges Kubernetes nodes with Node CRDs
 - Syncs node health status
 - Handles node registration/deregistration
+- Records what cluster-autoscaler decided about the machine (`internal/autoscaler`): the
+  `DeletionCandidateOfClusterAutoscaler` / `ToBeDeletedByClusterAutoscaler` markers become a
+  `AutoscalerDeletionCandidate` / `AutoscalerDeletionRequested` event on the Node CR, once per
+  transition, and the node's taints and `spec.unschedulable` are logged so a cordon is attributable
+  without raising the autoscaler's verbosity. The moment of the observation is in the condition's
+  message (`observed at ...`), because `lastTransitionTime` does not move on a
+  candidate→requested transition (both are `Status: True`) and would date the record early
+
+### Scale-up readiness
+
+The **scale-up** transition into `ready` (`JobCompleted` → Ready, the one that writes
+`status.progress: ready`) completes when the node is `Ready` **and** free of every readiness taint the
+pool declares. Pool workloads therefore do not need to tolerate `node.cilium.io/agent-not-ready`: the
+controller waits it out, because declaring a slot ready before its datapath works makes the autoscaler
+look at a Ready node its pending pod cannot land on and buy another machine.
+
+The key belongs to the CNI, so it is configuration: `Group.spec.nodeReadinessTaints` is the list the
+gate waits for, defaulted by the CRD to Cilium's `node.cilium.io/agent-not-ready` (stamped by Cilium
+since v1.9; this chart deploys 1.16.x). An empty list gates on `Ready` alone. The keys are recorded on
+the slot as the `NodeReadinessTaints` condition.
+
+The two deadlines are separate: 90s for the node object to register, then 4m for the gate, counted
+from the moment the object appears. On a timeout the controller **uncordons the node**, records a
+`ReadinessGateTimeout` Warning on the slot, and the transition completes - a cordoned machine is
+invisible to scale-down and would be paid for forever. See [State Management](state.md).
 
 ### gRPC Server (`internal/grpcserver/server.go`)
 

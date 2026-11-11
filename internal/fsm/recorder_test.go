@@ -103,7 +103,8 @@ func newRecordingStateMachine(t *testing.T, node *infrav1alpha1.Node, mockCoord 
 
 	rec := events.NewFakeRecorder(20)
 	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
-	nm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+	nm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	return nm, rec
 }
@@ -133,9 +134,17 @@ func TestNodeStateMachine_Events_ScaleUp(t *testing.T) {
 	assertEventCount(t, recorded, "Warning "+ReasonScaleUpFailed, 0)
 	assertEventCount(t, recorded, "Normal "+ReasonScaleDownRequested, 0)
 	assertEventCount(t, recorded, "Normal "+ReasonScaleDownCompleted, 0)
+
+	// This fixture has no corev1.Node for the scale-up to gate on, so the registration deadline
+	// expires and the loop records its timeout: the operator-visible half of "the machine never
+	// registered". That is the third event and the last one: two lifecycle events, one gate event, and
+	// no repeat.
+	gate := assertEventCount(t, recorded, "Warning "+ReasonReadinessGateTimeout, 1)
+	assert.Contains(t, gate[0], "has not appeared", "the event names the gate that ran out")
+
 	assert.True(t, strings.HasPrefix(recorded[0], "Normal "+ReasonScaleUpRequested),
 		"the request is recorded before the completion: %v", recorded)
-	assert.Len(t, recorded, 2, "one event per transition, no storm: %v", recorded)
+	assert.Len(t, recorded, 3, "one event per transition, one for the gate, no storm: %v", recorded)
 }
 
 func TestNodeStateMachine_Events_ScaleDown(t *testing.T) {
@@ -186,6 +195,7 @@ func TestNodeStateMachine_Events_ScaleUpFailure(t *testing.T) {
 	rec := events.NewFakeRecorder(20)
 	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	err := nm.StartNode()
 	require.Error(t, err)
@@ -320,6 +330,7 @@ func TestNodeStateMachine_Events_NilRecorderIsSilent(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			nm.uncordonTimeout = 100 * time.Millisecond
+			nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 			require.NoError(t, nm.StartNode())
 			require.NoError(t, nm.JobCompleted(nil))
@@ -389,6 +400,7 @@ func newCapturingStateMachine(t *testing.T, node *infrav1alpha1.Node, mockCoord 
 	nm := NewNodeStateMachine(node, CreateFakeClient(scheme, append([]client.Object{node}, objects...)...),
 		scheme, mockCoord, WithEventRecorder(rec))
 	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	return nm, rec
 }
@@ -455,6 +467,7 @@ func TestNodeStateMachine_Events_NewAPICallShape(t *testing.T) {
 		}
 		failNM := NewNodeStateMachine(failedNode, failing, scheme, NewMockCoordinationManager(), WithEventRecorder(failRec))
 		failNM.uncordonTimeout = 100 * time.Millisecond
+		failNM.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 		require.Error(t, failNM.StartNode())
 

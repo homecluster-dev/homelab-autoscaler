@@ -43,6 +43,11 @@ func TestIsProtectedKey(t *testing.T) {
 		"node.kubernetes.io/network-unavailable",
 		ToBeDeletedByClusterAutoscaler,
 		DeletionCandidateOfClusterAutoscaler,
+		// Cilium's bootstrap taint: its agent stamps it on a node that has just joined and removes it
+		// when the datapath is programmed. Declaring it in spec.nodeTaints stamps a taint the
+		// scale-up readiness gate then waits for, on a slot whose own declaration keeps putting it
+		// back - the gate can never be satisfied, and the pool pays for the timeout.
+		CiliumAgentNotReady,
 	}
 	for _, key := range protected {
 		assert.True(t, IsProtectedKey(key), "%s must be protected", key)

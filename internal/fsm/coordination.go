@@ -227,10 +227,7 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 		}
 
 		// Set lock annotations
-		fresh.Annotations[OperationLockAnnotation] = operation
-		fresh.Annotations[LockOwnerAnnotation] = cm.owner
-		fresh.Annotations[LockTimestampAnnotation] = time.Now().Format(time.RFC3339)
-		fresh.Annotations[LockTimeoutAnnotation] = strconv.FormatFloat(timeout.Seconds(), 'f', 0, 64)
+		stampLock(fresh, cm.owner, operation, time.Now(), timeout)
 
 		// Attempt to update with optimistic locking
 		if err := cm.client.Update(ctx, fresh); err != nil {
@@ -289,6 +286,21 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 
 		return nil
 	})
+}
+
+// stampLock writes the coordination lock annotations of a slot. AcquireLock and RenewLock share
+// it so the shape of a lock - and the expiry every reader of it computes - is written in one
+// place: a re-stamp that ages a lock differently from an acquisition is a lock the next
+// acquisition, the node controller's cleanup and the progress watchdog all read at odds.
+func stampLock(node *infrav1alpha1.Node, owner, operation string, at time.Time, timeout time.Duration) {
+	if node.Annotations == nil {
+		node.Annotations = make(map[string]string)
+	}
+
+	node.Annotations[OperationLockAnnotation] = operation
+	node.Annotations[LockOwnerAnnotation] = owner
+	node.Annotations[LockTimestampAnnotation] = at.Format(time.RFC3339)
+	node.Annotations[LockTimeoutAnnotation] = strconv.FormatFloat(timeout.Seconds(), 'f', 0, 64)
 }
 
 // lockOn reports the live lock a slot carries, if any, and nil for an expired one. It is
@@ -413,6 +425,88 @@ func (cm *DefaultCoordinationManager) IsLockExpired(lock *OperationLock) bool {
 
 	age := time.Since(lock.Timestamp)
 	return age > lock.Timeout
+}
+
+// RenewLock re-stamps the timestamp of the coordination lock this manager owns on a slot, and
+// reports whether it did. It is the heartbeat of a long-running operation: the acquisition writes
+// a lock with DefaultLockTimeout (5m), and every reader of that lock - the next acquisition, the
+// node controller's expired-lock cleanup, and the progress watchdog's lock gate - treats an older
+// one as free. An operation that holds a slot for longer than the timeout (the scale-up readiness
+// gate alone is bounded by 90s of registration plus 4m of gate) therefore loses the protection it
+// acquired, mid-wait, and the slot is open to the writers the lock exists to keep out.
+//
+// The rules, all of them refusals to take anything:
+//   - no lock on the slot: nothing to renew (returns false, no write). Renewal never acquires -
+//     acquiring is the before_ hook's job and it is the operation that owns the slot that renews;
+//   - a lock owned by someone else (cluster-autoscaler's provider, another controller): untouched,
+//     renewing a lock you do not own is claiming it;
+//   - an expired lock: not renewed. An expired lock names an operation that is over; re-stamping it
+//     would resurrect a lock nothing is running under, which is the shape the watchdog, the
+//     takeover path and cleanupExpiredLocks all exist to heal.
+//
+// The operation and the timeout of the holder are kept verbatim: only the timestamp moves, so the
+// lock an operator sees in the annotations still names the operation that owns the slot.
+func (cm *DefaultCoordinationManager) RenewLock(ctx context.Context, node *infrav1alpha1.Node) (bool, error) {
+	logger := log.Log.WithName("coordination")
+
+	renewed := false
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1alpha1.Node{}
+		if err := cm.client.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
+			return fmt.Errorf("failed to get fresh node: %w", err)
+		}
+
+		lock, exists := cm.CheckLock(ctx, fresh)
+		if !exists {
+			logger.V(1).Info("No coordination lock to renew",
+				"node", node.Name, "owner", cm.owner)
+
+			return nil
+		}
+
+		if lock.Owner != cm.owner {
+			logger.V(1).Info("Not renewing a coordination lock this component does not own",
+				"node", node.Name,
+				"owner", cm.owner,
+				"lockOwner", lock.Owner,
+				"operation", lock.Operation)
+
+			return nil
+		}
+
+		if cm.IsLockExpired(lock) {
+			logger.Info("Not renewing an expired coordination lock, the operation that wrote it is over",
+				"node", node.Name,
+				"operation", lock.Operation,
+				"owner", cm.owner,
+				"age", time.Since(lock.Timestamp),
+				"timeout", lock.Timeout)
+
+			return nil
+		}
+
+		stampLock(fresh, cm.owner, lock.Operation, time.Now(), lock.Timeout)
+
+		if err := cm.client.Update(ctx, fresh); err != nil {
+			return err
+		}
+
+		renewed = true
+
+		logger.V(1).Info("Re-stamped the coordination lock of a long-running operation",
+			"node", node.Name,
+			"operation", lock.Operation,
+			"owner", cm.owner,
+			"timeout", lock.Timeout)
+
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return renewed, nil
 }
 
 // ForceReleaseLock forcibly removes lock annotations from a node, regardless of ownership

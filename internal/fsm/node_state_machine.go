@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,12 +52,13 @@ func NewNodeStateMachine(
 	opts ...Option,
 ) *NodeStateMachine {
 	nm := &NodeStateMachine{
-		node:                node,
-		client:              k8sClient,
-		scheme:              scheme,
-		coordinationManager: coordMgr,
-		jobTimeout:          DefaultJobTimeout,
-		uncordonTimeout:     DefaultUncordonTimeout,
+		node:                 node,
+		client:               k8sClient,
+		scheme:               scheme,
+		coordinationManager:  coordMgr,
+		jobTimeout:           DefaultJobTimeout,
+		uncordonTimeout:      DefaultUncordonTimeout,
+		readinessGateTimeout: DefaultReadinessGateTimeout,
 	}
 
 	for _, opt := range opts {
@@ -113,6 +116,43 @@ func (nm *NodeStateMachine) StartNode() error {
 	ctx := context.TODO()
 
 	logger.Info("Triggering StartNode event", "node", nm.node.Name, "currentState", nm.fsm.Current())
+
+	// The startup-attempt bound, checked before the transition and therefore before the coordination
+	// lock, before the Job cleanup and before the Job: a slot that has used its attempts must not
+	// power a machine again, and it must not touch the slot of the operation that owns it either.
+	//
+	// This is the check that closes the loud loop. A startup Job that exits non-zero drives
+	// startingup -> JobFailed -> shutdown, afterJobFailed writes the *progress* only, and the next
+	// pass of the node controller sees desired on && powerState off && CanTransition(StartNode) and
+	// builds another Job and another machine. Unbounded, that is one machine per pass, forever, with
+	// no counter and no event. Bounded, this refusal is the end of it: the slot keeps the stable
+	// off/shutdown pair the rollback wrote, keeps its claim, and records one Warning naming the
+	// attempts it spent. The loop the progress watchdog re-arms (a startup whose Job completed with
+	// no node behind it) is the same counter, incremented by the same enterStartingUp hook and
+	// enforced by the same check - see internal/fsm/startup_attempts.go.
+	if attempts, exhausted := nm.StartupAttemptsSpent(); exhausted {
+		cause := startupAttemptRefusalCause(nm.node)
+
+		// The note is the deduplication: exactly one Warning per claim episode, whoever wrote the note
+		// (the watchdog's limit pass and this refusal share the record, so a slot is reported once).
+		_, noted := nm.noteStartupAttemptLimit(cause)
+		if noted {
+			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonStartupAttemptLimitReached, ActionPowerOn,
+				startupAttemptLimitNote(nm.node, attempts, cause))
+		}
+
+		// Info, not Error: the controller has stopped buying machines for a slot that cannot boot, and
+		// the refusal is the fix working. The attempts are in the line, because the question an
+		// operator asks next is "how many times did it try".
+		logger.Info("Refusing to start a slot that has used its startup attempts",
+			"node", nm.node.Name,
+			"attempts", attempts,
+			"limit", StartupAttemptLimit,
+			"evidence", cause,
+			"warning", "recorded on the slot"+notedSuffix(noted))
+
+		return &StartupAttemptLimitError{Node: nm.node.Name, Attempts: attempts, Limit: StartupAttemptLimit}
+	}
 
 	// Trigger FSM event. A cancellation from the coordination lock leaves status.progress on
 	// the stable state the transition started from (see beforeStartNode) and returns a
@@ -313,7 +353,7 @@ func (nm *NodeStateMachine) monitorJobCompletion(jobName string) {
 	defer cancel()
 
 	// Poll job status every 1 second for tests, 30 seconds for production
-	pollInterval := 30 * time.Second
+	pollInterval := JobMonitorPollInterval
 	if nm.jobTimeout < 5*time.Second {
 		pollInterval = 100 * time.Millisecond // Fast polling for tests
 	}
@@ -706,6 +746,53 @@ func (nm *NodeStateMachine) updateNodeProgress(progress infrav1alpha1.Progress) 
 	}
 }
 
+// startupAttemptRefusalCause renders the evidence a startup-attempt refusal quotes, read off the
+// slot itself. The two shapes the loop leaves behind are recorded on the slot - the JobFailed
+// condition afterJobFailed stamps, and the progress the attempt died at - so the Warning names what
+// happened to this slot's machines instead of guessing at a generic cause.
+func startupAttemptRefusalCause(node *infrav1alpha1.Node) string {
+	if condition := meta.FindStatusCondition(node.Status.Conditions, "JobFailed"); condition != nil &&
+		condition.Status == metav1.ConditionTrue {
+		return "the startup Jobs of those attempts exited non-zero, and the slot rolled back to status.progress " +
+			string(node.Status.Progress) + " each time"
+	}
+
+	if node.Spec.KubernetesNodeName != "" {
+		return fmt.Sprintf("no Kubernetes node %q ever registered for the machines those attempts started",
+			node.Spec.KubernetesNodeName)
+	}
+
+	return "each attempt ended back at status.powerState off with no Kubernetes node behind it"
+}
+
+// startupAttemptLimitNote renders the Warning of a refusal: the attempts, the evidence, what the
+// controller stopped doing, and the two things an operator can do about it. The condition the
+// refusal stamps carries the same facts for `kubectl describe`; this is the one-liner that shows up
+// in the event stream, where a pool that stopped booting has to be visible without opening an object.
+func startupAttemptLimitNote(node *infrav1alpha1.Node, attempts int, cause string) string {
+	return fmt.Sprintf(
+		"Scale up refused for %s: %d of %d startup attempts used (%s). The controller will not start "+
+			"another machine for this slot, so it stays at status.progress %q with status.powerState %q while "+
+			"spec.desiredPowerState stays %q - the request stands and the slot keeps being counted as requested "+
+			"capacity. Scale the group down to drop the claim, or fix what keeps the machine from booting (startup "+
+			"command, image, power API credentials): a boot that passes the readiness gate clears the record and the "+
+			"%d attempts with it.",
+		startupAttemptTarget(node), attempts, StartupAttemptLimit, cause,
+		string(node.Status.Progress), string(node.Status.PowerState), string(node.Spec.DesiredPowerState),
+		StartupAttemptLimit)
+}
+
+// notedSuffix says, for the log line, whether the Warning went out with this refusal. The note is
+// written once per claim episode, so every later refusal logs the refusal and records nothing, and
+// the log has to say which of the two happened.
+func notedSuffix(noted bool) string {
+	if noted {
+		return " on the slot"
+	}
+
+	return ", already recorded on the slot"
+}
+
 // setNodeUnschedulable cordons the Kubernetes node to prevent new pods from being scheduled
 func (nm *NodeStateMachine) setNodeUnschedulable(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "cordon")
@@ -802,10 +889,116 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 	return nil
 }
 
-// setNodeSchedulableWithRetry attempts to uncordon a Kubernetes node with exponential backoff
-// This is used after node startup to handle the case where the node hasn't registered yet.
-// On every pass, once the node object exists, it first stamps the taints the slot declares
-// (spec.nodeTaints) so the node is tainted before it becomes schedulable.
+// TaintCiliumAgentNotReady is Cilium's bootstrap taint: its agent adds it to a node that has just
+// joined, with a NoExecute effect, and removes it once its datapath is programmed for that node.
+// The kubelet marks the node Ready long before that happens, so Ready is not evidence that the
+// machine can take work.
+//
+// It is the documented default of the readiness gate, and the value the chart's Group CRs get by
+// CRD default (api/infra/v1alpha1 GroupSpec.NodeReadinessTaints): the key belongs to the CNI of
+// the cluster and is not verifiable from this repository, so the gate reads its list from the
+// Group and this constant is only the default in the schema. Cilium stamps the key from v1.9
+// onwards; the deployment this chart ships runs v1.16.x (Stable channel).
+//
+// The key is matched on its own, and no taint is ever written or removed here: Cilium owns the
+// taint, exactly like taints.IsProtectedKey refuses to let spec.nodeTaints write it.
+const TaintCiliumAgentNotReady = taints.CiliumAgentNotReady
+
+// nodeUsability reports whether a node object is Ready and free of every taint the gate waits for,
+// and returns the reason it is not, for the retry log and the timeout event. An empty reason means
+// the machine can take the pool's pods. keys is the list the slot's Group declares
+// (spec.nodeReadinessTaints); an empty list gates on the Ready condition alone, which is the
+// behaviour of a CNI that stamps no bootstrap taint.
+func nodeUsability(kubeNode *corev1.Node, keys []string) string {
+	isReady := false
+
+	for _, cond := range kubeNode.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			isReady = cond.Status == corev1.ConditionTrue
+
+			break
+		}
+	}
+
+	if !isReady {
+		return "node is not Ready"
+	}
+
+	for _, taint := range kubeNode.Spec.Taints {
+		for _, key := range keys {
+			if taint.Key == key {
+				return "node carries the readiness taint " + key
+			}
+		}
+	}
+
+	return ""
+}
+
+// schedulablePoll is the exponential backoff the uncordon / readiness loop sleeps with: 2s,
+// doubling, capped at MaxUncordonRetryInterval. It is a type so every branch of the loop has one
+// call (poll.wait()), and so the ceiling stays a single named number that
+// progress.SettleGracePeriod is measured against.
+type schedulablePoll struct {
+	interval time.Duration
+	max      time.Duration
+}
+
+func newSchedulablePoll() *schedulablePoll {
+	return &schedulablePoll{interval: 2 * time.Second, max: MaxUncordonRetryInterval}
+}
+
+// wait sleeps for the current interval, then doubles it for the next pass up to the ceiling.
+func (p *schedulablePoll) wait() {
+	time.Sleep(p.interval)
+
+	p.interval *= 2
+	if p.interval > p.max {
+		p.interval = p.max
+	}
+}
+
+// setNodeSchedulableWithRetry is the scale-up gate: it holds the transition into ready open until
+// the machine can take the pool's work, and then uncordons it.
+//
+// The gate has two halves and each has its own deadline, because they wait for two different things
+// and a cold boot spends nearly all of its time in the first one:
+//
+//   - registration, bounded by nm.uncordonTimeout (DefaultUncordonTimeout, 90s): the time allowed
+//     for the corev1.Node of a powered-on machine to appear, which is the kubelet joining;
+//   - readiness, bounded by nm.readinessGateTimeout (DefaultReadinessGateTimeout, 4m) counted from
+//     the pass on which the node object first appears: the node has to report Ready and be free of
+//     every readiness taint the slot's Group declares (spec.nodeReadinessTaints, by default
+//     Cilium's node.cilium.io/agent-not-ready, see TaintCiliumAgentNotReady). The CNI programs the
+//     datapath minutes after the kubelet checks in and the pool's pods do not tolerate that taint,
+//     so a slot declared ready at registration time is read by the autoscaler as capacity its
+//     pending pod cannot land on, and the pool buys a second machine for a node that is about to
+//     work.
+//
+// One budget for both halves is the bug this split closes. A machine that takes 80s to register has
+// 10s left for a gate that needs minutes, so the gate times out on nearly every boot: the slot is
+// declared ready with the bootstrap taint still on the node - the exact symptom the gate was added
+// for - and the operator pays a 90s hook and an ERROR line per scale-up that worked.
+//
+// On every pass, once the node object exists, the taints the slot declares (spec.nodeTaints) are
+// stamped before the node is uncordoned, so the machine is tainted before a pod can be bound to it
+// (see the loop body for the ordering).
+//
+// The loop also re-stamps the coordination lock of the slot (see renewOperationLock), on every pass
+// of both halves: the gate can outlast the lock's own timeout, and a lock that ages out stops
+// protecting the slot it names, which is precisely the window in which the progress watchdog, the
+// next acquisition and the expired-lock cleanup all conclude that the operation is over. Renewing
+// only in the readiness half is the bug this closes: a startup Job longer than ~3m arrives at the
+// gate with the lock already expired, RenewLock will not resurrect an expired lock, and the whole
+// 4m gate then runs with nothing protecting the slot.
+//
+// A timeout does not wedge anything: the loop uncordons the node on the way out, records a Warning
+// on the Node CR naming the gate it was waiting on, and returns an error the caller logs and
+// continues past (see afterJobCompleted). That is deliberate, twice over. Teardown must not block on
+// a readiness gate nothing can answer for, and a node left cordoned is worse than a node that is not
+// ready yet: cluster-autoscaler skips cordoned nodes when it picks scale-down candidates, so a
+// cordoned machine is never drained, never deleted, and keeps the pool paying for it, while the
+// slot's lifecycle operation is over and there is nothing left to run the uncordon.
 func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon-retry")
 
@@ -815,26 +1008,59 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 	}
 
 	start := time.Now()
-	retryInterval := 2 * time.Second
-	maxRetryInterval := 10 * time.Second
+	poll := newSchedulablePoll()
+
+	// The two deadlines. The gate's starts on the first pass that sees the node object, so the
+	// registration wait cannot spend it.
+	registrationDeadline := start.Add(nm.uncordonTimeout)
+	gateDeadline := start.Add(nm.readinessGateTimeout)
+	nodeSeen := false
+
+	// waitingOn records why the last pass refused the node, so a timeout names the gate that was
+	// never satisfied instead of leaving the operator to guess.
+	waitingOn := "the node object has not appeared"
 
 	for {
-		elapsed := time.Since(start)
-		if elapsed >= nm.uncordonTimeout {
-			return fmt.Errorf("nm.uncordonTimeout after %v: failed to uncordon node %s", nm.uncordonTimeout, nodeName)
+		now := time.Now()
+
+		if !nodeSeen && now.After(registrationDeadline) {
+			return nm.abandonReadinessGate(logger, nodeName, waitingOn, nm.uncordonTimeout, time.Since(start), false)
+		}
+
+		if nodeSeen && now.After(gateDeadline) {
+			return nm.abandonReadinessGate(logger, nodeName, waitingOn, nm.readinessGateTimeout, time.Since(start), true)
 		}
 
 		// Get current node status
 		ctx := context.TODO()
 		kubeNode := &corev1.Node{}
 		if err := nm.client.Get(ctx, client.ObjectKey{Name: nodeName}, kubeNode); err != nil {
-			logger.Info("Node not found yet, retrying", "error", err.Error(), "elapsed", elapsed.String())
-			time.Sleep(retryInterval)
-			retryInterval *= 2
-			if retryInterval > maxRetryInterval {
-				retryInterval = maxRetryInterval
-			}
+			logger.Info("Node not found yet, retrying", "error", err.Error(), "elapsed", time.Since(start).String())
+
+			// The registration wait keeps the lock too, and this is the half that used to run with
+			// none: a startup Job longer than ~3m means the lock - acquired when the transition into
+			// startingup ran, with DefaultLockTimeout (5m) - has already aged out by the time the
+			// node object appears, and RenewLock deliberately refuses to resurrect an expired lock.
+			// Renewing here is what keeps the lock alive across the whole gate: the slot is held for
+			// the registration wait as much as for the readiness half, and a watchdog that sees a stale
+			// lock settles a slot whose hook is still running.
+			nm.renewOperationLock()
+			poll.wait()
+
 			continue
+		}
+
+		if !nodeSeen {
+			nodeSeen = true
+			gateDeadline = time.Now().Add(nm.readinessGateTimeout)
+
+			logger.V(1).Info("Kubernetes node registered, opening the readiness gate",
+				"registrationElapsed", time.Since(start).String(),
+				"gateTimeout", nm.readinessGateTimeout.String())
+
+			// The slot is held for the whole gate: keep the lock that says so alive, from this pass
+			// and from every pass that refuses the node below.
+			nm.renewOperationLock()
 		}
 
 		// Stamp the taints the slot declares (spec.nodeTaints) before this node becomes
@@ -848,47 +1074,89 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		// taints) and the node object may have appeared since the last iteration. A failure here
 		// does not stop the uncordon, the next reconcile re-applies it.
 		if err := taints.ApplyToKubernetesNode(ctx, nm.client, nm.node, nm.eventRecorder); err != nil {
-			logger.Info("Failed to apply declared taints before uncordon", "error", err.Error(), "elapsed", elapsed.String())
+			logger.Info("Failed to apply declared taints before uncordon", "error", err.Error(), "elapsed", time.Since(start).String())
 		}
 
-		// Check if node is Ready
-		isReady := false
-		for _, cond := range kubeNode.Status.Conditions {
-			if cond.Type == corev1.NodeReady {
-				isReady = cond.Status == corev1.ConditionTrue
-				break
-			}
-		}
+		// The gate: Ready, and free of every readiness taint the Group declares. Both are required
+		// before the node is uncordoned and before the transition is treated as complete, because
+		// completing the transition writes status.progress: ready, and the autoscaler reads that as
+		// capacity it can place pods on. Declaring it early is what makes the pool buy a second
+		// machine for a node that is about to work.
+		if reason := nodeUsability(kubeNode, nm.readinessTaintKeys); reason != "" {
+			waitingOn = reason
 
-		if !isReady {
-			logger.Info("Node not Ready yet, retrying", "elapsed", elapsed.String())
-			time.Sleep(retryInterval)
-			retryInterval *= 2
-			if retryInterval > maxRetryInterval {
-				retryInterval = maxRetryInterval
-			}
+			logger.Info("Node cannot take the pool's pods yet, retrying",
+				"reason", reason,
+				"elapsed", time.Since(start).String(),
+				"gateRemaining", time.Until(gateDeadline).String())
+
+			nm.renewOperationLock()
+			poll.wait()
+
 			continue
 		}
 
 		// Try to uncordon using internal method (no retry)
 		err := nm.setNodeSchedulableInternal(nodeName)
 		if err == nil {
-			logger.Info("Successfully uncordoned Kubernetes node", "elapsed", elapsed.String())
+			logger.Info("Successfully uncordoned Kubernetes node",
+				"elapsed", time.Since(start).String(),
+				"gate", "satisfied")
+
 			return nil
 		}
 
-		// Log the retry attempt
-		logger.Info("Retrying uncordon operation", "error", err.Error(), "elapsed", elapsed.String(), "nextRetry", retryInterval.String())
-
-		// Wait before retrying
-		time.Sleep(retryInterval)
-
-		// Exponential backoff with max interval
-		retryInterval *= 2
-		if retryInterval > maxRetryInterval {
-			retryInterval = maxRetryInterval
-		}
+		logger.Info("Retrying uncordon operation", "error", err.Error(), "elapsed", time.Since(start).String())
+		nm.renewOperationLock()
+		poll.wait()
 	}
+}
+
+// abandonReadinessGate is the way out of the gate when a deadline expires: the operator-visible
+// record, a best-effort uncordon, and the error the caller logs and continues past.
+//
+// gateOpened says which half of the loop ran out of budget: the registration wait (there is no
+// node object at all, so nothing to uncordon) or the readiness gate itself.
+func (nm *NodeStateMachine) abandonReadinessGate(logger logr.Logger, nodeName, waitingOn string, budget, elapsed time.Duration, gateOpened bool) error {
+	gate := "registration"
+	if gateOpened {
+		gate = "readiness"
+	}
+
+	logger.Info("Timed out waiting for the node to become usable, uncordoning it anyway",
+		"gate", gate,
+		"elapsed", elapsed.String(),
+		"waitingOn", waitingOn,
+		"timeout", budget.String(),
+		"why", "a cordoned node is skipped by cluster-autoscaler's scale-down, and the lifecycle "+
+			"operation is over, so nothing would uncordon it again")
+
+	// The event, not only the log. A machine that comes up unable to take the pool's work - or one
+	// that never registers at all - is a fact the operator has to be able to see on the slot long
+	// after the controller's log line rolled away, and this is the repo's convention for "go look":
+	// a Warning on the Node CR, readable with `kubectl describe node.infra.homecluster.dev <name>`.
+	nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonReadinessGateTimeout, ActionUncordon,
+		readinessGateNote(nm.node.Name, nodeName, gate, waitingOn, budget))
+
+	if err := nm.setNodeSchedulableInternal(nodeName); err != nil {
+		logger.Error(err, "Best-effort uncordon after the readiness timeout failed, leaving the node cordoned",
+			"elapsed", elapsed.String())
+	}
+
+	// The caller logs this and continues: the transition completes, the lock is released, the slot
+	// is not left transitional. See afterJobCompleted.
+	return fmt.Errorf("timeout after %v: node %s never became usable (%s), uncordoned it anyway",
+		budget, nodeName, waitingOn)
+}
+
+// readinessGateNote renders the Warning's message: which half of the loop ran out of budget, what
+// it was waiting for, and what the controller did about it.
+func readinessGateNote(slotName, nodeName, gate, waitingOn string, budget time.Duration) string {
+	return fmt.Sprintf(
+		"Scale-up of node %s: the %s gate on Kubernetes node %s was not satisfied within %v (%s). "+
+			"The node was uncordoned anyway and the slot is recorded ready, because a cordoned machine is invisible to "+
+			"cluster-autoscaler's scale-down and nothing would uncordon it again: check the CNI of the pool.",
+		slotName, gate, nodeName, budget, waitingOn)
 }
 
 // removeClusterAutoscalerTaint removes the ToBeDeletedByClusterAutoscaler taint from the Kubernetes node if present

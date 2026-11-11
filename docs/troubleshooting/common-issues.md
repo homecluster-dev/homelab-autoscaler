@@ -111,6 +111,106 @@ kubectl get jobs -n homelab-autoscaler-system -o wide
 2. Verify power operation scripts work manually
 3. Check node power state: `kubectl describe node.infra.homecluster.dev <node-name>`
 
+### A Fresh Node Takes No Pods (Cilium Bootstrap Taint)
+
+A node that joins and is `Ready` is not yet able to run the pool's workloads: Cilium adds
+`node.cilium.io/agent-not-ready` to a node that has just joined and removes it once its datapath is
+programmed, which is minutes after the kubelet checked in. The controller waits for that taint to
+clear before it uncordons the node and before the scale-up transition is treated as complete, so
+**the pool's workloads do not need to tolerate the taint** - declare it nowhere, and do not add a
+toleration to work that is supposed to land on the pool.
+
+The key the gate waits for is the pool's configuration: `Group.spec.nodeReadinessTaints` is the list,
+defaulted by the CRD to Cilium's `node.cilium.io/agent-not-ready` (the key has been Cilium's since
+v1.9; this chart deploys 1.16.x). A pool on a CNI that stamps no bootstrap taint declares an empty
+list, and the gate becomes the `Ready` condition alone. What a slot is gated on is recorded on the
+slot, so a slot that has been booting for ten minutes says what it is waiting for:
+
+```bash
+kubectl get group <group> -o jsonpath='{.spec.nodeReadinessTaints}' ; echo
+kubectl describe node.infra.homecluster.dev <node-name>   # Condition: NodeReadinessTaints
+```
+
+The gate has its own 4 minute deadline, counted from the moment the node object registers - the 90s
+registration timeout is a separate budget, so a slow boot does not eat the gate. Past the deadline the
+controller uncordons the node, records a `ReadinessGateTimeout` **Warning** on the slot, and completes
+the transition (a cordoned node is skipped by cluster-autoscaler's scale-down, so it would never be
+drained, never deleted, and the pool would keep paying for it). The taint is visible on the node
+object:
+
+```bash
+kubectl get node <node> -o jsonpath='{.spec.taints}' ; echo
+kubectl get node <node> -o jsonpath='{.spec.unschedulable}' ; echo
+```
+
+### The Slot Reports a Machine That Is Not There
+
+`status.progress: ready`, `startingup` or `shuttingdown` on a slot with no `corev1.Node` and no
+lifecycle Job is what a machine deleted out of band leaves behind (a Hetzner server removed from the
+console, a startup whose manager restarted mid-flight). What the node controller does depends on the
+slot's own request, and it waits out a ~7 minute grace around a lifecycle Job that just finished
+(`progress.SettleGracePeriod`, derived from the deadlines the completed Job's own hook can consume):
+
+- `spec.desiredPowerState: off` -> **settled** to `off`/`shutdown`, one `ProgressReconciled` Warning
+  naming the progress it replaced.
+- `spec.desiredPowerState: on` (the autoscaler asked for this machine) -> **re-armed**: same pair, and
+  the claim left on, so the pool starts the machine again. The `ClaimRearmed` event names the attempt
+  the arming leads to. The retries are bounded by one **startup-attempt counter** (3 per claim episode,
+  `progress.ClaimRearmLimit`): it counts the startup attempts of the slot, it is recorded by the
+  `StartNode` transition, and it is cleared when a boot passes the readiness gate. Both loops pay into
+  it - a startup whose machine never registers, and a startup Job that exits non-zero (that one leaves
+  the slot at the stable `off`/`shutdown` pair, so the watchdog never looks at it: the FSM's `StartNode`
+  is what refuses). Past the bound the watchdog **settles** the slot, `StartNode` refuses to start it,
+  and one `ClaimRearmLimitReached` **Warning** is recorded: the slot is counted as requested capacity
+  with no machine behind it, and nothing will retry it again on its own. Scale the group down, or fix
+  what keeps the machine from booting (startup command, image, power API credentials); a boot that
+  passes the readiness gate clears the counter and the 3 attempts with it.
+- `spec.desiredPowerState: on`, at `ready`, and the node is cordoned with no Job, lock, or
+  autoscaler marker on it -> **uncordoned**, with a `CordonReconciled` Warning. This is the residue of
+  a shutdown that timed out or failed: the paths that roll back into `ready` never reach the uncordon
+  hook, and a cordoned node is never a scale-down candidate, so it is never removed.
+
+```bash
+kubectl describe node.infra.homecluster.dev <node-name>
+# Events: ProgressReconciled | ClaimRearmed | ClaimRearmLimitReached | CordonReconciled
+# Conditions: ClaimRearmed (ClaimRearmAttempt<N> while the attempts are being spent, then
+#            ClaimRearmLimitReached) - the startup-attempt record, readable from the slot
+kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
+kubectl get node <kubernetes-node-name> 2>&1              # no machine behind the slot
+```
+
+A slot the watchdog leaves alone is a slot an operation owns: a `corev1.Node` (its status belongs to
+the observation controllers), a startup/shutdown Job in flight, a Job that finished inside the grace,
+a startup stamped inside the grace by `status.lastStartupTime` when the Job object is already gone
+(the TTL collected it), or a live coordination lock.
+
+### Who Cordoned My Node
+
+cluster-autoscaler marks the nodes it is about to remove with its own taints, and the operator side
+records them on the Node CR, once per transition, so a cordon is attributable without raising the
+autoscaler's verbosity:
+
+```bash
+kubectl describe node.infra.homecluster.dev <node-name>
+# Events:  AutoscalerDeletionCandidate  (DeletionCandidateOfClusterAutoscaler, the soft marker)
+#          AutoscalerDeletionRequested  (ToBeDeletedByClusterAutoscaler, draining for deletion)
+# Condition: ClusterAutoscalerMarkedForDeletion, with the node's taints and spec.unschedulable
+```
+
+The controller reports the markers; it never adds, edits, or removes one, and it never writes
+`spec.desiredPowerState` - the scale-down request itself is the gRPC provider's to make.
+
+**Date the decision from the condition's message, not from its `lastTransitionTime`.** A condition
+timestamp only moves when the `Status` flips, and both markers are recorded with `Status: True`, so
+the `DeletionCandidate` → `DeletionRequested` transition - the one an operator asks about - keeps the
+candidate's time. The message carries the instant this controller read the node:
+
+```
+Type: ClusterAutoscalerMarkedForDeletion   Status: True   Reason: AutoscalerDeletionRequested
+Message: node worker-1 carries the cluster-autoscaler marker ToBeDeletedByClusterAutoscaler
+         (taints=[...], spec.unschedulable=true, observed at 2026-11-11T14:03:00Z)
+```
+
 ### Autoscaling Not Triggering
 1. Verify resource utilization metrics
 2. Check group scaling thresholds

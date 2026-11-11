@@ -118,6 +118,37 @@ func (nm *NodeStateMachine) cancelLockedTransition(logger logr.Logger, e *fsm.Ev
 	}
 }
 
+// renewOperationLock re-stamps the coordination lock this machine's operation holds on the slot.
+//
+// It exists for the one path that holds a slot open longer than the lock's own timeout: the
+// scale-up transition into ready runs setNodeSchedulableWithRetry, which can spend 90s waiting for
+// the node object to register and then 4 minutes on the readiness gate - more than
+// DefaultLockTimeout. A lock that ages out mid-wait is not a lock: the next acquisition takes it
+// over, validateStateTransition cleans it up, and the progress watchdog's lock gate stops
+// protecting the slot while its own grace is measured against the very loop that is running. The
+// caller that owns the slot therefore renews it on every pass of that loop, and nothing else does:
+// renewal never acquires, never touches a lock owned by another component, and never resurrects an
+// expired one (see DefaultCoordinationManager.RenewLock).
+func (nm *NodeStateMachine) renewOperationLock() {
+	renewed, err := nm.coordinationManager.RenewLock(context.TODO(), nm.node)
+	if err != nil {
+		// The slot is ours and the stamp did not land. Log it, do not stop the loop: the gate
+		// keeps running, and a watchdog that settles past a stale lock heals the slot to a stable
+		// progress, which is survivable, unlike abandoning the readiness gate on a transient write
+		// failure.
+		log.Log.WithName("fsm").Error(err, "Failed to re-stamp the coordination lock while holding the slot",
+			"node", nm.node.Name)
+
+		return
+	}
+
+	if !renewed {
+		log.Log.WithName("fsm").V(1).Info("No live coordination lock to re-stamp",
+			"node", nm.node.Name,
+			"why", "the lock is absent, owned by another component, or expired: renewal takes nothing over")
+	}
+}
+
 // After hooks - executed after state transitions for lock release and status updates
 func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
@@ -126,20 +157,55 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 	if e.Dst == StateReady {
 		logger.Info("Transitioning to Ready state, uncordonning Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 
-		// Retry uncordon with timeout to handle node registration delays
-		// Note: We do this BEFORE releasing the lock to ensure the node is schedulable
-		// before other operations can proceed
+		// Retry uncordon with the registration timeout, then hold the transition open on the
+		// readiness gate, and only then release the lock: the node has to be schedulable and usable
+		// before other operations can proceed.
 		//
-		// The retry loop also stamps the taints the slot declares (spec.nodeTaints) onto the
-		// node, on every pass, before the node is uncordoned: the taint has to be on the machine
-		// before a pod can be bound to it, and the loop is the first place this controller knows
-		// the node object exists. See setNodeSchedulableWithRetry.
+		// The loop first stamps the taints the slot declares (spec.nodeTaints) onto the node, on
+		// every pass, before the node is uncordoned: the taint has to be on the machine before a pod
+		// can be bound to it, and the loop is the first place this controller knows the node object
+		// exists. See setNodeSchedulableWithRetry.
+		//
+		// The gate is the second half of the same loop: the node has to report Ready and be free of
+		// the readiness taints the Group declares (spec.nodeReadinessTaints, by default Cilium's
+		// node.cilium.io/agent-not-ready), because the update of status.progress below is what the
+		// autoscaler reads as usable capacity. It has its own deadline
+		// (fsm.DefaultReadinessGateTimeout, 4m), counted from the moment the node object appears:
+		// sharing the 90s registration budget with it means a slow boot leaves no time for the gate
+		// at all, and the slot is declared ready with the taint on it - the churn this gate exists to
+		// close, plus a 90s hook and an ERROR per boot.
+		//
+		// A timeout does not wedge the transition: the loop uncordons the node on the way out, writes
+		// a Warning on the slot naming the gate, and the transition completes as it always has, so a
+		// readiness gate nothing can answer for never blocks the lock release below and never leaves
+		// the slot transitional. While the gate runs, the loop re-stamps this operation's coordination
+		// lock, because the gate is longer than the lock's own timeout and an aged lock protects
+		// nothing (see renewOperationLock).
 		if err := nm.setNodeSchedulableWithRetry(nm.node.Spec.KubernetesNodeName); err != nil {
-			logger.Error(err, "Failed to uncordon Kubernetes node after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
-			// Continue anyway - don't block the operation if uncordon fails
-			// The node will remain cordoned until manually uncordoned or until next startup
+			logger.Error(err, "Failed to confirm the Kubernetes node is usable after startup completion", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
+			// Continue anyway - don't block the operation if the gate cannot be satisfied. The
+			// uncordon itself has already been attempted by the loop on the way out of its timeout
+			// (setNodeSchedulableWithRetry), so the only case that leaves the node cordoned is a
+			// write that the API server refused, and the next startup's loop is the one that fixes it.
+			//
+			// A gate that timed out does NOT reset the startup-attempt record. The slot is about to be
+			// recorded ready with the bootstrap taint still on it, which is the machine the pool paid
+			// for and cannot use - the exact failure the bound exists to price. Only a gate that
+			// answered resets, in the else branch below.
 		} else {
 			logger.Info("Successfully uncordoned Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
+
+			// The gate is satisfied: the node object exists, it reports Ready, it is free of every
+			// readiness taint the Group declares, and it is uncordoned. That is the proof the claim
+			// episode booted a machine the pool can use, and the one place the startup-attempt counter
+			// is reset. JobCompleted alone is not: a startup whose Job succeeded and whose machine never
+			// clears its CNI taint has spent its attempts and must keep them counted, or the bound is
+			// cleared by the failure it bounds and the loop it exists for is unbounded again.
+			//
+			// Resetting here is also what keeps the counter from becoming a lifetime sentence: slots are
+			// long-lived and are reused across claim episodes, so a count that is never cleared makes the
+			// fourth unrelated failure of a machine over its life the last one the pool ever retries.
+			nm.clearStartupAttemptRecord()
 		}
 	}
 
@@ -255,6 +321,24 @@ func (nm *NodeStateMachine) enterStartingUp(ctx context.Context, e *fsm.Event) {
 
 	// Update node status
 	nm.updateNodeProgress(infrav1alpha1.ProgressStartingUp)
+
+	// Count the startup attempt. This is the one place every startup attempt begins: the
+	// shutdown -> startingup transition is what a lifecycle Job and a power-on of a real machine hang
+	// off, and both entries of the failure loop pass through it - the controller's StartNode after a
+	// JobFailed/JobTimeout rollback, and the re-arm the progress watchdog writes for a claim whose
+	// machine never registered, which hands the slot to that same StartNode. Counting here is what
+	// makes one bound cover both loops; counting the watchdog's re-arms covered one of them and left
+	// the loud one unbounded, buying a machine per pass.
+	//
+	// The record is cleared where an attempt demonstrably succeeded - the readiness gate of
+	// afterJobCompleted - so the bound is a bound on one claim episode, not on the life of a slot
+	// that is reused across claims. See internal/fsm/startup_attempts.go.
+	attempt := nm.recordStartupAttempt()
+
+	logger.V(1).Info("Recorded a startup attempt",
+		"node", nm.node.Name,
+		"attempt", attempt,
+		"limit", StartupAttemptLimit)
 
 	// Add progressing condition
 	nm.addNodeCondition(metav1.Condition{

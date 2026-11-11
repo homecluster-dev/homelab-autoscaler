@@ -131,6 +131,7 @@ its own sync loop:
 | `node.kubernetes.io/not-ready`, `node.kubernetes.io/unreachable`, `node.kubernetes.io/unschedulable`, `node.kubernetes.io/out-of-service` | node lifecycle controller |
 | `node.kubernetes.io/memory-pressure`, `node.kubernetes.io/disk-pressure`, `node.kubernetes.io/pid-pressure`, `node.kubernetes.io/network-unavailable` | kubelet |
 | `ToBeDeletedByClusterAutoscaler`, `DeletionCandidateOfClusterAutoscaler` | cluster-autoscaler |
+| `node.cilium.io/agent-not-ready` | Cilium (the bootstrap taint the scale-up readiness gate waits for - see the Group's `nodeReadinessTaints`) |
 
 A declaration on one of those keys is dropped, and the drop is visible: a Warning event on the
 Node CR (`kubectl describe node.infra.homecluster.dev <name>`, reason

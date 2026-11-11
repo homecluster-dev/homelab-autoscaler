@@ -37,10 +37,12 @@ type MockCoordinationManager struct {
 	releaseError error
 	checkError   error
 	forceError   error
+	renewError   error
 	acquireCalls []AcquireCall
 	releaseCalls []ReleaseCall
 	checkCalls   []CheckCall
 	forceCalls   []ForceCall
+	renewCalls   []RenewCall
 }
 
 type AcquireCall struct {
@@ -61,6 +63,12 @@ type ForceCall struct {
 	Node *infrav1alpha1.Node
 }
 
+// RenewCall records a re-stamp of the coordination lock, which is how a test asserts that the
+// readiness gate keeps the lock it holds alive (see NodeStateMachine.renewOperationLock).
+type RenewCall struct {
+	Node *infrav1alpha1.Node
+}
+
 // NewMockCoordinationManager creates a new mock coordination manager
 func NewMockCoordinationManager() *MockCoordinationManager {
 	return &MockCoordinationManager{
@@ -69,6 +77,7 @@ func NewMockCoordinationManager() *MockCoordinationManager {
 		releaseCalls: make([]ReleaseCall, 0),
 		checkCalls:   make([]CheckCall, 0),
 		forceCalls:   make([]ForceCall, 0),
+		renewCalls:   make([]RenewCall, 0),
 	}
 }
 
@@ -124,6 +133,7 @@ func (m *MockCoordinationManager) IsLockExpired(lock *OperationLock) bool {
 	return time.Since(lock.Timestamp) > lock.Timeout
 }
 
+// ForceReleaseLock forcibly removes lock annotations from a node, regardless of ownership
 func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
 	m.forceCalls = append(m.forceCalls, ForceCall{Node: node})
 
@@ -134,6 +144,30 @@ func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *in
 	// Simulate successful force release
 	delete(m.locks, node.Name)
 	return nil
+}
+
+// RenewLock re-stamps the timestamp of the mock's lock, mirroring the real manager's rules: no
+// lock, a lock owned by someone else, or an expired lock is left alone and reported as not
+// renewed.
+func (m *MockCoordinationManager) RenewLock(ctx context.Context, node *infrav1alpha1.Node) (bool, error) {
+	m.renewCalls = append(m.renewCalls, RenewCall{Node: node})
+
+	if m.renewError != nil {
+		return false, m.renewError
+	}
+
+	lock, exists := m.locks[node.Name]
+	if !exists || lock.Owner != NodeControllerOwner {
+		return false, nil
+	}
+
+	if time.Since(lock.Timestamp) > lock.Timeout {
+		return false, nil
+	}
+
+	lock.Timestamp = time.Now()
+
+	return true, nil
 }
 
 // Test helper methods
@@ -153,6 +187,10 @@ func (m *MockCoordinationManager) SetForceError(err error) {
 	m.forceError = err
 }
 
+func (m *MockCoordinationManager) SetRenewError(err error) {
+	m.renewError = err
+}
+
 func (m *MockCoordinationManager) GetAcquireCalls() []AcquireCall {
 	return m.acquireCalls
 }
@@ -167,6 +205,10 @@ func (m *MockCoordinationManager) GetCheckCalls() []CheckCall {
 
 func (m *MockCoordinationManager) GetForceCalls() []ForceCall {
 	return m.forceCalls
+}
+
+func (m *MockCoordinationManager) GetRenewCalls() []RenewCall {
+	return m.renewCalls
 }
 
 func (m *MockCoordinationManager) HasLock(nodeName string) bool {
@@ -184,10 +226,12 @@ func (m *MockCoordinationManager) Reset() {
 	m.releaseError = nil
 	m.checkError = nil
 	m.forceError = nil
+	m.renewError = nil
 	m.acquireCalls = make([]AcquireCall, 0)
 	m.releaseCalls = make([]ReleaseCall, 0)
 	m.checkCalls = make([]CheckCall, 0)
 	m.forceCalls = make([]ForceCall, 0)
+	m.renewCalls = make([]RenewCall, 0)
 }
 
 // CreateTestNode creates a test node with the given parameters

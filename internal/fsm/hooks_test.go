@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -471,10 +472,18 @@ func TestEnterStartingUp(t *testing.T) {
 	assert.Equal(t, infrav1alpha1.ProgressStartingUp, updatedNode.Status.Progress)
 	assert.NotNil(t, updatedNode.Status.LastStartupTime)
 
-	// Verify progressing condition was added
-	assert.Len(t, updatedNode.Status.Conditions, 1)
-	condition := updatedNode.Status.Conditions[0]
-	assert.Equal(t, "StartupProgressing", condition.Type)
+	// Verify the progressing condition was added, and that the transition itself counted the startup
+	// attempt: the shutdown -> startingup transition is where a lifecycle Job and a powered-on machine
+	// hang off, so it is the one place the bound is paid (see internal/fsm/startup_attempts.go).
+	require.Len(t, updatedNode.Status.Conditions, 2, "the attempt record and the progressing record")
+
+	attempt := meta.FindStatusCondition(updatedNode.Status.Conditions, ConditionStartupAttempts)
+	require.NotNil(t, attempt, "the attempt is counted by the transition, not by the watchdog")
+	assert.Equal(t, ReasonStartupAttempt+"1", attempt.Reason)
+	assert.Equal(t, 1, StartupAttemptsOf(updatedNode))
+
+	condition := meta.FindStatusCondition(updatedNode.Status.Conditions, "StartupProgressing")
+	require.NotNil(t, condition)
 	assert.Equal(t, metav1.ConditionTrue, condition.Status)
 	assert.Equal(t, "NodeStarting", condition.Reason)
 }
@@ -640,7 +649,8 @@ func TestHooksIntegration(t *testing.T) {
 	fakeClient := CreateFakeClient(scheme, node)
 
 	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
-	nm.uncordonTimeout = 100 * time.Millisecond // Short timeout for tests
+	nm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
 	t.Run("complete startup flow with hooks", func(t *testing.T) {
 		// Start the node - should trigger before and enter hooks
@@ -733,4 +743,53 @@ func TestHooksIntegration(t *testing.T) {
 		// Verify backoff strategy was cleared
 		assert.Nil(t, nm2.backoff)
 	})
+}
+
+// TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut is the bound on the
+// readiness gate. The transition is held open until the node can take the pool's pods (Ready plus
+// Cilium's bootstrap taint gone), because completing it writes status.progress: ready and the
+// autoscaler reads that as usable capacity. A CNI that never finishes must not wedge the slot:
+// the hook releases the coordination lock and writes the progress it would have written, so the
+// slot is not left transitional with a lock nothing is running under, and the node ends up
+// uncordoned by the loop's timeout path.
+func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+
+	bootstrap := corev1.Taint{Key: TaintCiliumAgentNotReady, Value: "true", Effect: corev1.TaintEffectNoExecute}
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	kubeNode := CreateTestKubernetesNode("test-node-k8s", true)
+	kubeNode.Spec.Taints = []corev1.Taint{bootstrap}
+
+	fakeClient := CreateFakeClient(scheme, node, kubeNode)
+
+	mockCoord := NewMockCoordinationManager()
+	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+	nm.uncordonTimeout = 100 * time.Millisecond
+	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
+
+	ctx := context.TODO()
+	event := &fsm.Event{
+		FSM:   nm.fsm,
+		Event: EventJobCompleted,
+		Src:   StateStartingUp,
+		Dst:   StateReady,
+		Args:  []interface{}{CreateTestJob("test-job", config.NewNamespaceConfig().Get(), "startup")},
+	}
+
+	nm.PrimeEnterState(StateReady)
+	nm.afterJobCompleted(ctx, event)
+
+	assert.Len(t, mockCoord.GetReleaseCalls(), 1, "the lock of a completed operation is released whatever the gate decided")
+
+	updated := &infrav1alpha1.Node{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updated))
+	assert.Equal(t, infrav1alpha1.ProgressReady, updated.Status.Progress,
+		"the transition completes: a slot is never left transitional by a readiness gate that timed out")
+
+	updatedKubeNode := &corev1.Node{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "test-node-k8s"}, updatedKubeNode))
+	assert.False(t, updatedKubeNode.Spec.Unschedulable, "the node is uncordoned on the timeout path")
 }

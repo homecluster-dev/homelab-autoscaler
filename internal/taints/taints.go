@@ -37,6 +37,16 @@ const (
 	DeletionCandidateOfClusterAutoscaler = "DeletionCandidateOfClusterAutoscaler"
 )
 
+// CiliumAgentNotReady is Cilium's bootstrap taint: its agent adds it to a node that has just
+// joined, with a NoExecute effect, and removes it once the datapath for that node is programmed.
+// The kubelet marks the node Ready long before that happens, so it is the key the scale-up
+// readiness gate waits for (fsm.setNodeSchedulableWithRetry), and it is a protected key here for
+// the same reason the keys above are: Cilium owns it, adds it, and removes it. A spec.nodeTaints
+// declaration that stamps it makes the slot's own scale-up wait for a taint the declaration put
+// there - the gate can never be satisfied while the declaration keeps re-adding it - so the
+// declaration is refused, loudly, like every other key with an owner.
+const CiliumAgentNotReady = "node.cilium.io/agent-not-ready"
+
 // The taints the node lifecycle controller, the cloud node controller and the kubelet stamp and
 // remove. Spelled out key by key because k8s.io/api does not export them; see
 // k8s.io/kubernetes/pkg/controller/util/node/controller_utils.go (not-ready, unreachable,
@@ -54,8 +64,8 @@ const (
 )
 
 // protectedKeys is the exact set of taint keys this controller will never write, because a
-// Kubernetes component adds and removes them on its own sync loop: two writers fighting over
-// one key never converges, and the owner always wins the last write.
+// Kubernetes component, an add-on, or a CNI adds and removes them on its own sync loop: two
+// writers fighting over one key never converges, and the owner always wins the last write.
 //
 // It is a set of keys, deliberately not a prefix test on "node.kubernetes.io/". That prefix is
 // a naming namespace, not an ownership claim: the key this repository's own k3d e2e taints its
@@ -79,11 +89,12 @@ var protectedKeys = sets.New[string](
 	NodeNetworkUnavailable,
 	ToBeDeletedByClusterAutoscaler,
 	DeletionCandidateOfClusterAutoscaler,
+	CiliumAgentNotReady,
 )
 
-// IsProtectedKey reports whether a taint key is owned by a Kubernetes component (the node
-// lifecycle controller, the kubelet, cluster-autoscaler) and must therefore not be written from
-// spec.nodeTaints. Every other key, including node.kubernetes.io/role and any other key that
+// IsProtectedKey reports whether a taint key is owned by something that stamps it itself (the
+// node lifecycle controller, the kubelet, cluster-autoscaler, the CNI) and must therefore not be
+// written from spec.nodeTaints. Every other key, including node.kubernetes.io/role and any other key that
 // merely shares the node.kubernetes.io namespace, is the operator's to declare.
 func IsProtectedKey(key string) bool {
 	return protectedKeys.Has(key)
