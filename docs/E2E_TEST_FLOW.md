@@ -51,7 +51,7 @@ All tests share state via Ginkgo's `BeforeSuite`/`AfterSuite` and global variabl
 - VM control server utilities (`VerifyVMControlServer`, `VerifyVMControlServerRequest`)
 - gRPC verification utilities (`GetClusterAutoscalerLogs`, `VerifyGRPCCall`)
 - Job verification utilities (`VerifyJobHasServiceAccount`, `VerifyJobHasVolume`, `WaitForJobCompletion`)
-- Node verification utilities (`WaitForNodeState`, `WaitForNodeReady`, `WaitForK3dNodeState`)
+- Slot and node verification utilities (`WaitForSlotPhase`, `WaitForNodeReady`, `WaitForK3dNodeState`)
 - Pod verification utilities (`WaitForPodScheduled`)
 
 ## Test Execution Flow
@@ -142,14 +142,14 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
    - Monitor CA logs for "unneeded" messages
 3. Verify gRPC `NodeGroupDeleteNodes` call was made
    - Check CA logs for "DeleteNodes" call
-4. Verify Node CR `spec.desiredPowerState` set to `off`
+4. Verify the slot is not wanted: no live `NodeClaim` names it (`v2alpha1` has no `spec.powerState`)
 5. Verify shutdown job is created
 6. Verify shutdown job has correct ServiceAccount (`controller-manager`)
 7. Verify shutdown job has Secret volume (`auth-secrets`)
 8. Verify VM control server receives `/stop` HTTP request
    - Requests logged to `/tmp/vm-control-requests.log`
 9. Verify k3d node is stopped
-10. Verify Node CR `status.progress` becomes `shutdown`
+10. Verify the slot's derived `status.phase` is `off` and `status.powerState` is `off`
 11. Verify Kubernetes node becomes NotReady
 
 **Verification Points**:
@@ -159,7 +159,7 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 - Shutdown job has ConfigMap and Secret volumes
 - VM control server receives `/stop` request
 - k3d node stops
-- Node CR reaches `shutdown` state
+- Slot reports `off`, and no live claim owns it
 - Kubernetes node becomes NotReady
 
 **Shared State**: Stores shutdown node name for Test 3
@@ -172,7 +172,7 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 
 **Preconditions**:
 - Test 2 completed (node is shutdown)
-- Shutdown state preserved (Node CR with `progress=shutdown`)
+- Slot is off (`Node.status.phase: off`) and free: no live `NodeClaim` names it
 
 **Steps**:
 1. Untaint the shutdown node to allow scheduling
@@ -181,14 +181,17 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 4. Wait for CA to detect need for scale-up
    - Check CA logs for "IncreaseSize" or "scale up"
 5. Verify gRPC `NodeGroupIncreaseSize` call was made
-6. Verify Node CR `spec.desiredPowerState` set to `on`
+6. Verify the provider created a `NodeClaim` for the slot, carrying the request (call, delta, group,
+    `requestedBy`), the deadline (the budget of one attempt, floored by the group's
+    `maxNodeProvisionTime`), the seeded `status.attempt`, the TTL and the ownerReference
 7. Verify startup job is created
 8. Verify startup job has correct ServiceAccount (`controller-manager`)
 9. Verify startup job has ConfigMap volume (`startup-config`)
 10. Verify VM control server receives `/start` HTTP request
 11. Verify k3d node starts
 12. Verify startup job completes
-13. Verify Node CR `status.progress` becomes `ready`
+13. Verify the claim moves `pending` -> `booting` -> `ready`, and the slot reports `ready` with
+    `status.powerState: on`
 14. Verify Kubernetes node becomes Ready
 15. Verify deployment pod is scheduled and running
 
@@ -200,7 +203,7 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 - VM control server receives `/start` request
 - k3d node starts
 - Startup job completes successfully
-- Node CR reaches `ready` state
+- The claim reaches `ready` and the slot reports `ready`
 - Kubernetes node Ready
 - Deployment pod scheduled and running
 
@@ -280,32 +283,41 @@ lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
 3. **Node tainting**: Agent nodes tainted with `node.kubernetes.io/role=agent:NoSchedule`
 4. **gRPC forwarder exists**: Service forwarder for local controller is configured
 5. **VM control server responding**: HTTP server accessible on localhost:8080
-6. **Node CRs created**: Node custom resources applied successfully
+6. **Node CRs created**: Node custom resources (`v2alpha1`) applied successfully
+7. **Slots are free**: no live `NodeClaim` names a slot, and an agent machine that is up with no claim
+   is reported `draining` - the law "a machine is wanted exactly when a live claim names the slot"
+   is what makes the idle pool of a homelab readable
 
 ### Test 2: Scale-Down Workflow
 7. **CA detects unneeded nodes**: CA logs show "unneeded" detection
 8. **gRPC DeleteNodes call**: CA calls `NodeGroupDeleteNodes` via gRPC
-9. **desiredPowerState set to off**: Node CR spec updated correctly
+9. **Slot is not wanted**: no live `NodeClaim` names the slot - the sentence v1alpha1's
+   `spec.powerState: off` carried, now derived from the absence of a claim
 10. **Shutdown job created**: Kubernetes job with correct labels
 11. **Shutdown job ServiceAccount**: Uses `controller-manager` ServiceAccount
 12. **Shutdown job volumes**: Has `auth-secrets` Secret volume
 13. **VM control server receives /stop**: Request logged to `/tmp/vm-control-requests.log`
 14. **k3d node stops**: Node status is not "running" or "up"
-15. **Node CR progress=shutdown**: Status reflects shutdown completion
+15. **Slot phase=off, observed off**: `Node.status.phase` is `off` and `status.powerState` is `off`,
+    and the slot's digest of the last claim records a terminal phase
 16. **Kubernetes node NotReady**: Node condition is False or Unknown
 
 ### Test 3: Scale-Up Workflow
+
 17. **Node untainted**: Taint removed, allowing scheduling
 18. **CA detects scale-up need**: CA logs show "IncreaseSize" or "scale up"
 19. **gRPC IncreaseSize call**: CA calls `NodeGroupIncreaseSize` via gRPC
-20. **desiredPowerState set to on**: Node CR spec updated correctly
+20. **NodeClaim created for the slot**: the scale-up is an object, with its attribution
+    (`request.call: IncreaseSize`, `request.group`, `request.delta`, `spec.requestedBy`), its
+    deadline, its seeded `status.attempt`, its TTL and its ownerReference on the slot
 21. **Startup job created**: Kubernetes job with correct labels
 22. **Startup job ServiceAccount**: Uses `controller-manager` ServiceAccount
 23. **Startup job volumes**: Has `startup-config` ConfigMap volume
 24. **VM control server receives /start**: Request logged to `/tmp/vm-control-requests.log`
 25. **k3d node starts**: Node status is "running" or "up"
 26. **Startup job completes**: Job reaches succeeded state
-27. **Node CR progress=ready**: Status reflects ready completion
+27. **Claim phase=ready, slot phase=ready**: the claim asserts the machine it asked for can take the
+    pool's work, the slot reports `ready`, `status.powerState` is `on`, and the slot keeps the digest
 28. **Kubernetes node Ready**: Node condition is True
 29. **Deployment pod running**: hello-world pod scheduled and running
 
