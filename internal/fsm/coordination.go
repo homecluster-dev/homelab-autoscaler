@@ -114,6 +114,13 @@ func (e *LockConflictError) RetryAfter() time.Duration {
 	return remaining
 }
 
+// Deferral renders the refusal for an operator: who owns the slot, and when this operation
+// comes back. It is the message of the Scale*Deferred event, so it says in one line that
+// nothing is wrong with the slot and that the request is not lost.
+func (e *LockConflictError) Deferral() string {
+	return fmt.Sprintf("%s, the opposite operation owns the slot, retrying in %v", e.Error(), e.RetryAfter())
+}
+
 // IsLockConflict reports whether err is, or wraps, a LockConflictError: a transition that
 // lost the coordination lock and has to be retried once the operation holding it is done.
 func IsLockConflict(err error) bool {
@@ -227,12 +234,49 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 
 		// Attempt to update with optimistic locking
 		if err := cm.client.Update(ctx, fresh); err != nil {
-			if apierrors.IsConflict(err) {
-				// The slot moved under this retry, which includes another operation taking
-				// the lock: report it as a conflict, so the caller defers and comes back on
-				// the lock's own schedule instead of treating the slot as broken.
-				return newLockConflict(operation, cm.lockOn(fresh), lockReasonChangedOnRetry)
+			if !apierrors.IsConflict(err) {
+				return err
 			}
+
+			// The write lost a race. Decide from what the API server holds, never from
+			// `fresh`: this attempt has already stamped our own lock annotations onto that
+			// copy, so a lock read off it is this acquisition reported as the holder, aged
+			// 0s. The retry loop stops on it too, because the error returned is no longer a
+			// conflict. A benign status/spec write race - no lock in the API at all - therefore
+			// cost a failure event and a defer of nearly the whole lock timeout, verified live:
+			//
+			//   coordination lock changed during retry: operation=scale-up,
+			//   owner=node-controller, age=335ms     ->  retryAfter=4m59.66s
+			//   lock really present in the API: false
+			//
+			// Re-reading the slot is the only way to tell the two shapes apart.
+			live := &infrav1alpha1.Node{}
+			if getErr := cm.client.Get(ctx, client.ObjectKeyFromObject(node), live); getErr != nil {
+				// Nothing is known about the lock and the fact in hand is the lost write, so
+				// return it: RetryOnConflict retries a conflict, and anything else - the slot
+				// is gone, the API server is unreachable - surfaces as the error it is.
+				logger.V(1).Info("Lost the lock write and cannot re-read the slot, retrying the acquisition",
+					"node", node.Name, "error", getErr.Error())
+
+				return err
+			}
+
+			if holder := cm.lockOn(live); holder != nil {
+				// The racer took the lock: report the real holder, so the caller defers and
+				// comes back on the deadline that lock actually has left.
+				return newLockConflict(operation, holder, lockReasonChangedOnRetry)
+			}
+
+			// No lock in the API. The slot moved under this attempt - a status write from
+			// the core controller, a resync, a spec write from the provider - which is all a
+			// resourceVersion conflict says. Return the original conflict and let
+			// RetryOnConflict run the acquisition again against the new object.
+			//
+			// A read that goes through a cache can lag behind the API and miss a lock the
+			// racer wrote milliseconds ago; the cost is one more pass of this loop, and the
+			// double-check at its top reports the lock as stolen on the next one.
+			logger.V(1).Info("Lost the lock write to a plain update, retrying the acquisition",
+				"node", node.Name, "operation", operation)
 
 			return err
 		}
@@ -247,8 +291,11 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 	})
 }
 
-// lockOn reports the live lock a slot carries, if any. It is the read behind a conflict
-// reported from the update path, where the lock is discovered by losing the write.
+// lockOn reports the live lock a slot carries, if any, and nil for an expired one. It is
+// the read behind a conflict reported from the update path, where the lock is discovered by
+// losing the write, so it takes the object re-read from the API: the copy an acquisition
+// attempt stamped with its own annotations is not evidence about the lock, it is the
+// acquisition.
 func (cm *DefaultCoordinationManager) lockOn(node *infrav1alpha1.Node) *OperationLock {
 	lock, exists := cm.CheckLock(context.TODO(), node)
 	if !exists || cm.IsLockExpired(lock) {

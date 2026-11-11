@@ -226,6 +226,39 @@ func TestNodeStateMachine_Events_ScaleDownFailure(t *testing.T) {
 	assert.Len(t, recorded, 1, "%v", recorded)
 }
 
+// TestNodeStateMachine_Events_LockConflictIsADeferral: a transition that lost the coordination
+// lock is the lock doing its job, not a lifecycle operation that died. It records one Normal
+// ScaleDownDeferred naming the holder and the deadline, and no Warning. The live trace this
+// branch starts from opens with a Warning for exactly this case, on a slot that is fine, and
+// the autoscaler emits one per collision on a busy pool.
+func TestNodeStateMachine_Events_LockConflictIsADeferral(t *testing.T) {
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	mockCoord := NewMockCoordinationManager()
+	mockCoord.SetAcquireError(newLockConflict(OperationScaleDown, &OperationLock{
+		Operation: OperationScaleUp,
+		Owner:     NodeControllerOwner,
+		Timestamp: time.Now().Add(-4 * time.Minute),
+		Timeout:   DefaultLockTimeout,
+	}, lockReasonAlreadyExists))
+
+	nm, rec := newRecordingStateMachine(t, node, mockCoord)
+
+	err := nm.ShutdownNode()
+	require.Error(t, err)
+	require.True(t, IsLockConflict(err))
+
+	recorded := drainEvents(rec)
+	deferred := assertEventCount(t, recorded, "Normal "+ReasonScaleDownDeferred, 1)
+	assert.Contains(t, deferred[0], "coordination lock already exists")
+	assert.Contains(t, deferred[0], "operation=scale-up")
+	assert.Contains(t, deferred[0], "owner=node-controller")
+	assert.Contains(t, deferred[0], "retrying in", "the event says when the operation comes back")
+
+	assertEventCount(t, recorded, "Warning "+ReasonScaleDownFailed, 0)
+	assertEventCount(t, recorded, "Normal "+ReasonScaleDownRequested, 0)
+	assert.Len(t, recorded, 1, "a deferral is one Normal event, not a Warning: %v", recorded)
+}
+
 func TestNodeStateMachine_Events_ObservedJobFailure(t *testing.T) {
 	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
 

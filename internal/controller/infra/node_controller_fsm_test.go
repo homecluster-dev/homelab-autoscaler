@@ -336,7 +336,7 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 		// on the deadline the lock itself names, and the intent that produced it -
 		// spec.desiredPowerState, written by cluster-autoscaler - is left in place, so nothing
 		// has to be asked for again. Returning the error instead handed the retry to
-		// controller-runtime's rate-limited queue with only a ScaleDownFailed warning as the
+		// controller-runtime's rate-limited queue, with only a ScaleDownDeferred event as the
 		// record that a shutdown was requested at all.
 		require.NoError(t, err)
 		assert.Greater(t, result.RequeueAfter, time.Duration(0), "the deferred transition is requeued")
@@ -350,7 +350,8 @@ func TestNodeReconciler_FSMIntegration(t *testing.T) {
 
 		// ...and the slot is untouched: a refused transition leaves no transitional progress
 		// behind, which is what keeps the next reconcile from being gated out of the slot by
-		// validateStateTransition for the duration of the stuck-transition cleanup.
+		// validateStateTransition - nothing in a reconcile undoes a transitional progress, only
+		// the operation that wrote it does.
 		updated := &infrav1alpha1.Node{}
 		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "test-node", Namespace: "default"}, updated))
 		assert.Equal(t, infrav1alpha1.ProgressShutdown, updated.Status.Progress)

@@ -34,14 +34,18 @@ import (
 // Before hooks - executed before state transitions for lock acquisition
 //
 // The hooks are the only place a transition takes the coordination lock, and they run before
-// looplab/fsm applies the state change and calls the enter_ hooks - the only writers of
-// status.progress. That ordering is the invariant the whole lifecycle rests on: a transition
-// refused by the lock never reaches a writer, so status.progress keeps the stable value it
-// had (ready for a scale-down that lost to a scale-up, shutdown for a scale-up that lost to a
-// scale-down). A progress left in startingup/shuttingdown is not cosmetic - it is excluded
-// from the provider's target size, the node controller's validateStateTransition refuses to
-// start a transition from a transitional progress, and the slot is only freed by the force
-// cleanup at StuckTransitionThreshold, 15 minutes later. See cancelLockedTransition.
+// looplab/fsm applies the state change and calls the enter_ hooks, the writers of
+// status.progress inside the FSM. That ordering is the invariant the lifecycle rests on: a
+// transition refused by the lock never reaches a writer, so status.progress keeps the stable
+// value it had (ready for a scale-down that lost to a scale-up, shutdown for a scale-up that
+// lost to a scale-down). A progress left in startingup/shuttingdown is not cosmetic: it is
+// excluded from the provider's target size, validateStateTransition gates every transition of
+// the slot out, and nothing in a reconcile heals it - the stuck-transition cleanup the docs
+// used to promise runs on the machine's own backoff record, which a reconciler builds fresh on
+// every pass, so ForceCleanup is never reached from there. The progress of a transitional slot
+// is moved by the operation that put it there, from its own job monitor, and by no one else.
+// That is why a refusal has to happen before a writer, not after it. See
+// cancelLockedTransition and docs/architecture/state.md.
 
 func (nm *NodeStateMachine) beforeStartNode(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
@@ -73,17 +77,20 @@ func (nm *NodeStateMachine) beforeShutdownNode(ctx context.Context, e *fsm.Event
 
 // cancelLockedTransition cancels a transition that failed to take the coordination lock.
 //
-// It writes nothing. That is the fix for a shutdown colliding with a scale-up in flight: the
-// live trace showed the slot left in progress=shuttingdown after
+// It writes nothing, and the caller has already touched nothing. That is the fix for a
+// shutdown colliding with a scale-up in flight: pre-fix the lifecycle entry points cleaned up
+// the pending Job of the slot, cordoned the Kubernetes node and cleared the
+// ToBeDeletedByClusterAutoscaler taint before the acquisition ran, so the operation that was
+// about to be refused tore the state of the operation that owns the slot apart on the way out,
+// and the refusal was an anonymous error the autoscaler treated as a failed scale down: the
+// live trace
 //
 //	ScaleDownFailed ... FSM transition failed: transition canceled with error:
 //	  coordination lock already exists: operation=scale-up, owner=node-controller, age=4m0s
 //
-// and a slot in shuttingdown is invisible to the provider's target size, is gated out of every
-// further transition by the controller, and backs off 2m -> 5m until the stuck-transition
-// cleanup at 15m. Cancelling in the before_ hook, where no enter_ hook has run, keeps the
-// progress on the stable state the transition started from, so the same reconcile path can ask
-// for the shutdown again as soon as the lock is free.
+// Cancelling in the before_ hook, where no enter_ hook has run, keeps the progress on the
+// stable state the transition started from, so the same reconcile path can ask for the
+// shutdown again as soon as the lock is free.
 //
 // A lock conflict is that case and is reported as a deferral, not as an error: the opposite
 // operation owns the slot for a bounded time, the caller learns how long from

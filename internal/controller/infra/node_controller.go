@@ -244,7 +244,7 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node
 // fires as soon as the scale-up in flight releases the slot - no second DeleteNodes from the
 // autoscaler, no operator intervention. Returning the error instead hands that retry to
 // controller-runtime's rate-limited queue, and the only record that a shutdown was asked for
-// at all is the ScaleDownFailed warning on the Node CR: the live shape this closes.
+// at all is a warning on the Node CR: the live shape this closes.
 //
 // Only a lock conflict is deferred this way. Any other failure of a transition is a real
 // failure and is returned as an error, so it keeps the controller's backoff, its log line and
@@ -255,10 +255,10 @@ func deferTransitionOnLockConflict(ctx context.Context, node *infrav1alpha1.Node
 		return ctrl.Result{}, false
 	}
 
-	// The lifecycle transitions in fsm record the failure event on the Node CR; the reason is
-	// the coordination lock, so the log says which operation owns the slot and when the retry
-	// runs, at V(1): a collision between a scale-up and a scale-down is a scheduled event on a
-	// homelab, not an incident.
+	// The lifecycle transitions in fsm record the deferral as a Normal Scale*Deferred event
+	// on the Node CR; the reason is the coordination lock, so the log says which operation
+	// owns the slot and when the retry runs, at V(1): a collision between a scale-up and a
+	// scale-down is a scheduled event on a homelab, not an incident.
 	log.FromContext(ctx).V(1).Info("FSM transition deferred by the coordination lock",
 		"node", node.Name,
 		"deferredOperation", conflict.Operation,

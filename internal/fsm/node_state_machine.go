@@ -119,7 +119,7 @@ func (nm *NodeStateMachine) StartNode() error {
 	// LockConflictError, which the caller defers: the intent this call carries is in
 	// spec.desiredPowerState already, so the request is retried, not dropped.
 	if err := nm.fsm.Event(ctx, EventStartNode); err != nil {
-		nm.recordScaleFailure(false, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
+		nm.recordTransitionRefusal(false, err)
 		return fmt.Errorf("FSM transition failed: %w", err)
 	}
 
@@ -186,7 +186,7 @@ func (nm *NodeStateMachine) ShutdownNode() error {
 	// Trigger FSM event, taking the coordination lock. See StartNode for what a cancellation
 	// does and does not leave behind.
 	if err := nm.fsm.Event(ctx, EventShutdownNode); err != nil {
-		nm.recordScaleFailure(true, fmt.Sprintf("FSM transition failed: %s", errorDetail(err)))
+		nm.recordTransitionRefusal(true, err)
 		return fmt.Errorf("FSM transition failed: %w", err)
 	}
 
@@ -646,10 +646,16 @@ func (nm *NodeStateMachine) setOwnerReference(job *batchv1.Job) {
 // refused. That is the second half of the rule that keeps a slot from being stranded in a
 // transitional progress, and it is written for the two racers this controller has: the async
 // job monitor goroutine an earlier reconcile started, and a state machine built from a Node
-// read before a transition ran. Either of them writing the progress it remembers is how a
-// slot ends up in shuttingdown with nothing driving it, excluded from the provider's target
-// size and gated out of every further transition by validateStateTransition until the stuck
-// cleanup at StuckTransitionThreshold, 15 minutes later.
+// read before a transition ran. Either of them writing the progress it remembers is how a slot
+// ends up in shuttingdown with nothing driving it: excluded from the provider's target size,
+// gated out of every further transition by validateStateTransition, and left there - the
+// stuck-transition cleanup runs on the machine's own backoff record, which a reconciler builds
+// fresh every pass, so no reconcile reaches ForceCleanup for it. Only the operation that wrote
+// the transitional progress moves it again.
+//
+// The guard covers the writes that go through it, i.e. the FSM's own. status.progress has
+// writers outside the FSM - the gRPC server and the core node controllers - and none of them
+// is a state machine this check can consult; see docs/architecture/state.md.
 //
 // The check is free on every legitimate path: looplab/fsm applies the state change before it
 // runs the enter_ and after_ callbacks, so the progress a hook passes is the state the machine
