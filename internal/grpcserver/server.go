@@ -872,12 +872,21 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	}
 
 	// Remove unschedulable taints
-	// Build a set of taint keys that should be removed. Start with the static list
+	// Build a set of taint keys that should be removed. Start with the static list: the
+	// transient node.kubernetes.io/* taints a booted template must not carry, and both
+	// cluster-autoscaler taints. The DeletionCandidate key matters because the template is now
+	// copied from a live node: a Ready node that cluster-autoscaler is currently evaluating for
+	// scale-down carries that taint, and copying it into the whole group's template gives the
+	// estimator a taint no pod tolerates, so nothing ever scales up. Do not replace this list
+	// with taints.IsProtectedKey: that set protects lifecycle keys from being *written*, and
+	// using it here would strip node.kubernetes.io/role=agent, the taint the e2e pools declare
+	// and tolerate, from the template too.
 	removeKeys := map[string]bool{
-		"node.kubernetes.io/unschedulable": true,
-		"node.kubernetes.io/not-ready":     true,
-		"node.kubernetes.io/unreachable":   true,
-		"ToBeDeletedByClusterAutoscaler":   true,
+		"node.kubernetes.io/unschedulable":          true,
+		"node.kubernetes.io/not-ready":              true,
+		"node.kubernetes.io/unreachable":            true,
+		taints.ToBeDeletedByClusterAutoscaler:       true,
+		taints.DeletionCandidateOfClusterAutoscaler: true,
 	}
 	// Extend with any custom taints configured on the Node CR. TaintsToRemove only filters
 	// taints out of the template; spec.nodeTaints, which adds taints to it, is applied below.
@@ -962,9 +971,16 @@ func (s *HomeClusterProviderServer) pickTemplateSource(ctx context.Context, item
 
 		candidateNode := &corev1.Node{}
 		if err := s.Client.Get(ctx, client.ObjectKey{Name: kubernetesNodeNameOf(candidate)}, candidateNode); err != nil {
-			if !errors.IsNotFound(err) {
-				logger.Error(err, "Failed to get Kubernetes node", "node", kubernetesNodeNameOf(candidate), "nodeCR", candidate.Name)
+			// "There is no node object for this slot" is the normal state of a powered off
+			// machine, and it says nothing about the other slots. Only a real failure is worth
+			// remembering: recording NotFound here meant a later slot's missing node overwrote
+			// an earlier slot's genuine API error, and the call answered with a placeholder for
+			// a cluster the provider cannot read at all.
+			if errors.IsNotFound(err) {
+				continue
 			}
+
+			logger.Error(err, "Failed to get Kubernetes node", "node", kubernetesNodeNameOf(candidate), "nodeCR", candidate.Name)
 			lastErr = err
 
 			continue
@@ -980,9 +996,11 @@ func (s *HomeClusterProviderServer) pickTemplateSource(ctx context.Context, item
 		return best, bestNode, nil
 	}
 
-	// No slot has a node object. A failure that is not "the node does not exist" (a
-	// permissions problem, a broken cache) must not be hidden behind a placeholder.
-	if lastErr != nil && !errors.IsNotFound(lastErr) {
+	// No slot has a node object. Any failure that is not "the node does not exist" (a
+	// permissions problem, a broken cache) is reported, it must not be hidden behind a
+	// placeholder: lastErr only ever holds such a failure, so one slot's NotFound cannot mask
+	// another slot's real error.
+	if lastErr != nil {
 		return nil, nil, status.Errorf(codes.Internal, "failed to get kubernetes node: %v", lastErr)
 	}
 

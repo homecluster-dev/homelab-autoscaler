@@ -33,6 +33,7 @@ import (
 	"github.com/looplab/fsm"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
 // NewNodeStateMachine creates a new FSM instance for node state management.
@@ -743,7 +744,9 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 }
 
 // setNodeSchedulableWithRetry attempts to uncordon a Kubernetes node with exponential backoff
-// This is used after node startup to handle the case where the node hasn't registered yet
+// This is used after node startup to handle the case where the node hasn't registered yet.
+// On every pass, once the node object exists, it first stamps the taints the slot declares
+// (spec.nodeTaints) so the node is tainted before it becomes schedulable.
 func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon-retry")
 
@@ -773,6 +776,20 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 				retryInterval = maxRetryInterval
 			}
 			continue
+		}
+
+		// Stamp the taints the slot declares (spec.nodeTaints) before this node becomes
+		// schedulable. Ordering is the whole point, twice over:
+		//   - setNodeSchedulableInternal writes the whole node object it just read, so a taint
+		//     applied after it would be wiped by that Update;
+		//   - a schedulable, untainted node is bindable by a pod the machine rejects, which is
+		//     the window spec.nodeTaints exists to close. A tainting startup Job cannot close
+		//     it, the Job finishes after the node joined.
+		// Called on every retry: it is idempotent (no write when the node already carries the
+		// taints) and the node object may have appeared since the last iteration. A failure here
+		// does not stop the uncordon, the next reconcile re-applies it.
+		if err := taints.ApplyToKubernetesNode(ctx, nm.client, nm.node, nm.eventRecorder); err != nil {
+			logger.Info("Failed to apply declared taints before uncordon", "error", err.Error(), "elapsed", elapsed.String())
 		}
 
 		// Check if node is Ready

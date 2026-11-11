@@ -54,16 +54,35 @@ spec:
                 description: |-
                   NodeTaints are the taints this slot's machine must carry.
 
-                  The node controller applies them to the Kubernetes node (a declared taint is added, or
-                  an existing taint with the same key is overwritten; taints that are not declared are
-                  left alone, and the taints owned by cluster-autoscaler and by the node lifecycle
-                  controllers are never written), and the provider includes them in the node template it
-                  reports for scale-up simulation, so the autoscaler sees them even before the machine
-                  has registered.
+                  What the field gives you: what cluster-autoscaler simulates matches what the pool boots
+                  with, the taints are declared in Git, and they survive node recreation. The provider puts
+                  them in the node template it reports for scale-up simulation, so the autoscaler sees
+                  dedicated=remote:NoSchedule before the machine has registered and stops placing pods on a
+                  node that rejects them.
 
-                  Declare taints here instead of tainting from the startup Job: a Job applies the taint
-                  after the node joined and after the autoscaler already simulated a placement on an
-                  untainted template, so pods get scheduled on a machine that rejects them.
+                  The controller applies them to the Kubernetes node as soon as the node object exists: the
+                  scale-up path stamps them in the same hook that uncordons the node, so the machine is
+                  tainted before it becomes schedulable, and every later reconcile re-applies them. A taint
+                  you remove by hand with `kubectl taint <node> <key>-` is put back on the next reconcile:
+                  the field only adds, and the declaration is the intent.
+
+                  Keys a Kubernetes component owns are skipped, and the skip is recorded as a Warning event
+                  on the Node CR: the node lifecycle controller and the kubelet own node.kubernetes.io/
+                  not-ready, unreachable, unschedulable, out-of-service, memory-pressure, disk-pressure,
+                  pid-pressure and network-unavailable, cluster-autoscaler owns
+                  ToBeDeletedByClusterAutoscaler and DeletionCandidateOfClusterAutoscaler. The node prefix is
+                  a namespace, not an ownership claim: node.kubernetes.io/role=agent, the taint the k3d
+                  setups use, is yours to declare.
+
+                  Declare taints here instead of tainting from a startup Job. A Job can only taint a node
+                  that already joined, which is after the autoscaler simulated a placement on an untainted
+                  template and after the node was schedulable, so pods get bound to a machine that rejects
+                  them.
+
+                  The window this closes is the one the controller drives. It can only patch a node that
+                  exists, so a machine you booted by hand, or one that registered while the controller was
+                  down, can be Ready and schedulable for a pass before the taint lands. Keep the tolerations
+                  of your own startup tooling correct.
                 items:
                   description: |-
                     The node this Taint is attached to has the "effect" on

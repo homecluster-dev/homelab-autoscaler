@@ -311,19 +311,21 @@ func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, nod
 }
 
 // applyNodeTaintsToKubernetesNode stamps the taints the Node CR declares (spec.nodeTaints)
-// onto the Kubernetes node, with the Get + merge patch shape the label and providerID helpers
-// use.
+// onto the Kubernetes node. It is a thin wrapper over taints.ApplyToKubernetesNode, the single
+// implementation the FSM's uncordon path calls too, so the two writers cannot drift.
 //
-// Semantics:
-//   - a declared taint whose key is not on the node is added;
-//   - a declared taint whose key is on the node overwrites it, so changing the value or the
-//     effect of a taint converges without a delete-then-add dance;
-//   - taints that are not declared are never removed. Removing a taint is not this
-//     controller's job: what an operator added with `kubectl taint` stays;
-//   - the keys owned by the node lifecycle controllers (node.kubernetes.io/*) and by
-//     cluster-autoscaler (ToBeDeletedByClusterAutoscaler,
-//     DeletionCandidateOfClusterAutoscaler) are skipped, a declaration cannot fight their
-//     owner over them.
+// Semantics, in short (taints.ApplyToKubernetesNode and taints.Merge hold the rules):
+//   - a declared taint is added, an existing taint with the same key is overwritten;
+//   - taints that are not declared are never removed, and a declared taint an operator deleted
+//     with `kubectl taint <node> ...-` is put back on the next reconcile: the declaration is
+//     the intent, a hand removal is not;
+//   - the keys a Kubernetes component owns are skipped, and the skip is surfaced with a Warning
+//     event on the Node CR. The set is explicit in taints.IsProtectedKey - the lifecycle and
+//     kubelet keys (node.kubernetes.io/not-ready, /unreachable, /unschedulable,
+//     /out-of-service, /memory-pressure, /disk-pressure, /pid-pressure,
+//     /network-unavailable) and the two cluster-autoscaler keys. A key that merely shares the
+//     node.kubernetes.io namespace, role=agent for instance, is not protected: the e2e pools
+//     declare exactly that and must be applied.
 //
 // It is idempotent: when the node already carries every declared taint nothing is patched.
 //
@@ -331,53 +333,7 @@ func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, nod
 // the provider reports to the autoscaler, it never touches the live node. Do not conflate
 // them.
 func (r *NodeReconciler) applyNodeTaintsToKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
-	logger := log.FromContext(ctx)
-
-	if len(node.Spec.NodeTaints) == 0 {
-		return nil
-	}
-
-	if node.Spec.KubernetesNodeName == "" {
-		// The slot has never been provisioned, so there is no node to taint.
-		return nil
-	}
-
-	// Get the Kubernetes node
-	kubernetesNode := &corev1.Node{}
-	if err := r.Get(ctx, types.NamespacedName{Name: node.Spec.KubernetesNodeName}, kubernetesNode); err != nil {
-		if errors.IsNotFound(err) {
-			// The machine has not registered yet. The taints are applied once the kubelet
-			// creates the node object, so this is not a failure.
-			logger.V(1).Info("Kubernetes node not found, skipping declared taints", "node", node.Spec.KubernetesNodeName, "nodeCR", node.Name)
-			return nil
-		}
-
-		logger.Error(err, "Failed to get Kubernetes node", "node", node.Spec.KubernetesNodeName)
-		return err
-	}
-
-	desired, changed, skipped := taints.Merge(kubernetesNode.Spec.Taints, node.Spec.NodeTaints)
-	for _, key := range skipped {
-		logger.Info("Ignoring declared taint with a key the operator does not own", "node", node.Spec.KubernetesNodeName, "taint", key)
-	}
-
-	if !changed {
-		return nil
-	}
-
-	// Create a patch with the merged taint list
-	patch := client.MergeFrom(kubernetesNode.DeepCopy())
-
-	kubernetesNode.Spec.Taints = desired
-
-	// Apply the patch
-	if err := r.Patch(ctx, kubernetesNode, patch); err != nil {
-		logger.Error(err, "Failed to patch Kubernetes node with taints", "node", node.Spec.KubernetesNodeName)
-		return err
-	}
-
-	logger.Info("Successfully patched Kubernetes node with declared taints", "node", node.Spec.KubernetesNodeName, "taints", len(node.Spec.NodeTaints))
-	return nil
+	return taints.ApplyToKubernetesNode(ctx, r.Client, node, r.EventRecorder)
 }
 
 // validateStateTransition validates that a state transition is valid and implements smart backoff strategy

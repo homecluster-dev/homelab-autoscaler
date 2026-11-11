@@ -29,12 +29,18 @@ func taint(key, value string, effect corev1.TaintEffect) corev1.Taint {
 }
 
 func TestIsProtectedKey(t *testing.T) {
+	// The protected set is a list of keys, not a prefix: a Kubernetes component owns the keys
+	// it adds and removes itself, and nothing else. The node.kubernetes.io/ prefix in particular
+	// is a naming namespace, and the pools in this repository live under it.
 	protected := []string{
 		"node.kubernetes.io/not-ready",
 		"node.kubernetes.io/unreachable",
 		"node.kubernetes.io/unschedulable",
 		"node.kubernetes.io/out-of-service",
-		"beta.kubernetes.io/arch",
+		"node.kubernetes.io/memory-pressure",
+		"node.kubernetes.io/disk-pressure",
+		"node.kubernetes.io/pid-pressure",
+		"node.kubernetes.io/network-unavailable",
 		ToBeDeletedByClusterAutoscaler,
 		DeletionCandidateOfClusterAutoscaler,
 	}
@@ -42,7 +48,19 @@ func TestIsProtectedKey(t *testing.T) {
 		assert.True(t, IsProtectedKey(key), "%s must be protected", key)
 	}
 
-	for _, key := range []string{"dedicated", "storage", "pool.homecluster.dev/gpu", "node-homecluster.dev/keep"} {
+	for _, key := range []string{
+		"dedicated", "storage", "pool.homecluster.dev/gpu", "node-homecluster.dev/keep",
+		// the taint this repository's k3d e2e, examples/k3d and config/manager use, and the
+		// key a k3s/k3d agent node carries. Declaring it in spec.nodeTaints is what the field
+		// is for, so it must not be swallowed by a prefix rule.
+		"node.kubernetes.io/role",
+		"node.kubernetes.io/hostname",
+		"node.kubernetes.io/",
+		// beta.kubernetes.io/* is a label namespace (arch, os, instance-type) the kubelet writes
+		// as labels, never as taints. Nothing owns a taint in it.
+		"beta.kubernetes.io/arch",
+		"beta.kubernetes.io/os",
+	} {
 		assert.False(t, IsProtectedKey(key), "%s must not be protected", key)
 	}
 }
@@ -104,6 +122,24 @@ func TestMerge(t *testing.T) {
 			want:        []corev1.Taint{storage, dedicated},
 			wantChanged: true,
 			wantSkipped: []string{"node.kubernetes.io/not-ready", ToBeDeletedByClusterAutoscaler},
+		},
+		{
+			// The taint the k3d e2e, examples/k3d and config/manager use. A prefix rule dropped
+			// it, and CA then simulated an untainted machine while the node booted tainted.
+			name:        "the pool's own node.kubernetes.io/role taint is applied",
+			current:     []corev1.Taint{storage},
+			declared:    []corev1.Taint{taint("node.kubernetes.io/role", "agent", corev1.TaintEffectNoSchedule)},
+			want:        []corev1.Taint{storage, taint("node.kubernetes.io/role", "agent", corev1.TaintEffectNoSchedule)},
+			wantChanged: true,
+		},
+		{
+			// beta.kubernetes.io/* is a label namespace, not a taint namespace: nothing owns a
+			// taint with such a key, so the declaration is the operator's.
+			name:        "an old-beta key is applied",
+			current:     nil,
+			declared:    []corev1.Taint{taint("beta.kubernetes.io/arch", "arm64", corev1.TaintEffectNoSchedule)},
+			want:        []corev1.Taint{taint("beta.kubernetes.io/arch", "arm64", corev1.TaintEffectNoSchedule)},
+			wantChanged: true,
 		},
 		{
 			name:        "the timeAdded of the node is kept when the taint is overwritten",

@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
 
@@ -50,9 +51,9 @@ func templateFor(t *testing.T, server *HomeClusterProviderServer) *corev1.Node {
 
 // taintStrings renders a taint list as "key=value:effect", so a failing assertion shows the
 // taints that came out instead of a diff of structs.
-func taintStrings(taints []corev1.Taint) []string {
-	out := make([]string, 0, len(taints))
-	for _, taint := range taints {
+func taintStrings(items []corev1.Taint) []string {
+	out := make([]string, 0, len(items))
+	for _, taint := range items {
 		out = append(out, taint.ToString())
 	}
 
@@ -243,6 +244,110 @@ func (c *failingNodeClient) Get(ctx context.Context, key client.ObjectKey, obj c
 	}
 
 	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestNodeGroupTemplateKeepsThePoolsOwnRoleTaint is the prefix rule's cost, measured on the
+// template. The k3d e2e, examples/k3d and config/manager taint agent nodes with
+// node.kubernetes.io/role=agent, and the deployment that runs on them tolerates exactly that.
+// A prefix-based protected-key rule dropped the declaration from the template, so the estimator
+// saw an untainted machine and placed pods the node rejects - the failure spec.nodeTaints
+// removes. The transient lifecycle taints next to it stay filtered out.
+func TestNodeGroupTemplateKeepsThePoolsOwnRoleTaint(t *testing.T) {
+	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+	unschedulable := corev1.Taint{Key: "node.kubernetes.io/unschedulable", Effect: corev1.TaintEffectNoSchedule}
+
+	server := newServer(t,
+		slotWithTaints("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, role),
+		nodeWithShape("slot-on", true, "8", "16Gi", role, unschedulable),
+	)
+
+	template := templateFor(t, server)
+
+	assert.Contains(t, taintStrings(template.Spec.Taints), role.ToString(),
+		"the taint the pool declares and the workload tolerates must be in the template")
+	assert.NotContains(t, taintStrings(template.Spec.Taints), unschedulable.ToString(),
+		"the transient taint of a cordoned node is still stripped")
+}
+
+// TestNodeGroupTemplatePlaceholderKeepsThePoolsOwnRoleTaint covers the same rule on the
+// placeholder path, a fully powered off pool: scale-from-zero simulations judge the pod against
+// the declared taints, so the pool's own key must survive the protected-key filter there too.
+func TestNodeGroupTemplatePlaceholderKeepsThePoolsOwnRoleTaint(t *testing.T) {
+	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+
+	server := newServer(t,
+		slotWithTaints("slot-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown, role),
+	)
+
+	template := templateFor(t, server)
+
+	assert.Equal(t, []string{role.ToString()}, taintStrings(template.Spec.Taints))
+}
+
+// TestNodeGroupTemplateDropsClusterAutoscalerScaleDownTaints is the cost of reading the template
+// from a live node. A Ready node that cluster-autoscaler is currently evaluating for scale-down
+// carries DeletionCandidateOfClusterAutoscaler; copied into the template of the whole group, it
+// is a taint no pod tolerates, so the estimator finds no placement and never scales up. Both CA
+// keys are filtered out of the template, and the pools own taint is not, which is why this list
+// is spelled out per key instead of reusing taints.IsProtectedKey.
+func TestNodeGroupTemplateDropsClusterAutoscalerScaleDownTaints(t *testing.T) {
+	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+	deletionCandidate := corev1.Taint{Key: taints.DeletionCandidateOfClusterAutoscaler, Effect: corev1.TaintEffectNoSchedule}
+	toBeDeleted := corev1.Taint{Key: taints.ToBeDeletedByClusterAutoscaler, Effect: corev1.TaintEffectNoSchedule}
+	notReady := corev1.Taint{Key: "node.kubernetes.io/not-ready", Effect: corev1.TaintEffectNoSchedule}
+	unreachable := corev1.Taint{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}
+
+	server := newServer(t,
+		slotWithTaints("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady, role),
+		nodeWithShape("slot-on", true, "8", "16Gi", role, deletionCandidate, toBeDeleted, notReady, unreachable),
+	)
+
+	template := templateFor(t, server)
+	got := taintStrings(template.Spec.Taints)
+
+	assert.NotContains(t, got, deletionCandidate.ToString(),
+		"a node CA is evaluating for scale-down must not taint the whole group's template")
+	assert.NotContains(t, got, toBeDeleted.ToString())
+	assert.NotContains(t, got, notReady.ToString())
+	assert.NotContains(t, got, unreachable.ToString())
+	assert.Equal(t, []string{role.ToString()}, got,
+		"the pool's own taint survives, so the estimator still matches the toleration")
+}
+
+// nodeGetFailureClient fails the corev1.Node lookup of one name with a real error and lets the
+// other lookups report "the node does not exist", the mix that hid a failure behind a placeholder.
+type nodeGetFailureClient struct {
+	client.Client
+	failFor string
+	err     error
+}
+
+func (c *nodeGetFailureClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, isNode := obj.(*corev1.Node); isNode && key.Name == c.failFor {
+		return c.err
+	}
+
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestNodeGroupTemplateRealFailureSurvivesANotFoundSlot keeps pickTemplateSource honest when the
+// pool mixes a slot the provider cannot read with a slot that has no node object: the last slot
+// visited must not overwrite the only interesting error, because "this pool is powered off" is
+// not a good answer for "the provider cannot talk to the API".
+func TestNodeGroupTemplateRealFailureSurvivesANotFoundSlot(t *testing.T) {
+	base := newServer(t,
+		nodeCR("a-slot", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeCR("z-slot", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+	)
+	server := NewHomeClusterProviderServer(
+		&nodeGetFailureClient{Client: base.Client, failFor: "a-slot", err: errors.New("connection refused")},
+		base.Scheme,
+	)
+
+	_, err := server.NodeGroupTemplateNodeInfo(context.Background(), &pb.NodeGroupTemplateNodeInfoRequest{Id: testGroup})
+	require.Error(t, err, "the z-slot's NotFound must not turn a real failure into a placeholder")
+	assert.Contains(t, err.Error(), "failed to get kubernetes node")
+	assert.Contains(t, err.Error(), "connection refused", "the reported error is the one that is worth reporting")
 }
 
 // TestNodeGroupTemplateSurfacesLookupFailures keeps a real API failure visible: the

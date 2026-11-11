@@ -25,12 +25,14 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
 // taintNodeCR returns the shared test Node CR with spec.nodeTaints declared.
@@ -44,9 +46,9 @@ func taintNodeCR(declared ...corev1.Taint) *infrav1alpha1.Node {
 
 // taintK8sNode returns the Kubernetes node the shared test Node CR points at, with the given
 // taints already on it.
-func taintK8sNode(taints ...corev1.Taint) *corev1.Node {
+func taintK8sNode(existing ...corev1.Taint) *corev1.Node {
 	k8sNode := createTestKubernetesNode()
-	k8sNode.Spec.Taints = taints
+	k8sNode.Spec.Taints = existing
 
 	return k8sNode
 }
@@ -140,11 +142,38 @@ func TestApplyNodeTaints(t *testing.T) {
 			patched:  false,
 		},
 		{
+			// node.kubernetes.io/role is the taint this repository's k3d e2e, examples/k3d and
+			// config/manager use, and the key the docs tell operators to migrate into this field.
+			// A prefix rule on node.kubernetes.io/ swallowed it, which is the "CA simulates the
+			// node without the taint" failure this PR removes.
+			name:     "the pool's own node.kubernetes.io/role taint is applied",
+			declared: []corev1.Taint{{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}},
+			existing: []corev1.Taint{storage},
+			want:     []corev1.Taint{storage, {Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}},
+			patched:  true,
+		},
+		{
+			name:     "an old-beta key is applied, nothing owns a taint in that namespace",
+			declared: []corev1.Taint{{Key: "beta.kubernetes.io/arch", Value: "arm64", Effect: corev1.TaintEffectNoSchedule}},
+			existing: nil,
+			want:     []corev1.Taint{{Key: "beta.kubernetes.io/arch", Value: "arm64", Effect: corev1.TaintEffectNoSchedule}},
+			patched:  true,
+		},
+		{
 			name:     "a standard node lifecycle taint is not written",
 			declared: []corev1.Taint{{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoSchedule}},
 			existing: nil,
 			want:     nil,
 			patched:  false,
+		},
+		{
+			// The inverse of the additive rule: removing a declared taint by hand is not a
+			// removal, the next reconcile puts it back, because the declaration is the intent.
+			name:     "a taint removed by hand is re-added",
+			declared: []corev1.Taint{dedicated},
+			existing: nil,
+			want:     []corev1.Taint{dedicated},
+			patched:  true,
 		},
 		{
 			name:     "nothing is declared, so the node is left alone",
@@ -215,4 +244,55 @@ func TestNodeReconcileAppliesDeclaredTaints(t *testing.T) {
 	assert.Equal(t, ctrl.Result{RequeueAfter: requeueFiveMinutes}, result)
 
 	assert.Equal(t, []corev1.Taint{storage, dedicated}, getK8sNode(t, reconciler.Client).Spec.Taints)
+}
+
+// TestApplyNodeTaintsSurfacesSkippedKeys covers what happens to a declaration the controller
+// refuses to write. Skipping it silently is the failure mode this field exists to remove: the
+// Node CR says the machine is tainted, the node is not, and cluster-autoscaler simulates a node
+// the pool does not boot. So the skip must be visible from outside the controller's logs - a
+// Warning event on the Node CR, readable with `kubectl describe` - while the keys the operator
+// does own, node.kubernetes.io/role first among them, are applied normally.
+func TestApplyNodeTaintsSurfacesSkippedKeys(t *testing.T) {
+	dedicated := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
+	role := corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
+	notReady := corev1.Taint{Key: "node.kubernetes.io/not-ready", Effect: corev1.TaintEffectNoSchedule}
+	deletionCandidate := corev1.Taint{Key: "DeletionCandidateOfClusterAutoscaler", Effect: corev1.TaintEffectNoSchedule}
+
+	recorder := events.NewFakeRecorder(8)
+
+	node := taintNodeCR(notReady, role, dedicated, deletionCandidate)
+	reconciler := newTaintReconciler(t, node, createTestGroup(), taintK8sNode())
+	reconciler.EventRecorder = recorder
+
+	require.NoError(t, reconciler.applyNodeTaintsToKubernetesNode(context.Background(), node))
+
+	// the owned keys landed, the owned-by-Kubernetes keys did not
+	assert.Equal(t, []corev1.Taint{role, dedicated}, getK8sNode(t, reconciler.Client).Spec.Taints)
+
+	require.NotEmpty(t, recorder.Events, "the fake recorder must expose its channel")
+	require.Equal(t, 1, len(recorder.Events), "one reconcile records one event, not one per key")
+
+	event := <-recorder.Events
+	assert.Contains(t, event, "Warning", "a drop that stops the pool from scaling must not be a Normal event")
+	assert.Contains(t, event, taints.ReasonSkippedProtectedKey)
+	assert.Contains(t, event, "node.kubernetes.io/not-ready", "the event names the key that was dropped")
+	assert.Contains(t, event, "DeletionCandidateOfClusterAutoscaler")
+	assert.NotContains(t, event, "node.kubernetes.io/role", "the event must not claim a key it applied")
+	assert.Contains(t, event, "test-node", "the event says which slot dropped the declaration")
+}
+
+// TestApplyNodeTaintsRecordsNoEventWhenNothingIsSkipped keeps the event stream clean: a healthy
+// declaration must not put an Event on every Node CR on every reconcile.
+func TestApplyNodeTaintsRecordsNoEventWhenNothingIsSkipped(t *testing.T) {
+	dedicated := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
+
+	recorder := events.NewFakeRecorder(8)
+
+	node := taintNodeCR(dedicated)
+	reconciler := newTaintReconciler(t, node, createTestGroup(), taintK8sNode())
+	reconciler.EventRecorder = recorder
+
+	require.NoError(t, reconciler.applyNodeTaintsToKubernetesNode(context.Background(), node))
+	assert.Equal(t, []corev1.Taint{dedicated}, getK8sNode(t, reconciler.Client).Spec.Taints)
+	assert.Zero(t, len(recorder.Events), "nothing was skipped, so nothing was recorded")
 }

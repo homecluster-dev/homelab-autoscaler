@@ -95,22 +95,49 @@ spec:
     effect: NoSchedule
 ```
 
-The node controller adds each declared taint to the Kubernetes node (a taint with the same key
-is overwritten), and the provider puts them in the node template it reports to
-cluster-autoscaler, so the autoscaler sees `dedicated=remote:NoSchedule` before the machine has
-registered and stops scheduling pods that the node rejects.
+What the field gives you:
 
-This replaces tainting from a startup Job. A Job taints the node after it joined, which is after
-the autoscaler already simulated a placement on an untainted template, so pods land on a node
-that never accepts them.
+- cluster-autoscaler simulates the machine your pool boots. The provider puts the declared taints
+  in the node template, so `dedicated=remote:NoSchedule` is there before the machine registers,
+  and a pod that doesn't tolerate it is never placed on this group.
+- The taints are in Git with the rest of the slot, and they survive node recreation. Nothing
+  depends on a startup script running.
 
-What the field does not do:
+The controller applies them to the Kubernetes node as soon as the node object exists: the
+scale-up path stamps them in the hook that uncordons the node, so the machine carries them before
+it becomes schedulable, and every later reconcile re-applies them.
 
-- It doesn't remove taints. Taints that aren't declared stay on the node; remove those with
-  `kubectl taint`.
-- It doesn't write taints someone else owns. `node.kubernetes.io/*` (node lifecycle controllers)
-  and `ToBeDeletedByClusterAutoscaler` / `DeletionCandidateOfClusterAutoscaler`
-  (cluster-autoscaler) are skipped, and the skip is logged on the controller.
+A tainting startup Job can't do that. It runs after the node joined, which is after the
+autoscaler simulated a placement on an untainted template and after the node was schedulable, so
+pods land on a machine that rejects them.
+
+The window this closes is the one the controller drives. It can only patch a node that exists, so
+a machine you booted by hand, or one that registered while the controller was down, can be Ready
+and schedulable for a pass before the taint lands. Keep the tolerations of your own startup
+tooling correct.
+
+The field only adds, and it keeps adding:
+
+- A taint you don't declare is never removed.
+- A taint you declare and then remove by hand with `kubectl taint <node> <key>-` is put back on
+  the next reconcile. The declaration is the intent, the `kubectl` run isn't.
+
+Keys the controller won't write, because a Kubernetes component owns them and re-applies them on
+its own sync loop:
+
+| Keys | Owner |
+| --- | --- |
+| `node.kubernetes.io/not-ready`, `node.kubernetes.io/unreachable`, `node.kubernetes.io/unschedulable`, `node.kubernetes.io/out-of-service` | node lifecycle controller |
+| `node.kubernetes.io/memory-pressure`, `node.kubernetes.io/disk-pressure`, `node.kubernetes.io/pid-pressure`, `node.kubernetes.io/network-unavailable` | kubelet |
+| `ToBeDeletedByClusterAutoscaler`, `DeletionCandidateOfClusterAutoscaler` | cluster-autoscaler |
+
+A declaration on one of those keys is dropped, and the drop is visible: a Warning event on the
+Node CR (`kubectl describe node.infra.homecluster.dev <name>`, reason
+`SkippedProtectedTaintKey`) and a `V(1)` log line. Nothing is dropped silently.
+
+The `node.kubernetes.io/` prefix is a namespace, not an ownership claim. The
+`node.kubernetes.io/role=agent` taint your k3d agents carry is yours to declare, and the
+controller applies it.
 
 `spec.taintsToRemove` is the opposite field and is unrelated: it filters taints out of the node
 template so the autoscaler ignores taints your startup process leaves behind. It never touches
@@ -118,8 +145,9 @@ the live node. A key listed in both fields ends up on the template, because `nod
 the machine boots with.
 
 If you migrate a pool from a tainting startup Job, drop the `kubectl taint` step from the Job and
-set `nodeTaints` on the Node CRs. The controller applies the taint on the next reconcile, and the
-template carries it immediately.
+set `nodeTaints` on the Node CRs. The template carries the taint as soon as the CR is applied;
+the node gets it the next time the controller touches it, which on a scale-up is before the node
+is uncordoned.
 
 ### Node Template
 
@@ -132,6 +160,13 @@ The provider reports one machine shape per group, built from a slot of that grou
    placeholder from the Node CR. It carries the group label and the declared `nodeTaints`, and no
    capacity, because the size of a machine that never registered can't be read and shouldn't be
    invented.
+
+Because the template is copied from a live node, the autoscaler's own taints are filtered out of
+it: `ToBeDeletedByClusterAutoscaler` and `DeletionCandidateOfClusterAutoscaler` on the
+representative node describe that machine's scale-down state, not the shape of a new one, and
+copying them into the group's template leaves the estimator with a taint no pod tolerates. The
+transient `node.kubernetes.io/unschedulable`, `not-ready` and `unreachable` taints are filtered
+out the same way. Keys the pool declares, `node.kubernetes.io/role` included, are not.
 
 ## Example
 
