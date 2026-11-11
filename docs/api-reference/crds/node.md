@@ -18,6 +18,7 @@ The Node Custom Resource Definition (CRD) represents individual physical machine
 | `shutdownPodSpec` | `MinimalPodSpec` | Yes | Pod specification for shutdown operations |
 | `kubernetesNodeName` | `string` | Yes | Name of the corresponding Kubernetes node |
 | `pricing` | `PricingSpec` | Yes | Cost information for the node |
+| `nodeCapacity` | `corev1.ResourceList` | No | The shape of the machine this slot boots, as the kubelet reports it. Applied to the node template resource by resource, which is what lets a pool at `minSize: 0` scale back up; `pods` is defaulted for you |
 | `nodeTaints` | `[]corev1.Taint` | No | Taints this machine must carry, applied to the Kubernetes node and included in the node template |
 | `taintsToRemove` | `[]corev1.Taint` | No | Taints stripped from the node template so the autoscaler ignores them |
 
@@ -149,6 +150,88 @@ set `nodeTaints` on the Node CRs. The template carries the taint as soon as the 
 the node gets it the next time the controller touches it, which on a scale-up is before the node
 is uncordoned.
 
+### Node Capacity
+
+Declare the shape of the machine a slot boots in `spec.nodeCapacity`:
+
+```yaml
+spec:
+  nodeCapacity:
+    cpu: 1950m
+    memory: 3.2Gi
+```
+
+What the field gives you is a pool that can come back up from zero. cluster-autoscaler decides
+whether a pod fits on a machine by simulating it on the group's node template, and that template
+is built from a `corev1.Node`. A pool whose every slot is powered off has no `corev1.Node` at all,
+so the provider synthesizes a placeholder, and a placeholder it has no size for carries no cpu and
+no memory. A pod with any resource request then fits nowhere, `NodeGroupIncreaseSize` is never
+called, and the pool stays at zero. That is why a `minSize: 0` pool needs an always-on machine
+today.
+
+Capacity is the one part of the machine's shape a Node CR can answer for, because you know the
+machine you are going to boot. It is declared in the spec and not copied into the status for the
+same reason: the template is needed before a slot has ever booted, so a status field fed from a
+live node is empty in exactly the case it would be read for, and keeping it filled means a pipeline
+that watches nodes and writes status. One field next to the `nodeTaints` of the same machine is
+reviewable in Git, and it describes a machine that does not exist yet.
+
+Declare what the kubelet reports, not what the box is sold as. The system reservation moves the
+number: a 2 vCPU / 4 GiB machine, a Hetzner CX23 for instance, reports `1950m` and `3.2Gi`.
+
+| Declared | Reported by the kubelet | Verdict |
+| --- | --- | --- |
+| `1950m` | `2` | 2.5% away, fine |
+| `1950m` | `1` | the machine is not the one you described |
+
+The autoscaler judges the pod's requests against the template, so a declaration larger than reality
+places work the machine cannot take, and a smaller one leaves capacity unused.
+
+Precedence in the template, resource by resource:
+
+- Every resource you declare wins over the live node's `status.capacity` and
+  `status.allocatable`, on the path that copies a registered node as well as on the placeholder.
+  The declaration is the shape of the machine the pool boots, and it is one value for every slot of
+  the group. Reading the live node would make the group's template change with which slot happens to
+  be Ready, and in a mixed pool it hands the estimator a different machine per call.
+- A resource you don't declare keeps the live node's number: `pods`, `ephemeral-storage`, hugepages,
+  `nvidia.com/gpu`, anything a device plugin adds. The estimator judges a pod against all of them,
+  so declaring cpu and memory declares the shape of the box, not the list of resources it has.
+  Replacing the whole list with a declaration is what makes a documented cpu-and-memory declaration
+  unplaceable: the template loses `pods`, and the scheduler answers every pod "Too many pods".
+- `pods` is defaulted for you. A template whose lists carry none gets `pods: 110`, the kubelet's
+  default `--max-pods` and the number cluster-autoscaler's own template builders put in. Declare it
+  only to move off that default, and a live node's own pod ceiling is never lowered to it. Nothing
+  else is defaulted: cpu, memory and disk are facts about one machine, and the provider doesn't
+  invent machines.
+- With the field unset, the live node's own numbers are used. A pool that declares nothing keeps
+  working exactly as before, and a pool that declares nothing and is fully powered off gets a
+  template with no cpu, no memory and no disk: the honest "this machine has no known size", never a
+  guess.
+
+The declaration goes into `status.capacity` as well as `status.allocatable`, because
+cluster-autoscaler reads both. Allocatable is what a pod's requests are judged against; capacity
+feeds the bookkeeping over the group's machines, the quota simulation and the resources it reports
+for registered nodes. A template that fills only one of the two is judged by the other. A template
+machine has no system daemons to subtract, so a placeholder's two lists end up identical; on a node
+copied from a live slot each keeps its own numbers, overlaid resource by resource.
+
+The controller checks the declaration against the machine once it registers:
+
+- A `status.allocatable` more than five percent away from the declaration, on any declared
+  resource, puts a `Warning` event on the Node CR with reason `NodeCapacityMismatch`, naming the
+  resource and both values. Read it with
+  `kubectl describe node.infra.homecluster.dev <name> -n <namespace>`.
+- Only the resources you declared are compared, so an incomplete declaration is not detected. Leave
+  `memory` out and no warning ever mentions it, while a pod that asks for memory is judged against a
+  template with no size for it. Declare every resource your workloads ask for; `pods` is the one
+  resource the provider fills in for you.
+- It warns only. The node is never reconciled to the declared values: the kubelet owns
+  `status.allocatable`, and a machine that registered is the truth about what booted. Fix it by
+  updating `spec.nodeCapacity`, or by fixing the machine.
+- Nothing is compared until the node is Ready, because before the kubelet reports allocatable there
+  is no measurement to compare. A pool that declares nothing is never warned about.
+
 ### Node Template
 
 The provider reports one machine shape per group, built from a slot of that group:
@@ -157,9 +240,11 @@ The provider reports one machine shape per group, built from a slot of that grou
    only source of `status.allocatable`, `spec.taints` and the labels a pod needs to schedule, so
    the autoscaler simulates a real machine.
 2. If no slot has a node object (the whole pool is powered off), the provider synthesizes a
-   placeholder from the Node CR. It carries the group label and the declared `nodeTaints`, and no
-   capacity, because the size of a machine that never registered can't be read and shouldn't be
-   invented.
+   placeholder from the Node CR. It carries the group label, the declared `nodeTaints` and the
+   declared `nodeCapacity`, on top of the default pod ceiling. No machine size is invented: a pool
+   that declared `nodeCapacity` is answering the question from Git, and a pool that declared nothing
+   gets a template with no cpu, no memory and no disk, because the size of a machine that never
+   registered can't be read.
 
 Because the template is copied from a live node, the autoscaler's own taints are filtered out of
 it: `ToBeDeletedByClusterAutoscaler` and `DeletionCandidateOfClusterAutoscaler` on the
@@ -204,6 +289,9 @@ spec:
   pricing:
     hourlyRate: 0.05
     podRate: 0.001
+  nodeCapacity:
+    cpu: 1950m
+    memory: 3.2Gi
   nodeTaints:
   - key: dedicated
     value: remote
@@ -362,6 +450,19 @@ kubectl patch node.infra.homecluster.dev worker-01 -n homelab-autoscaler-system 
    - Check job logs for error messages
    - Verify credentials and network access
    - Test power commands manually
+
+4. **A pool at `minSize: 0` never scales up**
+   - With no slot registered, the provider can only report the capacity the slots declare:
+     `kubectl get node.infra.homecluster.dev <slot> -o jsonpath='{.spec.nodeCapacity}'` returning
+     nothing means the group's template has no cpu and no memory, and no pod with requests fits it.
+     Declare the field, and declare every resource your workloads ask for
+   - `kubectl describe node.infra.homecluster.dev <slot>` shows a `NodeCapacityMismatch` warning
+     when the declaration and the booted machine disagree. That drift doesn't stop placement: it
+     means the estimator is sizing the machine wrong, so you over-provision work the node can't take
+     (the pod stays Pending after the machine boots) or leave a booted machine idle. The
+     unplaceable case is the missing declaration above
+   - A declaration that names no `pods` is not the problem it looks like: the provider defaults the
+     pod ceiling to the kubelet's 110, so a cpu-and-memory declaration scales from zero fine
 
 ### Debugging Commands
 

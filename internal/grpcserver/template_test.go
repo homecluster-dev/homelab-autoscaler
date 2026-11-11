@@ -60,9 +60,38 @@ func taintStrings(items []corev1.Taint) []string {
 	return out
 }
 
+// assertResource compares a resource the template must carry against the quantity it should hold.
+// Cmp, not assert.Equal on the Quantity: the template makes a round trip through protobuf, which
+// re-renders a BinarySI number (3.2Gi) as its milli-decimal equivalent (3435973836800m), and the
+// two Quantity values are the same number in two representations.
+func assertResource(t *testing.T, list corev1.ResourceList, name corev1.ResourceName, want string) {
+	t.Helper()
+
+	got, ok := list[name]
+	require.Truef(t, ok, "%s is missing from the template", name)
+
+	expected := resource.MustParse(want)
+	assert.Equalf(t, 0, expected.Cmp(got), "%s: want %s, got %s", name, want, got.String())
+}
+
 // nodeWithShape builds a Kubernetes node the way a machine that joined looks: the allocatable
-// the kubelet reported, a Ready condition, and the taints the node carries.
+// the kubelet reported, a Ready condition, and the taints the node carries. cpu and memory are the
+// part a caller varies; pods and ephemeral-storage are filled in, because every kubelet reports
+// them and a fixture that leaves them out is a node no scheduler can place a pod on.
 func nodeWithShape(name string, ready bool, cpu, memory string, nodeTaints ...corev1.Taint) *corev1.Node {
+	return nodeWithResources(name, ready, corev1.ResourceList{
+		corev1.ResourceCPU:              resource.MustParse(cpu),
+		corev1.ResourceMemory:           resource.MustParse(memory),
+		corev1.ResourcePods:             resource.MustParse("110"),
+		corev1.ResourceEphemeralStorage: resource.MustParse("40Gi"),
+	}, nodeTaints...)
+}
+
+// nodeWithResources builds a registered Kubernetes node with an exact resource list, shared by
+// capacity and allocatable, plus a Ready condition and the taints the node carries. It is the
+// fixture for what a real kubelet reports beyond cpu and memory: a pod ceiling, the local disk,
+// hugepages, and whatever a device plugin adds.
+func nodeWithResources(name string, ready bool, resources corev1.ResourceList, nodeTaints ...corev1.Taint) *corev1.Node {
 	status, reason := corev1.ConditionFalse, "KubeletNotReady"
 	if ready {
 		status, reason = corev1.ConditionTrue, "KubeletReady"
@@ -75,14 +104,8 @@ func nodeWithShape(name string, ready bool, cpu, memory string, nodeTaints ...co
 		},
 		Spec: corev1.NodeSpec{ProviderID: "homelab://" + name, Taints: nodeTaints},
 		Status: corev1.NodeStatus{
-			Capacity: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(cpu),
-				corev1.ResourceMemory: resource.MustParse(memory),
-			},
-			Allocatable: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(cpu),
-				corev1.ResourceMemory: resource.MustParse(memory),
-			},
+			Capacity:    resources.DeepCopy(),
+			Allocatable: resources.DeepCopy(),
 			Conditions: []corev1.NodeCondition{{
 				Type:   corev1.NodeReady,
 				Status: status,
@@ -98,6 +121,41 @@ func slotWithTaints(name string, desired, actual infrav1alpha1.PowerState, progr
 	node.Spec.NodeTaints = nodeTaints
 
 	return node
+}
+
+// slotWithCapacity builds a Node CR of the test group that declares spec.nodeCapacity: the shape
+// the slot's machine boots, as the kubelet reports it. The declaration names cpu and memory only,
+// which is the documented shape and the one a real operator writes.
+func slotWithCapacity(name string, desired, actual infrav1alpha1.PowerState, progress infrav1alpha1.Progress, cpu, memory string) *infrav1alpha1.Node {
+	return slotWithCapacityList(name, desired, actual, progress, corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpu),
+		corev1.ResourceMemory: resource.MustParse(memory),
+	})
+}
+
+// slotWithCapacityList builds a Node CR of the test group that declares an exact spec.nodeCapacity,
+// the fixture for a declaration that names more, or fewer, resources than cpu and memory.
+func slotWithCapacityList(name string, desired, actual infrav1alpha1.PowerState, progress infrav1alpha1.Progress, declared corev1.ResourceList) *infrav1alpha1.Node {
+	node := nodeCR(name, desired, actual, progress)
+	node.Spec.NodeCapacity = declared
+
+	return node
+}
+
+// allowedPodNumberOf mirrors the one derivation of the scheduler framework that decides whether a
+// template can host anything at all: framework.NodeInfo.SetNode reads v1.ResourcePods out of
+// status.allocatable and sets AllowedPodNumber from nothing else, and NodeResourcesFit
+// .fitsRequest answers "Too many pods" when len(pods)+1 exceeds it, before its zero-request early
+// return. A template with no pods in its allocatable therefore has AllowedPodNumber 0 and rejects
+// every pod, so the estimator finds no placement and NodeGroupIncreaseSize is never called - the
+// failure spec.nodeCapacity exists to close, and the reason the provider defaults the pod ceiling.
+func allowedPodNumberOf(list corev1.ResourceList) int64 {
+	pods, found := list[corev1.ResourcePods]
+	if !found {
+		return 0
+	}
+
+	return pods.Value()
 }
 
 // TestNodeGroupTemplateBuiltFromSlotWithRealNode is the regression a live cluster produced.
@@ -157,9 +215,11 @@ func TestNodeGroupTemplatePrefersReadyNode(t *testing.T) {
 
 // TestNodeGroupTemplateWithoutAnyNodeSynthesizesPlaceholder covers a pool in which no slot has
 // a machine. The provider still has to answer, and the honest answer is the shape the Node CR
-// declares (the group label and the declared taints) and nothing about capacity: the size of a
-// machine that has never registered cannot be read, and inventing it lets the autoscaler place
-// work the real machine cannot take.
+// declares (the group label and the declared taints) and nothing about size: the cpu, memory and
+// disk of a machine that has never registered cannot be read, and inventing them lets the
+// autoscaler place work the real machine cannot take. The pod ceiling is the one number that is
+// not a fact about the hardware - every kubelet has one, and the default is a constant - so the
+// placeholder carries it, and a pod with requests still fits nowhere.
 func TestNodeGroupTemplateWithoutAnyNodeSynthesizesPlaceholder(t *testing.T) {
 	dedicated := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
 
@@ -170,11 +230,269 @@ func TestNodeGroupTemplateWithoutAnyNodeSynthesizesPlaceholder(t *testing.T) {
 
 	template := templateFor(t, server)
 
-	assert.Empty(t, template.Status.Allocatable, "a placeholder must not invent capacity")
+	assert.NotContains(t, template.Status.Allocatable, corev1.ResourceCPU, "a placeholder must not invent a machine size")
+	assert.NotContains(t, template.Status.Allocatable, corev1.ResourceMemory, "a placeholder must not invent a machine size")
+	assert.NotContains(t, template.Status.Capacity, corev1.ResourceCPU, "a placeholder must not invent a machine size")
+	assert.NotContains(t, template.Status.Capacity, corev1.ResourceMemory, "a placeholder must not invent a machine size")
+	assert.Equal(t, template.Status.Allocatable, template.Status.Capacity,
+		"a template machine has no system daemons to subtract, so capacity and allocatable are the same numbers")
+	assert.Greater(t, allowedPodNumberOf(template.Status.Allocatable), int64(0),
+		"the pod ceiling is defaulted, so the template is a node the scheduler can place on at all")
 	assert.Equal(t, []string{dedicated.ToString()}, taintStrings(template.Spec.Taints),
 		"the placeholder carries the taints the slot declares")
 	assert.Equal(t, testGroup, template.Labels["infra.homecluster.dev/group"])
 	assert.Contains(t, template.Name, testGroup+"-template-")
+}
+
+// TestNodeGroupTemplatePlaceholderCarriesDeclaredCapacity is the scale-from-zero case the field
+// exists for. A pool in which no slot has ever booted has no corev1.Node, so its placeholder had
+// an empty status.allocatable: cluster-autoscaler found no pod that fits and never called
+// NodeGroupIncreaseSize, which is why a minSize: 0 pool stays at zero and the workaround is a
+// machine that never sleeps. The declaration is the shape the placeholder can honestly carry,
+// because it is written in Git next to the taints of the same machine.
+func TestNodeGroupTemplatePlaceholderCarriesDeclaredCapacity(t *testing.T) {
+	dedicated := corev1.Taint{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}
+
+	server := newServer(t,
+		slotWithCapacity("slot-off-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+			infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi"),
+		slotWithTaints("slot-off-2", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+			infrav1alpha1.ProgressShutdown, dedicated),
+	)
+
+	template := templateFor(t, server)
+
+	// a pod with cpu requests must fit the template, that is what makes the pool scale from zero
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")
+	assertResource(t, template.Status.Capacity, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Capacity, corev1.ResourceMemory, "3.2Gi")
+	// The shape is the declaration plus the defaulted pod ceiling. Locking the list to exactly the
+	// two declared resources locks the broken shape: the scheduler derives AllowedPodNumber from
+	// v1.ResourcePods alone, so that template answers every pod "Too many pods".
+	assertResource(t, template.Status.Allocatable, corev1.ResourcePods, "110")
+	assert.Len(t, template.Status.Allocatable, 3,
+		"the declared resources plus the defaulted pod ceiling, and nothing invented")
+	assert.Equal(t, template.Status.Allocatable, template.Status.Capacity,
+		"a template machine has no system daemons to subtract, so capacity and allocatable are the same list")
+}
+
+// TestNodeGroupTemplateDeclaredCapacityWithoutPodsStillAcceptsPods is the blocking shape of the
+// feature. The documented declaration is cpu and memory, because that is what an operator reads off
+// a machine; pods is a kubelet flag. Applied as a whole list, that declaration leaves the template
+// with no v1.ResourcePods, framework.NodeInfo.SetNode derives AllowedPodNumber 0 from it, and
+// NodeResourcesFit.fitsRequest answers "Too many pods" for every pod, before its zero-request early
+// return, so the estimator returns 0 nodes, NodeGroupIncreaseSize is never called and a minSize: 0
+// pool still cannot scale from zero. The provider fills the kubelet's default pod ceiling in.
+func TestNodeGroupTemplateDeclaredCapacityWithoutPodsStillAcceptsPods(t *testing.T) {
+	server := newServer(t,
+		slotWithCapacity("slot-off-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+			infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi"),
+	)
+
+	template := templateFor(t, server)
+
+	assert.Greater(t, allowedPodNumberOf(template.Status.Allocatable), int64(0),
+		"a declaration without pods must not leave the template at a pod ceiling of zero")
+	assert.Greater(t, allowedPodNumberOf(template.Status.Capacity), int64(0),
+		"capacity is read by cluster-autoscaler too, so it needs the pod ceiling as well")
+	assertResource(t, template.Status.Allocatable, corev1.ResourcePods, "110")
+	// the default must not displace the declaration
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "1950m")
+}
+
+// TestNodeGroupTemplateDeclaredCapacityWinsOverTheLiveNode covers the precedence on the path that
+// copies a registered node: the declaration is the shape of the machine the autoscaler is about
+// to boot, the live node is what one slot happens to report right now. Reading the live node
+// would make the whole group's template change with which slot is Ready, in a mixed pool it
+// hands the estimator a different machine per call.
+func TestNodeGroupTemplateDeclaredCapacityWinsOverTheLiveNode(t *testing.T) {
+	server := newServer(t,
+		slotWithCapacity("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn,
+			infrav1alpha1.ProgressReady, "1950m", "3.2Gi"),
+		nodeWithShape("slot-on", true, "8", "16Gi"),
+	)
+
+	template := templateFor(t, server)
+
+	// the declaration wins over the 8 CPU / 16 GiB the representative slot reports
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")
+	assertResource(t, template.Status.Capacity, corev1.ResourceCPU, "1950m")
+	assertResource(t, template.Status.Capacity, corev1.ResourceMemory, "3.2Gi")
+	// and it wins resource by resource: what the slot reports that the declaration does not name
+	// stays, which is what a cpu/memory declaration from the docs has to leave alone
+	assertResource(t, template.Status.Allocatable, corev1.ResourcePods, "110")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceEphemeralStorage, "40Gi")
+}
+
+// TestNodeGroupTemplateLiveNodeResourcesSurviveTheDeclaration is the other half of "the declared
+// values win": winning is per resource, the declaration does not replace the list. A real kubelet
+// reports a pod ceiling, the local disk, hugepages, and every device plugin resource next to cpu
+// and memory, and the estimator judges a pod against all of them. A 2 vCPU box that carries a GPU is
+// still a box with a GPU after the declaration is applied, and a kubelet configured with --max-pods
+// 250 keeps 250, so the provider does not lower a real machine to the default.
+func TestNodeGroupTemplateLiveNodeResourcesSurviveTheDeclaration(t *testing.T) {
+	gpu := corev1.ResourceName("nvidia.com/gpu")
+	hugepages := corev1.ResourceName(corev1.ResourceHugePagesPrefix + "2Mi")
+
+	server := newServer(t,
+		slotWithCapacity("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn,
+			infrav1alpha1.ProgressReady, "1950m", "3.2Gi"),
+		nodeWithResources("slot-on", true, corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse("8"),
+			corev1.ResourceMemory:           resource.MustParse("16Gi"),
+			corev1.ResourcePods:             resource.MustParse("250"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("80Gi"),
+			hugepages:                       resource.MustParse("1Gi"),
+			gpu:                             resource.MustParse("2"),
+		}),
+	)
+
+	template := templateFor(t, server)
+
+	for _, list := range []struct {
+		name  string
+		items corev1.ResourceList
+	}{
+		{"status.allocatable", template.Status.Allocatable},
+		{"status.capacity", template.Status.Capacity},
+	} {
+		// the two declared resources are the declaration
+		assertResource(t, list.items, corev1.ResourceCPU, "1950m")
+		assertResource(t, list.items, corev1.ResourceMemory, "3.2Gi")
+		// everything the machine reports that the declaration does not name is the machine's
+		assertResource(t, list.items, corev1.ResourcePods, "250")
+		assertResource(t, list.items, corev1.ResourceEphemeralStorage, "80Gi")
+		assertResource(t, list.items, hugepages, "1Gi")
+		assertResource(t, list.items, gpu, "2")
+		assert.Len(t, list.items, 6, "%s: the declared resources overlaid on the node's own list", list.name)
+	}
+}
+
+// TestNodeGroupTemplateFallsBackToTheLiveNodeAllocatable keeps the today-behaviour for a pool that
+// declares nothing: the kubelet's measured numbers are a better estimate than an empty template,
+// and no existing pool is asked to write the field to keep working.
+func TestNodeGroupTemplateFallsBackToTheLiveNodeAllocatable(t *testing.T) {
+	server := newServer(t,
+		nodeCR("slot-on", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+		nodeWithShape("slot-on", true, "8", "16Gi"),
+	)
+
+	template := templateFor(t, server)
+
+	// with no declaration the live node's allocatable is used
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "8")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceMemory, "16Gi")
+	assertResource(t, template.Status.Capacity, corev1.ResourceCPU, "8")
+	assertResource(t, template.Status.Capacity, corev1.ResourceMemory, "16Gi")
+}
+
+// TestApplyTemplateCapacityDoesNotAliasTheDeclaration guards the copy the precedence needs. The
+// Node CR the provider reads comes out of the manager's cache, so putting its map into the
+// template would hand every later reader a template-shaped object, and capacity and allocatable
+// would be one map: clearing one in a later step would clear the other.
+func TestApplyTemplateCapacityDoesNotAliasTheDeclaration(t *testing.T) {
+	slotCR := slotWithCapacity("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+		infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi")
+	template := &corev1.Node{}
+
+	applyTemplateCapacity(template, slotCR)
+
+	template.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("1")
+	template.Status.Capacity[corev1.ResourceMemory] = resource.MustParse("16Gi")
+
+	assert.Equal(t, resource.MustParse("1950m"), slotCR.Spec.NodeCapacity[corev1.ResourceCPU],
+		"the declaration is copied, not shared with the template")
+	assert.Equal(t, resource.MustParse("3.2Gi"), slotCR.Spec.NodeCapacity[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("3.2Gi"), template.Status.Allocatable[corev1.ResourceMemory],
+		"capacity and allocatable are two lists, not one map under two names")
+}
+
+// TestApplyTemplateCapacityLeavesAnUndeclaredSlotAlone covers the fallback half of the precedence
+// at the unit level: the numbers the copy carried, from the live node, survive untouched.
+func TestApplyTemplateCapacityLeavesAnUndeclaredSlotAlone(t *testing.T) {
+	slotCR := nodeCR("slot-1", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	template := nodeWithShape("slot-1", true, "8", "16Gi")
+
+	applyTemplateCapacity(template, slotCR)
+
+	assert.Equal(t, resource.MustParse("8"), template.Status.Allocatable[corev1.ResourceCPU])
+	assert.Equal(t, resource.MustParse("16Gi"), template.Status.Capacity[corev1.ResourceMemory])
+	assert.Equal(t, resource.MustParse("110"), template.Status.Allocatable[corev1.ResourcePods],
+		"the pod ceiling the node reports is kept, it is not lowered to the default")
+}
+
+// TestApplyTemplateCapacityOverlaysTheDeclarationPerResource is the unit level of the same rule:
+// the declared cpu replaces the live cpu, the live pod ceiling, disk and GPU survive, and the
+// declaration is applied to capacity as well as allocatable.
+func TestApplyTemplateCapacityOverlaysTheDeclarationPerResource(t *testing.T) {
+	gpu := corev1.ResourceName("nvidia.com/gpu")
+	slotCR := slotWithCapacity("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+		infrav1alpha1.ProgressShutdown, "3900m", "7.8Gi")
+	template := nodeWithResources("slot-1", true, corev1.ResourceList{
+		corev1.ResourceCPU:              resource.MustParse("8"),
+		corev1.ResourceMemory:           resource.MustParse("16Gi"),
+		corev1.ResourcePods:             resource.MustParse("250"),
+		corev1.ResourceEphemeralStorage: resource.MustParse("80Gi"),
+		gpu:                             resource.MustParse("2"),
+	})
+
+	applyTemplateCapacity(template, slotCR)
+
+	for _, items := range []corev1.ResourceList{template.Status.Capacity, template.Status.Allocatable} {
+		assert.Equal(t, resource.MustParse("3900m"), items[corev1.ResourceCPU], "the declaration wins for cpu")
+		assert.Equal(t, resource.MustParse("7.8Gi"), items[corev1.ResourceMemory], "the declaration wins for memory")
+		assert.Equal(t, resource.MustParse("250"), items[corev1.ResourcePods], "a resource the declaration omits stays")
+		assert.Equal(t, resource.MustParse("80Gi"), items[corev1.ResourceEphemeralStorage], "the disk stays")
+		assert.Equal(t, resource.MustParse("2"), items[gpu], "the GPU stays: a pod asking for it must fit")
+	}
+}
+
+// TestApplyTemplateCapacityDefaultsThePodCeilingOnAnEmptyTemplate is the placeholder half: the
+// object starts with nothing, so the pod ceiling comes from the default and no machine size is
+// added. This is the shape the documented cpu/memory declaration lands on, and the one the
+// scheduler can place a pod on at all.
+func TestApplyTemplateCapacityDefaultsThePodCeilingOnAnEmptyTemplate(t *testing.T) {
+	slotCR := slotWithCapacity("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff,
+		infrav1alpha1.ProgressShutdown, "1950m", "3.2Gi")
+	template := &corev1.Node{}
+
+	applyTemplateCapacity(template, slotCR)
+
+	assertResource(t, template.Status.Allocatable, corev1.ResourcePods, "110")
+	assertResource(t, template.Status.Capacity, corev1.ResourcePods, "110")
+	assertResource(t, template.Status.Allocatable, corev1.ResourceCPU, "1950m")
+	assert.NotContains(t, template.Status.Allocatable, corev1.ResourceEphemeralStorage,
+		"the default is the pod ceiling only, the provider does not invent a disk")
+}
+
+// TestApplyTemplateCapacityDoesNotAliasTheDefaults guards the package level default list. It is
+// shared by every call, and a Quantity carries a cached rendering and an optional pointer to its
+// internal representation: putting the default value into a template, and letting a caller (or the
+// protobuf round trip) touch it, would rewrite the default for every later pool.
+func TestApplyTemplateCapacityDoesNotAliasTheDefaults(t *testing.T) {
+	slotCR := nodeCR("slot-1", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	template := &corev1.Node{}
+
+	applyTemplateCapacity(template, slotCR)
+
+	pods := template.Status.Allocatable[corev1.ResourcePods]
+	pods.Add(resource.MustParse("1"))
+	template.Status.Allocatable[corev1.ResourcePods] = pods
+	template.Status.Capacity[corev1.ResourcePods] = resource.MustParse("1")
+
+	shared := defaultTemplateCapacity[corev1.ResourcePods]
+	assert.Equal(t, int64(defaultTemplateMaxPods), shared.Value(),
+		"the shared default is not reachable through the template")
+	// capacity and allocatable are two lists, and each carries its own copy of the default
+	assertResource(t, template.Status.Allocatable, corev1.ResourcePods, "111")
+	assertResource(t, template.Status.Capacity, corev1.ResourcePods, "1")
+
+	second := &corev1.Node{}
+	applyTemplateCapacity(second, slotCR)
+	assertResource(t, second.Status.Allocatable, corev1.ResourcePods, "110")
+	assertResource(t, second.Status.Capacity, corev1.ResourcePods, "110")
 }
 
 // TestNodeGroupTemplateDeclaredTaintsWin covers the overlay on the node copied from a live

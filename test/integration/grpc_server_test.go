@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -37,6 +38,16 @@ import (
 	"github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
 	"github.com/homecluster-dev/homelab-autoscaler/test/integration/testdata"
 )
+
+// cmpResource compares a declared quantity against what a template carries. Cmp, not a struct
+// comparison: the template round-trips through protobuf, which re-renders a BinarySI number
+// (3.2Gi) as its milli-decimal equivalent (3435973836800m), so the two Quantity values are the
+// same number in two representations.
+func cmpResource(list corev1.ResourceList, name corev1.ResourceName, declared string) int {
+	want, got := resource.MustParse(declared), list[name]
+
+	return want.Cmp(got)
+}
 
 var _ = Describe("gRPC Server Integration Tests", func() {
 	var (
@@ -541,7 +552,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 		})
 
 		Context("when no slot of the group has a Kubernetes node", func() {
-			It("answers with a placeholder that carries the declared taints and no capacity", func() {
+			It("answers with a placeholder that carries the declared taints and no machine size", func() {
 				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
 					WithGroup("test-group").
 					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
@@ -556,12 +567,86 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				templateNode := &corev1.Node{}
 				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
 
-				// capacity of a machine that never registered cannot be read, so it is not invented
-				Expect(templateNode.Status.Allocatable).To(BeEmpty())
+				// the cpu, memory and disk of a machine that never registered cannot be read, so they
+				// are not invented. The pod ceiling is the kubelet's own default and is not a fact about
+				// the hardware, and a template without it is a node the scheduler answers "Too many
+				// pods" for, so the estimator never calls NodeGroupIncreaseSize.
+				Expect(templateNode.Status.Allocatable).NotTo(HaveKey(corev1.ResourceCPU))
+				Expect(templateNode.Status.Allocatable).NotTo(HaveKey(corev1.ResourceMemory))
+				Expect(templateNode.Status.Allocatable).NotTo(HaveKey(corev1.ResourceEphemeralStorage))
+				Expect(templateNode.Status.Allocatable).To(HaveKey(corev1.ResourcePods))
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourcePods, "110")).To(BeZero())
+				Expect(templateNode.Status.Capacity).To(Equal(templateNode.Status.Allocatable))
 				Expect(templateNode.Spec.Taints).To(ConsistOf(corev1.Taint{
 					Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule,
 				}))
 				Expect(templateNode.Labels).To(HaveKeyWithValue("infra.homecluster.dev/group", "test-group"))
+			})
+		})
+
+		Context("when a powered off slot declares the capacity of its machine", func() {
+			It("builds the placeholder at that size, so the pool can scale from zero", func() {
+				// The template is the machine cluster-autoscaler simulates a placement on, and a
+				// pool at zero has no corev1.Node to read its shape from. With no declaration the
+				// placeholder carries an empty allocatable, no pod with requests fits, and
+				// NodeGroupIncreaseSize is never called: the pool stays at zero. The declaration is
+				// the shape the placeholder can honestly carry, because it is in Git.
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff),
+						mocks.WithNodeCapacity("1950m", "3.2Gi")).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+
+				templateNode := &corev1.Node{}
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
+
+				_, hasCPU := templateNode.Status.Allocatable[corev1.ResourceCPU]
+				Expect(hasCPU).To(BeTrue(), "a pod with cpu requests must fit the template")
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceCPU, "1950m")).To(BeZero(),
+					"the template is the declared size")
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")).To(BeZero())
+				Expect(cmpResource(templateNode.Status.Capacity, corev1.ResourceCPU, "1950m")).To(BeZero(),
+					"capacity and allocatable are the same list on a template machine")
+				// the pod ceiling of the template is what lets the scheduler place a pod on it at all:
+				// NodeResourcesFit checks "Too many pods" before it looks at any request
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourcePods, "110")).To(BeZero())
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceEphemeralStorage, "40Gi")).To(BeZero())
+			})
+		})
+
+		Context("when the slot declares a capacity and a live node reports another one", func() {
+			It("uses the declaration, so the template does not depend on which slot is Ready", func() {
+				// The declaration is the shape of the machine the autoscaler is about to boot;
+				// what one slot reports right now is an accident of the pool's current state, and
+				// in a mixed pool it would hand the estimator a different machine per call.
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodePowerState(infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn),
+						mocks.WithNodeCapacity("1950m", "3.2Gi")).
+					// the builder's node reports 3.8 CPU / 7.5 GiB allocatable
+					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group")).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+
+				templateNode := &corev1.Node{}
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
+
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceCPU, "1950m")).To(BeZero(),
+					"the declaration wins over the 3.8 CPU the representative slot reports")
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceMemory, "3.2Gi")).To(BeZero())
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourceEphemeralStorage, "40Gi")).To(BeZero(),
+					"the declaration wins for the resources it names, over the 38Gi the node reports")
+				Expect(cmpResource(templateNode.Status.Allocatable, corev1.ResourcePods, "110")).To(BeZero(),
+					"the template keeps a pod ceiling: the scheduler rejects every pod without one")
 			})
 		})
 

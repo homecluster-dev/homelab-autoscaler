@@ -29,6 +29,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -833,6 +834,11 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	// Create template node by copying the representative node
 	templateNode := k8sNode.DeepCopy()
 
+	// Put the capacity cluster-autoscaler will judge the pod's requests against into the template.
+	// The declaration is read here, after the copy and before the marshal, so that the rule below
+	// is the same for the node copied from a live slot and for the synthesized placeholder.
+	applyTemplateCapacity(templateNode, representativeNodeCR)
+
 	// Generate a unique template name
 	templateNode.Name = fmt.Sprintf("%s-template-%d", req.Id, time.Now().Unix())
 	templateNode.UID = ""
@@ -947,9 +953,10 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 //     object its powered off machine left behind) is the next best thing.
 //  2. no slot has a corev1.Node at all, i.e. the whole pool is powered off: keep the previous
 //     pick (prefer a powered off slot, then the first slot) and return a nil node, so the
-//     caller synthesizes a placeholder. Capacity is not invented there, and a lookup that
-//     failed for a reason other than "the node does not exist" is reported instead of being
-//     turned into an empty template.
+//     caller synthesizes a placeholder. Capacity is not invented there - the placeholder carries
+//     the shape the slot declares in spec.nodeCapacity plus the kubelet's default pod ceiling, and
+//     no size the provider guessed - and a lookup that failed for a reason other than "the node
+//     does not exist" is reported instead of being turned into an empty template.
 //
 // The returned Node CR is never nil when the error is nil.
 func (s *HomeClusterProviderServer) pickTemplateSource(ctx context.Context, items []infrav1alpha1.Node) (*infrav1alpha1.Node, *corev1.Node, error) {
@@ -1035,14 +1042,108 @@ func kubernetesNodeIsReady(node *corev1.Node) bool {
 	return false
 }
 
+// defaultTemplateMaxPods is the pod ceiling a template carries when nothing names it. It is the
+// kubelet's own default (--max-pods, 110), and it is the number cluster-autoscaler's own node
+// template builders put into the machines they hand the estimator: the gce, aws, azure and
+// hetzner builders all set corev1.ResourcePods in the template's allocatable and capacity.
+const defaultTemplateMaxPods = 110
+
+// defaultTemplateCapacity is the starting shape of a template's resource lists.
+//
+// pods is in it because it is the one resource the scheduler needs that a declaration is not
+// expected to name: cpu and memory are facts about one specific machine, copied off its kubelet,
+// while the pod ceiling is a kubelet flag with a fixed default. It is also the resource the
+// scheduler judges first. framework.NodeInfo derives AllowedPodNumber from v1.ResourcePods alone,
+// and NodeResourcesFit.fitsRequest tests "Too many pods" *before* its zero-request early return,
+// so a template whose allocatable has no pods gives AllowedPodNumber 0 and every pod is rejected -
+// with requests, and without them. The estimator then finds no placement for the pending pod,
+// NodeGroupIncreaseSize is never called, and a minSize: 0 pool stays at zero: the documented
+// declaration names cpu and memory, so filling the pod ceiling in is the provider's job.
+//
+// Nothing else is defaulted. cpu, memory, ephemeral-storage, hugepages and device plugin
+// resources describe a machine, and inventing them invents hardware the pool may not own: a pool
+// that declares nothing keeps being told "this machine has no known size" for those.
+var defaultTemplateCapacity = corev1.ResourceList{
+	corev1.ResourcePods: *resource.NewQuantity(defaultTemplateMaxPods, resource.DecimalSI),
+}
+
+// applyTemplateCapacity puts the machine size into the template: the defaults a schedulable
+// template needs, then what the copy came with, then the slot's declaration. The node copied from
+// a live slot and the synthesized placeholder go through this one function, so the two paths
+// cannot drift apart.
+//
+// Precedence, per resource, spelled out because it is the whole point of the field:
+//
+//   - spec.nodeCapacity, when the slot declares it, wins for every resource it names, over the
+//     live node's status.capacity and status.allocatable and over the defaults. The template is
+//     the shape of the machine the autoscaler is about to boot, and the declaration is that shape
+//     on purpose; what a slot happens to report right now is an accident of which slot is Ready.
+//     A group whose slots are not identical (a mixed pool, a slot mid-replacement, a node object
+//     its powered off machine left behind) would otherwise hand the estimator a different capacity
+//     per call, and a pool at zero has no live node at all, which is the case the field exists for;
+//   - a resource the declaration does not name is left alone, not dropped. A real node reports
+//     pods, ephemeral-storage, hugepages, nvidia.com/gpu, and whatever a device plugin adds, and
+//     the estimator judges a pod against all of them. Declaring cpu and memory declares the shape
+//     of the box, not the list of resources it has, so the overlay is per resource: replacing the
+//     whole list with the declaration is what made the documented declaration unplaceable, because
+//     the template lost pods and the scheduler answered every pod "Too many pods";
+//   - with no declaration, the live node's own numbers stay in the template: the kubelet measured
+//     them, and that is today's behaviour for every pool that declares nothing. On the placeholder
+//     path there is no live node, so an undeclared pool carries the defaults and nothing else: the
+//     pod ceiling is the kubelet's default, and the size of a machine that never registered stays
+//     unknown rather than being guessed.
+//
+// The declaration is applied to status.capacity as well as status.allocatable: the estimator
+// judges requests against allocatable, and cluster-autoscaler's registered-node bookkeeping
+// (quota simulation, resource reporting) reads capacity, so a template that fills only one of the
+// two is judged by the other. A template machine has no system daemons to subtract, so on the
+// placeholder path the two lists end up identical; on the live path each keeps its own numbers,
+// overlaid resource by resource.
+func applyTemplateCapacity(templateNode *corev1.Node, slot *infrav1alpha1.Node) {
+	overlayDeclaredCapacity(&templateNode.Status.Capacity, slot.Spec.NodeCapacity)
+	overlayDeclaredCapacity(&templateNode.Status.Allocatable, slot.Spec.NodeCapacity)
+}
+
+// overlayDeclaredCapacity merges one of a template's resource lists: the defaults for any
+// resource the list does not already carry, then the declaration, resource by resource. Nothing
+// is removed, and nothing a live node reported is overwritten by a default.
+//
+// Every map written here is a new one and every quantity a copy: the Node CR the provider reads
+// comes out of the manager's cache, so aliasing its map, or the package-level defaults, into the
+// template is a mutation of shared state waiting to happen, and capacity and allocatable must not
+// become one map under two names.
+func overlayDeclaredCapacity(list *corev1.ResourceList, declared corev1.ResourceList) {
+	merged := make(corev1.ResourceList, len(*list)+len(defaultTemplateCapacity)+len(declared))
+
+	for name, quantity := range *list {
+		merged[name] = quantity
+	}
+
+	for name, quantity := range defaultTemplateCapacity {
+		if _, carried := merged[name]; !carried {
+			merged[name] = quantity.DeepCopy()
+		}
+	}
+
+	for name, quantity := range declared {
+		merged[name] = quantity.DeepCopy()
+	}
+
+	*list = merged
+}
+
 // placeholderTemplateNode builds the object the template is derived from when no slot of the
-// group has a corev1.Node: a fully powered off pool. It carries everything that can be read
-// from the Node CR, the group label and the taints the slot declares, and deliberately
-// nothing about capacity. status.allocatable of a machine that has never registered cannot be
-// read, and inventing it would let the autoscaler place work the real machine cannot take. An
-// honest "I do not know the size of this machine" is what a placeholder may say.
+// group has a corev1.Node: a fully powered off pool. It carries everything that can be read from
+// the Node CR, the group label, the taints the slot declares, and the capacity the slot declares,
+// on top of the defaults applyTemplateCapacity fills in. No machine size is invented: cpu, memory,
+// ephemeral-storage of a machine that has never registered cannot be read, so an undeclared
+// placeholder says "I do not know the size of this machine" by carrying none of them, and the pool
+// that declared spec.nodeCapacity is answering the question from Git. The pod ceiling is the one
+// number that is not a fact about the hardware, and it is defaulted so the scheduler can place a
+// pod on the template at all. The call here is what makes the placeholder a complete object on its
+// own.
 func placeholderTemplateNode(slot *infrav1alpha1.Node) *corev1.Node {
-	return &corev1.Node{
+	placeholder := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: slot.Name,
 			Labels: map[string]string{
@@ -1058,6 +1159,10 @@ func placeholderTemplateNode(slot *infrav1alpha1.Node) *corev1.Node {
 			Reason: "KubeletReady",
 		}}},
 	}
+
+	applyTemplateCapacity(placeholder, slot)
+
+	return placeholder
 }
 
 // NodeGroupGetOptions returns NodeGroupAutoscalingOptions for the node group
