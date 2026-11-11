@@ -204,5 +204,6 @@ Startup/shutdown jobs:
 - [Installation](../getting-started/installation.md) - Helm deployment
 - [Quick Start](../getting-started/quick-start.md) - k3d testing
 - [FSM Architecture](state.md) - State management
+- [NodeClaim Design](../design/nodeclaim.md) - Where scale-up intent goes in v2alpha1
 - [Known Issues](../troubleshooting/known-issues.md) - Current limitations
 - [API Reference](../api-reference/crds/group.md) - CRD specs

@@ -484,4 +484,5 @@ kubectl describe node.infra.homecluster.dev <node-name> -n homelab-autoscaler-sy
 ## Related Documentation
 
 - [Group CRD](group.md) - Autoscaling group configuration
+- [NodeClaim Design](../../design/nodeclaim.md) - Removes `spec.powerState` in v2alpha1, where this field's claim lives instead
 - [Architecture Overview](../../architecture/overview.md) - System design

@@ -36,6 +36,14 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Design',
+      items: [
+        'design/nodeclaim',
+      ],
+      collapsed: false,
+    },
+    {
+      type: 'category',
       label: 'API Reference',
       items: [
         {

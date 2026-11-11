@@ -606,5 +606,6 @@ Supported power control methods:
 
 ## Related Documentation
 - [Architecture Overview](overview.md) - System design
+- [NodeClaim Design](../design/nodeclaim.md) - The v2alpha1 model, which removes the field this page's authority order exists to arbitrate
 - [Node CRD](../api-reference/crds/node.md) - Node resource definition
 - [Development Setup](../development/setup.md) - FSM implementation details
