@@ -115,6 +115,7 @@ make test-e2e
 
 - **[Quick Start](docs/getting-started/quick-start.md)** - k3d testing setup
 - **[Architecture](docs/architecture/overview.md)** - System design and components
+- **[NodeClaim Design](docs/design/nodeclaim.md)** - Scale-up intent as its own object
 - **[API Reference](docs/api-reference/crds/group.md)** - CRD specifications
 - **[Troubleshooting](docs/troubleshooting/debugging-guide.md)** - Debugging guide
 

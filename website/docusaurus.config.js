@@ -114,6 +114,10 @@ const config = {
                 to: '/docs/architecture/overview',
               },
               {
+                label: 'Design',
+                to: '/docs/design/nodeclaim',
+              },
+              {
                 label: 'API Reference',
                 to: '/docs/api-reference/crds/group',
               },
