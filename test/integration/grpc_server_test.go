@@ -76,7 +76,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 
 				// Verify specific groups. dev-group is the group that declares a per-group
 				// minimum size in the test data; every other group keeps the default floor of 0.
-				var groupNames []string
+				groupNames := make([]string, 0, len(resp.NodeGroups))
 				for _, group := range resp.NodeGroups {
 					groupNames = append(groupNames, group.Id)
 
