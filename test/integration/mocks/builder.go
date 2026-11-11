@@ -265,6 +265,14 @@ func WithNodeTaintsToRemove(taints []corev1.Taint) NodeOption {
 	}
 }
 
+// WithNodeTaints adds the taints a Node CR declares for its machine (spec.nodeTaints): the node
+// controller applies them to the Kubernetes node and the provider puts them in the template.
+func WithNodeTaints(taints []corev1.Taint) NodeOption {
+	return func(n *infrav1alpha1.Node) {
+		n.Spec.NodeTaints = taints
+	}
+}
+
 // WithNodeLastStartupTime sets the last startup time
 func WithNodeLastStartupTime(t time.Time) NodeOption {
 	return func(n *infrav1alpha1.Node) {

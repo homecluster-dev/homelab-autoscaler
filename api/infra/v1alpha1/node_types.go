@@ -96,8 +96,26 @@ type NodeSpec struct {
 	Pricing            PricingSpec    `json:"pricing"`
 	// TaintsToRemove is a list of taints that should be stripped from the node when generating a template.
 	// It allows users to declare custom taints that the autoscaler must ignore.
+	//
+	// It is unrelated to NodeTaints: this field filters taints out of the node template,
+	// NodeTaints puts them in. Do not conflate them.
 	// +optional
 	TaintsToRemove []corev1.Taint `json:"taintsToRemove,omitempty"`
+
+	// NodeTaints are the taints this slot's machine must carry.
+	//
+	// The node controller applies them to the Kubernetes node (a declared taint is added, or
+	// an existing taint with the same key is overwritten; taints that are not declared are
+	// left alone, and the taints owned by cluster-autoscaler and by the node lifecycle
+	// controllers are never written), and the provider includes them in the node template it
+	// reports for scale-up simulation, so the autoscaler sees them even before the machine
+	// has registered.
+	//
+	// Declare taints here instead of tainting from the startup Job: a Job applies the taint
+	// after the node joined and after the autoscaler already simulated a placement on an
+	// untainted template, so pods get scheduled on a machine that rejects them.
+	// +optional
+	NodeTaints []corev1.Taint `json:"nodeTaints,omitempty"`
 }
 
 type PricingSpec struct {

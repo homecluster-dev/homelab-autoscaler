@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
 
@@ -817,45 +818,16 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 		return nil, status.Error(codes.Unimplemented, "scale from zero not supported")
 	}
 
-	// Find a representative node (prefer powered off nodes)
-	var representativeNodeCR *infrav1alpha1.Node
-	for i := range nodes.Items {
-		if nodes.Items[i].Status.PowerState == infrav1alpha1.PowerStateOff {
-			representativeNodeCR = &nodes.Items[i]
-			break
-		}
-	}
-	if representativeNodeCR == nil {
-		// No powered on nodes, use first node
-		representativeNodeCR = &nodes.Items[0]
-	}
-
-	// Get the corresponding Kubernetes node. In tests the mock client may not contain a corev1.Node
-	// for the given name. If the node is not found, synthesize a minimal node object that mirrors the
-	// group label and basic Ready condition. This keeps the method robust for both real clusters and
-	// unit‑test environments.
-	k8sNode := &corev1.Node{}
-	err = s.Client.Get(ctx, client.ObjectKey{Name: representativeNodeCR.Name}, k8sNode)
+	// Pick the slot the template is built from, and the Kubernetes node that describes it.
+	representativeNodeCR, k8sNode, err := s.pickTemplateSource(ctx, nodes.Items)
 	if err != nil {
-		// If the error is a NotFound, create a placeholder node instead of failing.
-		if errors.IsNotFound(err) {
-			// Populate minimal fields needed for the template generation.
-			k8sNode = &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: representativeNodeCR.Name,
-					Labels: map[string]string{
-						"infra.homecluster.dev/group": representativeNodeCR.Labels["group"],
-					},
-				},
-				Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
-					Type:   corev1.NodeReady,
-					Status: corev1.ConditionTrue,
-					Reason: "KubeletReady",
-				}}},
-			}
-		} else {
-			return nil, status.Errorf(codes.Internal, "failed to get kubernetes node: %v", err)
-		}
+		return nil, err
+	}
+	if k8sNode == nil {
+		// No slot of the group has a Kubernetes node object, so the whole pool is powered off.
+		// Synthesize a placeholder so the call keeps answering, and carry what the Node CR
+		// knows about the slot.
+		k8sNode = placeholderTemplateNode(representativeNodeCR)
 	}
 
 	// Create template node by copying the representative node
@@ -907,7 +879,8 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 		"node.kubernetes.io/unreachable":   true,
 		"ToBeDeletedByClusterAutoscaler":   true,
 	}
-	// Extend with any custom taints configured on the Node CR
+	// Extend with any custom taints configured on the Node CR. TaintsToRemove only filters
+	// taints out of the template; spec.nodeTaints, which adds taints to it, is applied below.
 	for _, t := range representativeNodeCR.Spec.TaintsToRemove {
 		removeKeys[t.Key] = true
 	}
@@ -920,6 +893,14 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 		filtered = append(filtered, taint)
 	}
 	templateNode.Spec.Taints = filtered
+
+	// Overlay the taints the slot declares. They are applied last, so they win over what the
+	// representative node happens to carry: the Node CR is the intent for the machine the
+	// autoscaler is about to boot, and the live node of the representative slot can lag behind
+	// it. Applying them here is what lets CA see dedicated=remote:NoSchedule before the
+	// machine has registered, and it is why a consumer no longer has to taint from a startup
+	// Job.
+	templateNode.Spec.Taints = taints.Overlay(templateNode.Spec.Taints, representativeNodeCR.Spec.NodeTaints)
 
 	// Ensure node is schedulable
 	templateNode.Spec.Unschedulable = false
@@ -934,6 +915,131 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	return &pb.NodeGroupTemplateNodeInfoResponse{
 		NodeBytes: nodeBytes,
 	}, nil
+}
+
+// pickTemplateSource chooses the slot the node template is built from, and returns the
+// Kubernetes node that describes it (nil when no slot of the group has one).
+//
+// The template is the machine shape cluster-autoscaler simulates a scale-up on, and only a
+// corev1.Node carries that shape: status.allocatable, spec.taints, and the labels a pod needs
+// in order to schedule. The old policy was "prefer a slot whose status.powerState is off",
+// which is exactly what made the template wrong: a powered off machine has no corev1.Node
+// object, so the lookup fell into the NotFound branch and the template was a placeholder with
+// no taints and no capacity. CA then simulated an untainted, zero-capacity node while the
+// machine boots tainted (dedicated=remote:NoSchedule), so it placed pods on a node that never
+// accepts them and had no capacity to judge the requests against. It only worked before
+// status.powerState started being seeded: the off slots had an empty status, so the loop fell
+// through to the running slot and the template was accurate by accident.
+//
+// Policy, in order:
+//  1. a slot whose corev1.Node exists, a Ready one preferred. Any live node object is a real
+//     source of allocatable, taints and labels, which is what the template needs; a Ready one
+//     is the shape of a machine that actually carries work, and a NotReady leftover (a node
+//     object its powered off machine left behind) is the next best thing.
+//  2. no slot has a corev1.Node at all, i.e. the whole pool is powered off: keep the previous
+//     pick (prefer a powered off slot, then the first slot) and return a nil node, so the
+//     caller synthesizes a placeholder. Capacity is not invented there, and a lookup that
+//     failed for a reason other than "the node does not exist" is reported instead of being
+//     turned into an empty template.
+//
+// The returned Node CR is never nil when the error is nil.
+func (s *HomeClusterProviderServer) pickTemplateSource(ctx context.Context, items []infrav1alpha1.Node) (*infrav1alpha1.Node, *corev1.Node, error) {
+	logger := log.Log.WithName("grpc-server")
+
+	var (
+		best       *infrav1alpha1.Node
+		bestNode   *corev1.Node
+		bestReady  bool
+		poweredOff *infrav1alpha1.Node
+		lastErr    error
+	)
+
+	for i := range items {
+		candidate := &items[i]
+		if poweredOff == nil && candidate.Status.PowerState == infrav1alpha1.PowerStateOff {
+			poweredOff = candidate
+		}
+
+		candidateNode := &corev1.Node{}
+		if err := s.Client.Get(ctx, client.ObjectKey{Name: kubernetesNodeNameOf(candidate)}, candidateNode); err != nil {
+			if !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to get Kubernetes node", "node", kubernetesNodeNameOf(candidate), "nodeCR", candidate.Name)
+			}
+			lastErr = err
+
+			continue
+		}
+
+		ready := kubernetesNodeIsReady(candidateNode)
+		if bestNode == nil || (ready && !bestReady) {
+			best, bestNode, bestReady = candidate, candidateNode, ready
+		}
+	}
+
+	if bestNode != nil {
+		return best, bestNode, nil
+	}
+
+	// No slot has a node object. A failure that is not "the node does not exist" (a
+	// permissions problem, a broken cache) must not be hidden behind a placeholder.
+	if lastErr != nil && !errors.IsNotFound(lastErr) {
+		return nil, nil, status.Errorf(codes.Internal, "failed to get kubernetes node: %v", lastErr)
+	}
+
+	fallback := poweredOff
+	if fallback == nil {
+		fallback = &items[0]
+	}
+
+	return fallback, nil, nil
+}
+
+// kubernetesNodeNameOf returns the name of the corev1.Node object that backs a slot. The
+// operator fills spec.kubernetesNodeName in when the machine is provisioned; the Node CR name
+// is the fallback, which is the rule NodeGroupNodes uses too.
+func kubernetesNodeNameOf(node *infrav1alpha1.Node) string {
+	if node.Spec.KubernetesNodeName != "" {
+		return node.Spec.KubernetesNodeName
+	}
+
+	return node.Name
+}
+
+// kubernetesNodeIsReady reports whether the kubelet of a Kubernetes node is posting a ready
+// status. A node without a Ready condition at all is not ready.
+func kubernetesNodeIsReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}
+
+// placeholderTemplateNode builds the object the template is derived from when no slot of the
+// group has a corev1.Node: a fully powered off pool. It carries everything that can be read
+// from the Node CR, the group label and the taints the slot declares, and deliberately
+// nothing about capacity. status.allocatable of a machine that has never registered cannot be
+// read, and inventing it would let the autoscaler place work the real machine cannot take. An
+// honest "I do not know the size of this machine" is what a placeholder may say.
+func placeholderTemplateNode(slot *infrav1alpha1.Node) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: slot.Name,
+			Labels: map[string]string{
+				"infra.homecluster.dev/group": slot.Labels["group"],
+			},
+		},
+		Spec: corev1.NodeSpec{
+			Taints: taints.Overlay(nil, slot.Spec.NodeTaints),
+		},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionTrue,
+			Reason: "KubeletReady",
+		}}},
+	}
 }
 
 // NodeGroupGetOptions returns NodeGroupAutoscalingOptions for the node group

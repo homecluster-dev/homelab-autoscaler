@@ -508,6 +508,62 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 				}
 			})
 		})
+
+		Context("when a pool mixes powered off slots with a slot that has a Kubernetes node", func() {
+			It("builds the template from the slot with a node, and carries the declared taints", func() {
+				// The shape of the machine (allocatable, taints, labels) can only be read from a
+				// corev1.Node, so the off slots, which have none, must not be the representative.
+				// The declared spec.nodeTaints must reach the template, so a pod that does not
+				// tolerate dedicated=remote:NoSchedule is never simulated onto this group.
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
+					WithNode("test-node-2", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff)).
+					WithKubernetesNode("test-node-1", mocks.WithKubernetesNodeGroupLabel("test-group")).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+
+				templateNode := &corev1.Node{}
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
+
+				Expect(templateNode.Status.Allocatable).To(HaveKey(corev1.ResourceCPU),
+					"the template must come from the node object, not from a placeholder")
+				Expect(templateNode.Spec.Taints).To(ContainElement(corev1.Taint{
+					Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule,
+				}))
+			})
+		})
+
+		Context("when no slot of the group has a Kubernetes node", func() {
+			It("answers with a placeholder that carries the declared taints and no capacity", func() {
+				mockClient := mocks.NewMockClientBuilder(scheme.Scheme).
+					WithGroup("test-group").
+					WithNode("test-node-1", mocks.WithNodeGroup("test-group"),
+						mocks.WithNodePowerState(infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff),
+						mocks.WithNodeTaints([]corev1.Taint{{Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule}})).
+					Build()
+				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)
+
+				resp, err := server.NodeGroupTemplateNodeInfo(testCtx, &pb.NodeGroupTemplateNodeInfoRequest{Id: "test-group"})
+				Expect(err).NotTo(HaveOccurred())
+
+				templateNode := &corev1.Node{}
+				Expect(templateNode.Unmarshal(resp.NodeBytes)).To(Succeed())
+
+				// capacity of a machine that never registered cannot be read, so it is not invented
+				Expect(templateNode.Status.Allocatable).To(BeEmpty())
+				Expect(templateNode.Spec.Taints).To(ConsistOf(corev1.Taint{
+					Key: "dedicated", Value: "remote", Effect: corev1.TaintEffectNoSchedule,
+				}))
+				Expect(templateNode.Labels).To(HaveKeyWithValue("infra.homecluster.dev/group", "test-group"))
+			})
+		})
+
 		Context("when group has no nodes", func() {
 			It("should return unimplemented error for scale from zero", func() {
 				// Setup test data with empty group

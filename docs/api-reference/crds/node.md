@@ -18,6 +18,8 @@ The Node Custom Resource Definition (CRD) represents individual physical machine
 | `shutdownPodSpec` | `MinimalPodSpec` | Yes | Pod specification for shutdown operations |
 | `kubernetesNodeName` | `string` | Yes | Name of the corresponding Kubernetes node |
 | `pricing` | `PricingSpec` | Yes | Cost information for the node |
+| `nodeTaints` | `[]corev1.Taint` | No | Taints this machine must carry, applied to the Kubernetes node and included in the node template |
+| `taintsToRemove` | `[]corev1.Taint` | No | Taints stripped from the node template so the autoscaler ignores them |
 
 #### PowerState
 
@@ -81,6 +83,56 @@ const (
 )
 ```
 
+### Node Taints
+
+Declare the taints a machine must carry in `spec.nodeTaints`:
+
+```yaml
+spec:
+  nodeTaints:
+  - key: dedicated
+    value: remote
+    effect: NoSchedule
+```
+
+The node controller adds each declared taint to the Kubernetes node (a taint with the same key
+is overwritten), and the provider puts them in the node template it reports to
+cluster-autoscaler, so the autoscaler sees `dedicated=remote:NoSchedule` before the machine has
+registered and stops scheduling pods that the node rejects.
+
+This replaces tainting from a startup Job. A Job taints the node after it joined, which is after
+the autoscaler already simulated a placement on an untainted template, so pods land on a node
+that never accepts them.
+
+What the field does not do:
+
+- It doesn't remove taints. Taints that aren't declared stay on the node; remove those with
+  `kubectl taint`.
+- It doesn't write taints someone else owns. `node.kubernetes.io/*` (node lifecycle controllers)
+  and `ToBeDeletedByClusterAutoscaler` / `DeletionCandidateOfClusterAutoscaler`
+  (cluster-autoscaler) are skipped, and the skip is logged on the controller.
+
+`spec.taintsToRemove` is the opposite field and is unrelated: it filters taints out of the node
+template so the autoscaler ignores taints your startup process leaves behind. It never touches
+the live node. A key listed in both fields ends up on the template, because `nodeTaints` is what
+the machine boots with.
+
+If you migrate a pool from a tainting startup Job, drop the `kubectl taint` step from the Job and
+set `nodeTaints` on the Node CRs. The controller applies the taint on the next reconcile, and the
+template carries it immediately.
+
+### Node Template
+
+The provider reports one machine shape per group, built from a slot of that group:
+
+1. A slot whose Kubernetes node object exists, a Ready one preferred. That node object is the
+   only source of `status.allocatable`, `spec.taints` and the labels a pod needs to schedule, so
+   the autoscaler simulates a real machine.
+2. If no slot has a node object (the whole pool is powered off), the provider synthesizes a
+   placeholder from the Node CR. It carries the group label and the declared `nodeTaints`, and no
+   capacity, because the size of a machine that never registered can't be read and shouldn't be
+   invented.
+
 ## Example
 
 ```yaml
@@ -117,6 +169,10 @@ spec:
   pricing:
     hourlyRate: 0.05
     podRate: 0.001
+  nodeTaints:
+  - key: dedicated
+    value: remote
+    effect: NoSchedule
 status:
   health: healthy
   powerState: on
