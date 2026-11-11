@@ -207,7 +207,9 @@ request: the claim has a deadline, and the deadline is the heal.
 
 A shutdown Job is a script: it exits 0 when its own commands ran, which is not evidence that the
 provider's power-off landed. The controller reads the machine, so the slot keeps reporting
-`draining`, the scale-down claim keeps its finalizer, and the attempts are counted **on that claim**:
+`draining`, the scale-down claim keeps its finalizer, and the attempts are counted **on that claim**,
+one per shutdown Job — the transition that fires the shutdown writes the count, and the claim
+controller's 15s poll of the observation only reads it:
 
 ```bash
 kubectl describe nodeclaim claim-<node-name> -n homelab-autoscaler-system
@@ -220,8 +222,8 @@ kubectl logs -n homelab-autoscaler-system job/<shutdown-job>
 The attempts are `status.shutdownAttempts`, a counter of its own: `status.attempt` is the record of
 the machines the request bought, and a shutdown that never lands must not spend it.
 
-Past the bound the slot reconciler **stops firing the shutdown** — no fifth Job for a script that
-keeps exiting 0 — and the machine stays up, cordoned, unwanted, and paid for. That is deliberate:
+Past the bound the slot reconciler **stops firing the shutdown** — no fourth Job for a script that
+has had its three — and the machine stays up, cordoned, unwanted, and paid for. That is deliberate:
 the fix is the script. Make `spec.shutdownPodSpec` call the provider's own power-off and exit
 non-zero when the machine is still on.
 

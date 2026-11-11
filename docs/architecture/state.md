@@ -147,7 +147,7 @@ deadlineAt = requestedAt + max(budget, group.spec.maxNodeProvisionTime)
 
 The startup Job's own timeout is in the sum because the clock runs from `spec.requestedAt`, i.e.
 from before the Job exists: one attempt can spend the Job's whole 5m, then the 90s it takes the
-node to register, then the 4m of the readiness gate — about 9m50s of deadlines, in series. A
+node to register, then the 4m of the readiness gate — 10m30s of deadlines, in series. A
 budget of 7m10s (the first sketch of §4) fails the claim in the middle of the machine it is still
 buying, and the machine that boots an instant later is force-shut-down as overdue. The 0.1.20
 progress watchdog excluded the Job timeout for exactly this reason — its grace applied only to a
@@ -179,8 +179,12 @@ Attempts live on the request, not on the slot:
 - `claim.MaxConsecutiveAttempts` (3) is the bound. Past it, the claim controller fails the claim
   with `reason: AttemptLimitExceeded` before a machine is bought.
 - a scale-down's attempts are counted on the claim that asked for the scale-down, on
-  `status.shutdownAttempts` (`BumpScaleDownAttempt`) — a counter of its own, so a shutdown script
-  that never lands does not spend the boot attempts of the episode it is draining. The slot
+  `status.shutdownAttempts`, by the transition that fires the shutdown (`fsm.ShutdownNode` →
+  `recordShutdownAttempt` → `BumpScaleDownAttempt`) — one per shutdown Job, never per reconcile
+  pass, because the claim controller's finalizer poll of the observation runs every 15s and a
+  streak counted there is 45s of polling with one Job behind it. It is a counter of its own, so a
+  shutdown script that never lands does not spend the boot attempts of the episode it is
+  draining. The slot
   reconciler stops firing a shutdown that will not land once the streak is spent, and the streak
   resets when the machine is observed off (the claim ends with the observation) or after
   `claim.ShutdownAttemptResetGrace` (30m), which is what picks up a pool whose script has been
@@ -283,9 +287,11 @@ So the shutdown completion (`internal/fsm/shutdown_completion.go`) reads the mac
 report follows the machine:
 
 - the shutdown Job completed and the machine is observed **up** → the slot keeps reporting
-  `draining`, the scale-down claim keeps its finalizer, and the claim controller counts the
-  attempt on `status.shutdownAttempts` — a counter of its own, because `status.attempt` is the
-  record of the machines the request bought and a shutdown that will not land must not spend it.
+  `draining`, the scale-down claim keeps its finalizer, and the transition that fired the Job
+  counts the attempt on `status.shutdownAttempts` (`fsm.recordShutdownAttempt`) — a counter of its
+  own, counted on shutdown Jobs, because `status.attempt` is the record of the machines the request
+  bought and a shutdown that will not land must not spend it. The claim controller's poll of the
+  observation is read-only.
   Past `claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that will not
   land, the record is the `ShutdownAttemptLimitReached` warning on the claim, and the refusal
   requeues.

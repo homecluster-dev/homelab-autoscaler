@@ -238,7 +238,7 @@ and no lock). Under this model:
 - Canceling a `pending` claim is deleting it. Nothing is in flight, the controller drops it, the
   unit comes off the target size on the same write.
 - Canceling a `booting` claim is not possible. The finalizer lands on the **same write** that
-  records the `booting` phase (`claim.Recorder.closeBootWindow`), not on a later pass of the claim
+  records the `booting` phase (`claim.Recorder.openBootWindow`), not on a later pass of the claim
   controller, so there is no window in which a `DeleteNodes` deletes a committed boot with no
   shutdown behind it. A delete is therefore not an abandonment: the claim runs to `ready` or
   `failed`, and the machine is powered off by the shutdown path. A boot is reversed, never
@@ -270,7 +270,7 @@ watchdog is gone with this model: the budget of a claim is what its deadline enf
 startup Job's own timeout is in the sum, because the clock runs from `spec.requestedAt`, i.e.
 from **before the Job exists**. One attempt can spend the Job's whole 5m (the Job's timeout is
 `DefaultJobTimeout`, and `JobTimeout` is a reachable event), then the 90s it takes the node to
-register, then the 4m of the readiness gate: about 9m50s of deadlines in series. A budget of
+register, then the 4m of the readiness gate: 10m30s of deadlines in series. A budget of
 7m10s — the first sketch of this section, and the number the watchdog's grace used, which was
 safe there because the grace applied only to a Job that had **already finished**
 (`internal/progress/watchdog.go`, deleted) — fails a claim in the middle of the machine it is
@@ -307,7 +307,8 @@ attempt N+1.
 
 The deadline bounds the **boot**, not the machine's life. `phase.InBootWindow` is the range the
 deadline, and the attempt bound that rides on it, apply to, and the `booting → ready` write
-clears `spec.deadlineAt` (`claim.Recorder.closeBootWindow`): a claim that reached `ready` owns a
+clears `spec.deadlineAt` (`claim.Recorder.clearBootDeadline`, on the write *after* the status one):
+a claim that reached `ready` owns a
 machine, every healthy machine in a homelab pool is requested more than 12 minutes before it
 serves its first pod, and a CRD whose deadline field still names an instant in its past is a
 healthy unit that every later reader — the controller, the digest, `kubectl get nodeclaim` — reads
@@ -331,8 +332,13 @@ horizon as the deadline, deliberately: a reboot is not an attempt that ends — 
 **A scale-down whose shutdown never lands.** The shutdown Job is a script, and it can exit 0 with
 the machine observed up (the pool's wrapper swallows the power-off). The claim's finalizer cannot
 release, so the poll is permanent unless the attempts are counted and bounded. They are counted on
-`status.shutdownAttempts` — a counter of its own, never `status.attempt`, which is the record of
-the machines the request bought and the seed of the next claim's number. Past
+`status.shutdownAttempts`, **where the shutdown fires** — the state machine's `ShutdownNode`, on the
+branch that created the shutdown Job (`recordShutdownAttempt` → `BumpScaleDownAttempt`) — so three
+attempts are three shutdown Jobs and not three passes of a poll: the claim controller's
+`reconcileDeletion` reads the machine every 15s and writes nothing, and a streak written there
+reaches the bound in 45s with one Job behind it, starting the pause early. It is a counter of its
+own, never `status.attempt`, which is the record of the machines the request bought and the seed of
+the next claim's number. Past
 `claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that will not land, and
 the claim carries the `ShutdownAttemptLimitReached` warning.
 
@@ -362,12 +368,13 @@ Attempts are a property of the request, not of the slot:
   episode. The bound is enforced on a claim in the boot window: a claim that has its machine
   (`ready`) is not failed by the number it landed on.
 - A scale-down's attempts are a **separate** count, `status.shutdownAttempts`, on the claim that
-  asked for the scale-down, with the same bound and a bounded pause (§4).
+  asked for the scale-down, incremented by the transition that fires the shutdown — one per
+  shutdown Job, never per reconcile pass — with the same bound and a bounded pause (§4).
 
 | Today | Under NodeClaim |
 | --- | --- |
 | `fsm.StartupAttemptLimit` (3) on the `ClaimRearmed` condition of the slot, reset at the readiness gate of `afterJobCompleted` (`internal/fsm/startup_attempts.go`) | Subsumed: `status.attempt` on the claim, bounded per slot by `status.lastClaim.attempt`. The reset rule disappears with the object — nothing on the slot to clear, and no lifetime sentence for a slot that is reused across claims. |
-| `fsm.ShutdownAttemptLimit` (3) on the `ShutdownAttempts` condition of the slot, reset in two places (`internal/fsm/shutdown_attempts.go`) | Subsumed: a scale-down is a claim (`request.call: DeleteNodes`), so its attempts are counted on the claim that asked for it and end when it ends. |
+| `fsm.ShutdownAttemptLimit` (3) on the `ShutdownAttempts` condition of the slot, reset in two places (`internal/fsm/shutdown_attempts.go`) | Subsumed: a scale-down is a claim (`request.call: DeleteNodes`), so its attempts are counted on the claim that asked for it — one per shutdown Job, at the transition that fires it — and end when it ends. |
 | The progress watchdog's re-arm (`progress.Settle`, `ClaimRearmed` / `ProgressReconciled`, `internal/progress/watchdog.go`) | Subsumed: re-arming a long-lived slot becomes "create the next claim (attempt N+1)"; settling a claim that produced nothing becomes "record `failed` at the deadline". The slot is never written back to a stable pair, because it never held the request. |
 | The observed-power precedence rule (`ReconcileObservedPower`, 0.1.22) | Kept, and promoted to the general input law (§6). It stops being a writer of the FSM's state. |
 | `Node.status.conditions` entries `ClaimRearmed`, `ShutdownAttempts` | Replaced by the one-line `Node.status.lastClaim` digest plus the claims themselves. The events (`ScaleUpRequested`, `ReadinessGateTimeout`, `ShutdownNotObserved`, `internal/fsm/recorder.go`) stay events, and gain the claim's name in their message. |
@@ -705,8 +712,9 @@ one detail settled by what the tests showed.
   observed up". The implementation covers the wider case, and states it in
   `docs/architecture/state.md`: a shutdown Job that completed while the machine is still observed up
   leaves the slot at `draining` (`phase.Derive` reads `ShutdownJobInFlight` first), the claim keeps
-  its finalizer, and `BumpScaleDownAttempt` counts the attempt on the claim that asked for the
-  scale-down. Past `claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that
+  its finalizer, and the transition that fired the Job counts the attempt on the claim that asked
+  for the scale-down (`fsm.recordShutdownAttempt` → `BumpScaleDownAttempt`) — one count per shutdown
+  Job, and a claim controller poll of the observation that counts nothing. Past `claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that
   will not land and the record is the `ShutdownAttemptLimitReached` warning on the claim. This is
   the design's own rule — the bound lives on the request — applied to the scale-down, and it is what
   the v1alpha1 `ShutdownAttempts` condition did on the slot, with its two reset sites.
@@ -728,16 +736,25 @@ one detail settled by what the tests showed.
   is a success, not a fifth attempt.
 - **The budget is the set of deadlines an attempt can spend, in series.** `claim.AttemptBudget`
   includes `fsm.DefaultJobTimeout`: the clock starts at `spec.requestedAt`, before the startup Job
-  exists, so an attempt can spend 5m of Job + 90s of registration + 4m of gate (≈9m50s) and a
+  exists, so an attempt can spend 5m of Job + 90s of registration + 4m of gate (10m30s) and a
   7m10s budget kills it inside the machine it is buying. `claim.BudgetConstants` is the set, and
   the test asserts the sum, the membership of each constant, and that no proper subset adds up to
   the budget.
 - **A deleted slot releases its claim.** A claim whose `Node` is gone has nothing left to run: the
-  reason `SlotDeleted` is recorded, the finalizer comes off, and the ownerReference's garbage
-  collection finishes the object. Leaving the finalizer on is a claim stuck in `Terminating`
-  forever, never retried, with the machine still running — and it is reachable through the
-  documented rollout, which deletes the Node CRs (§9). No digest is stamped: the record lives on
-  the slot, and the slot does not exist, so the claim object is the record while its TTL keeps it.
+  reason `SlotDeleted` is recorded, the finalizer comes off, and the pass that released it keeps
+  the claim's TTL (`finishReleasedSlot`): the collection path every other terminal claim goes
+  through is reached *through the slot*, and the slot is gone. Leaving the finalizer on is a claim
+  stuck in `Terminating` forever, never retried, with the machine still running — and it is
+  reachable through the documented rollout, which deletes the Node CRs (§9). The fact is re-read
+  with `mgr.GetAPIReader()` before anything is given up: releasing a finalizer cannot be undone, and
+  a cached `NotFound` on a slot the rollout recreated is a claim released while its machine is
+  wanted. No digest is stamped — the record lives on the slot, and the slot does not exist, so the
+  claim object is the record, and it survives for `spec.ttlSecondsAfterFinished` from the moment it
+  was failed. A claim the scale-down had **already** marked is deleted by the API server on the
+  write that removes its finalizer, and a claim an ownerReference points at can be taken by the
+  slot's garbage collection at the same instant: neither reads its TTL, which is why the release
+  path is the one that honours it, and why a hand-applied claim with no ownerReference is not left
+  to accumulate on a cluster with no collector for it.
 - **The digest is the newest episode's, and the collector never loses a claim.** `StampDigest`
   stamps only the newest claim of the slot (the ordering rule `claim.LiveOfSlot` uses), so a late
   write from a superseded episode cannot rewrite the story with the older one. A terminal claim
@@ -747,25 +764,44 @@ one detail settled by what the tests showed.
   (§4). `ClaimReasonMachineGone` is written by `NodeClaimReconciler.watchMachine`, on
   `claim.MachineGoneGrace` (one boot window), with the clock on the claim
   (`MachineObservedOff`), so a reboot heals and a manager restart does not restart the bound.
-- **A restarted manager re-attaches to its Jobs.** The lifecycle Job monitor is a goroutine of the
-  process that ran the transition, and the coordination lock is its ownership marker. A restart
-  loses the goroutine and keeps the objects, leaving a booting claim whose Job completed with no
-  event left to fire — and it sits at `booting` until its deadline fails it, destroying a machine
-  that booted successfully. The slot reconciler therefore watches the claims of its slot
-  (`Owns(&NodeClaim{})`, so a claim created while the manager was down boots when it is created)
-  and reads the Job objects: a finished Job whose lifecycle phase matches the state the input law
-  derived, on a slot with no live lock, has its `JobCompleted` / `JobFailed` event re-fired.
-- **A scale-down counts its own attempts** on `status.shutdownAttempts`, with a bounded pause
-  (`claim.ShutdownAttemptResetGrace`) and a documented manual escape hatch (§4). Spending the
-  *boot* `status.attempt` on a shutdown that never lands is the bug the separate counter closes:
-  the boot attempts are the record of the machines the request bought, and the seed of the next
-  claim's number.
-- **The finalizer arrives with the boot.** `claim.Recorder.Move` stamps it on the same write that
-  records `booting`, and clears `spec.deadlineAt` on the write that records `ready`; both are
-  metadata/spec writes, applied **before** the status write, so a manager that dies between the
-  two leaves the boot committed with its deadline intact — the safe direction. `ensureFinalizer`
-  in the claim controller is the belt for a phase a hand write landed, re-Gets before it writes,
-  and refuses a finalizer on a pending, terminal, or already-deleted claim.
+- **A restarted manager re-attaches to its Jobs, correlated to the claim.** The lifecycle Job
+  monitor is a goroutine of the process that ran the transition, and the coordination lock is its
+  ownership marker. A restart loses the goroutine and keeps the objects, leaving a booting claim
+  whose Job completed with no event left to fire — and it sits at `booting` until its deadline
+  fails it, destroying a machine that booted successfully. The slot reconciler therefore watches
+  the claims of its slot (`Owns(&NodeClaim{})`, so a claim created while the manager was down boots
+  when it is created) and reads the Job objects — as **this claim's Job**, because a finished Job
+  of the right phase on the right slot is not evidence about the operation running now:
+  `startingup` is the state a `ready` claim with a machine momentarily observed off derives, exactly
+  like a real boot, and re-firing the startup Job its readiness gate consumed long ago runs that
+  gate again on a serving machine (`failed/ReadinessGateTimeout` in ~96s, instead of the
+  `MachineGone` the 12m10s observation bound is there to record, and a power-off of the machine
+  when it comes back). So the recovery is gated four ways: a live claim, in the boot window for a
+  startup and named by a scale-down for a shutdown; the **newest** Job of the wanted phase
+  (finished, because an unfinished newer one means the operation is in flight and its monitor owns
+  its event — the newest *finished* Job is somebody else's attempt); a Job that does not predate
+  the operation (`claim.BootCommittedAt`, `claim.ScaleDownRequestedAt`); and no live coordination
+  lock. The shutdown branch is inert in the normal shape by those gates — `shuttingdown` derives
+  only while a shutdown Job is in flight — and law 3 owns the restart case by firing the shutdown
+  again.
+- **A scale-down counts its own attempts** on `status.shutdownAttempts`, one per shutdown Job, at
+  the transition that fires it (`fsm.recordShutdownAttempt` → `BumpScaleDownAttempt`), with a
+  bounded pause (`claim.ShutdownAttemptResetGrace`) and a documented manual escape hatch (§4). The
+  claim controller's finalizer poll of the observation is read-only: counting it counts reconciles,
+  and at 15s a poll the bound arrives in 45s with zero Jobs, which trips it after one real attempt.
+  Spending the *boot* `status.attempt` on a shutdown that never lands is the bug the separate
+  counter closes: the boot attempts are the record of the machines the request bought, and the seed
+  of the next claim's number.
+- **The finalizer arrives with the boot, the deadline leaves at ready.** `claim.Recorder.Move`
+  stamps the finalizer on the metadata write that precedes the `booting` status write — a manager
+  that dies between the two leaves the boot committed with its deadline intact — and clears
+  `spec.deadlineAt` on the write that **follows** the `ready` status write. The two orders are
+  opposite because the two shapes a crash between them leaves behind are not equally healable: a
+  `ready` claim that still carries its deadline has an inert field (every guard reads the deadline
+  inside the boot window) and an idempotent re-apply of the move that clears it, while a `booting`
+  claim with no deadline has nothing left to fail it once the Job's TTL removes the Job.
+  `ensureFinalizer` in the claim controller is the belt for a phase a hand write landed, re-Gets
+  before it writes, and refuses a finalizer on a pending, terminal, or already-deleted claim.
 - **`status.phase` has no CRD default, on purpose.** The status subresource strips `status` from a
   create, so a default there is only stamped by the first status write, and the window it appears
   to cover is the window the model has to survive: `phase.IsLive` reads an empty phase as pending,
