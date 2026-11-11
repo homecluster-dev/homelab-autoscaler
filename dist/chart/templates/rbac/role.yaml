@@ -6,7 +6,10 @@ grants cluster-scoped CRUD on configmaps and secrets, which the generated role d
 Jobs mount). Run `make manifests` and merge the rules over by hand, they are not rendered
 from the markers, and keep the configmaps/secrets rule: a plain copy silently drops it.
 Rules the markers DO generate must be mirrored here identically and in the generated order -
-the events create/patch rule (scale up/down Events recorded on the Node CR) is one such rule.
+the events create/patch rule (scale up/down Events recorded on the Node CR) is one such
+rule; it covers the core group and events.k8s.io, because the controller records through
+the new events API (k8s.io/client-go/tools/events) while the broadcaster still mirrors to
+the core events API.
 The templated metadata.name must stay name-consistent with the roleRef in ./role_binding.yaml.
 */ -}}
 {{- if and .Values.rbac.enable .Values.controllerManager.enabled }}
@@ -17,13 +20,6 @@ metadata:
     {{- include "chart.labels" . | nindent 4 }}
   name: {{ include "chart.name" . }}-manager-role
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
 - apiGroups:
   - ""
   resources:
@@ -77,6 +73,14 @@ rules:
   - pods/eviction
   verbs:
   - create
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - batch
   resources:

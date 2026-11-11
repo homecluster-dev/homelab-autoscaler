@@ -186,7 +186,7 @@ func (nm *NodeStateMachine) enterStartingUp(ctx context.Context, e *fsm.Event) {
 
 	// Reached only when the shutdown -> startingup transition actually happened, so this
 	// records one event per scale-up request and never on a plain resync.
-	nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleUpRequested,
+	nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleUpRequested, ActionPowerOn,
 		fmt.Sprintf("Scale up requested for %s: machine is being powered on", nm.lifecycleTarget()))
 }
 
@@ -215,7 +215,7 @@ func (nm *NodeStateMachine) enterShuttingDown(ctx context.Context, e *fsm.Event)
 	})
 
 	// See enterStartingUp: entered on the real ready -> shuttingdown transition only.
-	nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleDownRequested,
+	nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleDownRequested, ActionPowerOff,
 		fmt.Sprintf("Scale down requested for %s: machine is being powered off", nm.lifecycleTarget()))
 }
 
@@ -248,7 +248,7 @@ func (nm *NodeStateMachine) enterReady(ctx context.Context, e *fsm.Event) {
 
 	switch e.Event {
 	case EventJobCompleted:
-		nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleUpCompleted,
+		nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleUpCompleted, ActionPowerOn,
 			fmt.Sprintf("Scale up completed for %s: startup job finished, machine is on and the slot is ready",
 				nm.lifecycleTarget()))
 	case EventJobTimeout:
@@ -285,7 +285,7 @@ func (nm *NodeStateMachine) enterShutdown(ctx context.Context, e *fsm.Event) {
 
 	switch e.Event {
 	case EventJobCompleted:
-		nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleDownCompleted,
+		nm.recordLifecycleEvent(corev1.EventTypeNormal, ReasonScaleDownCompleted, ActionPowerOff,
 			fmt.Sprintf("Scale down completed for %s: shutdown job finished, machine is off and the slot is shut down",
 				nm.lifecycleTarget()))
 	case EventJobTimeout:

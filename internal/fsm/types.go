@@ -25,7 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
@@ -125,7 +125,8 @@ type NodeStateMachine struct {
 
 	// eventRecorder publishes Kubernetes Events on the Node CR for the lifecycle
 	// transitions the FSM performs. Optional: nil records nothing (see WithEventRecorder).
-	eventRecorder record.EventRecorder
+	// It is the new events API (k8s.io/client-go/tools/events, i.e. events.k8s.io).
+	eventRecorder events.EventRecorder
 
 	// Coordination management
 	coordinationManager CoordinationManager

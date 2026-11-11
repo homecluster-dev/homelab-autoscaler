@@ -22,7 +22,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 )
 
 // Reasons recorded on the Node CR, so that `kubectl describe node.infra.homecluster.dev
@@ -37,6 +37,14 @@ const (
 	ReasonScaleDownFailed    = "ScaleDownFailed"
 )
 
+// Actions recorded on the Node CR. The new events API keeps `reason` (what happened,
+// UpperCamelCase, stable, greppable) apart from `action` (what the controller did to the
+// machine), so `kubectl get events -o wide` shows PowerOn/PowerOff without parsing notes.
+const (
+	ActionPowerOn  = "PowerOn"
+	ActionPowerOff = "PowerOff"
+)
+
 // Bounds on recorded messages. An Event is a real API object: `kubectl describe` shows it,
 // and etcd keeps it. Startup/shutdown Job failures and webhook denials can carry long,
 // multi-line payloads, so they are flattened onto one line and cut off.
@@ -44,6 +52,12 @@ const (
 	maxEventMessageLength = 512
 	truncatedSuffix       = "... (truncated)"
 )
+
+// eventNoteFormat is the note passed to the new events API. The new API renders the note as
+// a format string, and the lifecycle messages are already rendered: a Job failure or a
+// webhook denial can carry a literal '%' in its payload, which Sprintf would then try to
+// interpret. So the message always goes through as an argument to "%s".
+const eventNoteFormat = "%s"
 
 // Option customises a NodeStateMachine. Options exist so that the recorder is optional:
 // callers that pass none (every existing caller, and the unit tests) get the historical
@@ -54,7 +68,7 @@ type Option func(*NodeStateMachine)
 // the FSM performs: scale up/down requested, completed, and failed. A nil recorder - the
 // default - records nothing, so the FSM stays usable in tests and in callers that have no
 // manager to build a recorder from.
-func WithEventRecorder(recorder record.EventRecorder) Option {
+func WithEventRecorder(recorder events.EventRecorder) Option {
 	return func(nm *NodeStateMachine) { nm.eventRecorder = recorder }
 }
 
@@ -63,12 +77,17 @@ func WithEventRecorder(recorder record.EventRecorder) Option {
 // Callers must only invoke it from code that runs on an actual transition (the enter_/
 // after_ hooks, and the failure sites in StartNode/ShutdownNode/monitorJobCompletion):
 // it is deliberately not called from Reconcile, which runs on every resync.
-func (nm *NodeStateMachine) recordLifecycleEvent(eventType, reason, message string) {
+//
+// regarding is the Node CR and related stays nil: every lifecycle event is about the CR
+// itself, the Job it acted on is named in the note. The note is eventNoteFormat, so the
+// message is passed as an argument (see eventNoteFormat).
+func (nm *NodeStateMachine) recordLifecycleEvent(eventType, reason, action, message string) {
 	if nm.eventRecorder == nil {
 		return
 	}
 
-	nm.eventRecorder.Event(nm.node, eventType, reason, truncateEventMessage(message))
+	nm.eventRecorder.Eventf(nm.node, nil, eventType, reason, action,
+		eventNoteFormat, truncateEventMessage(message))
 }
 
 // recordScaleFailure records a Warning event for a failed lifecycle operation, naming the
@@ -77,12 +96,12 @@ func (nm *NodeStateMachine) recordLifecycleEvent(eventType, reason, message stri
 // rolls it back to shutdown, so the caller - not the resulting state - decides.
 func (nm *NodeStateMachine) recordScaleFailure(isScaleDown bool, detail string) {
 	if isScaleDown {
-		nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonScaleDownFailed,
+		nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonScaleDownFailed, ActionPowerOff,
 			fmt.Sprintf("Scale down failed for %s: %s", nm.lifecycleTarget(), detail))
 		return
 	}
 
-	nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonScaleUpFailed,
+	nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonScaleUpFailed, ActionPowerOn,
 		fmt.Sprintf("Scale up failed for %s: %s", nm.lifecycleTarget(), detail))
 }
 
