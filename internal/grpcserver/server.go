@@ -494,7 +494,13 @@ func (s *HomeClusterProviderServer) NodeGroupIncreaseSize(ctx context.Context, r
 	return &pb.NodeGroupIncreaseSizeResponse{}, nil
 }
 
-// NodeGroupDeleteNodes deletes nodes from this node group
+// NodeGroupDeleteNodes deletes nodes from this node group. The floor of the group
+// (spec.minSize) is judged against the target size that results from the request, using
+// targetSizeOf, the same number NodeGroupTargetSize reports. A request that deletes
+// nothing takes no capacity away, so it is answered as a no-op success: the group can
+// already be at or below its floor while a shutdown from an earlier request is still in
+// flight, and a FailedPrecondition there is a refusal the autoscaler retries forever for
+// an operation that would change nothing.
 func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDeleteNodesRequest) (*pb.NodeGroupDeleteNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDeleteNodes called", "nodeGroup", req.Id, "nodes", len(req.Nodes))
@@ -531,7 +537,12 @@ func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, re
 		}
 	}
 
-	if projected := currentSize - deleting; projected < minSize {
+	// Only a request that actually takes capacity away can cross the floor. A slot that is
+	// already shut down is off the target size, so a request that deletes nothing projects
+	// the current size: when the group is already at or below its floor (a shutdown from an
+	// earlier delete is still in flight) that is not a request crossing the floor and
+	// refusing it would wedge the autoscaler over a no-op.
+	if projected := currentSize - deleting; deleting > 0 && projected < minSize {
 		logger.Info("Refusing to delete nodes, the group would fall below its minSize",
 			"nodeGroup", req.Id, "nodesRequested", len(req.Nodes), "deleting", deleting,
 			"currentSize", currentSize, "projectedSize", projected, "minSize", minSize)

@@ -489,7 +489,9 @@ func desiredPowerStates(t *testing.T, server *HomeClusterProviderServer, names .
 
 // TestNodeGroupDeleteNodesRefusesBelowMinSize: the provider must not power machines off
 // below the floor of the group. The refusal is explicit and logged, not a silent accept
-// that leaves the always-on slot destroyed.
+// that leaves the always-on slot destroyed. A request that deletes nothing takes no
+// capacity away, so it is a no-op success even when the group is already at or below its
+// floor.
 func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 	running := func(name string) *infrav1alpha1.Node {
 		return slotInSystemNamespace(name, infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
@@ -518,6 +520,20 @@ func TestNodeGroupDeleteNodesRefusesBelowMinSize(t *testing.T) {
 			objects: []client.Object{groupCR(testGroup, 1), running("slot-1"), running("slot-2")},
 			nodes:   []string{"slot-2"},
 			refuse:  false,
+		},
+		{
+			// The group is below its floor while a shutdown from an earlier request is still
+			// in flight, and this request deletes a slot that is already shut down, so it
+			// takes no capacity away. Refusing it asks the autoscaler to do something the
+			// provider cannot act on and locks the delete loop on a no-op.
+			name: "a request that deletes nothing is allowed while the group is below its floor",
+			objects: []client.Object{
+				groupCR(testGroup, 2),
+				slotInSystemNamespace("slot-powering-off", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
+				slotInSystemNamespace("slot-shut", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown),
+			},
+			nodes:  []string{"slot-shut"},
+			refuse: false,
 		},
 		{
 			name:    "a group without a Group CR keeps the old, unbounded behaviour",
