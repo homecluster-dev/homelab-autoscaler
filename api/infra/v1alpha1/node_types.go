@@ -88,8 +88,27 @@ const (
 
 // NodeSpec defines the desired state of Node
 type NodeSpec struct {
+	// DesiredPowerState is the desired *claim* for this slot: "on" asks the operator to bring the
+	// machine up, "off" asks it to shut the machine down. "off" is the CRD default, so a Node that
+	// is created, or applied, without the field is claimed off by the API server.
+	//
+	// The autoscaler owns the write. Scale-up claims a slot "on", scale-down and slot cleanup drop
+	// the claim to "off". The Node controller never writes it, it only acts on it: claim "on" with
+	// the machine off boots the machine, claim "off" with the machine on shuts it down. Nobody else
+	// writes the field, and nothing in Git declares it.
+	//
+	// A GitOps manifest must not carry this field. Argo CD with selfHeal re-applies the value that
+	// is in git every sync (~2-3 minutes), so a manifest that says powerState: off reverts the
+	// autoscaler's claim ~2.5 minutes after it was written: the FSM shuts the machine down while a
+	// pod is using it, the pending pod triggers the next scale-up, and the slot churns forever. An
+	// applied field is a claim the autoscaler can never win, which is why the field is optional and
+	// defaulted rather than Required: a Node that omits it gets "off" from the API server, git stops
+	// being a writer, and the last claim stands.
 	// +kubebuilder:validation:Enum=on;off
-	DesiredPowerState  PowerState     `json:"powerState"` // "on" or "off"
+	// +kubebuilder:default=off
+	// +optional
+	DesiredPowerState PowerState `json:"powerState,omitempty"` // "on" or "off"; "off" is the CRD default. This is the desired claim, and the autoscaler is its only writer: do not mark the field Required, and do not declare it in a GitOps manifest.
+
 	StartupPodSpec     MinimalPodSpec `json:"startupPodSpec"`
 	ShutdownPodSpec    MinimalPodSpec `json:"shutdownPodSpec"`
 	KubernetesNodeName string         `json:"kubernetesNodeName"`
