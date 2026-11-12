@@ -57,23 +57,31 @@ The main configuration is in [`docusaurus.config.js`](./docusaurus.config.js). K
 
 ### Sidebar Configuration
 
-The documentation sidebar is configured in [`sidebars.js`](./sidebars.js). It organizes the documentation into logical sections:
+The documentation sidebar is configured in [`sidebars.js`](./sidebars.js). Every doc in `../docs` is
+listed there — a page in the tree and not in the sidebar is a page nothing links to. The categories
+follow the order an operator meets the material in:
 
-- Getting Started
-- Architecture
-- API Reference
-- Development
-- Troubleshooting
+- Getting Started (`intro.md` is the docs root: its front matter carries `slug: /`)
+- Concepts
+- Operations
+- Reference (CRDs, examples, events, changelog, upgrade)
+- Contributing (setup, CRD sync, state management, the NodeClaim design, the e2e flow)
 
 ### Versioning
 
-The site supports versioning for documentation. The current version is extracted from the Helm chart version (0.1.9).
+The docs are not versioned: there is one set of pages, and `versions.current.label` is the label the
+navbar dropdown shows. The `docs-deploy` workflow rewrites that label from `dist/chart/Chart.yaml` on
+every release (it patches the `label: 'v…'` string in this file), so keep that shape. The checked-in
+label matches the current chart, `0.2.3`.
 
-To create a new version:
+To start real versioning — a snapshot per release — run:
 
 ```bash
-npm run docusaurus docs:version 0.2.0
+npm run docusaurus docs:version 0.2.3
 ```
+
+That creates `website/versioned_docs/` and `website/versioned_sidebars.json`, and adds the version to
+`versions.json`. Nothing does that today.
 
 ## Documentation Structure
 
@@ -81,22 +89,35 @@ The documentation is read from the `../docs` directory and organized as follows:
 
 ```
 docs/
+├── intro.md                    # slug: / — the docs root
 ├── getting-started/
 │   ├── overview.md
 │   ├── installation.md
 │   └── quick-start.md
+├── concepts/
+│   ├── nodeclaim-model.md
+│   ├── node-labels.md
+│   └── pool-at-a-glance.md
 ├── architecture/
-│   ├── overview.md
-│   └── state.md
+│   └── overview.md
+├── reference/
+│   └── events.md
 ├── api-reference/
 │   ├── crds/
 │   └── examples/
-├── development/
-│   ├── setup.md
-│   └── crd-sync.md
-└── troubleshooting/
-    ├── debugging-guide.md
-    └── known-issues.md
+├── releases/
+│   ├── changelog.md
+│   └── upgrade-0.1-to-0.2.md
+├── troubleshooting/
+│   ├── common-issues.md
+│   ├── debugging-guide.md
+│   └── known-issues.md
+└── development/
+    ├── setup.md
+    ├── crd-sync.md
+    ├── state.md
+    ├── nodeclaim.md
+    └── e2e-test-flow.md
 ```
 
 ## Customization
@@ -123,8 +144,13 @@ Custom React components are located in the `src/components/` directory:
 
 Static assets are stored in the `static/` directory:
 
-- `img/logo.png`: Project logo (copied from docs/images/logo.png)
-- `img/*.svg`: Feature icons for the homepage
+- `img/logo.png`: the project logo. It is also the site `favicon` and the navbar logo; there is no
+  `favicon.ico` in the repository, and `docusaurus.config.js` points at this file
+- `img/*.svg`: feature icons for the homepage
+
+There is no social card: the `themeConfig.image` key is unset, because the file the template shipped
+as a default (`img/homelab-autoscaler-social-card.jpg`) is not in the repository. Add the image, then
+set the key.
 
 ## Search
 

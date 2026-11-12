@@ -34,118 +34,12 @@ kubectl run grpc-test --rm -it --image=nicolaka/netshoot -- \
 - Verify gRPC service is enabled in Helm values
 - Check network policies if using in production
 
-## Read the Pool at a Glance
+## Read The Pool At A Glance
 
-Two commands, no logs, no port-forward: the shape of a pool, and the shape of one slot.
-
-### The pool
-
-```bash
-kubectl get groups -n homelab-autoscaler-system
-```
-
-```
-NAME             SLOTS   ON   OFF   LASTSCALE   HEALTH   AGE
-remote-workers   5       2    3     24m         healthy  41d
-```
-
-| Column | What it answers |
-| --- | --- |
-| `SLOTS` | how many `Node` CRs are labelled `group: <name>`: the machines the pool can have, i.e. its max size |
-| `ON` | the slots reporting a machine the pool is paying for: `booting`, `ready`, `draining` |
-| `OFF` | the rest: `off`, `pending`, and a slot that has never reported. `SLOTS == ON + OFF` always |
-| `LASTSCALE` | when the pool last grew or shrank. For a scale-up that is the instant the request was made; for a scale-down it is the instant the scale-down **landed on the claim**, because a `DeleteNodes` names a machine that was booted by an older request and does not rewrite that request's time - dating a shrink by the boot it reversed is the bug the digest's `scaledDownAt` exists to close. The verb and the slot are one `kubectl describe group` away, under `lastScaleAction`: `up remote-worker-2`, `down remote-worker-4`, `ca:DeleteNodes remote-worker-3` |
-| `HEALTH` | `offline` when no slot of the pool has ever reported a phase - no slots committed, or a pool nobody's reconciler is running on - and `healthy` once at least one has. A pool whose every machine is `off` is a pool that is asleep, which is the whole idea, and not an outage: the column answers "is the control loop alive for this pool" |
-
-`NAME` and `AGE` are the columns every Kubernetes table has, not ones this CRD declares.
-
-The numbers are computed by the group controller from the slots' reports, in one pass over the list
-it already has, and the pass writes only when what it computed differs from what it read. `LASTSCALE`
-is the interesting one: the same story is a Kubernetes Event, Events are garbage-collected in about an
-hour, and "what did this pool do last night" is asked the next morning - so it is a field on the pool,
-materialized from the `status.lastClaim` digest each slot keeps after its claim is collected. See
-[State Management](../architecture/state.md).
-
-### The slots
-
-```bash
-kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system
-```
-
-```
-NAME              POWERSTATE   PHASE     GROUP           ZONE   SINCE    ON24H
-remote-worker-1   on           ready     remote-workers  fsn1   3h13m    3
-remote-worker-2   on           booting   remote-workers  fsn1   4m       1
-remote-worker-3   off          off       remote-workers  hel1   18h      2
-remote-worker-4   on           draining  remote-workers         30m      0
-remote-worker-5   off          off       remote-workers         55m      0
-```
-
-| Column | What it answers |
-| --- | --- |
-| `POWERSTATE` | what the provider observes: `on` when the `corev1.Node` reports `NodeReady=True` |
-| `PHASE` | the derived report of the slot: `off`, `pending`, `booting`, `ready`, `draining` (see [State Management](../architecture/state.md)) |
-| `GROUP` | the pool this slot belongs to (`metadata.labels.group`) |
-| `ZONE` | the zone the slot declares, `spec.nodeLabels["topology.kubernetes.io/zone"]`. Empty for a pool that does not zone its slots |
-| `SINCE` | when `status.phase` last changed value (`status.lastTransitionTime`) |
-| `ON24H` | how many times this machine was booted inside the last 24 hours (`status.activationsLast24H`) |
-
-`ON24H` is the churn column: a pool that is `ON 2 / OFF 3` at 3 AM and whose slots each report 6
-activations was woken up six times by work that finished, and the electric bill is the answer to a
-question nobody had a field for before. It is a count of the boots of the window - `status.recentActivations`,
-the ledger of their instants, pruned on the pass the oldest one leaves the window, so the number does
-not go stale while the pool sleeps - and it is deliberately **not** counted from
-`status.recentTransitions`: that ring is the display history, is capped at 32 rows, and a slot that
-churns 40 times a day writes 80 rows a day, so a count read through the ring goes flat at 16 exactly
-where the question starts to matter. The ledger is capped at 512 boots a day (21 an hour, nonstop); a
-slot reporting exactly `512` is a slot that booted *at least* 512 times, which is a floor the number
-states by sitting at the cap, not a silent flatline.
-
-### The history of one slot
-
-```bash
-kubectl describe node.infra.homecluster.dev remote-worker-3 -n homelab-autoscaler-system
-```
-
-The `recentTransitions` block is the last 24 hours of that slot, newest last, capped at 32 rows.
-"Newest last" is the order the writes landed, not a clock sort: the two writers of the report append
-as they go, so two rows inside one second can be listed out of chronological order - the rows carry
-their own instants, and the order of the list is a display detail of a churn:
-
-```
-Status:
-  Phase:  off
-  Power State:  off
-  Previous Phase:  draining
-  Last Transition Time:  2026-11-11T20:58:00Z
-  Activations Total:  9
-  Activations Last24 H:  1
-  Recent Activations:
-    2026-11-11T09:12:00Z
-  Recent Transitions:
-    At:  2026-11-11T09:12:00Z
-    From:  off
-    To:  booting
-    Reason:  claim remote-worker-3-4b7e pending, observed off, startup job in flight
-    At:  2026-11-11T09:19:00Z
-    From:  booting
-    To:  ready
-    Reason:  claim remote-worker-3-4b7e ready, observed on, node usable
-    At:  2026-11-11T20:52:00Z
-    From:  ready
-    To:  draining
-    Reason:  claim remote-worker-3-4b7e marked for scale-down, observed on
-    At:  2026-11-11T20:58:00Z
-    From:  draining
-    To:  off
-    Reason:  claim remote-worker-3-4b7e marked for scale-down, observed off
-```
-
-The `Reason` of a row names the inputs the report was derived from - the live claim, the observed
-power, the usability of the node object - so "why does this slot say `draining`" is answered without
-opening the claim. `recentActivations` is the block under the ring, and the ledger the `ON24H` number
-is the length of: this slot booted once in the day, at 09:12, and its ring's four rows are the phases
-that boot went through.
+The columns of `kubectl get groups` and `kubectl get nodes.infra.homecluster.dev`, one slot's
+timeline, and what each number answers, are their own page:
+[Read the Pool at a Glance](../concepts/pool-at-a-glance.md). What is here is the symptom, and the
+one reading that needs the clock.
 
 ### How long has this machine been up?
 
@@ -171,7 +65,8 @@ kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system -o json \
       | @tsv'
 ```
 
-With `now` at `2026-11-12T15:00:00Z` and the slots of the sample above, that prints:
+With `now` at `2026-11-12T15:00:00Z` and the pool of the example in
+[Read the Pool at a Glance](../concepts/pool-at-a-glance.md#the-slots), that prints:
 
 ```
 remote-worker-1  up for         3h 13m
@@ -185,9 +80,9 @@ to measure for a machine the operator has never observed. `SINCE` alone (the col
 relative rendering of the same instant, rounded its own way (`18h`); the command above is exact, and
 it is what the runbook tells you to run when the rounding is the question.
 
-Both the command and its output above are asserted by a test
-(`test/integration/duration_snippet_test.go`), against the fixture in
-`test/integration/testdata/pool-shape/nodes.json`, so the snippet cannot rot.
+The command and its sample output are run against a fixture of a pool in the documented shape on
+every `make test`, so the snippet cannot rot. The list of what the tests keep honest is in
+[CRD Synchronization](../development/crd-sync.md#what-the-tests-keep-honest).
 
 ## Common Operations
 
@@ -674,7 +569,7 @@ kubectl logs deployment/homelab-autoscaler-controller-manager -n homelab-autosca
   | grep "the slots of a group disagree"
 ```
 
-- No slot of the group declares the label: no scale-up is planned for this group, and the autoscaler
+- No slot of the group declares the label: no scale-up is ever requested for this group, and the autoscaler
   is right. Declare it on the slots.
 - The slots declare **different** values, or only some of them declare it: the key is **left out of
   the template**, so a pod selecting it is not placed on this group at all. The group cannot guarantee

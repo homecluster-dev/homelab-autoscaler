@@ -94,7 +94,7 @@ write the phase - the observation path, the lifecycle transition path, the seed 
 never-provisioned slot - and by nothing else: `phase.Record` is the single writer of every field
 above, so a slot's history is the same list of changes whichever path got there first. Nothing in
 the operator reads them, and
-[the state doc](../../architecture/state.md#the-observability-fields) says why that is asserted by
+[the state doc](../../development/state.md#the-observability-fields) says why that is asserted by
 a test and not by a promise.
 
 ### The Columns of `kubectl get`
@@ -121,18 +121,20 @@ remote-worker-4   on           draining  remote-workers         30m      0
 | `Since` | `.status.lastTransitionTime`, type `date` |
 | `On24h` | `.status.activationsLast24H`, type `integer`, visible by default - the marker carries no `priority`, because `0` is the default and writing it out invites the reading that the column is optional |
 
-The names and casing of `Powerstate` and `Phase` are the ones shipped before this work and are
-frozen by `internal/controller/infra/crd_columns_test.go`, which asserts the columns of the
-generated CRD **and** of the Helm chart's copy: a printer column is a string nothing compiles, and
-the failure mode of a typo is a silent column in front of an operator.
+The names and casing of `Powerstate` and `Phase` are the ones shipped before this work, and they are
+treated as a published string: a printer column is a value nothing compiles, and the failure mode of
+a typo is a silent column in front of an operator. The check that keeps the generated CRD and the
+chart's copy identical is listed in
+[What the tests keep honest](../../development/crd-sync.md#what-the-tests-keep-honest).
 
 **There is no duration column, and there cannot be one.** A printer column is a JSONPath evaluated
 on the object: it selects a value, it does not subtract one, and "up for 3h" is the difference
 between `status.lastTransitionTime` and the time you ask the question. The API server prints what
 the object holds, so the object holds the instant and the duration is computed at read time. The
-exact command, and its output, are in the runbook: [Read the Pool at a
-Glance](../../troubleshooting/common-issues.md#read-the-pool-at-a-glance) - and that snippet is run
-by a test (`test/integration/duration_snippet_test.go`), so the doc cannot rot.
+columns and how to read them are in
+[Read the Pool at a Glance](../../concepts/pool-at-a-glance.md), and the exact duration command, and
+its checked output, are in the runbook:
+[How long has this machine been up?](../../troubleshooting/common-issues.md#how-long-has-this-machine-been-up).
 
 #### PowerState
 
@@ -161,7 +163,7 @@ const (
 )
 ```
 
-The table that computes it is in [State Management](../../architecture/state.md#the-input-law).
+The table that computes it is in [State Management](../../development/state.md#the-input-law).
 It is a report: write a value that contradicts the claim and the observation and nothing about the
 operator's behaviour changes — the next pass overwrites the value from its inputs. The phase the
 model acts on is the **claim's** (`NodeClaim.status.phase`).
@@ -237,6 +239,10 @@ is uncordoned.
 
 Declare the labels and annotations a machine must carry in `spec.nodeLabels` and
 `spec.nodeAnnotations`:
+
+The operator-facing digest of these rules — the write order, the drift rule, the ownership record,
+the reserved namespaces and the group's consensus rule — is
+[Node labels](../../concepts/node-labels.md). This section is the reference form of the same rules.
 
 ```yaml
 spec:
@@ -602,7 +608,7 @@ status:
   conditions:
   - type: NodeReadinessTaints
     status: "True"
-    reason: ReadinessTaints
+    reason: NodeReadinessTaints
     message: "node.cilium.io/agent-not-ready"
     lastTransitionTime: "2025-01-01T11:52:00Z"
 ```
@@ -826,6 +832,6 @@ kubectl describe node.infra.homecluster.dev <node-name> -n homelab-autoscaler-sy
 
 - [Group CRD](group.md) - Autoscaling group configuration
 - [NodeClaim CRD](nodeclaim.md) - the request for a machine: the field this Node CRD no longer has
-- [NodeClaim Design](../../design/nodeclaim.md) - why `spec.powerState` is gone
-- [State Management](../../architecture/state.md) - the input law, and the report `status.phase` is
+- [NodeClaim Design](../../development/nodeclaim.md) - why `spec.powerState` is gone
+- [State Management](../../development/state.md) - the input law, and the report `status.phase` is
 - [Architecture Overview](../../architecture/overview.md) - System design

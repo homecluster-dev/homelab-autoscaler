@@ -8,9 +8,8 @@ object, and settles the questions the 0.1.19–0.1.22 fixes kept re-opening.
 Every statement about current behaviour names the file that implements it, so the model can be
 checked against the code.
 
-**Status: implemented, in chart `0.2.0`** (`dist/chart/Chart.yaml`). `v2alpha1` is the served and
-storage version of `nodes`, `groups` and the new `nodeclaims`, and `v1alpha1` is removed
-(§9). Where the running code is not exactly the sketch above, §11 says so.
+`v2alpha1` is the served and storage version of `nodes`, `groups` and `nodeclaims`, and `v1alpha1` is
+removed (§9). §3 sketches the API; §11 records where the running code is sharper than the sketch.
 
 ## 1. The Problem This Replaces
 
@@ -60,7 +59,7 @@ The consequences are all live, and each one is a fix:
   added the observation precedence rule (`internal/progress/observed_power.go`,
   `ReconcileObservedPower`): an observed `on` outranks a recorded `shutdown`, because a record of
   what the FSM last did is not evidence about a machine. The four-rule authority order that
-  documents both is in [State Management](../architecture/state.md). It is a disambiguation of one
+  documents both is in [State Management](state.md). It is a disambiguation of one
   field with four writers, and every rule in it exists because a claim has no object of its own.
 
 The last consequence is the structural one: the scalar is the lock, the request, the history, and
@@ -89,7 +88,7 @@ race with Git, and no scalar that has to mean three things.
 One live claim per slot, and that is the whole model:
 
 - **No claim** → the slot is free. It is not capacity, and it is the only shape
-  `IncreaseSize` may claim. Today the equivalent test is a three-field scan
+  `IncreaseSize` may claim. The `v1alpha1` test was a three-field scan
   (`{powerState: off, status.powerState: off, status.progress: shutdown}`) plus a controller whose
   only job is to seed the status of slots that never had a machine so the arithmetic excludes them
   (`NodeSlotReconciler`, `internal/controller/core/node_slot_controller.go`). "No live claim"
@@ -213,7 +212,7 @@ behind it, and is recorded on the slot, not on the claim (§6).
 
 | Phase | Meaning | Legal next phases | Who writes the move | What the slot does |
 | --- | --- | --- | --- | --- |
-| `pending` | Claim exists, no lifecycle Job has been created. The only cancelable phase. | `booting`, `completed`, `failed` | claim controller | Nothing yet. The slot is capacity and is counted. `StartNode` runs on the next pass: coordination lock, startup Job, power-on. |
+| `pending` | Claim exists, no lifecycle Job has been created. The only cancelable phase. | `booting`, `ready`, `completed`, `failed` | claim controller | Nothing yet. The slot is capacity and is counted. `StartNode` runs on the next pass: coordination lock, startup Job, power-on. |
 | `booting` | The startup Job exists; the power-on has been asked for. Committed. | `ready`, `failed` | The Job monitor of the machine that started it (`monitorJobCompletion` → `JobCompleted` / `JobFailed` / `JobTimeout`) | The machine is booting. The readiness gate holds the claim at `booting` until the node is Ready and free of the pool's readiness taints. |
 | `ready` | The machine is up, joined, and can take the pool's work. | `completed`, `failed` | the readiness gate of the startup transition (`afterJobCompleted`, the only writer of the move), the provider (a scale-down lands on it), the claim controller's machine-loss bound (§4) | The slot serves pods. A scale-down names it in `DeleteNodes`, which moves it to `completed` and powers the machine off. |
 | `failed` | The attempt did not produce a usable machine, and never will. Terminal. | — | the lifecycle transition (Job failed / timed out, readiness-gate timeout), the claim controller (deadline, attempt limit, machine gone, `Superseded` for a second live claim on the slot) | Not capacity. The machine is force-shut-down so an overdue boot cannot join and start serving. The next claim on the slot is attempt N+1. |
@@ -229,9 +228,9 @@ as "not live" in that window is a slot two requests can claim.
 
 **`pending` is cancelable and `booting` is committed.** A boot that has started is never
 cancelled: the startup Job, the coordination lock, the cordon, the node object and the machine are
-all in flight, and a cancel leaves the Job in a state nothing owns — the exact residue
-`docs/architecture/state.md` documents under "Why a transitional progress has to come from a
-transition" (the 0.1.19 fix, commit `553e190`, removed the one out-of-band canceller:
+all in flight, and a cancel leaves the Job in a state nothing owns — the residue a transitional
+record leaves when the caller that writes it owns no transition
+(the 0.1.19 fix, commit `553e190`, removed the one out-of-band canceller:
 `NodeGroupDecreaseTargetSize` writing `status.progress: shuttingdown` with no transition, no Job
 and no lock). Under this model:
 
@@ -386,7 +385,7 @@ Attempts are a property of the request, not of the slot:
   asked for the scale-down, incremented by the transition that fires the shutdown — one per
   shutdown Job, never per reconcile pass — with the same bound and a bounded pause (§4).
 
-| Today | Under NodeClaim |
+| In `v1alpha1` | Under NodeClaim |
 | --- | --- |
 | `fsm.StartupAttemptLimit` (3) on the `ClaimRearmed` condition of the slot, reset at the readiness gate of `afterJobCompleted` (`internal/fsm/startup_attempts.go`) | Subsumed: `status.attempt` on the claim, bounded per slot by `status.lastClaim.attempt`. The reset rule disappears with the object — nothing on the slot to clear, and no lifetime sentence for a slot that is reused across claims. |
 | `fsm.ShutdownAttemptLimit` (3) on the `ShutdownAttempts` condition of the slot, reset in two places (`internal/fsm/shutdown_attempts.go`) | Subsumed: a scale-down is a claim (`request.call: DeleteNodes`), so its attempts are counted on the claim that asked for it — one per shutdown Job, at the transition that fires it — and end when it ends. |
@@ -396,7 +395,7 @@ Attempts are a property of the request, not of the slot:
 
 ## 5. How cluster-autoscaler's RPCs Map
 
-| RPC | Today | Under NodeClaim |
+| RPC | In `v1alpha1` | Under NodeClaim |
 | --- | --- | --- |
 | `NodeGroupTargetSize` | `targetSizeOf` counts a slot when `spec.desiredPowerState: on` **or** its progress is not one of `shuttingdown`/`shutdown`/`startingup` (`countsTowardsTargetSize`, `internal/grpcserver/server.go`) | The count of **live claims** for the group: `pending` + `booting` + `ready`. No progress values appear in the arithmetic. |
 | `NodeGroupIncreaseSize(delta)` | Validates `delta > 0`, refuses a request that crosses `maxSize` (the slot count), then claims the **first** free slot it finds and returns: one slot per call, whatever `delta` says (`internal/grpcserver/server.go`) | Creates `delta` claims on `delta` free slots (free = no live claim), each with the request attributed, `attempt` seeded, `deadlineAt` set. The `maxSize` check is `liveClaims + delta > slots`. |
@@ -433,7 +432,7 @@ claim's finalizer is what makes the request non-forgettable (§3).
 
 **A `failed` or overdue claim is not counted.** The target size counts live claims, so the state
 "the autoscaler is paying for a machine that never arrived, forever" has no place to exist in.
-Today that state is real and documented: a slot at `{desired: on, progress: ready}` with no
+`v1alpha1` had that state, and documented it: a slot at `{desired: on, progress: ready}` with no
 machine is counted by `NodeGroupTargetSize` forever, cannot be cancelled by
 `NodeGroupDecreaseTargetSize` (its gate wants `progress: startingup`), and is kept alive on
 purpose by the watchdog's claim gate — "the autoscaler's arithmetic … is not this controller's
@@ -462,7 +461,7 @@ The FSM's input is no longer a recorded phase. Every decision reads:
 (live claim phase, observed power, kubelet liveness / node readiness)
 ```
 
-Three consequences, each of which is a rule in `docs/architecture/state.md` today:
+Three consequences, each of which is a rule in `docs/development/state.md`:
 
 - **The 0.1.22 precedence rule becomes the general input law, not a rule 2.**
   `progress.ReconcileObservedPower` exists because a record of what the FSM last did is not
@@ -481,11 +480,12 @@ Three consequences, each of which is a rule in `docs/architecture/state.md` toda
   invisible to cluster-autoscaler's scale-down, so it is paid for forever — which is why the
   uncordon runs on the way out of a gate that timed out, and why a claim that is failed with a
   cordoned node behind it is force-shut-down rather than left serving.
-- **`validateStateTransition`'s gate on transitional slots goes away.** Today no transition may
-  start on a slot whose progress is `startingup`/`shuttingdown`, and a transitional progress may
-  only be written by the operation that wrote it, because the field is both the FSM's state and
-  the world's report. With claims, "an operation is in flight on this slot" is the existence of a
-  claim in `booting`, which is a fact about an object, not about a string.
+- **`validateStateTransition`'s gate on transitional slots is gone.** In `v1alpha1` no transition
+  could start on a slot whose `status.progress` was `startingup`/`shuttingdown`, and a transitional
+  progress could only be written by the operation that wrote it, because the field was both the FSM's
+  state and the world's report. That field no longer exists: "an operation is in flight on this
+  slot" is the existence of a claim in `booting` and the lifecycle Job behind it, which is a fact
+  about an object, not about a string.
 
 The same split runs through the reporting: the slot keeps its **events of the machine**
 (`ScaleUpRequested`, `ScaleUpCompleted`, `ScaleDownRequested`, … on the `Node`, written by the
@@ -499,7 +499,7 @@ has an object, and the object has a timeline.
 
 ## 7. What Is Deliberately Kept
 
-**The coordination lock stays, for one more release, as a belt.** A live claim is *intended* to
+**The coordination lock stays, as a belt.** A live claim is *intended* to
 be the lock — one claim per slot, created by the same code path, is the mutual exclusion the
 annotations provide (`OperationLockAnnotation`, `LockOwnerAnnotation`, `LockTimestampAnnotation`,
 `LockTimeoutAnnotation`, `internal/fsm/coordination.go`, `fsm.DefaultLockTimeout` 5m, `RenewLock`
@@ -507,9 +507,9 @@ across the readiness gate, expired-lock cleanup, force release at
 `fsm.StuckTransitionThreshold` 15m). It is not the lock yet, because two things the lock currently
 guarantees are not yet guaranteed by a claim:
 
-- **Atomicity of the handover.** Today the lock is acquired in the `before_` hook, before the
-  state change and before the `enter_` hooks that write progress
-  (`docs/architecture/state.md`, "What a refused transition leaves behind"), so a scale-up and a
+- **Atomicity of the handover.** The lock is acquired in the `before_` hook, before the
+  state change and before the `enter_` hooks that record the transition
+  (`docs/development/state.md`, "What a refused transition leaves behind"), so a scale-up and a
   scale-down on one slot cannot both take the slot apart. The claim equivalent is "create the
   claim and stamp the finalizer, and no other writer can get the slot in between", which needs the
   one-live-claim-per-slot enforcement to be airtight under concurrent writes.
@@ -517,7 +517,7 @@ guarantees are not yet guaranteed by a claim:
   deadline, and a claim whose controller died is collected only when something reads its deadline.
   One release of running both is the cheap proof.
 
-Removing the lock is listed in §10 as the first follow-up once claims are proven.
+What removing the lock needs is stated in §10.
 
 **The readiness gate stays, and becomes the gate for `phase: ready`.** Nothing about
 `Group.spec.nodeReadinessTaints` (defaulted to Cilium's
@@ -663,7 +663,7 @@ first. Nothing in the order is optional: each step's risk is the previous step's
 manifest, and living with the claims the operator left behind. Do the rollout on a pool that can
 be empty for ten minutes.
 
-## 10. Open Questions / Future Work
+## 10. Open Questions
 
 **Claim-side cancellation for `DeleteNodes`, or a finalizer on the node.** Settled: the finalizer
 goes on the **claim** (§11). The machine-deleted-by-hand case is read as the design says — the
@@ -696,8 +696,8 @@ persisted as `status.phase`, so `kubectl get nodes.infra.homecluster.dev` keeps 
 The precedent in this repo is the `NodeReadinessTaints` condition: a record of what a slot is gated
 on, kept because an operator reads it in a crisis.
 
-**Removing the coordination lock.** The first follow-up (§7). The work is the two guarantees a
-claim does not yet provide: making the create-claim-and-stamp-finalizer write atomic with taking
+**Removing the coordination lock.** The lock stays as a belt (§7), and what gates removing it is two
+guarantees a claim does not yet provide: making the create-claim-and-stamp-finalizer write atomic with taking
 the slot, and giving a claim whose controller died a collection path that does not need a lock
 timeout. When both hold, the lock is a second mutex over the same critical section, and every
 `LockConflictError`, `ScaleUpDeferred` / `ScaleDownDeferred` requeue and expired-lock cleanup
@@ -707,12 +707,12 @@ timeout. When both hold, the lock is a second mutex over the same critical secti
 **`Node.status.lastClaim`: one digest, or the last N attempts.** One digest is bounded, survives
 GC, and answers "why is this slot like this". A list of the last N attempts makes
 `kubectl describe` tell the retry story the claims no longer exist to tell, and puts a pruning rule
-back on the slot — the same class of bookkeeping this design removes. Start with the digest, and
-add the list when an operator asks for a history that outlives the TTL.
+back on the slot — the same class of bookkeeping this design removes. The digest is what ships, for
+that reason; the list is the open half of the question.
 
 **Manual scale-up, and the hand-deleted machine.** There is no field an operator declares to get a
 machine up: the manual action is creating a `NodeClaim` by hand, with `requestedBy` naming who did
-it. The mirror case — a machine deleted out of the pool — is the shape the watchdog handles today
+it. The mirror case — a machine deleted out of the pool — is the shape the v1alpha1 watchdog handled
 and the claim's deadline handles here; what is not settled is whether an operator is allowed to
 delete a claim, or has to cancel it through the autoscaler.
 
@@ -753,7 +753,7 @@ one detail settled by what the tests showed.
 - **A shutdown whose machine is observed up reports `draining`, and counts its attempts on the
   claim.** §6 lists `draining` as "a claim marked for scale-down, node cordoned, machine still
   observed up". The implementation covers the wider case, and states it in
-  `docs/architecture/state.md`: a shutdown Job that completed while the machine is still observed up
+  `docs/development/state.md`: a shutdown Job that completed while the machine is still observed up
   leaves the slot at `draining` (`phase.Derive` reads `ShutdownJobInFlight` first), the claim keeps
   its finalizer, and the transition that fired the Job counts the attempt on the claim that asked
   for the scale-down (`fsm.recordShutdownAttempt` → `BumpScaleDownAttempt`) — one count per shutdown
@@ -861,7 +861,7 @@ open. Everything else in this document is the model as it runs.
 ## Related Documentation
 
 - [Architecture Overview](../architecture/overview.md) — the components this design changes
-- [State Management](../architecture/state.md) — the FSM, the authority order for the
+- [State Management](state.md) — the FSM, the authority order for the
   report `status.phase` is, and the rules §6 collapses
 - [Node CRD](../api-reference/crds/node.md) — the v1alpha1 fields this design removes and keeps
 - [Group CRD](../api-reference/crds/group.md) — `maxNodeProvisionTime`, `minSize`,

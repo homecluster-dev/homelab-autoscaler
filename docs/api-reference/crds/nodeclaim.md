@@ -76,20 +76,12 @@ Job, power off, and the claim ends `completed`.
 
 The claim is the attempt, so the attempt's timeline is on the claim: `kubectl describe nodeclaim
 <name>` shows when the request was created, when it committed to a boot, when it became ready, and
-how it ended. Every one of these Events has `involvedObject.kind: NodeClaim` — the set is written by
-`internal/claim/recorder.go` (`Recorder.Move`, `Recorder.Seed`), the one chokepoint every phase write
-of the model passes through, so "exactly one Event per transition" is a property of the structure,
-not a rule each caller has to remember.
-
-| Event | Type | On | When | The message carries |
-|-------|------|----|------|---------------------|
-| `ClaimCreated` | Normal | claim | the claim object is created (its first write, the attempt seed) | `requestedBy`, `request.call` + `delta` / `group` (the node names for a `DeleteNodes`), the attempt number, `deadlineAt` |
-| `ClaimBooting` | Normal | claim | `pending → booting` | the startup Job of the attempt, and that the boot is now committed — no longer cancelable |
-| `ClaimReady` | Normal | claim | `booting → ready` | the Kubernetes node name, that the readiness gate passed, the time from `requestedAt` |
-| `ClaimFailed` | Warning | claim | any move to `failed` | `status.reason` (`DeadlineExceeded`, `StartupJobFailed`, `ReadinessGateTimeout`, `MachineGone`, `AttemptLimitExceeded`, …) and the number behind it: the deadline that passed, the Job that died, the attempts spent |
-| `ClaimCancelled` | Normal | claim | a live claim is cancelled (`DecreaseTargetSize`, `DeleteNodes`, `DeletedByHand`) | which call asked, and its delta / nodes |
-| `ClaimCompleted` | Normal | claim | a move to `completed` with no cancel behind it | that the machine is observed off, and the total duration |
-| `ClaimSuperseded` | Normal | claim | a move to `failed` with reason `Superseded` | the newer claim's name — the request that owns the slot now |
+how it ended. Every one of these Events has `involvedObject.kind: NodeClaim`, carries the action
+`nodeclaim`, and is published by the one chokepoint every phase write of the model passes through
+(`internal/claim/recorder.go`, which calls the table in `internal/claim/events.go`), so "exactly one
+Event per transition" is a property of the structure, not a rule each caller has to remember. The
+table of the set — with the two scale-down streak records and the slot's own events — is in
+[Events](../../reference/events.md).
 
 Three rules the set keeps:
 
@@ -174,8 +166,8 @@ spec:
     call: IncreaseSize
     delta: 1
     group: worker-nodes
-  deadlineAt: "2026-03-04T09:45:25Z"
-  maxNodeProvisionTime: 15m0s
+  deadlineAt: "2026-03-04T09:53:15Z"   # requestedAt + max(12m10s, the group's number)
+  maxNodeProvisionTime: "15m0s"        # the group's number, copied at creation
   ttlSecondsAfterFinished: 3600
 status:
   phase: booting
@@ -262,8 +254,11 @@ kubectl delete nodeclaim worker-01-7f4b9c -n homelab-autoscaler-system
 
 ## Related Documentation
 
-- [NodeClaim Design](../../design/nodeclaim.md) - why this object, and what it replaced
-- [State Management](../../architecture/state.md) - the input law, the phase table, the deadlines
+- [The NodeClaim model](../../concepts/nodeclaim-model.md) - the law, the phases and the bounds, in
+  operator's words
+- [Events](../../reference/events.md) - every reason this object and the slot publish, and what lasts
+- [NodeClaim Design](../../development/nodeclaim.md) - why this object, and what it replaced
+- [State Management](../../development/state.md) - the input law, the phase table, the deadlines
 - [Node CRD](node.md) - the slot a claim asks for
 - [Group CRD](group.md) - `minSize`, `maxNodeProvisionTime`, the readiness taints
 - [Common issues](../../troubleshooting/common-issues.md) - the runbooks

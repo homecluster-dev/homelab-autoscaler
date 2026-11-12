@@ -39,7 +39,7 @@ The group controller writes all of it, in one pass over the slots of the pool, a
 reconciles when a slot changes (`Owns(&Node{})`, via the controller reference the slot's reconciler
 stamps). The counts are a sum over the slots' `status.phase`; they are a display sum, and no
 decision reads them - the provider's arithmetic counts live claims and slots directly
-([NodeClaim design](../../design/nodeclaim.md)). The pass compares what it computed with what it
+([NodeClaim design](../../development/nodeclaim.md)). The pass compares what it computed with what it
 read and writes nothing when they agree: the slot's own write is what woke the pool, so a
 pass that repeats the pool's numbers is the common case, and a controller that regenerates the
 event it is subscribed to is a pool that never settles in `kubectl get groups -w`.
@@ -68,12 +68,12 @@ remote-workers   5       2    3     24m         healthy  41d
 
 `NAME` and `AGE` are the built-in columns of a Kubernetes table; the five that come between them are
 this CRD's. A pool that used to answer "it exists" now answers "five slots, two machines up, the
-last thing it did was take one back 24 minutes ago". The columns are asserted on the generated CRD
-and on the chart's copy by `internal/controller/infra/crd_columns_test.go`, and their values are
-asserted against a live API server in `internal/controller/infra/group_columns_envtest_test.go`.
+last thing it did was take one back 24 minutes ago". The columns are checked on the generated CRD and
+on the chart's copy, and their values against a live API server — the list is in
+[What the tests keep honest](../../development/crd-sync.md#what-the-tests-keep-honest).
 
-The read-time companion, for one slot's history and for durations, is the runbook's
-[Read the Pool at a Glance](../../troubleshooting/common-issues.md#read-the-pool-at-a-glance).
+What each column answers, and the read-time companion for one slot's history and for durations, are
+in [Read the Pool at a Glance](../../concepts/pool-at-a-glance.md).
 
 ## Readiness Gate
 
@@ -118,7 +118,7 @@ spec:
 
 The keys a slot is gated on are recorded on the slot as the `NodeReadinessTaints` condition, so a slot
 that has been booting for ten minutes says what it is waiting for. See
-[State Management](../../architecture/state.md).
+[State Management](../../development/state.md).
 
 ## Example
 

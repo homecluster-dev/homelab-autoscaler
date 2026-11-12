@@ -41,8 +41,11 @@ the second and names the holder).
 
 Constants, and the numbers the bounds above are built from: the idle resync of a settled slot (5m), the
 lifecycle Job monitor poll (30s), the readiness gate (4m), the registration/uncordon window (90s), the
-attempt bound (3), the shutdown streak (3 attempts, 30m reset grace), the boot budget (12m10s: the sum
-of the previous five plus a margin).
+attempt bound (3), the shutdown streak (3 attempts, 30m reset grace), and the boot budget: 12m10s,
+which is the startup Job's own timeout (5m) plus the Job monitor poll (30s) plus the registration wait
+(90s) plus the readiness gate (4m) plus the uncordon retry ceiling (10s) plus a 1m margin. Raise the
+budget only through the Group's `spec.maxNodeProvisionTime`, which lifts the floor of every claim's
+`spec.deadlineAt`.
 
 The knobs are the fields of the objects: the **Group's** seven spec fields (`scaleDownUtilizationThreshold`,
 `scaleDownGpuUtilizationThreshold`, `scaleDownUnneededTime`, `scaleDownUnreadyTime`, `maxNodeProvisionTime`,
@@ -64,5 +67,7 @@ what cluster-autoscaler sizes, not the machine.
 | A shutdown that never lands | [The Shutdown Job Exits 0 and the Machine Stays Up](common-issues.md#the-shutdown-job-exits-0-and-the-machine-stays-up): three Jobs, then a 30m pause, and the `shutdownAttempts` patch as the escape hatch |
 
 [Debugging Guide](debugging-guide.md) is the component-by-component method,
-[State Management](../architecture/state.md) the phase table and the deadlines,
-[NodeClaim Design](../design/nodeclaim.md) why the bounds live on the request.
+[State Management](../development/state.md) the phase table and the deadlines,
+[Events](../reference/events.md) every reason the claim and the slot publish,
+[The NodeClaim model](../concepts/nodeclaim-model.md) and
+[NodeClaim Design](../development/nodeclaim.md) why the bounds live on the request.

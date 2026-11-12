@@ -8,8 +8,8 @@ const FeatureList = [
     Svg: require('@site/static/img/undraw_server_status.svg').default,
     description: (
       <>
-        Manage physical machine power states based on workload demands.
-        Supports wake-on-LAN, IPMI, BMC interfaces, and smart PDUs.
+        Powers physical machines on when cluster-autoscaler has work for them, and off when it has
+        none: wake-on-LAN, IPMI, BMC, smart PDU, or your own script.
       </>
     ),
   },
@@ -18,18 +18,20 @@ const FeatureList = [
     Svg: require('@site/static/img/undraw_kubernetes.svg').default,
     description: (
       <>
-        Uses Custom Resource Definitions and controllers for native integration.
-        Webhook validation ensures data integrity across all resources.
+        Three resources: a pool's policy, a machine slot, one request for one machine.
+        Admission refuses a second live claim on a slot, a reserved label key, and two slots
+        claiming one node.
       </>
     ),
   },
   {
-    title: 'State Management',
+    title: 'Derived, Not Stored',
     Svg: require('@site/static/img/undraw_server_cluster.svg').default,
     description: (
       <>
-        Advanced finite state machine manages node power transitions.
-        Coordination locks prevent race conditions during state changes.
+        A machine is wanted when a live NodeClaim names its slot. The state machine's input is the
+        claim, the observed power and the node's usability — no spec field carries an intent, so a
+        GitOps apply cannot revert a scale-up.
       </>
     ),
   },

@@ -1,50 +1,50 @@
 /**
- * Creating a sidebar enables you to:
- - create an ordered group of docs
- - render a sidebar for each doc of that group
- - provide next/previous navigation
-
- The sidebars can be generated from the filesystem, or explicitly defined here.
-
- Create as many sidebars as you want.
+ * The docs sidebar. Categories are the order an operator meets the material in: start, understand,
+ * run, look up, contribute. Every doc in `docs/` is listed here — a page in the tree and not in the
+ * sidebar is a page nothing links to.
  */
 
 // @ts-check
 
 /** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
 const sidebars = {
-  // By default, Docusaurus generates a sidebar from the docs folder structure
   tutorialSidebar: [
     {
       type: 'category',
       label: 'Getting Started',
+      collapsed: false,
       items: [
+        'intro',
         'getting-started/overview',
         'getting-started/installation',
         'getting-started/quick-start',
       ],
-      collapsed: false,
     },
     {
       type: 'category',
-      label: 'Architecture',
+      label: 'Concepts',
+      collapsed: false,
       items: [
+        'concepts/nodeclaim-model',
+        'concepts/node-labels',
+        'concepts/pool-at-a-glance',
         'architecture/overview',
-        'architecture/state',
       ],
-      collapsed: false,
     },
     {
       type: 'category',
-      label: 'Design',
+      label: 'Operations',
+      collapsed: false,
       items: [
-        'design/nodeclaim',
+        'troubleshooting/common-issues',
+        'troubleshooting/debugging-guide',
+        'troubleshooting/known-issues',
       ],
-      collapsed: false,
     },
     {
       type: 'category',
-      label: 'API Reference',
+      label: 'Reference',
+      collapsed: true,
       items: [
         {
           type: 'category',
@@ -52,6 +52,7 @@ const sidebars = {
           items: [
             'api-reference/crds/group',
             'api-reference/crds/node',
+            'api-reference/crds/nodeclaim',
           ],
         },
         {
@@ -67,49 +68,24 @@ const sidebars = {
             'api-reference/examples/production-examples',
           ],
         },
+        'reference/events',
+        'releases/changelog',
+        'releases/upgrade-0.1-to-0.2',
       ],
-      collapsed: true,
     },
     {
       type: 'category',
-      label: 'Development',
+      label: 'Contributing',
+      collapsed: true,
       items: [
         'development/setup',
         'development/crd-sync',
+        'development/state',
+        'development/nodeclaim',
+        'development/e2e-test-flow',
       ],
-      collapsed: true,
-    },
-    {
-      type: 'category',
-      label: 'Releases',
-      items: [
-        'releases/changelog',
-      ],
-      collapsed: false,
-    },
-    {
-      type: 'category',
-      label: 'Troubleshooting',
-      items: [
-        'troubleshooting/debugging-guide',
-        'troubleshooting/known-issues',
-      ],
-      collapsed: true,
     },
   ],
-
-  // But you can create a sidebar manually
-  /*
-  tutorialSidebar: [
-    'intro',
-    'hello',
-    {
-      type: 'category',
-      label: 'Tutorial',
-      items: ['tutorial-basics/create-a-document'],
-    },
-  ],
-   */
 };
 
 module.exports = sidebars;

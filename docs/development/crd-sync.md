@@ -1,23 +1,16 @@
-# CRD Synchronization Process
+# CRD Synchronization
 
-This document explains the automated CRD synchronization process that keeps Helm chart CRDs in sync with kubebuilder-generated CRDs.
+The chart's CRDs are generated, not hand-written. `make manifests` writes
+`config/crd/bases/*.yaml` from the Go types in `api/infra/v2alpha1/`, and `make helm-sync-crds`
+renders those into `dist/chart/templates/crd/*.yaml`. One schema, two copies, and a target that keeps
+them identical.
 
-## Overview
+## Why The Chart Has Its Own Copy
 
-The homelab-autoscaler project uses kubebuilder to generate CRDs from Go struct definitions. These CRDs need to be synchronized with the Helm chart templates to ensure consistency between the Go code and the deployed resources.
-
-## Problem Solved
-
-Previously, CRDs in the Helm chart (`dist/chart/templates/crd/`) were manually maintained and could become outdated when the Go struct definitions changed. This led to:
-
-- Schema mismatches between Go structs and deployed CRDs
-- E2E test failures due to incorrect CRD schemas
-- Manual maintenance overhead
-- Risk of deploying incompatible CRD versions
-
-## Solution Architecture
-
-The automated CRD sync process integrates into the build pipeline:
+A chart that carries a hand-maintained copy of a CRD goes stale the first time a field is added: the
+deployed schema refuses the object the operator writes, the e2e run fails on a field the chart does
+not know, and the release publishes a `groups`/`nodes` pair that cannot serve a scale-up. The sync
+target removes the manual step:
 
 ```mermaid
 graph LR
@@ -31,86 +24,60 @@ graph LR
     H --> I[E2E tests use correct CRDs]
 ```
 
+Three CRDs, in both directories. A release that installs `groups` and `nodes` without `nodeclaims`
+cannot serve a scale-up: the provider creates a `NodeClaim` per machine it is asked for, and the
+operator needs `nodeclaims/status` and `nodeclaims/finalizers` to run one to its end.
+
 ## Components
 
-### 1. CRD Sync Script (`hack/sync-helm-crds.sh`)
+### The sync script (`hack/sync-helm-crds.sh`)
 
-Transforms kubebuilder-generated CRDs into Helm-templated versions:
+Transforms the generated CRDs into Helm-templated versions:
 
-- **Input**: `config/crd/bases/*.yaml` (kubebuilder output)
-- **Output**: `dist/chart/templates/crd/*.yaml` (Helm templates)
-- **Transformations**:
-  - Wraps CRDs with `{{- if .Values.crd.enable }}` conditional
-  - Adds Helm labels: `{{- include "chart.labels" . | nindent 4 }}`
-  - Adds conditional keep annotation: `{{- if .Values.crd.keep }}`
-  - Preserves the exact schema from kubebuilder
+- **input**: `config/crd/bases/*.yaml` (kubebuilder output)
+- **output**: `dist/chart/templates/crd/*.yaml` (Helm templates)
+- **transformations**: wraps each CRD in `{{- if .Values.crd.enable }}`, adds
+  `{{- include "chart.labels" . | nindent 4 }}`, adds the conditional
+  `{{- if .Values.crd.keep }}` keep annotation, and preserves the kubebuilder schema exactly
 
-### 2. Makefile Integration
+### Makefile integration
 
-- **`helm-sync-crds` target**: Runs the sync script
-- **Dependency chain**: `manifests` → `helm-sync-crds` → `build` → `test-e2e`
-- **Automatic execution**: CRDs are synced whenever manifests are generated
+- **`helm-sync-crds`** runs the sync script
+- **the chain**: `manifests` → `helm-sync-crds` → `build` → `test-e2e`, so the CRDs are synced
+  whenever the manifests are generated
 
-### 3. Validation Script (`hack/validate-helm-crds.sh`)
+### The validation script (`hack/validate-helm-crds.sh`)
 
-Validates that Helm chart CRDs match kubebuilder output:
-
-- Compares schema sections between source and target CRDs
-- Validates Helm templating is correctly applied
-- Reports any inconsistencies or missing templates
+Compares the schema sections of the source and the target CRDs, checks that the Helm templating is
+applied, and reports a template that was edited by hand.
 
 ## Usage
 
-### Automatic Sync (Recommended)
-
-The sync happens automatically when running standard build commands:
+The sync runs on the standard targets, so there is nothing to remember:
 
 ```bash
-# Generate manifests and sync CRDs
-make manifests
-
-# Build project (includes CRD sync)
-make build
-
-# Run E2E tests (includes CRD sync)
-make test-e2e
+make manifests     # CRDs, RBAC and webhook manifests into config/
+make build         # generates, syncs the chart's CRDs, formats, vets, builds
+make test-e2e      # the same, then the k3d suite
 ```
 
-### Manual Sync
-
-To manually sync CRDs:
+To run the steps directly:
 
 ```bash
-# Sync CRDs from kubebuilder to Helm chart
-make helm-sync-crds
-
-# Validate CRD consistency
-./hack/validate-helm-crds.sh
+make helm-sync-crds        # config/crd/bases -> dist/chart/templates/crd
+./hack/validate-helm-crds.sh   # are the two copies in sync?
 ```
 
-### Validation
+`./hack/validate-helm-crds.sh` exits non-zero when a chart CRD's schema section differs from the
+generated one.
 
-To check if CRDs are in sync:
+## Changing A Type
 
-```bash
-./hack/validate-helm-crds.sh
-```
-
-This will:
-- Compare schemas between kubebuilder and Helm chart CRDs
-- Validate Helm templating is correct
-- Report any inconsistencies
-
-## Development Workflow
-
-When modifying Go struct definitions:
-
-1. **Modify Go structs** in `api/infra/v2alpha1/`
-2. **Run `make manifests`** - This automatically:
-   - Generates new CRDs via controller-gen
-   - Syncs CRDs to Helm chart
-3. **Test changes** with `make test-e2e`
-4. **Commit both Go changes and updated Helm CRDs**
+1. Edit the Go types in `api/infra/v2alpha1/`
+2. `make manifests` — controller-gen regenerates the CRDs, and the sync renders them into the chart
+3. `make test-e2e` — the suite runs against the chart's copy
+4. Commit the Go change **and** the regenerated `config/crd/bases/` and `dist/chart/templates/crd/`
+   files: a chart CRD is a generated artifact, and a PR that edits one by hand fails validation
 
 ## File Structure
 
@@ -132,102 +99,64 @@ When modifying Go struct definitions:
     └── validate-helm-crds.sh      # CRD validation script
 ```
 
-Three CRDs, in both directories. A release that installs `groups` and `nodes` without
-`nodeclaims` cannot serve a scale-up: the provider creates a `NodeClaim` per machine it is asked
-for, and the operator needs `nodeclaims/status` and `nodeclaims/finalizers` to run one to its end.
-
-## Helm Chart Integration
-
-The synchronized CRDs integrate seamlessly with Helm chart features:
-
-### Conditional Installation
-
-```yaml
-# CRDs are only installed if enabled
-{{- if .Values.crd.enable }}
----
-# CRD content here
-{{- end -}}
-```
-
-### Resource Policy
-
-```yaml
-# CRDs can be preserved during uninstall
-annotations:
-  {{- if .Values.crd.keep }}
-  "helm.sh/resource-policy": keep
-  {{- end }}
-```
-
-### Labels
-
-```yaml
-# CRDs get standard Helm chart labels
-labels:
-  {{- include "chart.labels" . | nindent 4 }}
-```
-
-## Configuration
-
-CRD behavior is controlled via Helm values:
+## Chart Values That Control The CRDs
 
 ```yaml
 # values.yaml
 crd:
-  # Enable/disable CRD installation
-  enable: true
-  
-  # Keep CRDs when uninstalling chart
-  keep: true
+  enable: true   # render the three CRDs into the release
+  keep: true     # add helm.sh/resource-policy: keep, so uninstall leaves them
 ```
+
+`crd.enable: true` puts the CRDs in the release **as templates**, so `helm upgrade` replaces their
+schemas. `crd.keep: true` keeps them, and every `Group`, `Node` and `NodeClaim` in them, through
+`helm uninstall`. A chart that carries CRDs in a `crds/` directory behaves the other way round: Helm
+installs them once and never replaces or drops a served version. The migration from `v1alpha1` states
+what that costs an operator: [Upgrade 0.1 to 0.2](../releases/upgrade-0.1-to-0.2.md).
 
 ## Troubleshooting
 
-### CRD Schema Mismatch
+**A schema mismatch, or an e2e failure on a field the chart does not know.**
+`./hack/validate-helm-crds.sh`, then `make helm-sync-crds`, then re-check the Go type against the
+schema you expected.
 
-If E2E tests fail with CRD schema errors:
+**The sync script fails.** `ls config/crd/bases/` (run `make manifests` if it is empty), and check the
+script is executable: `chmod +x hack/sync-helm-crds.sh`.
 
-1. Check if CRDs are in sync: `./hack/validate-helm-crds.sh`
-2. Re-sync CRDs: `make helm-sync-crds`
-3. Verify the Go struct matches expected schema
+**Validation reports a difference.** A hand edit to `dist/chart/templates/crd/` is the usual cause:
+re-run `make helm-sync-crds` and commit the regenerated file.
 
-### Sync Script Failures
+## What The Tests Keep Honest
 
-If the sync script fails:
-
-1. Ensure kubebuilder CRDs exist: `ls config/crd/bases/`
-2. Run `make manifests` to generate CRDs
-3. Check script permissions: `chmod +x hack/sync-helm-crds.sh`
-
-### Validation Failures
-
-If validation reports schema differences:
-
-1. Check for manual edits to Helm chart CRDs
-2. Re-run sync: `make helm-sync-crds`
-3. Verify Go struct changes are correct
-
-## Benefits
-
-- **Zero manual maintenance**: CRDs automatically stay in sync
-- **Prevents schema drift**: Helm chart always matches Go structs
-- **Reliable E2E tests**: Tests use correct CRD schemas
-- **Preserves Helm features**: Conditional installation, labels, annotations
-- **Developer friendly**: No changes to development workflow
-- **Validation included**: Built-in consistency checking
-
-## Where This Is Asserted
+A generated file is only as good as the check that regenerates it. These are the checks the
+documentation quotes, so an operator-facing string cannot rot silently:
 
 - `internal/controller/infra/crd_columns_test.go` asserts the printer columns of the generated CRD
-  **and** of the chart's copy, so a schema that synced without its columns fails a test
+  **and** of the chart's copy, so a schema that synced without its columns fails a test. A printer
+  column is a string nothing compiles, and the failure mode of a typo is a silent column in front of
+  an operator
+- `internal/controller/infra/group_columns_envtest_test.go` asserts the pool's column values against a
+  live API server
+- `test/integration/duration_snippet_test.go` extracts the duration command and its sample output from
+  [the runbook](../troubleshooting/common-issues.md#how-long-has-this-machine-been-up), runs the
+  `jq` program over `test/integration/testdata/pool-shape/nodes.json`, and asserts the doc's own
+  sample comes out — the doc is the tested artifact
+- `internal/phase/hygiene_test.go` asserts on the source that no code outside the writer of
+  `Node.status.phase` and its history reads those fields, so the observability stays a report
+- `TestReportPhaseCompareAndSetsOnTheObservation` and `TestReportPhaseRefusesAStaleMachine`, in
+  `internal/fsm`, pin the compare-and-set on the observation that
+  [the state doc](state.md#the-report-has-two-writers-and-the-write-is-a-compare-and-set-on-the-observation)
+  states
 - `./hack/validate-helm-crds.sh` compares the schema sections of source and target
-- `make pre-commit` runs `pre-commit-generate` (manifests, generate, helm-sync), validation and the
-  unit tests, and stages the generated files. `make install-pre-commit` installs the
+- `make pre-commit` runs `pre-commit-generate` (manifests, generate, helm-sync), the validation and
+  the unit tests, and stages the generated files. `make install-pre-commit` installs the
   [pre-commit](https://pre-commit.com) hooks that run it on every commit
   (`.pre-commit-config.yaml`)
 
-## Remaining Improvements
+## Related Documentation
 
-- **Schema versioning**: track CRD schema changes over time, so a diff of a release names the field
-  that moved
+- [Development Setup](setup.md) — the targets, and the k3d environment
+- [E2E Test Flow](e2e-test-flow.md) — what the suite runs, spec by spec
+- [Upgrade 0.1 to 0.2](../releases/upgrade-0.1-to-0.2.md) — what a CRD change costs a running pool
+- [Group CRD](../api-reference/crds/group.md), [Node CRD](../api-reference/crds/node.md),
+  [NodeClaim CRD](../api-reference/crds/nodeclaim.md) — the schemas these files render

@@ -1,8 +1,10 @@
-# Homelab Autoscaler E2E Test Flow
+# E2E Test Flow
 
-## Overview
-
-The `make test-e2e` target runs comprehensive end-to-end integration tests against a real k3d Kubernetes cluster. It validates the complete autoscaling workflow where the homelab-autoscaler controller communicates with Kubernetes Cluster Autoscaler (CA) via gRPC to provision and deprovision nodes based on workload demand.
+`make test-e2e` runs the suite against a real k3d cluster: cluster-autoscaler in the cluster, the
+manager on your laptop, the pool's machines as k3d containers that only the suite's HTTP server can
+start and stop. It is the only test that drives the whole loop — a pending pod, the gRPC provider's
+claim, a lifecycle Job, a machine that joins, a scale-down that powers it off — and the only one that
+fails when the model and a real cluster stop agreeing.
 
 ## Test Structure
 

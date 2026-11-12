@@ -440,8 +440,10 @@ helm upgrade homelab-autoscaler homelab-autoscaler/homelab-autoscaler \
 The CRDs are chart templates, so `helm upgrade` updates their schemas — unlike a chart that carries
 them in `crds/`, which never replaces them. Read the
 [changelog](../releases/changelog.md) before a minor bump: `0.2.0` removed `v1alpha1` and
-`Node.spec.powerState`, and that release's migration is documented in
-[NodeClaim Design §9](../design/nodeclaim.md#9-migration).
+`Node.spec.powerState`. Coming from `0.1.x` is not a routine upgrade: the order of operations, and
+what the cluster does in the window between the CRDs and the operator, is
+[Upgrade 0.1 to 0.2](../releases/upgrade-0.1-to-0.2.md); the reasoning behind the cut is
+[NodeClaim design §9](../development/nodeclaim.md#9-migration).
 
 Pin the chart version you run: `helm list -n homelab-autoscaler-system` prints it, and
 `--version` on the upgrade is what keeps the image tag and the CRDs of one release together.
@@ -468,5 +470,5 @@ kubectl delete namespace homelab-autoscaler-system
 1. [Quick Start](quick-start.md) — the same system on k3d, with a power API you can run on a laptop
 2. [Group CRD](../api-reference/crds/group.md) and [Node CRD](../api-reference/crds/node.md) — the
    fields you are declaring
-3. [Common Issues & Solutions](../troubleshooting/common-issues.md) — the runbooks, read the pool at
-   a glance first
+3. [Common Issues & Solutions](../troubleshooting/common-issues.md) — the runbooks, after
+   [Read the Pool at a Glance](../concepts/pool-at-a-glance.md)

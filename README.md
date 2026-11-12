@@ -154,22 +154,31 @@ make pre-commit     # generate, sync the chart's CRDs, fmt, vet, lint, test, sta
 ```
 
 See [Development Setup](docs/development/setup.md) for the local-controller / in-cluster-autoscaler
-environment, and [E2E Test Flow](docs/E2E_TEST_FLOW.md) for what the suite proves.
+environment, and [E2E Test Flow](docs/development/e2e-test-flow.md) for what the suite proves.
 
 ## Documentation
 
-- [Overview](docs/getting-started/overview.md) - what the system is, in one page
-- [Quick Start](docs/getting-started/quick-start.md) - k3d, five minutes
-- [Installation](docs/getting-started/installation.md) - the chart, and every value
-- [Architecture](docs/architecture/overview.md) and [State Management](docs/architecture/state.md)
-- [NodeClaim Design](docs/design/nodeclaim.md) - scale-up intent as its own object, and what it replaced
-- [API Reference](docs/api-reference/crds/group.md) - [Group](docs/api-reference/crds/group.md),
-  [Node](docs/api-reference/crds/node.md), [NodeClaim](docs/api-reference/crds/nodeclaim.md)
-- [Examples](docs/api-reference/examples/index.md) - k3d, and production power management
-- [Common Issues](docs/troubleshooting/common-issues.md),
+The site's structure, in the order the docs read it:
+
+- [Start Here](docs/intro.md) - what this is, and where to begin
+- [Overview](docs/getting-started/overview.md), [Quick Start](docs/getting-started/quick-start.md),
+  [Installation](docs/getting-started/installation.md)
+- Concepts: [The NodeClaim model](docs/concepts/nodeclaim-model.md),
+  [Node labels](docs/concepts/node-labels.md),
+  [Read the Pool at a Glance](docs/concepts/pool-at-a-glance.md),
+  [Architecture](docs/architecture/overview.md)
+- Operations: [Common Issues](docs/troubleshooting/common-issues.md),
   [Debugging Guide](docs/troubleshooting/debugging-guide.md),
   [Known Issues](docs/troubleshooting/known-issues.md)
-- [Changelog](docs/releases/changelog.md)
+- Reference: [Group](docs/api-reference/crds/group.md), [Node](docs/api-reference/crds/node.md),
+  [NodeClaim](docs/api-reference/crds/nodeclaim.md), [Examples](docs/api-reference/examples/index.md),
+  [Events](docs/reference/events.md), [Changelog](docs/releases/changelog.md),
+  [Upgrade 0.1 to 0.2](docs/releases/upgrade-0.1-to-0.2.md)
+- Contributing: [Development Setup](docs/development/setup.md),
+  [CRD Synchronization](docs/development/crd-sync.md),
+  [State Management](docs/development/state.md),
+  [NodeClaim Design](docs/development/nodeclaim.md),
+  [E2E Test Flow](docs/development/e2e-test-flow.md)
 
 The site is at [autoscaler.homecluster.dev](https://autoscaler.homecluster.dev), and the Helm
 repository is at the same address.

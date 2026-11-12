@@ -139,7 +139,8 @@ Slots can describe the machine they want.
 Apply in this order: the new CRDs (delete the old `v1alpha1` objects first, or
 step through a merged CRD — the API server refuses to drop a storage version
 that still holds data), then the operator, then the GitOps manifests, then let
-the pool reconcile to zero.
+the pool reconcile to zero. The procedure, with the commands and the risks of
+each step, is [Upgrade 0.1 to 0.2](upgrade-0.1-to-0.2.md).
 
 ## [0.1.22] - 2026-11-11
 

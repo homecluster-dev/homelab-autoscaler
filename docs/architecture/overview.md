@@ -64,7 +64,7 @@ nothing about what anyone wants it to do next:
 - Finite State Machine architecture (`internal/fsm`), seeded from that triple and never from a
   record
 - Coordination locking for race prevention (kept as a belt over the claim, see
-  [State Management](state.md))
+  [State Management](../development/state.md))
 - Owns the claim moves a transition is the evidence for (`pending → booting` with the startup Job,
   `booting → ready` with the readiness gate, `→ failed` with a Job failure, a timeout, a stuck
   transition)
@@ -113,7 +113,7 @@ from the moment the object appears. On a timeout the controller **uncordons the 
 machine is invisible to scale-down and would be paid for forever), records a `ReadinessGateTimeout`
 Warning on the slot, and moves the claim to **`failed`** with that reason: the input law then powers
 the machine off, the slot becomes free, and the next claim on it is attempt N+1. See
-[State Management](state.md).
+[State Management](../development/state.md).
 
 ### gRPC Server (`internal/grpcserver/server.go`)
 
@@ -237,7 +237,7 @@ network policy isolation.
 ## Related Documentation
 - [Installation](../getting-started/installation.md) - Helm deployment
 - [Quick Start](../getting-started/quick-start.md) - k3d testing
-- [State Management](state.md) - the input law, the claim phases, the lock
+- [State Management](../development/state.md) - the input law, the claim phases, the lock
 - [NodeClaim CRD](../api-reference/crds/nodeclaim.md) - the request object
-- [NodeClaim Design](../design/nodeclaim.md) - why this model
+- [NodeClaim Design](../development/nodeclaim.md) - why this model
 - [Known Issues](../troubleshooting/known-issues.md) - Current limitations
