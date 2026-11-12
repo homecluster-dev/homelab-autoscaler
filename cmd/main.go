@@ -241,9 +241,12 @@ func main() {
 	if err := (&controller.NodeClaimReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		// The claim controller publishes the two endings an operator acts on - the deadline that
-		// closed an attempt, the attempt bound that stopped one - on the NodeClaim itself, so
-		// `kubectl describe nodeclaim <name>` shows why a scale-up ended.
+		// The claim's timeline is published on the NodeClaim itself, by the claim recorder
+		// SetupWithManager wires from the manager (internal/claim/events.go): the create, the commit,
+		// the readiness, every ending, each with the attempt-side detail - attempt number, Job name,
+		// deadline, duration - so `kubectl describe nodeclaim <name>` shows why a scale-up ended.
+		// This field is the recorder a hand-built Recorder falls back to (unit tests, and a caller
+		// that constructs the reconciler without SetupWithManager).
 		EventRecorder: mgr.GetEventRecorder("homelab-autoscaler"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NodeClaim")

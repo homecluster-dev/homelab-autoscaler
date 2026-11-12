@@ -21,6 +21,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,9 +44,13 @@ type transitionClaimWriter struct {
 	slot *infrav2alpha1.Node
 }
 
-// claimWriterFor builds the writer for a client, bound to the slot the state machine runs on.
-func claimWriterFor(c client.Client, slot *infrav2alpha1.Node) *transitionClaimWriter {
-	return &transitionClaimWriter{recorder: claim.NewRecorder(c), client: c, slot: slot}
+// claimWriterFor builds the writer for a client, bound to the slot the state machine runs on, and
+// wired with the recorder that publishes the claim's timeline: the transition path is the writer of
+// the `pending -> booting` commit, of `booting -> ready` (the readiness gate), and of the endings a
+// Job produces, so the events of those moves are published at the claim.Recorder the writer drives
+// (internal/claim/events.go), not here.
+func claimWriterFor(c client.Client, slot *infrav2alpha1.Node, ev events.EventRecorder) *transitionClaimWriter {
+	return &transitionClaimWriter{recorder: claim.NewRecorderWithEvents(c, ev), client: c, slot: slot}
 }
 
 // MoveClaim applies one phase move of the claim. The in-memory copy the caller passes is updated

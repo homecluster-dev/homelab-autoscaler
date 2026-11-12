@@ -257,6 +257,14 @@ The `pending → booting` edge is also the attempt boundary: incrementing `statu
 of the same write that creates the startup Job, so an attempt is a machine bought and nothing
 else.
 
+**The events of these edges land on the claim.** A phase is the claim's, so its timeline is
+readable on it: `ClaimCreated`, `ClaimBooting`, `ClaimReady`, `ClaimFailed`, `ClaimCancelled`,
+`ClaimCompleted`, `ClaimSuperseded`, one Event per transition, written by the same
+`claim.Recorder` that writes the phase (`internal/claim/recorder.go`, `internal/claim/events.go`) —
+so a move the table refused, a write the API server refused, and a re-apply that changed nothing
+publish nothing. The table of the set, and the commands that read it, are in
+[the CRD reference](../api-reference/crds/nodeclaim.md#events).
+
 ## 4. Deadlines and Attempts
 
 ### `spec.deadlineAt`
@@ -477,6 +485,16 @@ Three consequences, each of which is a rule in `docs/architecture/state.md` toda
   only be written by the operation that wrote it, because the field is both the FSM's state and
   the world's report. With claims, "an operation is in flight on this slot" is the existence of a
   claim in `booting`, which is a fact about an object, not about a string.
+
+The same split runs through the reporting: the slot keeps its **events of the machine**
+(`ScaleUpRequested`, `ScaleUpCompleted`, `ScaleDownRequested`, … on the `Node`, written by the
+transition path), and the claim gets its **events of the attempt** (`ClaimCreated`,
+`ClaimBooting`, `ClaimReady`, `ClaimFailed`, `ClaimCancelled`, `ClaimCompleted`,
+`ClaimSuperseded` on the `NodeClaim`, written at the phase-write chokepoint). They are one episode
+read from two objects, not the same sentence twice: the slot's event says what the machine did,
+the claim's event says what happened to this request and carries the request's numbers — attempt,
+startup Job, deadline, duration. The reported phase itself stays a report; the story of a request
+has an object, and the object has a timeline.
 
 ## 7. What Is Deliberately Kept
 

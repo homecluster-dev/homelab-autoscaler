@@ -1134,7 +1134,7 @@ func startupGateMachine(reconciler *NodeReconciler, slot *infrav2alpha1.Node, li
 	return fsm.NewNodeStateMachine(fresh, k8sClient, scheme.Scheme, coord,
 		fsm.WithReadinessTaintKeys(readyTaintKeysOf(fresh)),
 		fsm.WithInput(input),
-		fsm.WithClaim(live, claimWriterFor(k8sClient, fresh)))
+		fsm.WithClaim(live, claimWriterFor(k8sClient, fresh, reconciler.EventRecorder)))
 }
 
 // readyTaintKeysOf is the gate the slot records for its Group: the keys the observation path reads

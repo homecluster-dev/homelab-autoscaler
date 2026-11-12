@@ -313,7 +313,7 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(
 		fsm.WithEventRecorder(r.EventRecorder),
 		fsm.WithReadinessTaintKeys(r.readinessTaintKeys(ctx, node, group)),
 		fsm.WithInput(input),
-		fsm.WithClaim(live, claimWriterFor(r.Client, node)))
+		fsm.WithClaim(live, claimWriterFor(r.Client, node, r.EventRecorder)))
 
 	state := stateMachine.GetCurrentState()
 

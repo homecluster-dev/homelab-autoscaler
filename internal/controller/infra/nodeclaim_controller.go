@@ -20,7 +20,6 @@ import (
 	"context"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
@@ -53,12 +52,17 @@ type NodeClaimReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// EventRecorder publishes Events on the NodeClaim: the deadline that closed an attempt, the
-	// attempt bound that stopped one, the extra live claim that was refused. nil records nothing.
+	// EventRecorder is the recorder the claim's timeline is published through. The timeline itself is
+	// written by the claim.Recorder (internal/claim/events.go: one Event per phase move, plus the
+	// creation and the endings), because that is the chokepoint every phase write of the model passes
+	// through - so this reconciler's job is to hand that recorder an event recorder, which
+	// SetupWithManager does with the manager's. nil records nothing, and the phase writes are
+	// unaffected.
 	EventRecorder events.EventRecorder
 
-	// Recorder writes claim status. Set to claim.NewRecorder(r.Client) in SetupWithManager when
-	// nil, so tests can inject their own.
+	// Recorder writes claim status, and publishes the claim's timeline through it. Set to
+	// claim.NewRecorderWithEvents(r.Client, mgr.GetEventRecorder("nodeclaim-controller")) in
+	// SetupWithManager when nil, so tests can inject their own.
 	Recorder *claim.Recorder
 
 	// APIReader reads the slot of a claim straight from the API server, past the cache. The one path
@@ -315,10 +319,6 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 			}
 		}
 
-		r.eventf(nodeClaim, "ClaimDeadlineExceeded",
-			"claim %s of slot %s is overdue (deadline %s, phase %s): recorded failed, the machine is force-shut-down and the next claim of the slot is attempt %d",
-			nodeClaim.Name, slot.Name, nodeClaim.Spec.DeadlineAt, nodeClaim.Status.Phase, nodeClaim.Status.Attempt+1)
-
 		logger.Info("Claim passed its deadline", "claim", nodeClaim.Name, "slot", slot.Name,
 			"phase", string(nodeClaim.Status.Phase), "deadline", nodeClaim.Spec.DeadlineAt)
 	}
@@ -337,10 +337,6 @@ func (r *NodeClaimReconciler) reconcileLive(ctx context.Context, nodeClaim *infr
 				return ctrl.Result{}, client.IgnoreNotFound(err)
 			}
 		}
-
-		r.eventf(nodeClaim, "ClaimAttemptLimitExceeded",
-			"claim %s of slot %s is attempt %d of %d: the slot has used its consecutive attempts, no machine is bought for it, and the record lives on this claim",
-			nodeClaim.Name, slot.Name, nodeClaim.Status.Attempt, claim.MaxConsecutiveAttempts)
 	}
 
 	if phase.IsTerminal(nodeClaim.Status.Phase) {
@@ -442,10 +438,6 @@ func (r *NodeClaimReconciler) watchMachine(ctx context.Context, nodeClaim *infra
 		return false, nil, err
 	}
 
-	r.eventf(nodeClaim, "ClaimMachineGone",
-		"the machine of slot %s has been observed off for %s, longer than one boot window %s: claim %s is recorded failed, the slot is free, and the next claim of the slot is attempt %d",
-		slot.Name, time.Since(first).Round(time.Second).String(), grace.String(), nodeClaim.Name, nodeClaim.Status.Attempt+1)
-
 	logger.Info("The machine of a ready claim is gone",
 		"claim", nodeClaim.Name, "slot", slot.Name, "observedSince", first.String(), "grace", grace.String())
 
@@ -525,7 +517,9 @@ const shutdownPollResync = 15 * time.Second
 // (admission races, a hand-applied claim, a provider that listed a stale inventory). The newest live
 // claim of a slot is the one the slot answers for; every older live claim on the same slot is failed
 // with reason Superseded, and the error names the slot, because "two claims want one machine" is an
-// operator-visible bug and not a supported state (docs/design/nodeclaim.md §8).
+// operator-visible bug and not a supported state (docs/design/nodeclaim.md §8). The event of the fact
+// is the recorder's ClaimSuperseded on that move, and it names the claim that won the slot
+// (internal/claim/events.go).
 func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) (bool, error) {
 	if !phase.IsLive(nodeClaim.Status.Phase) {
 		return false, nil
@@ -559,28 +553,17 @@ func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeCla
 		return false, nil
 	}
 
-	owner := claim.LiveOfSlot(claims)
-	ownerName := ""
-	if owner != nil {
-		ownerName = owner.Name
-	}
-
 	for _, extra := range extras {
 		if extra.Name == nodeClaim.Name {
-			r.eventf(nodeClaim, "SlotAlreadyClaimed",
-				"slot %s already carries the live claim %s: one live claim per slot, this claim is failed as superseded",
-				claim.SlotNameOf(nodeClaim), ownerName)
-
+			// The claim fails itself. The event of the fact - which claim owns the slot now - is the
+			// recorder's ClaimSuperseded on the move below: one event per transition, and the detail
+			// (the newer claim's name) is in it.
 			if _, err := r.recorder().MoveOf(ctx, nodeClaim, infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonSuperseded); err != nil {
 				return false, err
 			}
 
 			return true, nil
 		}
-
-		r.eventf(extra, "SlotAlreadyClaimed",
-			"slot %s already carries the live claim %s: one live claim per slot, this claim is failed as superseded",
-			claim.SlotNameOf(extra), nodeClaim.Name)
 
 		if _, err := r.recorder().Move(ctx, client.ObjectKeyFromObject(extra), infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonSuperseded); err != nil {
 			return false, err
@@ -726,32 +709,27 @@ func reasonForDeletion(nodeClaim *infrav2alpha1.NodeClaim) string {
 	}
 }
 
-// recorder returns the status writer, defaulting to one bound to this reconciler's client.
+// recorder returns the status writer, defaulting to one bound to this reconciler's client and to the
+// reconciler's event recorder, so the claim's timeline is published at the chokepoint that writes the
+// phase whatever built the Recorder.
 func (r *NodeClaimReconciler) recorder() *claim.Recorder {
 	if r.Recorder != nil {
 		return r.Recorder
 	}
 
-	r.Recorder = claim.NewRecorder(r.Client)
+	r.Recorder = claim.NewRecorderWithEvents(r.Client, r.EventRecorder)
 
 	return r.Recorder
-}
-
-// eventf publishes an Event on the claim, and is a no-op without a recorder.
-func (r *NodeClaimReconciler) eventf(nodeClaim *infrav2alpha1.NodeClaim, reason, format string, args ...interface{}) {
-	if r.EventRecorder == nil || nodeClaim == nil {
-		return
-	}
-
-	// Every record the claim controller publishes is a Warning: each one is an attempt that
-	// ended without a usable machine, which is what an operator has to be told to go look.
-	r.EventRecorder.Eventf(nodeClaim, nil, corev1.EventTypeWarning, reason, "nodeclaim", format, args...)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		r.Recorder = claim.NewRecorder(r.Client)
+		// The claim's timeline is the recorder's, and the manager is the source of the event recorder
+		// it publishes through. A recorder named for this controller is the record in
+		// `kubectl get events -o wide`: the reporting controller says which controller spoke, and the
+		// action (claim.ActionClaim) is the key the new events API aggregates repeats on.
+		r.Recorder = claim.NewRecorderWithEvents(r.Client, mgr.GetEventRecorder("nodeclaim-controller"))
 	}
 
 	if r.APIReader == nil {

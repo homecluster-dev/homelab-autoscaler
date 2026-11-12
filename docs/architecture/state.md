@@ -132,6 +132,19 @@ Two consequences worth stating plainly:
   boot is reversed, never interrupted. `NodeGroupDecreaseTargetSize` therefore cancels `pending`
   claims only, and `NodeGroupDeleteNodes` cancels a `booting`/`ready` claim through its finalizer.
 
+Both records of a move are written at that one chokepoint, on the claim. The **conditions**
+(`Ready`, `MachineCommitted`, `MachineObservedOff`) are the durable record: they live on
+`status.conditions` as long as the claim does, and the slot's digest outlives the claim, so they are
+what answers "what is true about this attempt" the day after. The **Events** (`ClaimCreated`,
+`ClaimBooting`, `ClaimReady`, `ClaimFailed`, `ClaimCancelled`, `ClaimCompleted`,
+`ClaimSuperseded` — `internal/claim/events.go`) are the timeline: one Event per transition, published
+on the claim after the status write landed, and nothing published for a move the table refused, for a
+write the API server refused, or for a re-apply that changed nothing. They carry the attempt's
+numbers (attempt, Job, deadline, duration), they coalesce on repeats, and they expire with the
+cluster's Event TTL (one hour by default) — so `kubectl describe nodeclaim` is the "what just
+happened, in order" view, the conditions and the digest are the "what is true" view, and both are on
+the claim.
+
 ## Deadlines and attempts
 
 `spec.deadlineAt` is born with the claim, measured from `spec.requestedAt`
