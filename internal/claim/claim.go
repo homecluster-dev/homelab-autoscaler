@@ -64,7 +64,7 @@ const (
 	// fsm.ShutdownAttemptLimit conditions carried on the long-lived slot. It lives on the request
 	// now: a claim's status.attempt is seeded from the slot's digest, and a claim whose attempt
 	// crosses this bound is failed before it buys a machine. The streak ends with the object that
-	// carries it, which is why there is no reset heuristic (docs/design/nodeclaim.md §4).
+	// carries it, which is why there is no reset heuristic (docs/development/nodeclaim.md §4).
 	MaxConsecutiveAttempts = int32(3)
 )
 
@@ -154,14 +154,14 @@ func Budget(group *infrav2alpha1.Group) *metav1.Duration {
 // up, at the resync the refusal paces it at).
 //
 // The escape hatch for an operator who does not want to wait for the grace is documented in
-// docs/design/nodeclaim.md §4: zero the counter on the claim's status subresource, and the next pass
+// docs/development/nodeclaim.md §4: zero the counter on the claim's status subresource, and the next pass
 // fires the shutdown.
 const ShutdownAttemptResetGrace = 30 * time.Minute
 
 // ScaleDownStreakSpent reports that a scale-down claim has used its shutdown attempts on a machine
 // the provider still observes up, and returns how long is left of the reset grace. Past the grace the
 // streak is not spent any more: the refusal was a bounded pause, not a sentence, and the machine is
-// asked to go off again (docs/design/nodeclaim.md §4, docs/architecture/state.md).
+// asked to go off again (docs/development/nodeclaim.md §4, docs/development/state.md).
 //
 // The count is status.shutdownAttempts, and it is a counter of its own: status.attempt counts the
 // machines the request bought, and a shutdown that will not land must not spend the boot attempts of
@@ -208,7 +208,7 @@ func ScaleDownStreakResetDue(c *infrav2alpha1.NodeClaim) bool {
 // SeedAttempt is the attempt number a new claim of a slot carries: the slot's last attempt + 1
 // while the slot keeps failing, and 1 again once an attempt has landed.
 //
-// "A bound on attempts is a bound on consecutive claims" (docs/design/nodeclaim.md §4), and the
+// "A bound on attempts is a bound on consecutive claims" (docs/development/nodeclaim.md §4), and the
 // digest's phase is the record of what the last one did: an episode that ended in ready or
 // completed bought a machine the pool could use, so the next request of that slot starts a new
 // streak. That is the whole reset rule - it reads the object that ends with the episode, so
@@ -377,7 +377,7 @@ func ListOfSlot(ctx context.Context, c client.Client, namespace, slotName string
 // LiveOfSlot returns the live claim of a slot: the newest claim whose phase is live (pending,
 // booting, ready). A claim a scale-down marked for deletion is returned too, and it is the claim of
 // the slot: the boot it started is committed, and deleting the claim is the request that reverses
-// it, so the object stays on the slot until the machine is observed off (docs/design/nodeclaim.md §3).
+// it, so the object stays on the slot until the machine is observed off (docs/development/nodeclaim.md §3).
 //
 // "Live" is the phase question - does an episode of this slot still own the machine. WantsMachine,
 // below, is the stronger question the state machine asks before it boots anything. When more than
@@ -406,7 +406,7 @@ func LiveOfSlot(claims []infrav2alpha1.NodeClaim) *infrav2alpha1.NodeClaim {
 // off, and the claim's finalizer is what keeps the request from being forgotten - so a pass that
 // would boot the slot must not read a marked claim as a want, and a pass that powers the slot off
 // must not lose sight of it. The pair is the difference between "the startup is committed" and
-// "the startup is the next thing to do" (docs/design/nodeclaim.md §3, §5).
+// "the startup is the next thing to do" (docs/development/nodeclaim.md §3, §5).
 func WantsMachine(c *infrav2alpha1.NodeClaim) bool {
 	return c != nil && phase.IsLive(c.Status.Phase) && c.DeletionTimestamp.IsZero()
 }

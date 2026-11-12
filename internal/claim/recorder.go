@@ -36,7 +36,7 @@ import (
 // Finalizer is the finalizer a claim carries from the moment its phase becomes booting. It is what
 // makes "a boot that has started is never cancelled" true: deleting a booting or ready claim is not
 // an abandonment of the machine, it is the scale-down request, and the finalizer runs the object to
-// completed / failed once the machine is off (docs/design/nodeclaim.md §3).
+// completed / failed once the machine is off (docs/development/nodeclaim.md §3).
 //
 // A pending claim carries no finalizer, so canceling a pending claim is a plain delete: nothing is
 // in flight, the object goes, and the unit comes off the target size on that write.
@@ -53,7 +53,7 @@ func HasFinalizer(c *infrav2alpha1.NodeClaim) bool {
 
 // ErrIllegalMove is returned by Recorder.Move for a phase transition the model does not allow, the
 // one that matters being a cancel of a booting claim: "pending is cancelable, booting is
-// committed" (docs/design/nodeclaim.md §3). A caller that asks for it gets an error naming both
+// committed" (docs/development/nodeclaim.md §3). A caller that asks for it gets an error naming both
 // phases, and nothing is written.
 var ErrIllegalMove = errors.New("illegal NodeClaim phase transition")
 
@@ -290,7 +290,7 @@ func (r *Recorder) Move(ctx context.Context, key client.ObjectKey, to infrav2alp
 // openBootWindow writes the metadata half of the `-> booting` move, and reports whether it wrote: the
 // scale-down finalizer arrives with the boot, on the write that records the phase. A finalizer that
 // lands on a later pass of the claim controller leaves a window in which a DeleteNodes deletes a
-// committed boot with no shutdown behind it (docs/design/nodeclaim.md §3), so this half runs *before*
+// committed boot with no shutdown behind it (docs/development/nodeclaim.md §3), so this half runs *before*
 // the status write, and a manager that dies between the two leaves the boot committed and the
 // deadline intact - the safe direction, the one where the claim controller lands the phase on its
 // next pass.
@@ -369,7 +369,7 @@ func (r *Recorder) stampLiveConditions(c *infrav2alpha1.NodeClaim, to infrav2alp
 //     operator reads to answer "is there a machine behind this dead claim".
 //
 // It is a record, never an instruction: the shutdown is decided from the observation, not from a
-// condition (docs/architecture/state.md's authority table).
+// condition (docs/development/state.md's authority table).
 func (r *Recorder) stampTerminalConditions(c *infrav2alpha1.NodeClaim, from, to infrav2alpha1.NodeClaimPhase, reason string) {
 	stampCondition(c, infrav2alpha1.ClaimConditionReady, metav1.ConditionFalse, string(to), reason)
 	stampCondition(c, infrav2alpha1.ClaimConditionMachineCommitted,
@@ -468,7 +468,7 @@ func (r *Recorder) StampFinishedAt(ctx context.Context, key client.ObjectKey) (b
 // observes off, and returns the instant the loss was first observed plus whether this call wrote. It
 // is the clock of the MachineGone bound: the first pass that sees the machine off writes the
 // condition and its lastTransitionTime, every later pass reads it back, and only an observation that
-// outlasts a whole boot window ends the claim (docs/design/nodeclaim.md §4). A reboot of a healthy
+// outlasts a whole boot window ends the claim (docs/development/nodeclaim.md §4). A reboot of a healthy
 // machine shows the same shape for minutes, which is why the case is bounded by an observation and
 // not by a single pass.
 func (r *Recorder) RecordMachineLoss(ctx context.Context, key client.ObjectKey) (time.Time, bool, error) {

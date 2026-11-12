@@ -84,7 +84,7 @@ const (
 	EventClaimCompleted = "ClaimCompleted"
 	// EventClaimSuperseded: a move to failed for the reason Superseded. It is not a Warning: the
 	// model has not broken, one live claim per slot is load-bearing and the extra one is the claim
-	// that ends (docs/design/nodeclaim.md §3).
+	// that ends (docs/development/nodeclaim.md §3).
 	EventClaimSuperseded = "ClaimSuperseded"
 
 	// ActionClaim is the action every event of this set carries. The new events API

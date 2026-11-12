@@ -301,11 +301,19 @@ jobs:
             const configPath = path.join(__dirname, 'docusaurus.config.js');
             let config = fs.readFileSync(configPath, 'utf8');
             
-            // Replace the version in the versions configuration
+            // Replace the version in the versions configuration. The pattern is anchored to the start
+            // of a line and only the first match is replaced, so a comment that quotes the shape of
+            // the field can never steal the patch; the leading whitespace is captured and put back.
             config = config.replace(
-              /label: 'v[^']*'/,
-              \`label: 'v${{ env.CHART_VERSION }}'\`
+              /^(\s*)label: 'v[^']*'/m,
+              \`\$1label: 'v${{ env.CHART_VERSION }}'\`
             );
+            
+            // Loud, not silent: the label is the point of this step.
+            if (!/^\s*label: 'v${{ env.CHART_VERSION }}',$/m.test(config)) {
+              console.error('docusaurus.config.js has no version label line to patch — the shape of versions.current.label changed');
+              process.exit(1);
+            }
             
             // Also update package.json version for consistency
             const packagePath = path.join(__dirname, 'package.json');

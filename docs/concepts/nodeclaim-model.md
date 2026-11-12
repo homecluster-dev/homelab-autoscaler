@@ -40,8 +40,12 @@ runs the reversal to its end — cordon, shutdown Job, power off — and the cla
 A claim created and not yet stamped has no phase at all; the model reads an empty phase as `pending`,
 so a request is capacity from the instant the API server accepts it.
 
-`booting → ready` is written by the readiness gate, and it is the only writer. The same write clears
-`spec.deadlineAt`.
+`booting → ready` is written by the readiness gate, and it is the only writer. The move is one
+`Recorder.Move` and **two API writes**: the status write that lands the phase, then a spec write that
+clears `spec.deadlineAt` (`claim.Recorder.clearBootDeadline`, called after the status update). The
+order is the one that heals: a manager that dies between the two leaves a `ready` claim still carrying
+its boot deadline, the deadline guard is scoped to the boot window so the field is inert there, and the
+next pass re-lands the (idempotent) move and clears it.
 
 ## One live claim per slot
 
@@ -53,9 +57,14 @@ admission, where you see the refusal, and in the claim controller, where admissi
 the claim that owns it:
 
 ```
-error: metadata: Invalid value: "worker-01": slot "worker-01" already has the live NodeClaim
-"worker-01-7f4b9c" in phase "booting": one live claim per slot
+Error from server: admission webhook "nodeclaim-v2alpha1.kb.io" denied the request:
+spec.slotRef: Forbidden: slot "worker-01" already has the live NodeClaim "worker-01-7f4b9c" in phase
+"booting": one live claim per slot
 ```
+
+That is the real shape of the refusal: the webhook answers with `field.Forbidden` on
+`spec.slotRef` (`internal/webhook/infra/v2alpha1/nodeclaim_webhook.go`), and the API server prefixes
+it with the webhook's name.
 
 If two live claims are ever found on one slot, the newest owns it and the extra one ends
 `failed` with `reason: Superseded`. A terminal claim frees its slot, and a delete is never refused.
@@ -155,11 +164,15 @@ The two bounds that outlive the boot window are the ones you read about, not the
 
 Attempts are a property of the request, not of the slot.
 
-- `status.attempt` is seeded once, on the claim's first pass, from `Node.status.lastClaim.attempt`:
-  the next number while the slot keeps failing, and back to `1` after an episode that ended `ready`
-  or `completed`.
-- It is incremented by the `pending → booting` write, so it counts machines bought, not reconcile
-  passes.
+- `status.attempt` has exactly one writer: `claim.Recorder.Seed`, run once, on the controller's first
+  pass over the claim, and only when `status.attempt == 0`. It takes the number from
+  `Node.status.lastClaim.attempt` — the next number while the slot keeps failing, and back to `1`
+  after an episode that ended `ready` or `completed`.
+- Nothing writes it again. The `pending → booting` write does not touch it, and neither does a
+  reconcile pass: the field is stamped once, never changes, and **one claim is one attempt**. The
+  provider does not set it either — the claim is created with no attempt, because the seeding reads
+  the slot's digest and a claim built from a stale cache must not bake in a number the controller
+  cannot correct.
 - The bound is 3. Past it, a claim in the boot window is failed with `reason: AttemptLimitExceeded`
   before a machine is bought, and nothing is created for the slot.
 - What resets it: an attempt that lands — the streak restarts at 1 after an episode ends `ready` or

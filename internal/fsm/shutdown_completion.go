@@ -43,7 +43,7 @@ package fsm
 //     is an observation and cannot contradict one.
 //  4. NodeGroupDecreaseTargetSize used to write status.phase: shuttingdown directly - no
 //     transition, no Job, no lock - and no longer does (see
-//     docs/architecture/state.md). A writer outside the FSM is the shape this audit has to keep out
+//     docs/development/state.md). A writer outside the FSM is the shape this audit has to keep out
 //     of the completion path, not a cause it can fix here.
 //
 // What turns one of those writes into a slot that cannot heal is the pair, not the write:

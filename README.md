@@ -8,6 +8,17 @@ Scale-up intent is an object. `Node` is what a slot *is*, `NodeClaim` is one req
 with an attribution, a deadline and an end — and `Node.status` is what the cluster observes. That is
 why a GitOps apply cannot revert a scale-up, and why every attempt ends by itself.
 
+## Use of AI in development
+
+The code, the tests and the documentation of this project are written with the help of AI coding
+assistants. Every change is read, tested and merged by a human maintainer, who is the one responsible
+for what lands: the unit tests, envtest, the integration suite and the k3d end-to-end run — which stops
+and starts real cluster nodes — run on every pull request, and releases are cut from `main` by CI.
+
+Treat it like any other open-source project. Read the code you are about to run, check the manifests
+against your own cluster, and verify the behaviour on a pool you can afford to empty before it sits in
+front of machines that draw power.
+
 ## Quick Start
 
 The chart ships the CRDs, the manager (which embeds the gRPC server cluster-autoscaler calls) and,

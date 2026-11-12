@@ -122,7 +122,7 @@ func (nm *NodeStateMachine) StartNode() error {
 	// The attempt bound of the model lives on the claim, not on the slot: a claim whose
 	// status.attempt is past claim.MaxConsecutiveAttempts is failed by the claim controller before it
 	// buys a machine, so this call is never reached for an exhausted slot, and the counter that ends
-	// with the episode needs no reset heuristic (docs/design/nodeclaim.md §4).
+	// with the episode needs no reset heuristic (docs/development/nodeclaim.md §4).
 
 	// Trigger FSM event. A cancellation from the coordination lock leaves status.progress on
 	// the stable state the transition started from (see beforeStartNode) and returns a
@@ -171,7 +171,7 @@ func (nm *NodeStateMachine) StartNode() error {
 
 	// The pending -> booting edge of the claim, on the same path that created the startup Job: an
 	// attempt is a machine bought, not a reconcile pass, and from here the boot is committed -
-	// nothing cancels it (docs/design/nodeclaim.md §3).
+	// nothing cancels it (docs/development/nodeclaim.md §3).
 	nm.commitAttempt("")
 	nm.reportPhase()
 

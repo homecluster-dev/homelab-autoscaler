@@ -36,7 +36,7 @@ import (
 // ClaimFinalizer is the finalizer the claim model puts on a claim the moment its phase becomes
 // booting. It is the claim.Finalizer constant, spelled here so the controller that removes it on a
 // landed scale-down names the same string the recorder writes; see internal/claim/recorder.go for
-// the rules and docs/design/nodeclaim.md §3.
+// the rules and docs/development/nodeclaim.md §3.
 const ClaimFinalizer = claim.Finalizer
 
 // NodeClaimReconciler owns the lifecycle of a NodeClaim: the attempt seed, one live claim per slot,
@@ -95,7 +95,7 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			// run: the finalizer comes off and the GC finishes the object. Leaving it on is a claim
 			// stuck in Terminating forever, never retried, with a machine running behind it - and
 			// it is reachable through the documented rollout, which deletes the Node CRs
-			// (docs/design/nodeclaim.md §9), and through garbage collection of a namespace.
+			// (docs/development/nodeclaim.md §9), and through garbage collection of a namespace.
 			//
 			// The read that says so is the cached one, and the write behind it cannot be undone: a
 			// cache that has not caught up with a slot that exists - a slot recreated by the rollout,
@@ -517,7 +517,7 @@ const shutdownPollResync = 15 * time.Second
 // (admission races, a hand-applied claim, a provider that listed a stale inventory). The newest live
 // claim of a slot is the one the slot answers for; every older live claim on the same slot is failed
 // with reason Superseded, and the error names the slot, because "two claims want one machine" is an
-// operator-visible bug and not a supported state (docs/design/nodeclaim.md §8). The event of the fact
+// operator-visible bug and not a supported state (docs/development/nodeclaim.md §8). The event of the fact
 // is the recorder's ClaimSuperseded on that move, and it names the claim that won the slot
 // (internal/claim/events.go).
 func (r *NodeClaimReconciler) refuseExtraLiveClaims(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) (bool, error) {
@@ -591,7 +591,7 @@ func isNewerClaim(a, b *infrav2alpha1.NodeClaim) bool {
 // ensureFinalizer is the belt of the scale-down finalizer. The writer is the recorder: the
 // pending -> booting move stamps it on the same write that records the phase, so a DeleteNodes in
 // the pass boundary cannot delete a committed boot with no shutdown behind it (M5, and
-// docs/design/nodeclaim.md §3). This pass covers what that writer cannot see: a claim whose phase
+// docs/development/nodeclaim.md §3). This pass covers what that writer cannot see: a claim whose phase
 // was landed on by a hand write, or by a move whose metadata write the API server refused.
 func (r *NodeClaimReconciler) ensureFinalizer(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error {
 	if claim.HasFinalizer(nodeClaim) {

@@ -125,7 +125,7 @@ func claimCR(slotName string, claimPhase infrav2alpha1.NodeClaimPhase, mutate fu
 	}
 
 	// A live claim carries the controller's finalizer from the moment its boot starts: deleting it
-	// is then the scale-down request, not an abandonment (docs/design/nodeclaim.md §3). A pending
+	// is then the scale-down request, not an abandonment (docs/development/nodeclaim.md §3). A pending
 	// claim carries none, which is what makes cancelling it a plain delete.
 	if claimPhase == infrav2alpha1.NodeClaimBooting || claimPhase == infrav2alpha1.NodeClaimReady {
 		nodeClaim.Finalizers = append(nodeClaim.Finalizers, claimFinalizer)

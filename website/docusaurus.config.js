@@ -46,13 +46,19 @@ const config = {
           path: '../docs',
           routeBasePath: 'docs',
           sidebarPath: require.resolve('./sidebars.js'),
-          editUrl: 'https://github.com/homecluster-dev/homelab-autoscaler/edit/main/',
+          // The docs are read from ../docs, and Docusaurus joins this URL with that path, so the
+          // directory has to be named: with `…/edit/main/` the join normalises to `…/edit/docs/…`
+          // (a ref named `docs`, which GitHub 404s). From `…/edit/main/website/` the same join
+          // resolves to `…/edit/main/docs/<page>.md`, the real path in the repository.
+          editUrl: 'https://github.com/homecluster-dev/homelab-autoscaler/edit/main/website/',
           showLastUpdateAuthor: true,
           showLastUpdateTime: true,
           versions: {
             current: {
-              // The deploy workflow rewrites this label from dist/chart/Chart.yaml on every release,
-              // so it stays in step with the chart. Keep the `label: 'v...'` shape it patches.
+              // The deploy workflow rewrites the version label below from dist/chart/Chart.yaml on
+              // every release, so the navbar keeps the label in step with the chart. Its pattern is
+              // anchored to the start of a line, so this field — and only it — can match: a comment
+              // that quotes the shape of the field is never patched in its place.
               label: 'v0.2.3',
               path: '',
             },
@@ -115,7 +121,7 @@ const config = {
             items: [
               {
                 label: 'Start Here',
-                to: '/',
+                to: '/docs/',
               },
               {
                 label: 'The NodeClaim Model',
@@ -191,11 +197,9 @@ const config = {
         contextualSearch: true,
         // Optional: Specify domains where the navigation should occur through window.location instead on history.push
         externalUrlRegex: 'autoscaler\\.homecluster\\.dev',
-        // Optional: Replace parts of the item URLs from Algolia. Useful when using the same search index for multiple deployments using a different baseUrl
-        replaceSearchResultPathname: {
-          from: '/docs/', // or as RegExp: /\/docs\//
-          to: '/',
-        },
+        // No replaceSearchResultPathname: the index holds /docs/… URLs and the site serves /docs/…, so
+        // rewriting the pathname only turns every hit into a 404. Add the key when a second deployment
+        // needs the same index under a different baseUrl.
         // Optional: Algolia search parameters
         searchParameters: {},
         // The site's own search page, disabled. `false` is the boolean: the string 'false' is a

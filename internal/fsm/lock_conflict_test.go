@@ -152,7 +152,7 @@ func bootingSlot(name string) *infrav2alpha1.Node {
 //     one, and nothing in the controller heals it: the stuck-transition cleanup the docs
 //     promised runs on the machine's own backoff record, which the reconciler builds fresh on
 //     every pass, so ForceCleanup is never reached from a reconcile (see
-//     docs/architecture/state.md);
+//     docs/development/state.md);
 //   - the refusal is reported as a deferral with a deadline, not a terminal cancellation (b);
 //   - the lock of the operation in flight is untouched, and the shutdown performs none of its
 //     side effects on a slot it does not own (c);

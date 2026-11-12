@@ -198,11 +198,14 @@ spec:
                   node that already matches is not patched) and one Normal event with reason
                   `NodeLabelsApplied` is recorded on the Node CR when a write happens.
 
-                  cluster-autoscaler sees them twice over. The group's node template is built from one
-                  representative slot and carries that slot's declared labels, and a slot at zero whose pool
-                  has no node object at all gets a placeholder carrying them, so the estimator can place a
-                  zoned pod on a machine that does not exist yet. Existing machines are read from their
-                  corev1.Node, which is the object the controller stamps.
+                  cluster-autoscaler sees them twice over. What reaches the group's node template is the group's
+                  consensus, not one slot's declaration: a key counts only when every slot of the group declares
+                  it with the same value, and a key the slots disagree on is left out of the template and reported
+                  in the provider's log (nodelabels.Consensus, groupTemplateConsensus). A slot at zero whose pool
+                  has no node object at all gets a placeholder carrying that same consensus set, so the estimator
+                  can place a zoned pod on a machine that does not exist yet, and places it only where every slot
+                  of the pool will carry the label. Existing machines are read from their corev1.Node, which is
+                  the object the controller stamps.
 
                   Keys a Kubernetes component, the autoscaler, a GitOps tool, or this operator owns are refused
                   at admission, with the reason in the message: `infra.homecluster.dev/*` and
@@ -229,7 +232,7 @@ spec:
                   buys whichever slot of the group is free. So a declared key reaches the template only when every
                   slot of the group declares it with the same value: a key they disagree on is left out, and
                   reported in the provider's log, because a template carrying a label some slots will not have buys
-                  a machine the pod cannot use. Group slots you need to tell apart into different groups.
+                  a machine the pod cannot use. Put the slots you need to tell apart into different groups.
                 maxProperties: 64
                 type: object
               nodeTaints:
@@ -588,7 +591,7 @@ spec:
                     description: |-
                       LastShutdownAttemptAt is when the last of those attempts was counted. The streak reset's grace is
                       measured from it, so a slot whose pool script has been fixed is not sentenced by the attempts of
-                      the episodes that ended (docs/design/nodeclaim.md §4).
+                      the episodes that ended (docs/development/nodeclaim.md §4).
                     format: date-time
                     type: string
                   name:

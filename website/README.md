@@ -71,8 +71,10 @@ follow the order an operator meets the material in:
 
 The docs are not versioned: there is one set of pages, and `versions.current.label` is the label the
 navbar dropdown shows. The `docs-deploy` workflow rewrites that label from `dist/chart/Chart.yaml` on
-every release (it patches the `label: 'v…'` string in this file), so keep that shape. The checked-in
-label matches the current chart, `0.2.3`.
+every release. Its pattern is anchored to the start of a line — `/^(\s*)label: 'v[^']*'/m`, first
+match, indentation captured and put back — and the step exits non-zero when no line matches, so the
+label has to stay a field on its own line and a comment quoting the shape of the field can never be
+patched in its place. The checked-in label matches the current chart, `0.2.3`.
 
 To start real versioning — a snapshot per release — run:
 
@@ -148,13 +150,25 @@ Static assets are stored in the `static/` directory:
   `favicon.ico` in the repository, and `docusaurus.config.js` points at this file
 - `img/*.svg`: feature icons for the homepage
 
-There is no social card: the `themeConfig.image` key is unset, because the file the template shipped
-as a default (`img/homelab-autoscaler-social-card.jpg`) is not in the repository. Add the image, then
-set the key.
+There is no social card, and the site publishes no `og:image`.
+[`docusaurus.config.js`](./docusaurus.config.js) leaves `themeConfig.image` unset, so a link to the
+docs shared on Slack, GitHub, X, or Discord renders as a text link with no preview image — the page
+itself is fine, the card is empty. To add one: put the image in `static/img/`, set
+`themeConfig.image: 'img/<name>.png'`, and Docusaurus emits the meta tags on every page.
 
 ## Search
 
-The site is configured for Algolia DocSearch. Update the search configuration in `docusaurus.config.js` with your Algolia credentials when ready to enable search.
+Search is enabled. [`docusaurus.config.js`](./docusaurus.config.js) carries the DocSearch credentials
+under `themeConfig.algolia` — the application ID, the public API key, the index name — and the navbar
+renders the search box. The index itself is built by the [DocSearch
+crawler](https://docsearch.algolia.com/docs/what-is-docsearch/), which runs from the DocSearch
+dashboard against `https://autoscaler.homecluster.dev`; nothing in this repository crawls anything, and
+the crawl only works while the deployed site is reachable.
+
+Two keys in that block are load-bearing. `externalUrlRegex` makes hits on this domain open in the
+existing page instead of a full navigation. There is deliberately **no** `replaceSearchResultPathname`:
+the index holds `/docs/…` URLs and the site serves `/docs/…`, so rewriting `/docs/` to `/` sends every
+hit to a 404. Add that key only when a second deployment reuses this index under a different `baseUrl`.
 
 ## Contributing
 

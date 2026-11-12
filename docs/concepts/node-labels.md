@@ -18,11 +18,27 @@ metadata:
     group: storage-nodes
 spec:
   kubernetesNodeName: storage-01
+  pricing:
+    hourlyRate: "0.04"
+    podRate: "0.001"
+  startupPodSpec:
+    image: gemtest/ipmitool:latest
+    command: ["ipmitool"]
+    args: ["-I", "lanplus", "-H", "storage-01-ipmi.homelab.local", "-U", "admin", "-P", "password", "power", "on"]
+  shutdownPodSpec:
+    image: gemtest/ipmitool:latest
+    command: ["ipmitool"]
+    args: ["-I", "lanplus", "-H", "storage-01-ipmi.homelab.local", "-U", "admin", "-P", "password", "power", "soft"]
   nodeLabels:
     topology.kubernetes.io/zone: fsn1
   nodeAnnotations:
     pool.homecluster.dev/serial: SN-0001
 ```
+
+The slot carries `spec.pricing` and the two lifecycle pod specs because the CRD requires them —
+`kubernetesNodeName`, `pricing`, `startupPodSpec` and `shutdownPodSpec` are the required fields of
+`Node.spec`, and a manifest without them is refused at `kubectl apply`. The two fields this page is
+about are optional.
 
 A pod with `nodeSelector: {topology.kubernetes.io/zone: fsn1}` is a candidate for this pool only when
 the pool's template carries that label, and the template is built from what the slots declare. In a

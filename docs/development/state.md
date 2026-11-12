@@ -144,7 +144,7 @@ The phase table of the design, as the running code enforces it
 | Phase | Meaning | Legal next | Written by |
 | --- | --- | --- | --- |
 | `pending` | claimed, no lifecycle Job yet. The only cancelable phase. | `booting`, `ready`, `completed`, `failed` | created by the provider (the gRPC handler) with **no phase at all** — the status subresource strips `status` from a create, and there is no default on the field — and read as `pending` by `phase.IsLive` / `phase.IsPending` |
-| `booting` | the startup Job exists and the power-on has been asked for. Committed. | `ready`, `completed`, `failed` | the `StartNode` transition: the `pending → booting` write is the same write that created the startup Job and incremented `status.attempt` |
+| `booting` | the startup Job exists and the power-on has been asked for. Committed. | `ready`, `completed`, `failed` | the `StartNode` transition: the `pending → booting` write is the same write that created the startup Job. It does **not** touch `status.attempt`: that was stamped on the claim's first pass (`claim.Recorder.Seed`) and never rewritten |
 | `ready` | the machine is up, joined, and free of the pool's readiness taints | `completed`, `failed` | `afterJobCompleted` in the startup direction, i.e. the readiness gate (`fsm.setNodeSchedulableWithRetry`) |
 | `failed` | the attempt produced no usable machine and never will. Terminal. | — | the claim controller (deadline, attempt bound, superseded, slot deleted), the Job monitor (`JobFailed` / `JobTimeout`), the readiness-gate timeout, a force cleanup |
 | `completed` | the claim ended with the machine available. Terminal. | — | the claim controller's finalizer path, once the machine is observed off |
@@ -214,7 +214,8 @@ Attempts live on the request, not on the slot:
 - `status.attempt` is seeded once, on the claim's first pass, from `Node.status.lastClaim.attempt`
   (`claim.SeedAttempt`): +1 while the slot keeps failing, and back to 1 after an episode that
   ended `ready` or `completed`.
-- it is incremented by the `pending → booting` write, so it counts machines bought;
+- nothing writes the field after that seed — not the `pending → booting` write, not a reconcile pass —
+  so one claim is one attempt, and the number names the machine that claim buys;
 - `claim.MaxConsecutiveAttempts` (3) is the bound. Past it, the claim controller fails the claim
   with `reason: AttemptLimitExceeded` before a machine is bought.
 - a scale-down's attempts are counted on the claim that asked for the scale-down, on

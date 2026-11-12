@@ -43,13 +43,13 @@ import (
 // created - which is why the transition that refuses has to refuse before it creates, and what it
 // leaves behind is a slot with a Job of the operation that owns the lock, and nothing else. Under
 // v1alpha1 the same shape was a `status.progress` the slot reconciler gated every transition of
-// out (`validateStateTransition`, gone with docs/design/nodeclaim.md §6); under the claim model
+// out (`validateStateTransition`, gone with docs/development/nodeclaim.md §6); under the claim model
 // the state is derived from (claim, observation, Jobs), so a refusal that writes nothing also
 // claims nothing. The transitional slot is moved on by the operation that put it there, from its
 // own job monitor, and - if that monitor died with a manager restart - by the reconcile that reads
 // the Job object (internal/controller/infra/lifecycle.go).
 // That is why a refusal has to happen before a writer, not after it. See
-// cancelLockedTransition and docs/architecture/state.md.
+// cancelLockedTransition and docs/development/state.md.
 
 func (nm *NodeStateMachine) beforeStartNode(ctx context.Context, e *fsm.Event) {
 	logger := log.Log.WithName("fsm")
@@ -206,7 +206,7 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 			// The gate is the answer for the claim: the node object exists, it reports Ready, it is
 			// free of every readiness taint the Group declares, and it is uncordoned. That is exactly
 			// the sentence the claim's ready phase asserts - "the machine I asked for can take the
-			// pool's work" (docs/design/nodeclaim.md §3, §7) - and it is the only writer of that
+			// pool's work" (docs/development/nodeclaim.md §3, §7) - and it is the only writer of that
 			// move. The attempt bound needs no reset here: the count lives on the claim, and this
 			// claim ends as a success, so the streak the digest carries restarts at 1 for the next
 			// request of the slot (internal/claim.SeedAttempt).
@@ -358,7 +358,7 @@ func (nm *NodeStateMachine) enterStartingUp(ctx context.Context, e *fsm.Event) {
 	// the slot's digest when the claim is created, and the pending -> booting write (StartNode,
 	// commitAttempt) is the edge that buys the machine. There is no counter on the slot to
 	// accumulate, so the reset heuristics of the v1alpha1 ClaimRearmed condition are gone with it
-	// (docs/design/nodeclaim.md §4).
+	// (docs/development/nodeclaim.md §4).
 
 	// Add progressing condition
 	nm.addNodeCondition(metav1.Condition{

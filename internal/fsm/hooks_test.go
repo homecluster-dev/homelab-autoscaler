@@ -492,7 +492,7 @@ func TestEnterStartingUp(t *testing.T) {
 
 	// The progressing condition is the only record the transition leaves on the slot: the startup
 	// attempt is counted on the NodeClaim, not on the long-lived slot, so there is no condition to
-	// stamp and no reset heuristic to run (docs/design/nodeclaim.md §4).
+	// stamp and no reset heuristic to run (docs/development/nodeclaim.md §4).
 	require.Len(t, updatedNode.Status.Conditions, 1, "the progressing record alone")
 
 	condition := meta.FindStatusCondition(updatedNode.Status.Conditions, "StartupProgressing")

@@ -36,7 +36,7 @@ import (
 // internal/phase, which owns the mapping from (live claim, observed power, node usability) to a
 // state (phase.State). They used to be the values of the Node's status.progress enum, because the
 // state machine read its own state out of that field; v2alpha1 has no such field, and the input of
-// a pass is derived, not recorded (docs/design/nodeclaim.md §6).
+// a pass is derived, not recorded (docs/development/nodeclaim.md §6).
 const (
 	StateShutdown     = phase.StateShutdown
 	StateStartingUp   = phase.StateStartingUp
@@ -285,7 +285,7 @@ type ClaimWriter interface {
 	// writer (and the bound the count feeds) lives behind it, and it is called where the shutdown is
 	// fired: the path that created the shutdown Job. A reconcile pass that only looked at the machine
 	// is not an attempt, and a streak counted per pass spends the bound on polling the observation
-	// (docs/design/nodeclaim.md §4).
+	// (docs/development/nodeclaim.md §4).
 	RecordShutdownAttempt(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error
 }
 

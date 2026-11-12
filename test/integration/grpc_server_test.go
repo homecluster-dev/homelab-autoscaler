@@ -433,7 +433,7 @@ var _ = Describe("gRPC Server Integration Tests", func() {
 		Context("when group has running nodes", func() {
 			It("refuses a decrease of a group whose live claims are all committed, retryably", func() {
 				// The scenario's machine is a ready claim: the machine is running work, and
-				// this entry point cancels pending claims only (docs/design/nodeclaim.md §5).
+				// this entry point cancels pending claims only (docs/development/nodeclaim.md §5).
 				mockClient, err := loader.CreateMockClientWithScenario("shutting-down")
 				Expect(err).NotTo(HaveOccurred())
 				server = grpcserver.NewHomeClusterProviderServer(mockClient, scheme.Scheme)

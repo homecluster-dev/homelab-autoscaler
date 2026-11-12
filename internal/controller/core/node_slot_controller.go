@@ -43,7 +43,7 @@ import (
 // shuttingdown/shutdown/startingup, so an unseeded pool reported targetSize == number of slots,
 // cluster-autoscaler read "max size reached" and never asked for a scale up - the seeding existed to
 // make that arithmetic come out. v2alpha1 counts live claims, and "no live claim" needs no seeding,
-// no status and no observation (docs/design/nodeclaim.md §2). What is left here is the report: one
+// no status and no observation (docs/development/nodeclaim.md §2). What is left here is the report: one
 // column that tells an operator the slot is free.
 //
 // KubernetesNodeReconciler is driven by corev1.Node objects, so a slot with no machine never gets a
@@ -176,7 +176,7 @@ func needsStatusSeed(node *infrav2alpha1.Node) bool {
 // What has to be seeded is decided by the spec, so the watch uses GenerationChangedPredicate: it
 // lets create events and spec changes through, and ignores updates that only touch fields written by
 // the other reconcilers. In v2alpha1 the spec of a slot carries no runtime intent at all
-// (spec.desiredPowerState is gone with the claim model, docs/design/nodeclaim.md §2), so "the spec
+// (spec.desiredPowerState is gone with the claim model, docs/development/nodeclaim.md §2), so "the spec
 // changed" is the only question this predicate answers, and it is the right one: a status write bumps
 // the resourceVersion, never the generation, so status-only updates from KubernetesNodeReconciler and
 // the FSM do not re-trigger this reconciler.

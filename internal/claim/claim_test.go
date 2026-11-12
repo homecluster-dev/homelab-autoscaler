@@ -35,7 +35,7 @@ import (
 )
 
 // The fixtures every test of this package reads: one slot, one group, one request. The names are
-// the ones the design's example uses (docs/design/nodeclaim.md §3), so a failure reads as the doc.
+// the ones the design's example uses (docs/development/nodeclaim.md §3), so a failure reads as the doc.
 const (
 	fixNamespace = "homelab-autoscaler-system"
 	fixSlot      = "remote-worker-2"
@@ -138,7 +138,7 @@ func TestAttemptBudgetIsTheSumOfTheDeadlines(t *testing.T) {
 			"the budget is built from %s too: without it a claim is killed at the boundary of a deadline it is still inside", name)
 	}
 
-	// The design names the number the set adds up to (docs/design/nodeclaim.md §4:
+	// The design names the number the set adds up to (docs/development/nodeclaim.md §4:
 	// 5m + 30s + 90s + 4m + 10s + 1m = 12m10s). Changing a deadline is a deliberate act, and this
 	// assertion is the one that says so in the release notes.
 	assert.Equal(t, 12*time.Minute+10*time.Second, AttemptBudget(),

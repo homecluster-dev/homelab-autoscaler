@@ -55,17 +55,56 @@ kubectl get nodes.infra.homecluster.dev -A -o jsonpath=\
 '{range .items[*]}{.apiVersion} {.metadata.namespace}/{.metadata.name}{"\n"}{end}'
 ```
 
-The API server refuses a CRD update that drops the storage version while objects are still stored
-under it. Two ways out, and both mean the same thing for your data, because the pool goes to zero
-anyway:
+The field that decides whether the upgrade is accepted is `status.storedVersions`, and the API
+server **only ever adds to it**. The CRD registry appends the storage version on create and on update
+(`customresourcedefinition/strategy.go`), and every name in the list has to still be in
+`spec.versions` — which is the rule a v2-only CRD breaks:
 
-- **Delete the objects first.** They are the slots, and step 4 recreates them from Git:
-  `kubectl delete nodes.infra.homecluster.dev -n homelab-autoscaler-system --all` (same for `groups`
-  if you re-apply them too).
+```
+CustomResourceDefinition.apiextensions.k8s.io "nodes.infra.homecluster.dev" is invalid:
+status.storedVersions[0]: Invalid value: "v1alpha1": missing from spec.versions; v1alpha1 was
+previously a storage version, and must remain in spec.versions until a storage migration ensures no
+data remains persisted in v1alpha1 and removes v1alpha1 from status.storedVersions
+```
+
+Deleting the objects does **not** clear the field. It is a status field of the CRD, and a write to
+the spec cannot touch it (the registry strategy copies the old status over the new one). Two ways
+out, and both mean the same thing for your data, because the pool goes to zero anyway:
+
+- **Delete the objects, then patch the status.** The slots are what step 4 recreates from Git.
 - **Step through a merged CRD.** Apply a CRD that serves `v1alpha1` and `v2alpha1` with `v2alpha1` as
-  the storage version, let the existing objects be read as `v2alpha1`, delete them, then apply the
+  the storage version, let the existing objects be read as `v2alpha1`, delete them, then land the
   chart's CRD set. This is the path that keeps objects readable in the middle, and it is the slower
-  one.
+  one — and it ends at the same status patch, because the merged CRD keeps `v1alpha1` in
+  `spec.versions`, so the entry stays in `status.storedVersions`.
+
+### 2a. Delete the objects
+
+```bash
+kubectl delete nodes.infra.homecluster.dev -n homelab-autoscaler-system --all
+kubectl delete groups.infra.homecluster.dev -n homelab-autoscaler-system --all
+```
+
+### 2b. Patch the stored versions — mandatory, both CRDs
+
+```bash
+kubectl patch crd nodes.infra.homecluster.dev --subresource=status --type=merge -p '{"status":{"storedVersions":["v2alpha1"]}}'
+kubectl patch crd groups.infra.homecluster.dev --subresource=status --type=merge -p '{"status":{"storedVersions":["v2alpha1"]}}'
+
+# both lines must answer ["v2alpha1"] before the upgrade
+kubectl get crd nodes.infra.homecluster.dev groups.infra.homecluster.dev \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.status.storedVersions}{"\n"}{end}'
+```
+
+Without this the `helm upgrade` below is refused — `crd.enable: true` renders the three CRDs as
+templates, so the upgrade replaces them, and replacing them is the write the validation above
+refuses. The check at the end of this step, `status.storedVersions == ["v2alpha1"]`, is unreachable:
+the field still says `["v1alpha1"]` and the release never lands.
+
+The patch is not a claim about data you kept: you deleted the objects in 2a, so nothing is persisted
+under `v1alpha1`, and `["v2alpha1"]` is the truth the CRD update requires. **If you did not delete
+the objects, do not patch.** With `v1alpha1` gone from `spec.versions` those objects are unreadable —
+no schema, no decode — and the migration has to go through the merged CRD instead.
 
 Then apply the `0.2.3` CRDs:
 
@@ -85,10 +124,25 @@ kubectl get crd nodes.infra.homecluster.dev -o jsonpath='{.status.storedVersions
 kubectl get crd groups.infra.homecluster.dev nodes.infra.homecluster.dev nodeclaims.infra.homecluster.dev
 ```
 
+If that line says `["v1alpha1"]`, 2b did not run and the `helm upgrade` above did not land: the CRD on
+the cluster is still the `0.1.x` one, and the manager you are about to start in step 3 has no
+`v2alpha1` to watch.
+
 **A stale `metadata.managedFields`.** An object whose managed-fields entries name
-`infra.homecluster.dev/v1alpha1` can be refused by a write after that version is gone, with a
-conversion error naming `v1alpha1`. The procedure recreates the slots (step 4), which clears it. If
-you restore from a `kubectl get -o yaml` backup, strip `metadata.managedFields` (and
+`infra.homecluster.dev/v1alpha1` can be refused by a write after that version stops being served, by
+a conversion the API server cannot answer:
+
+```
+Error from server (InternalError): Internal error occurred: request to convert CR from an invalid
+group/version: infra.homecluster.dev/v1alpha1
+```
+
+A write to the object converts its managed fields, and the converter only knows the group/versions the
+CRD serves. The fix is to re-add `v1alpha1` to the CRD as a **served** version and not the storage
+version (`served: true, storage: false`) long enough to delete the stale objects, or rewrite them with
+`kubectl replace`, then drop the version again — which needs the 2b status patch a second time, for
+the same reason. The procedure above recreates the slots from Git (step 4), so it does not hit this.
+If you restore from a `kubectl get -o yaml` backup, strip `metadata.managedFields` (and
 `metadata.creationTimestamp`, `metadata.uid`, `metadata.resourceVersion`) from the file you apply.
 
 ## 3. The operator

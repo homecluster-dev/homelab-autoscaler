@@ -377,7 +377,7 @@ func lifecycleJob(slot *infrav2alpha1.Node, jobPhase string) *batchv1.Job {
 // the claim digest of the slot. A shutdown script that exits 0 while the machine stays up is the
 // pool's bug, not a reason for the controller to fire the same shutdown every resync; and the count
 // that decides it lives on the claim that asked for the scale-down, so it ends with that episode and
-// needs no reset heuristic on the long-lived slot (docs/design/nodeclaim.md §4, the removal of the
+// needs no reset heuristic on the long-lived slot (docs/development/nodeclaim.md §4, the removal of the
 // v1alpha1 ShutdownAttempts condition).
 func TestNodeReconciler_ScaleDownAttemptBound(t *testing.T) {
 	// scaleDownDigest is the record of an episode that left a machine up: the scale-down call, the
@@ -659,7 +659,7 @@ func TestNodeReconciler_ErrorHandling(t *testing.T) {
 // TestNodeReconciler_InputLawStates is the state half of the input law, as a table: every shape of
 // (live claim, observed power, usability, lifecycle Jobs) maps to exactly one state, and the
 // slot's recorded report is not an input to that mapping. It is the phase state table of
-// docs/architecture/state.md, asserted on the state the machine starts a pass in.
+// docs/development/state.md, asserted on the state the machine starts a pass in.
 func TestNodeReconciler_InputLawStates(t *testing.T) {
 	tests := []struct {
 		name  string

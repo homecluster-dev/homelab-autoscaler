@@ -430,7 +430,7 @@ func GetJobEvents(namespace string, jobLabel string) (string, error) {
 // booting, ready or draining. The report is computed from (the live NodeClaim of the slot, the
 // power the provider observes, the usability of the node), so it is the field to read for what a
 // slot is doing. The v1alpha1 status.progress - the FSM's state and the world's report at once - is
-// gone with the model that needed it (docs/design/nodeclaim.md 11).
+// gone with the model that needed it (docs/development/nodeclaim.md 11).
 func WaitForSlotPhase(namespace string, nodeName string, phase string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 

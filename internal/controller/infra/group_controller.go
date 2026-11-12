@@ -134,7 +134,7 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 // keeps them honest without a second record of the same fact: a slot's phase is computed from (the
 // live claim, the observed power, the node's usability), and the pool's number is the sum of its
 // slots' values. It is a display sum, and the group controller decides nothing from it - the
-// provider's arithmetic reads the live claims and the slots directly (docs/design/nodeclaim.md §5).
+// provider's arithmetic reads the live claims and the slots directly (docs/development/nodeclaim.md §5).
 //
 // The last scale is the one field that is **materialized rather than read on demand**, and it has
 // to be: the same story is a Kubernetes Event on a slot, Events are garbage-collected in about an
