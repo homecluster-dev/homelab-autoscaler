@@ -1542,16 +1542,20 @@ spec:
 				nil)).To(Succeed())
 
 			// The suite's write is the input of the rule; the controller acts on the slot it can read.
-			// So the gate first waits for the slot to carry the declaration the suite applied - if a
-			// write of the same object from the operator, a Git apply or the harness wins that race,
-			// this is where it is named, with the slot's own lines beside it - and only then asserts
-			// what the writer does with it.
-			Eventually(func() string {
-				return slotDeclarationNote(zonedSlot)
+			// So the gate first waits for the slot to carry *exactly* the declaration the suite applied,
+			// read as maps off the API server (not a substring of a rendering, which a superset of the
+			// declaration satisfies), and only then asserts what the writer does with it. Two writers can
+			// lose this gate, and the gate names both: a second writer that puts a key back, and the
+			// suite's own patch not meaning what it says - a JSON merge patch merges maps, so a key the
+			// patch does not name stays declared, and the removal below has nothing to remove.
+			// `patchSlotLabels` is what turns the map into the nulls that removal needs.
+			Eventually(func() (declaredMetadata, error) {
+				return slotDeclaration(zonedSlot)
 			}, labelGate, checkInterval).Should(
-				ContainSubstring(fmt.Sprintf(`{"topology.kubernetes.io/zone":"%s"}`, zoneA)),
-				"the slot carries the dropped declaration, so the pass below has one input to act on: %s",
-				controllerLogNote(zonedSlot))
+				Equal(declaredMetadata{Labels: map[string]string{"topology.kubernetes.io/zone": zoneA}}),
+				"the slot carries the dropped declaration and nothing else - the annotations field is gone, "+
+					"the rack key is gone - so the pass below has one input to act on: %s",
+				slotDeclarationNote(zonedSlot)+controllerLogNote(zonedSlot))
 
 			// A key the declaration drops comes off the node on the slot's next pass, and a settled slot
 			// has no pass of its own. The suite asks for the pass on every poll, so the gate measures

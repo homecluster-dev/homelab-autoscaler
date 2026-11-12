@@ -43,12 +43,37 @@ import (
 // helper that returns the zero value lets an Eventually poll, and the gate above it is the sentence
 // about the feature.
 
-// patchSlotLabels writes spec.nodeLabels and spec.nodeAnnotations of a slot, the way a Git apply
-// does: a merge patch that replaces the two maps. A nil map is sent as null, which removes the
-// field, which is the "operator deleted the key from the file" case the apply has to follow.
+// patchSlotLabels writes spec.nodeLabels and spec.nodeAnnotations of a slot so the slot ends up
+// carrying *exactly* the maps passed: that is the state a Git apply of the slot's file produces, and
+// it is the only state the specs in this suite can be read as.
+//
+// The write is a JSON merge patch (`kubectl patch --type=merge`), and a merge patch *merges* maps:
+// RFC 7386 keeps every key of the object that the patch does not name, and removes a key only when
+// the patch names it with a null. Sending the new map bare is therefore an edit of the declaration,
+// not the declaration — the key the operator deleted from the file is precisely the key that has to
+// be named as a null, and the field they deleted entirely is the field sent as a null (a nil map
+// here). Verified against the API server's own semantics, and re-asserted in
+// node_labels_helpers_test.go: `--type=merge -p '{"nodeLabels":{"a":"1"}}'` on a slot declaring
+// `{"a":"1","b":"2"}` leaves `b` in place, for the whole life of that machine.
+//
+// The keys to remove are computed from the slot as the API server holds it now (`readSlot`, a direct
+// read of the object, never a cached one), so the write means "this is the declaration". It matters
+// for what this suite proves: the spec drops a key from a declaration and asserts the writer takes
+// that label off the machine, and a patch that quietly keeps the key in the slot is a spec asserting
+// a removal rule with no removal in its input — the gate that waits for the slot to carry the new
+// declaration is the one that catches it, and it is the gate that failed.
 func patchSlotLabels(slot string, labels, annotations map[string]string) error {
-	body := map[string]any{}
-	body["spec"] = map[string]any{"nodeLabels": labels, "nodeAnnotations": annotations}
+	current, err := readSlot(slot)
+	if err != nil {
+		return fmt.Errorf("read the declaration of slot %s before patching it: %w", slot, err)
+	}
+
+	body := map[string]any{
+		"spec": map[string]any{
+			"nodeLabels":      declarationPatch(current.Spec.NodeLabels, labels),
+			"nodeAnnotations": declarationPatch(current.Spec.NodeAnnotations, annotations),
+		},
+	}
 
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -59,6 +84,54 @@ func patchSlotLabels(slot string, labels, annotations map[string]string) error {
 		"--type=merge", "-p", string(payload)))
 
 	return err
+}
+
+// declarationPatch is one field of a declaration rendered as the value a merge patch needs to make
+// the slot's field equal `declared`: every declared key with its value, and a null for every key the
+// live declaration carries and the new one drops. A nil `declared` drops the field.
+func declarationPatch(current, declared map[string]string) any {
+	if declared == nil {
+		return nil
+	}
+
+	value := make(map[string]any, len(declared)+len(current))
+	for key, valueOf := range declared {
+		value[key] = valueOf
+	}
+
+	for key := range current {
+		if _, kept := declared[key]; !kept {
+			value[key] = nil
+		}
+	}
+
+	return value
+}
+
+// declaredMetadata is a slot's declaration as one comparable value, for a gate that asserts the whole
+// declaration of a slot. nil and an empty map are kept apart on purpose: the field is absent, and the
+// field declares nothing, are two answers, and the removal rule is stated over the set of keys the
+// slot declares.
+type declaredMetadata struct {
+	Labels      map[string]string
+	Annotations map[string]string
+}
+
+// slotDeclaration reads a slot's declaration through the API server — `kubectl get -o json`, decoded
+// against the API type, so a gate compares maps and not a rendering — and reports a read that failed:
+// a declaration that could not be read must not answer as the empty declaration it is asserted
+// against. The read is direct, so a gate over it does not race an informer's cache: the suite's own
+// patch has already been through the API server when the poll starts.
+func slotDeclaration(slot string) (declaredMetadata, error) {
+	current, err := readSlot(slot)
+	if err != nil {
+		return declaredMetadata{}, fmt.Errorf("read slot %s: %w", slot, err)
+	}
+
+	return declaredMetadata{
+		Labels:      current.Spec.NodeLabels,
+		Annotations: current.Spec.NodeAnnotations,
+	}, nil
 }
 
 // kubeNodeLabels reads the labels of the Kubernetes node of a slot.
@@ -203,12 +276,12 @@ func describeNodeMetadata(nodeName string) string {
 		}
 	}
 
-	out, err := utils.Run(kubectl("get", "nodes.infra.homecluster.dev", nodeName, "-n", namespace,
-		"-o", `jsonpath={.spec.nodeLabels} {.spec.nodeAnnotations}`))
+	declared, err := slotDeclaration(nodeName)
 	if err != nil {
 		lines = append(lines, "  slot declaration unreadable: "+err.Error())
 	} else {
-		lines = append(lines, "  slot declares: "+strings.TrimSpace(out))
+		lines = append(lines, "  slot declares: "+renderDeclaration(declared.Labels)+
+			" "+renderDeclaration(declared.Annotations))
 	}
 
 	return "\n" + strings.Join(lines, "\n")
@@ -216,13 +289,32 @@ func describeNodeMetadata(nodeName string) string {
 
 // slotDeclarationNote renders the slot's own declaration, the input of every write the suite asserts.
 func slotDeclarationNote(slot string) string {
-	out, err := utils.Run(kubectl("get", "nodes.infra.homecluster.dev", slot, "-n", namespace,
-		"-o", `jsonpath={.spec.nodeLabels} {.spec.nodeAnnotations}`))
+	declared, err := slotDeclaration(slot)
 	if err != nil {
 		return "  slot declaration unreadable: " + err.Error()
 	}
 
-	return "  slot declares: " + strings.TrimSpace(out)
+	return "  slot declares: " + renderDeclaration(declared.Labels) + " " +
+		renderDeclaration(declared.Annotations)
+}
+
+// renderDeclaration renders one declared map with encoding/json: sorted keys, no spacing, a format
+// this file controls. It is deliberately not `kubectl get -o jsonpath` output: the client library
+// prints a Go map with its own rendering, which has changed between kubectl versions, and a
+// diagnostic — let alone a gate — whose text the toolchain chooses reads as a failure of the feature.
+// An absent field says so, because "the key is not in the declaration" and "the declaration is gone"
+// are different answers about a removal.
+func renderDeclaration(declared map[string]string) string {
+	if declared == nil {
+		return "unset"
+	}
+
+	payload, err := json.Marshal(declared)
+	if err != nil {
+		return "unreadable: " + err.Error()
+	}
+
+	return string(payload)
 }
 
 // sortedKeysOf renders a map's keys in order, for a message that has to be comparable between runs.
