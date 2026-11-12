@@ -436,24 +436,34 @@ spec:
             description: status defines the observed state of Node
             properties:
               activationsLast24H:
+                default: 0
                 description: |-
                   ActivationsLast24H is how many of those boots are inside the last 24 hours. It is a
-                  materialized count of status.recentTransitions, not a third record of the same fact: the
-                  ring is the ledger and this is its sum, recomputed on every write of the report, and pruned
-                  and recomputed on the pass that watches the oldest entry expire (see
-                  phase.NextTransitionExpiry). Churn - the pool that boots a machine for one pod and powers it
-                  off ten minutes later - is visible here and nowhere else in the API.
+                  materialized count, not a third record of the same fact: it is the sum of
+                  status.recentActivations - the ledger of the boots inside the window - recomputed on every
+                  write of the report, and pruned and recomputed on the pass that watches the oldest boot expire
+                  (see phase.NextTransitionExpiry). Churn - the pool that boots a machine for one pod and powers
+                  it off ten minutes later - is visible here and nowhere else in the API.
+
+                  It is **not** counted from status.recentTransitions: the ring is the display history, is capped
+                  at 32 rows, and a slot that churns writes more rows a day than the ring keeps, so a pool that
+                  booted 40 times today would report 16 and the column would go flat exactly when the question
+                  gets interesting. The ledger's rows are one timestamp each, so the count is honest to
+                  ActivationWindowCap boots a day, and past that bound it is a floor, not a guess: a slot
+                  reporting 512 is a slot the pool woke up at least 512 times.
                 format: int32
                 minimum: 0
                 type: integer
               activationsTotal:
+                default: 0
                 description: |-
                   ActivationsTotal is the monotonic count of the slot's boots: every pass that recorded the
                   report entering `booting` counted one. It is the slot's lifetime counter ("how many times has
                   this machine been woken up"), and it never resets, so it is comparable to the machine, not
                   to the clock. It carries no `omitempty`: a zero is a number an operator reads ("this slot has
                   never been booted"), and a field omitted at zero renders an empty column, which is a different
-                  and worse sentence.
+                  and worse sentence. The default is what gives that zero to a slot written before the field
+                  existed: without it its column renders `<none>`.
                 format: int32
                 minimum: 0
                 type: integer
@@ -594,6 +604,22 @@ spec:
                     description: RequestedAt is when the request was made.
                     format: date-time
                     type: string
+                  scaledDownAt:
+                    description: |-
+                      ScaledDownAt is the instant a scale-down named this claim: the deletionTimestamp
+                      NodeGroupDeleteNodes, NodeGroupDecreaseTargetSize, a hand delete or the TTL collection of an
+                      expired claim landed on it (claim.ScaleDownRequestedAt is the same reading). Nil says no
+                      scale-down ended this episode, which is what tells a scale-up's digest from a scale-down's.
+
+                      It exists because the instant a scale-down asked is **not** the instant the episode's request
+                      was made. DeleteNodes rewrites spec.request.call, spec.request.nodes and spec.requestedBy on a
+                      claim that can be days old and does not touch spec.requestedAt, so "RequestedAt three days ago
+                      with Call DeleteNodes" is the normal shape of a scale-down and not a bug - and a machine taken
+                      back 24 minutes ago was being dated three days ago. The pool's `LASTSCALE` reads this field for
+                      a scale-down episode (group_controller.lastScaleOf), so the column is the instant the pool
+                      shrank.
+                    format: date-time
+                    type: string
                   shutdownAttempts:
                     description: |-
                       ShutdownAttempts is the scale-down attempts the claim had spent when the episode ended. It is
@@ -658,16 +684,44 @@ spec:
                 - ready
                 - draining
                 type: string
+              recentActivations:
+                description: |-
+                  RecentActivations is the ledger of the slot's boots inside the 24 h window: the instant of
+                  every entry into `booting` the window still contains, oldest first, capped at
+                  ActivationWindowCap. activationsLast24H is its length.
+
+                  Why a second ledger next to the ring: the ring is bounded for display (32 rows), and a bound
+                  that a count is read through is a bound on the count - a slot that churns 40 times a day has
+                  80 rows a day and the ring keeps 32 of them, so the honest number and the displayed number
+                  cannot be the same field. This ledger holds nothing but the instants, so 512 of them cost less
+                  than 32 ring rows do, and the count is honest to 512 boots a day. Past the cap the count is a
+                  floor, and it says so by sitting at the cap.
+
+                  It is pruned by the same cutoff, on the same pass, by the one writer of the record
+                  (phase.Record). Like the ring it is observability: nothing in the operator reads it to decide
+                  anything, and internal/phase/hygiene_test.go enforces that.
+                items:
+                  format: date-time
+                  type: string
+                maxItems: 512
+                type: array
+                x-kubernetes-list-type: atomic
               recentTransitions:
                 description: |-
                   RecentTransitions is the bounded, time-boxed ring of the slot's phase changes: the last
                   TransitionRingCap of them, pruned to TransitionWindow. It is the shape of the pool over a
                   day (`off -> booting -> ready -> draining -> off` at 03:00, and again at 09:00), readable
-                  with no second command, and it is what activationsLast24H is counted from.
+                  with no second command.
 
                   It is observability and nothing else: no reconciler, hook, provider call or state machine
                   reads it, and it is bounded on purpose - a day of a slot is 32 rows, not a growing list in
-                  etcd.
+                  etcd. The rows are appended by the pass that records each change, so their order is the order
+                  the writes landed and not the order the changes happened: two writers racing inside one second
+                  (the observation path and the transition path) can be listed out of chronological order, which
+                  is a display detail of a churn and not a fact any code reads.
+
+                  It is not the ledger activationsLast24H is counted from - that is status.recentActivations,
+                  which has no display cap to trade against.
                 items:
                   description: |-
                     NodeTransition is one recorded change of Node.status.phase: the moment, the phase it came from,

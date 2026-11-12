@@ -28,6 +28,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
@@ -46,6 +47,15 @@ import (
 // The file asserts the writers are the ones the design names, too: phase.Record is the only writer
 // of the report's history, and it is called from the four passes that already own a write of
 // status.phase and from nowhere else.
+//
+// The granularity of the two allowlists below is the **file**, not the function: the greps render a
+// whole file (the AST walk for the selectors, the raw text for the rest), so the law pinned here is
+// "no file outside these writes the record", and a fifth writer inside a listed file - a second call
+// to Record in node_controller.go, say - is green here and is a review question, not a test one.
+// File granularity is the honest scope of a grep and it is deliberate: the class of bug this file
+// exists for is the *new* reader of the history, the code that consults a record of the past "just to
+// know what happened last", and that arrives as a new file (a new controller, a new package) far more
+// often than as a new function in a file whose job the design already names.
 
 // internalDir is the source tree the law is asserted over, relative to this file.
 const internalDir = "../../internal"
@@ -53,6 +63,7 @@ const internalDir = "../../internal"
 // observabilitySelectors are the field accesses that mean "this code read the report's history".
 var observabilitySelectors = []string{
 	".Status.RecentTransitions",
+	".Status.RecentActivations",
 	".Status.ActivationsTotal",
 	".Status.ActivationsLast24H",
 	".Status.PreviousPhase",
@@ -149,6 +160,9 @@ func TestNodePhaseFieldHasOneWriter(t *testing.T) {
 	require.Contains(t, src, "node.Status.LastTransitionTime = &stamp")
 	require.Contains(t, src, "node.Status.ActivationsTotal++")
 	require.Contains(t, src, "node.Status.ActivationsLast24H = count")
+	require.Contains(t, src, "node.Status.RecentTransitions = append(node.Status.RecentTransitions, infrav2alpha1.NodeTransition{")
+	require.Contains(t, src, "node.Status.RecentActivations = append(node.Status.RecentActivations, stamp)")
+	require.NotContains(t, src, "activationsInWindow", "the 24 h count is not read through the display ring's cap")
 }
 
 // TestRecordIsTheWriterOfEveryNewField is the round trip of the API fields: Record writes them, and
@@ -170,11 +184,17 @@ func TestRecordIsTheWriterOfEveryNewField(t *testing.T) {
 	assert.Equal(t, int32(1), node.Status.ActivationsTotal)
 	assert.Equal(t, int32(1), node.Status.ActivationsLast24H)
 
+	require.Len(t, node.Status.RecentActivations, 1, "the boot is recorded in the ledger the count is read from")
+	assert.True(t, node.Status.RecentActivations[0].Time.Equal(at))
+	assert.Equal(t, int32(1), node.Status.ActivationsLast24H, "and the count is its length")
+
 	clone := node.DeepCopy()
 	clone.Status.RecentTransitions[0].Reason = "mutated"
+	clone.Status.RecentActivations[0] = metav1.NewTime(at.Add(time.Hour))
 	clone.Status.ActivationsTotal = 99
 
 	assert.Equal(t, "claim c1, observed off", node.Status.RecentTransitions[0].Reason, "the ring is deep-copied, not aliased")
+	assert.True(t, node.Status.RecentActivations[0].Time.Equal(at), "so is the activation ledger")
 	assert.Equal(t, int32(1), node.Status.ActivationsTotal)
 }
 

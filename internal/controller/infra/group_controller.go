@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"time"
 
+	equality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -66,6 +68,9 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	// The status as it was read, kept to compare the computed one against.
+	before := *group.Status.DeepCopy()
+
 	// The slots of the pool: the same list the provider's max-size arithmetic reads (label `group`),
 	// and the only source of every number this controller writes.
 	slots := &infrahomeclusterdevv2alpha1.NodeList{}
@@ -77,22 +82,34 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	// Mark the Group status as "Loaded" using metav1.Condition
-	now := metav1.Now()
-	loadedCondition := metav1.Condition{
+	// The status this pass computes, on the object it just read. `Loaded` goes through
+	// meta.SetStatusCondition so its lastTransitionTime dates the moment the condition's status last
+	// changed and not this pass: stamping `now` on every write makes the field a counter of
+	// reconciles, and an operator reading it cannot tell a pool that started loading an hour ago from
+	// one that has been re-listing its slots every resync.
+	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{
 		Type:               "Loaded",
 		Status:             metav1.ConditionTrue,
-		LastTransitionTime: now,
 		Reason:             "GroupLoaded",
 		Message:            "Group has been successfully loaded and is ready for use",
-	}
+		LastTransitionTime: metav1.Now(),
+	})
 
-	// Update the Group status conditions
-	group.Status.Conditions = []metav1.Condition{loadedCondition}
-
-	// The pool at a glance: how many slots it has, how many report a machine that is up, and the
-	// last scale it made.
+	// The pool at a glance: how many slots it has, how many report a machine that is up, the last
+	// scale it made, and whether anything in it reports at all.
 	recordPoolShape(group, slots.Items)
+
+	// This controller runs on every phase change of every slot of the pool (Owns(&Node{})), and the
+	// slot's own write is what woke it, so a pass that computed what the pool already says is the
+	// common case: skip the write. A pool that rewrites its own status on every pass of every slot is
+	// a generator of the very events it is subscribed to, and an operator watching `kubectl get
+	// groups -w` sees a pool that never settles.
+	if equality.Semantic.DeepEqual(before, group.Status) {
+		logger.V(1).Info("Group status unchanged, skipping the write",
+			"group", group.Name, "slots", group.Status.Slots, "on", group.Status.On)
+
+		return ctrl.Result{}, nil
+	}
 
 	// Update the Group in the cluster
 	if err := r.Status().Update(ctx, group); err != nil {
@@ -125,19 +142,37 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 // the per-slot record that outlives a claim's TTL collection, so the newest of them, over the pool,
 // is materialized onto the pool itself: a scale is visible a day later, on the object an operator
 // opens, with nothing to correlate and no Event to have kept.
+//
+// The HEALTH column is derived here too, and cheaply: `offline` when nothing in the pool has ever
+// reported a phase (no slots committed, or a pool whose slot reconciler has never run on them),
+// `healthy` when at least one has. A pool whose every machine is `off` is a pool that is doing its
+// job, not an outage, so the column is not `on > 0`: it answers "is the control loop alive for this
+// pool", which is the one question the column can answer from data the controller has.
 func recordPoolShape(group *infrahomeclusterdevv2alpha1.Group, slots []infrahomeclusterdevv2alpha1.Node) {
 	group.Status.Slots = int32(len(slots))
 
-	var on int32
+	var on, reporting int32
 
 	for i := range slots {
 		if phase.IsUp(slots[i].Status.Phase) {
 			on++
 		}
+
+		if slots[i].Status.Phase != "" {
+			reporting++
+		}
 	}
 
 	group.Status.On = on
 	group.Status.Off = group.Status.Slots - on
+
+	// The pool is healthy when something in it reports: a slot that has never written a phase is a
+	// slot nobody is watching, and a pool of those is a pool that is not running.
+	if reporting == 0 {
+		group.Status.Health = infrahomeclusterdevv2alpha1.GroupHealthOffline
+	} else {
+		group.Status.Health = infrahomeclusterdevv2alpha1.GroupHealthHealthy
+	}
 
 	at, action, ok := lastScaleOf(slots)
 	if !ok {
@@ -151,17 +186,37 @@ func recordPoolShape(group *infrahomeclusterdevv2alpha1.Group, slots []infrahome
 
 	stamp := metav1.NewTime(at)
 	group.Status.LastScaleAt = &stamp
-	group.Status.LastScaleAction = action
+
+	// Clipped, not trusted: the sentence is `verb <slot name>`, a slot name is 253 characters by DNS
+	// rule and the field is bounded at scaleActionMaxLength, so an unclipped write is a status the API
+	// server refuses - on every pass, forever, for a pool whose operator cannot fix it without
+	// deleting the object.
+	group.Status.LastScaleAction = phase.Clip(action, scaleActionMaxLength)
 }
+
+// scaleActionMaxLength bounds Group.status.lastScaleAction, and matches the
+// +kubebuilder:validation:MaxLength of the field. The clipping itself is phase.Clip, the one helper
+// that bounds a composed display string (the ring's reason uses it for the same reason).
+const scaleActionMaxLength = phase.ScaleActionMaxLength
 
 // lastScaleOf returns the newest scale the slots remember: when it was asked for, and the one line
 // naming the slot and the request that moved it (`up remote-worker-3`, `down remote-worker-7`,
 // `ca:DeleteNodes remote-worker-2`).
 //
-// "Newest" is the request's own instant (status.lastClaim.requestedAt, falling back to finishedAt
-// for a digest written by a path that had no request time), because the question is when the pool
-// grew, not when its episode closed. The list the API server returns is name-ordered, so a tie is
-// resolved deterministically by keeping the first newest slot.
+// "Newest" is the **request's own instant**, which is two different fields of the digest:
+//
+//   - a scale-up is dated by `requestedAt`, the instant IncreaseSize created the claim;
+//   - a scale-down is dated by `scaledDownAt`, the deletionTimestamp the request landed on the claim.
+//     The two are not the same moment and the first one is not even close: DeleteNodes rewrites
+//     spec.request of a claim that can be days old and never touches spec.requestedAt, so reading the
+//     request time for a shrink dates "a machine taken back 24 minutes ago" by its boot, three days
+//     ago. The same rule as scaleVerbOf: the digest knows which kind of episode it is, and the
+//     rendering asks it.
+//
+// `finishedAt` is the fallback for a digest written by a path that had neither, and a digest with no
+// instant at all dates nothing: a slot whose claim never carried a time is not evidence about when
+// the pool moved. The list the API server returns is name-ordered, so a tie is resolved
+// deterministically by keeping the first newest slot.
 func lastScaleOf(slots []infrahomeclusterdevv2alpha1.Node) (time.Time, string, bool) {
 	var (
 		newest  time.Time
@@ -176,16 +231,8 @@ func lastScaleOf(slots []infrahomeclusterdevv2alpha1.Node) (time.Time, string, b
 			continue
 		}
 
-		at := time.Time{}
-		if digest.RequestedAt != nil {
-			at = digest.RequestedAt.Time
-		} else if digest.FinishedAt != nil {
-			at = digest.FinishedAt.Time
-		}
-
+		at := scaleInstantOf(digest)
 		if at.IsZero() {
-			// A digest with no time cannot date a scale; a slot whose claim never carried one is
-			// not evidence about when the pool moved.
 			continue
 		}
 
@@ -202,9 +249,29 @@ func lastScaleOf(slots []infrahomeclusterdevv2alpha1.Node) (time.Time, string, b
 	return newest, action, found
 }
 
+// scaleInstantOf is the instant a digest dates its scale by: the scale-down's own request when there
+// was one, the episode's request time when there was not, and the end of the episode as the last
+// resort of a record written before either was kept.
+func scaleInstantOf(digest *infrahomeclusterdevv2alpha1.LastClaimSummary) time.Time {
+	if digest.ScaledDownAt != nil {
+		return digest.ScaledDownAt.Time
+	}
+
+	if digest.RequestedAt != nil {
+		return digest.RequestedAt.Time
+	}
+
+	if digest.FinishedAt != nil {
+		return digest.FinishedAt.Time
+	}
+
+	return time.Time{}
+}
+
 // scaleVerbOf renders the request a slot carries into the verb an operator reads. The three calls
-// are the three ways a pool moves in this model: the autoscaler asking for a machine, the
-// autoscaler taking one back, and the autoscaler naming the machines to remove. Anything else (a
+// are the three ways a pool moves in this model: the autoscaler asking for a machine, the autoscaler
+// cancelling a pending request (DecreaseTargetSize, which records its attribution on the claim it
+// deletes before it deletes it), and the autoscaler naming the machines to remove. Anything else (a
 // call a future version adds) is rendered by its own name, so the column never silently lies about
 // a verb it does not know.
 func scaleVerbOf(call string) string {

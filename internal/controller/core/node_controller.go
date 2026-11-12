@@ -33,6 +33,7 @@ import (
 	"github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
@@ -235,7 +236,19 @@ func nodeUsable(k8sNode *corev1.Node, nodeCR *infrav2alpha1.Node) bool {
 }
 
 // observationInput assembles the state machine's input for one observation of one slot: the live
-// claim the slot carries, the power the node object shows, and whether the node can take work.
+// claim the slot carries, the power the node object shows, whether the node can take work, and the
+// two lifecycle-Job facts that separate "claimed, nothing started" from "a startup is in flight".
+//
+// The Job fields are not decoration: phase.Derive reads them (a pending claim with a startup Job
+// running is `booting`, and without it `pending`), and the transition path fills them. An observation
+// that left them empty derived a **different phase for one machine** than the transition path derived
+// from the same world, and since the record of the report became one writer's job every such
+// disagreement appends a row to the slot's ring and can count a boot twice - the two paths trading
+// one slot's `pending` and `booting` back and forth, once per pass. So the fields are filled by the
+// one helper that answers the question, the same one the transition path calls
+// (fsm.JobsInFlightOfSlot, via the infra reconciler). The pair is pinned by
+// TestObservationInputAndLifecycleInputDeriveOnePhase, in this package and in
+// internal/controller/infra/node_controller_test.go.
 //
 // A claim list that fails is not fatal: a slot with no claim read is a slot reported from the
 // observation alone, which is the value of the report before any claim existed, and the next pass
@@ -249,10 +262,14 @@ func (r *KubernetesNodeReconciler) observationInput(ctx context.Context, nodeCR 
 		live = claim.LiveOfSlot(claims)
 	}
 
+	startup, shutdown := fsm.JobsInFlightOfSlot(ctx, r.Client, nodeCR.Namespace, nodeCR.Name)
+
 	return phase.Input{
-		Claim:         live,
-		ObservedPower: powerState,
-		NodeUsable:    nodeUsable(k8sNode, nodeCR),
+		Claim:               live,
+		ObservedPower:       powerState,
+		NodeUsable:          nodeUsable(k8sNode, nodeCR),
+		StartupJobInFlight:  startup,
+		ShutdownJobInFlight: shutdown,
 	}
 }
 

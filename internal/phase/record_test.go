@@ -109,9 +109,13 @@ func TestIsActivationIsTheReportNotTheTransition(t *testing.T) {
 	assert.False(t, IsActivation(infrav2alpha1.NodePhaseOff, infrav2alpha1.NodePhasePending))
 }
 
-// TestRingIsBounded: 40 changes of a churning slot leave the last 32, newest last. The bound is
-// what keeps a day of a pool in etcd.
-func TestRingIsBounded(t *testing.T) {
+// TestRingIsBoundedAndTheCountIsNot: 40 boots of a churning slot leave the ring with its last 32
+// rows, newest last - the bound is what keeps a day of a pool in etcd - and the 24 h count with all
+// 40. A count read through a display bound is a count capped at half the display bound: the ring is
+// 32 rows and a boot is two of them (in and out), so counting the ring flatlines the churn column at
+// 16 exactly where the question starts to matter. The ledger of boots is a second, cheaper list
+// (one timestamp per row) and is what activationsLast24H is the length of.
+func TestRingIsBoundedAndTheCountIsNot(t *testing.T) {
 	node := slot()
 
 	at := t0
@@ -128,10 +132,70 @@ func TestRingIsBounded(t *testing.T) {
 	assert.Equal(t, infrav2alpha1.NodePhaseOff, node.Status.RecentTransitions[TransitionRingCap-1].To)
 	assert.True(t, node.Status.RecentTransitions[TransitionRingCap-1].At.Time.Equal(at.Add(-time.Minute)))
 
-	// The counter is a lifetime counter and is not bounded by the ring: all 40 boots are counted
-	// in the total, and only the ones the ring still holds are counted in the 24 h window.
+	// The lifetime counter is not bounded by anything, and the window count is not bounded by the
+	// ring: all 40 boots are in both, and the ledger that counts them holds exactly 40 rows.
 	assert.Equal(t, int32(40), node.Status.ActivationsTotal)
-	assert.Equal(t, int32(16), node.Status.ActivationsLast24H, "the ring's newest 32 rows carry 16 boots")
+	assert.Equal(t, int32(40), node.Status.ActivationsLast24H, "the count is the ledger, not the ring")
+	require.Len(t, node.Status.RecentActivations, 40)
+
+	// The two lists are pruned by the same cutoff. The churn spans 80 minutes, so a pass 26 hours
+	// later has a cutoff past every row of both, and the count goes with them.
+	Record(node, infrav2alpha1.NodePhaseOff, t0.Add(26*time.Hour), "resync")
+
+	assert.Equal(t, int32(0), node.Status.ActivationsLast24H)
+	assert.Empty(t, node.Status.RecentActivations, "the ledger ages out row by row, like the ring")
+	assert.Equal(t, int32(40), node.Status.ActivationsTotal, "the lifetime counter is not a window")
+}
+
+// TestActivationWindowIsBoundedIsTheHonestBound: 600 boots in a day are 600 rows in a list of
+// timestamps, and the ledger's own cap (ActivationWindowCap) is where the count stops - a floor the
+// column states by sitting at the cap, not a silent flatline at 16.
+func TestActivationWindowIsBoundedIsTheHonestBound(t *testing.T) {
+	node := slot()
+
+	at := t0
+
+	for range 600 {
+		Record(node, infrav2alpha1.NodePhaseBooting, at, "boot")
+		at = at.Add(time.Second)
+
+		Record(node, infrav2alpha1.NodePhaseOff, at, "off")
+		at = at.Add(time.Second)
+	}
+
+	assert.Equal(t, int32(600), node.Status.ActivationsTotal, "the lifetime count is unbounded")
+	require.Len(t, node.Status.RecentTransitions, TransitionRingCap, "the display ring keeps its bound")
+	require.Len(t, node.Status.RecentActivations, ActivationWindowCap, "the ledger keeps its own, 16x wider")
+	assert.Equal(t, int32(ActivationWindowCap), node.Status.ActivationsLast24H, "the count is the ledger's length: a stated floor")
+
+	// The rows the cap dropped are the oldest: the newest boot of all is in the ledger, and the
+	// window's next expiry is the oldest row it kept.
+	expiry, ok := NextTransitionExpiry(node, at)
+	require.True(t, ok)
+	assert.True(t, expiry.After(at), "the count still has boots to lose, and the requeue says when")
+}
+
+// TestLedgerIsSeededFromTheRingOnUpgrade: a slot written before the ledger existed has a ring and no
+// activation rows. Recomputing the count from an empty ledger would zero a churning pool's column on
+// the upgrade and for a day after it, so the boots the ring still names become the ledger's rows.
+func TestLedgerIsSeededFromTheRingOnUpgrade(t *testing.T) {
+	node := slot()
+
+	at := metav1.NewTime(t0)
+	node.Status.RecentTransitions = []infrav2alpha1.NodeTransition{
+		{At: &at, From: infrav2alpha1.NodePhaseOff, To: infrav2alpha1.NodePhaseBooting},
+		{At: &at, From: infrav2alpha1.NodePhaseBooting, To: infrav2alpha1.NodePhaseReady},
+	}
+	node.Status.Phase = infrav2alpha1.NodePhaseReady
+	node.Status.ActivationsLast24H = 1
+
+	// A stable pass: the slot reports what the inputs derive, so nothing is appended and the window
+	// is what moves - and the seeding is what keeps the count at 1 instead of 0.
+	require.True(t, Record(node, infrav2alpha1.NodePhaseReady, t0.Add(time.Hour), "resync"))
+
+	require.Len(t, node.Status.RecentActivations, 1, "the boot the ring remembers became a ledger row")
+	assert.True(t, node.Status.RecentActivations[0].Time.Equal(t0))
+	assert.Equal(t, int32(1), node.Status.ActivationsLast24H)
 }
 
 // TestActivationsLast24HIsNotStale is the 24 h honesty case the design note asks for, with an
@@ -245,6 +309,24 @@ func TestRecordClipsAReason(t *testing.T) {
 
 	require.Len(t, node.Status.RecentTransitions, 1)
 	assert.Len(t, node.Status.RecentTransitions[0].Reason, ReasonMaxLength)
+}
+
+// TestClipIsTheBoundOfBothComposedStrings: the ring's reason and the pool's last-scale sentence are
+// composed from object names, and Clip is their one bound. A Kubernetes name is 253 characters, the
+// verb `ca:DeleteNodes` is 14 plus a space, and the field is bounded at 256 - so the composition is
+// over the bound by 12 characters on a legal name, and a writer that does not clip produces a status
+// the API server refuses on every pass, for an object nobody can fix without deleting it.
+func TestClipIsTheBoundOfBothComposedStrings(t *testing.T) {
+	long := "ca:DeleteNodes " + strings.Repeat("w", 253)
+	require.Greater(t, len([]rune(long)), ScaleActionMaxLength)
+
+	clipped := Clip(long, ScaleActionMaxLength)
+
+	assert.Len(t, []rune(clipped), ScaleActionMaxLength, "exactly the bound, ellipsis included")
+	assert.True(t, strings.HasPrefix(clipped, "ca:DeleteNodes "), "the verb survives the clip: the sentence starts with what the pool did")
+	assert.True(t, strings.HasSuffix(clipped, "..."), "and the truncation is visible")
+
+	assert.Equal(t, "up remote-worker-2", Clip("up remote-worker-2", ScaleActionMaxLength), "a string inside the bound is returned untouched")
 }
 
 // TestReasonNamesTheInputsItWasDerivedFrom: the row says what the value was computed from, so

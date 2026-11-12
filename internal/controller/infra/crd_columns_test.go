@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,33 +56,41 @@ const (
 // wantNodeColumns is `kubectl get nodes.infra.homecluster.dev`, column by column. Powerstate and
 // Phase are the columns that existed before this work: their names, casing and paths are frozen
 // here, so the two that came first cannot be renamed by the ones that came after.
+//
+// No column declares a priority: the markers carry no `priority=0`, because 0 is the field's default
+// and writing it out invites the reading that a column is optional. The default is asserted here, on
+// the generated manifest, as part of each column's key.
 var wantNodeColumns = []columnSpec{
 	{name: "Powerstate", kind: "string", jsonPath: ".status.powerState"},
 	{name: "Phase", kind: "string", jsonPath: ".status.phase"},
 	{name: "Group", kind: "string", jsonPath: ".metadata.labels.group"},
 	{name: "Zone", kind: "string", jsonPath: `.spec.nodeLabels['topology\.kubernetes\.io/zone']`},
 	{name: "Since", kind: "date", jsonPath: ".status.lastTransitionTime"},
-	{name: "On24h", kind: "integer", jsonPath: ".status.activationsLast24H", priority: 0},
+	{name: "On24h", kind: "integer", jsonPath: ".status.activationsLast24H"},
 }
 
 // wantGroupColumns is `kubectl get groups`: NAME and AGE were all it had.
 var wantGroupColumns = []columnSpec{
 	{name: "Slots", kind: "integer", jsonPath: ".status.slots"},
-	{name: "On", kind: "integer", jsonPath: ".status.on", priority: 0},
-	{name: "Off", kind: "integer", jsonPath: ".status.off", priority: 0},
-	{name: "LastScale", kind: "date", jsonPath: ".status.lastScaleAt", priority: 0},
-	{name: "Health", kind: "string", jsonPath: ".status.health", priority: 0},
+	{name: "On", kind: "integer", jsonPath: ".status.on"},
+	{name: "Off", kind: "integer", jsonPath: ".status.off"},
+	{name: "LastScale", kind: "date", jsonPath: ".status.lastScaleAt"},
+	{name: "Health", kind: "string", jsonPath: ".status.health"},
 }
 
 type columnSpec struct {
 	name     string
 	kind     string
 	jsonPath string
+
+	// priority is the printer's visibility knob: 0 means the column is in the default table. It is
+	// part of the asserted key, so a `priority=1` that quietly hides a column from `kubectl get` is a
+	// red test and not a column an operator stops seeing.
 	priority int32
 }
 
 func (c columnSpec) String() string {
-	return c.name + "|" + c.kind + "|" + c.jsonPath
+	return fmt.Sprintf("%s|%s|%s|priority=%d", c.name, c.kind, c.jsonPath, c.priority)
 }
 
 func TestNodeCRDPrinterColumns(t *testing.T) {
@@ -130,7 +139,8 @@ func TestNodeStatusFieldsAreInTheCRD(t *testing.T) {
 	status := statusProperties(t, nodeCRD)
 
 	for _, name := range []string{
-		"lastTransitionTime", "previousPhase", "activationsTotal", "activationsLast24H", "recentTransitions",
+		"lastTransitionTime", "previousPhase", "activationsTotal", "activationsLast24H",
+		"recentTransitions", "recentActivations",
 	} {
 		field, ok := status[name]
 		require.True(t, ok, "status.%s is missing from the generated Node CRD", name)
@@ -144,10 +154,26 @@ func TestNodeStatusFieldsAreInTheCRD(t *testing.T) {
 				assert.Contains(t, field.Items.Schema.Properties, key, "the ring row carries %s", key)
 			}
 
-			assert.Equal(t, int64(32), *field.MaxItems, "the ring is bounded")
+			assert.Equal(t, int64(32), *field.MaxItems, "the display ring is bounded")
+		case "recentActivations":
+			// The ledger the 24 h count is read from: bounded on its own, wider than the ring, and a
+			// list of plain timestamps - which is what buys the wider bound.
+			assert.Equal(t, "array", field.Type)
+			require.NotNil(t, field.Items)
+			assert.Equal(t, "string", field.Items.Schema.Type)
+			assert.Equal(t, "date-time", field.Items.Schema.Format)
+			assert.Equal(t, int64(512), *field.MaxItems, "the count's bound is the ledger's, not the ring's")
 		case "activationsTotal", "activationsLast24H":
 			assert.Equal(t, "integer", field.Type)
 			assert.InDelta(t, 0.0, *field.Minimum, 0)
+
+			// The default is what stops a slot written before the field existed from rendering
+			// `<none>` in a column whose whole job is a number.
+			require.NotNil(t, field.Default, "status.%s carries a default of 0", name)
+
+			var default0 int64
+			require.NoError(t, yaml.Unmarshal(field.Default.Raw, &default0))
+			assert.Zero(t, default0, "and it is the zero the column means")
 		case "lastTransitionTime":
 			assert.Equal(t, "string", field.Type)
 			assert.Equal(t, "date-time", field.Format)
@@ -158,10 +184,29 @@ func TestNodeStatusFieldsAreInTheCRD(t *testing.T) {
 	}
 }
 
+// TestLastClaimDigestCarriesBothInstants: the pool's LASTSCALE is materialized from the slots'
+// digests, and the digest has to carry the two moments of an episode - the request that owned the
+// slot, and the scale-down that named it - because DeleteNodes rewrites the attribution of a claim
+// that is days old and never touches its request time. A digest without the second instant dates a
+// shrink by the boot it reversed, which is the bug the field exists to close.
+func TestLastClaimDigestCarriesBothInstants(t *testing.T) {
+	status := statusProperties(t, nodeCRD)
+
+	digest, ok := status["lastClaim"]
+	require.True(t, ok, "status.lastClaim is missing from the generated Node CRD")
+
+	for _, key := range []string{"name", "phase", "attempt", "call", "group", "reason", "requestedAt", "scaledDownAt", "deadlineAt", "finishedAt"} {
+		assert.Contains(t, digest.Properties, key, "the digest carries %s", key)
+	}
+
+	require.Contains(t, digest.Properties, "scaledDownAt")
+	assert.Equal(t, "date-time", digest.Properties["scaledDownAt"].Format)
+}
+
 func TestGroupStatusFieldsAreInTheCRD(t *testing.T) {
 	status := statusProperties(t, groupCRD)
 
-	for _, name := range []string{"slots", "on", "off", "lastScaleAt", "lastScaleAction"} {
+	for _, name := range []string{"slots", "on", "off", "lastScaleAt", "lastScaleAction", "health"} {
 		require.Contains(t, status, name, "status.%s is missing from the generated Group CRD", name)
 	}
 
@@ -170,7 +215,11 @@ func TestGroupStatusFieldsAreInTheCRD(t *testing.T) {
 	assert.Equal(t, "integer", status["off"].Type)
 	assert.Equal(t, "date-time", status["lastScaleAt"].Format)
 	assert.Equal(t, "string", status["lastScaleAction"].Type)
-	assert.Equal(t, int64(256), *status["lastScaleAction"].MaxLength)
+	assert.Equal(t, int64(256), *status["lastScaleAction"].MaxLength,
+		"the bound the group controller clips its composed sentence to (phase.ScaleActionMaxLength)")
+
+	assert.ElementsMatch(t, []any{"healthy", "offline", "unknown"}, enumValues(status["health"].Enum),
+		"HEALTH is an enum the controller derives, not free text")
 }
 
 // --- the machinery ---------------------------------------------------------------------------

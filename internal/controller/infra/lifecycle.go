@@ -80,37 +80,12 @@ func (r *NodeReconciler) lifecycleInput(ctx context.Context, node *infrav2alpha1
 }
 
 // lifecycleJobsInFlight reports whether a startup Job and whether a shutdown Job of this slot is
-// running. The lifecycle Jobs carry the slot's name and the lifecycle phase as labels
-// (fsm.LabelNodeCR, fsm.LabelPhase), so this is one list, and the answer is a fact about objects
-// that exist, not about a string someone wrote on a slot.
+// running. It is one call to the one place that answers the question (fsm.JobsInFlightOfSlot): the
+// labels it reads are the lifecycle Job's own, and the observation path - the other writer of the
+// derived report - asks the same question through the same helper, so the two writers of one phase
+// cannot feed phase.Derive two inputs about one machine.
 func (r *NodeReconciler) lifecycleJobsInFlight(ctx context.Context, node *infrav2alpha1.Node) (bool, bool) {
-	jobList := &batchv1.JobList{}
-	selector := labels.SelectorFromSet(labels.Set{fsm.LabelNodeCR: node.Name})
-
-	if err := r.List(ctx, jobList, &client.ListOptions{Namespace: node.Namespace, LabelSelector: selector}); err != nil {
-		log.FromContext(ctx).V(1).Info("Failed to list the lifecycle Jobs of the slot",
-			"node", node.Name, "error", err.Error())
-
-		return false, false
-	}
-
-	var startup, shutdown bool
-
-	for i := range jobList.Items {
-		job := &jobList.Items[i]
-		if !job.DeletionTimestamp.IsZero() || job.Status.Succeeded > 0 || job.Status.Failed > 0 {
-			continue
-		}
-
-		switch job.Labels[fsm.LabelPhase] {
-		case fsm.PhaseStartup:
-			startup = true
-		case fsm.PhaseShutdown:
-			shutdown = true
-		}
-	}
-
-	return startup, shutdown
+	return fsm.JobsInFlightOfSlot(ctx, r.Client, node.Namespace, node.Name)
 }
 
 // recoverFinishedLifecycleJob re-fires the lifecycle event of a Job that finished with nobody

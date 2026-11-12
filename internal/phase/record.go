@@ -44,6 +44,25 @@ const (
 	// than trusting the names to be short. A write the API server refused for a long reason would
 	// cost the whole report.
 	ReasonMaxLength = 320
+
+	// ScaleActionMaxLength bounds Group.status.lastScaleAction, and matches the
+	// +kubebuilder:validation:MaxLength of that field. The sentence is composed by the group
+	// controller as `verb <slot name>` - a verb up to `ca:DeleteNodes` and a Kubernetes name up to
+	// 253 characters - so the composition can exceed the bound, and the writer clips it here rather
+	// than trusting the names: a status write the API server refuses for a long name is a pool whose
+	// shape never updates again, for every pass, with no fix short of deleting the object. It lives
+	// beside ReasonMaxLength because the two are the same class of field, the same composed display
+	// string, and Clip is their one bound.
+	ScaleActionMaxLength = 256
+
+	// ActivationWindowCap bounds Node.status.recentActivations: the boots of the last 24 hours the
+	// slot keeps. It is 16x the ring's cap because the two rows cost different things - a ring row is
+	// a timestamp, two phases and a sentence, a ledger row is one timestamp - and the count has to be
+	// honest past the ring's display bound: a slot that churns 40 times a day writes 80 rows and the
+	// ring keeps 32 of them, so a count read through the ring is a count capped at 16, going flat
+	// exactly where the column starts to matter. 512 boots a day is 21 an hour, nonstop, past any
+	// pool this project is built for; past the cap the count is a floor and says so by sitting at it.
+	ActivationWindowCap = 512
 )
 
 // Record is the single writer of the observability that rides on Node.status.phase:
@@ -70,9 +89,9 @@ const (
 // nothing. A change is:
 //
 //   - the phase changing value: lastTransitionTime, previousPhase, one ring row, and (for a boot)
-//     activationsTotal;
-//   - the window moving: an entry that left it, which changes recentTransitions and
-//     activationsLast24H with no transition to record. That is the whole reason Record prunes on
+//     activationsTotal and one row of the activation ledger;
+//   - the window moving: an entry that left it, which changes recentTransitions, recentActivations
+//     and activationsLast24H with no transition to record. That is the whole reason Record prunes on
 //     every call and the slot reconciler requeues at the expiry instant: a count of the last 24 h
 //     that is only recomputed on a transition is a number that goes stale while the pool sleeps,
 //     and the question "how often does this machine boot in a day" is asked a day later.
@@ -90,11 +109,12 @@ func Record(node *infrav2alpha1.Node, derived infrav2alpha1.NodePhase, at time.T
 			At:     &stamp,
 			From:   from,
 			To:     derived,
-			Reason: clip(reason, ReasonMaxLength),
+			Reason: Clip(reason, ReasonMaxLength),
 		})
 
 		if IsActivation(from, derived) {
 			node.Status.ActivationsTotal++
+			node.Status.RecentActivations = append(node.Status.RecentActivations, stamp)
 		}
 	}
 
@@ -117,33 +137,50 @@ func IsActivation(from, to infrav2alpha1.NodePhase) bool {
 	return to == infrav2alpha1.NodePhaseBooting && from != infrav2alpha1.NodePhaseBooting
 }
 
-// NextTransitionExpiry reports the instant the oldest entry of the ring leaves the window, and
-// whether the slot has any entry to expire at all.
+// NextTransitionExpiry reports the instant the record next changes on its own - the oldest row of
+// the ring or the oldest boot of the activation ledger leaving the window - and whether the slot has
+// anything to expire at all.
 //
-// It is the honest half of activationsLast24H: the count changes when an entry ages out, and
-// nothing about the pool triggers a reconcile at that instant (a slot that is `off` has no node
-// object, no claim, no Job, so no event). The slot reconciler folds it into its own
-// `RequeueAfter`, so the pass that prunes runs at the moment the number changes, and not one
-// minute later. An entry that is already outside the window reports "now", which is a pass to run.
+// It is the honest half of activationsLast24H: the count changes when a boot ages out, and nothing
+// about the pool triggers a reconcile at that instant (a slot that is `off` has no node object, no
+// claim, no Job, so no event). The slot reconciler folds it into its own `RequeueAfter`, so the pass
+// that prunes runs at the moment the number changes, and not one minute later. An entry that is
+// already outside the window reports "now", which is a pass to run.
+//
+// Both ledgers are asked because both are pruned on that pass: the ledger answers when the *count*
+// moves, the ring when the *display* does, and the earlier of the two is the next pass worth running.
 func NextTransitionExpiry(node *infrav2alpha1.Node, now time.Time) (time.Time, bool) {
 	var earliest time.Time
 
-	for i := range node.Status.RecentTransitions {
-		at := node.Status.RecentTransitions[i].At
+	consider := func(at *metav1.Time) bool {
 		if at == nil {
 			// A row with no time cannot age out; Record always stamps one, so this is a
 			// hand-written object, and the next write prunes it.
-			continue
+			return false
 		}
 
 		expiry := at.Add(TransitionWindow)
 		if !expiry.After(now) {
 			// Already outside the window: the very next pass is the one that prunes it.
-			return now, true
+			return true
 		}
 
 		if earliest.IsZero() || expiry.Before(earliest) {
 			earliest = expiry
+		}
+
+		return false
+	}
+
+	for i := range node.Status.RecentTransitions {
+		if consider(node.Status.RecentTransitions[i].At) {
+			return now, true
+		}
+	}
+
+	for i := range node.Status.RecentActivations {
+		if consider(&node.Status.RecentActivations[i]) {
+			return now, true
 		}
 	}
 
@@ -154,55 +191,53 @@ func NextTransitionExpiry(node *infrav2alpha1.Node, now time.Time) (time.Time, b
 	return earliest, true
 }
 
-// pruneWindow drops the rows that left the window and re-materializes the count from what is
-// left. It returns true when it changed anything.
+// pruneWindow drops what left the window from both ledgers, applies their caps, and re-materializes
+// the count from what is left of the activation ledger. It returns true when it changed anything.
 //
-// The count is never its own record of a fact: activationsLast24H is recomputed from the ring on
-// every write, so the two cannot disagree, and the pruning is the only place the window moves.
-// Rows with no timestamp are kept (a hand-written row is not this writer's to judge), and the cap
-// is applied last, keeping the newest rows.
+// The count is never its own record of a fact: activationsLast24H is the length of
+// status.recentActivations, recomputed on every write, so the two cannot disagree, and the pruning is
+// the only place the window moves. Rows with no timestamp are kept (a hand-written row is not this
+// writer's to judge), and the caps are applied last, keeping the newest rows.
+//
+// A slot whose record predates the ledger - a slot upgraded into this release, with a ring and no
+// activation rows - is seeded from the boots its ring still names, so an upgrade does not zero the
+// churn column of a pool that was churning the day before.
 func pruneWindow(node *infrav2alpha1.Node, at time.Time) bool {
+	cutoff := at.Add(-TransitionWindow)
 	changed := false
 
-	ring := node.Status.RecentTransitions
-	if len(ring) == 0 {
-		if node.Status.ActivationsLast24H != 0 {
-			node.Status.ActivationsLast24H = 0
+	if len(node.Status.RecentActivations) == 0 {
+		if seeded := bootsOf(node.Status.RecentTransitions, cutoff); len(seeded) > 0 {
+			node.Status.RecentActivations = seeded
 
-			return true
-		}
-
-		return false
-	}
-
-	cutoff := at.Add(-TransitionWindow)
-	kept := make([]infrav2alpha1.NodeTransition, 0, len(ring))
-
-	for _, entry := range ring {
-		if entry.At != nil && entry.At.Time.Before(cutoff) {
 			changed = true
-
-			continue
 		}
-
-		kept = append(kept, entry)
 	}
 
+	kept := pruneRing(node.Status.RecentTransitions, cutoff)
 	if len(kept) > TransitionRingCap {
 		kept = kept[len(kept)-TransitionRingCap:]
-
-		changed = true
 	}
 
-	count := activationsInWindow(kept)
-	if node.Status.ActivationsLast24H != count {
-		node.Status.ActivationsLast24H = count
-
-		changed = true
-	}
-
-	if len(kept) != len(ring) {
+	if len(kept) != len(node.Status.RecentTransitions) {
 		node.Status.RecentTransitions = kept
+
+		changed = true
+	}
+
+	ledger := pruneActivations(node.Status.RecentActivations, cutoff)
+	if len(ledger) > ActivationWindowCap {
+		ledger = ledger[len(ledger)-ActivationWindowCap:]
+	}
+
+	if len(ledger) != len(node.Status.RecentActivations) {
+		node.Status.RecentActivations = ledger
+
+		changed = true
+	}
+
+	if count := int32(len(ledger)); node.Status.ActivationsLast24H != count {
+		node.Status.ActivationsLast24H = count
 
 		changed = true
 	}
@@ -210,18 +245,86 @@ func pruneWindow(node *infrav2alpha1.Node, at time.Time) bool {
 	return changed
 }
 
-// activationsInWindow counts the boots the rows record: every entry into `booting`, which is the
-// row IsActivation names, counted on the pruned ring, which is the window.
-func activationsInWindow(ring []infrav2alpha1.NodeTransition) int32 {
-	var count int32
+// pruneRing / pruneActivations drop the rows of one ledger that are strictly older than the cutoff.
+// Both return the input untouched when there is nothing to drop: the fast path of a stable slot is a
+// scan and no allocation, and this runs on every write of every report.
+func pruneRing(ring []infrav2alpha1.NodeTransition, cutoff time.Time) []infrav2alpha1.NodeTransition {
+	dropped := 0
 
-	for _, entry := range ring {
-		if entry.To == infrav2alpha1.NodePhaseBooting {
-			count++
+	for i := range ring {
+		if ring[i].At != nil && ring[i].At.Time.Before(cutoff) {
+			dropped++
 		}
 	}
 
-	return count
+	if dropped == 0 {
+		return ring
+	}
+
+	kept := make([]infrav2alpha1.NodeTransition, 0, len(ring)-dropped)
+
+	for i := range ring {
+		if ring[i].At != nil && ring[i].At.Time.Before(cutoff) {
+			continue
+		}
+
+		kept = append(kept, ring[i])
+	}
+
+	return kept
+}
+
+func pruneActivations(activations []metav1.Time, cutoff time.Time) []metav1.Time {
+	dropped := 0
+
+	for i := range activations {
+		if activations[i].Time.Before(cutoff) {
+			dropped++
+		}
+	}
+
+	if dropped == 0 {
+		return activations
+	}
+
+	kept := make([]metav1.Time, 0, len(activations)-dropped)
+
+	for i := range activations {
+		if activations[i].Time.Before(cutoff) {
+			continue
+		}
+
+		kept = append(kept, activations[i])
+	}
+
+	return kept
+}
+
+// bootsOf is the seeding of the activation ledger from the ring: the instants of the entries into
+// `booting` that are inside the window, the same rows IsActivation names. A row with no timestamp
+// cannot seed a window it cannot be placed in.
+func bootsOf(ring []infrav2alpha1.NodeTransition, cutoff time.Time) []metav1.Time {
+	out := make([]metav1.Time, 0, len(ring))
+
+	for i := range ring {
+		if ring[i].To != infrav2alpha1.NodePhaseBooting || ring[i].At == nil {
+			continue
+		}
+
+		if ring[i].At.Time.Before(cutoff) {
+			continue
+		}
+
+		out = append(out, *ring[i].At)
+	}
+
+	if len(out) == 0 {
+		// Nothing to seed: the caller keeps the ledger empty, which is the answer for a slot whose
+		// ring remembers no boot.
+		return nil
+	}
+
+	return out
 }
 
 // Reason turns the triple a report was derived from into the one line NodeTransition.reason
@@ -278,10 +381,16 @@ func Reason(in Input, derived infrav2alpha1.NodePhase) string {
 	return strings.Join(parts, ", ")
 }
 
-// clip bounds a composed string to the CRD's MaxLength, so a long object name cannot make a status
-// write the API server refuses. The bound is in runes, which is what the CRD's maxLength counts, and
-// the ellipsis is ASCII, so the result is valid UTF-8 and exactly `max` long.
-func clip(s string, max int) string {
+// Clip bounds a composed string to the MaxLength of the field it is written into, so a long object
+// name cannot make a status write the API server refuses. It is the bound of the ring's reason
+// (ReasonMaxLength) and of the pool's last-scale sentence (the group controller's
+// scaleActionMaxLength), because both are composed from an object name and a name is 253 characters
+// by DNS rule: a bound the code does not enforce is a write that fails forever, on every pass, on an
+// object an operator can only fix by deleting it.
+//
+// The bound is in runes, which is what a CRD's maxLength counts, and the ellipsis is ASCII, so the
+// result is valid UTF-8 and exactly `max` long.
+func Clip(s string, max int) string {
 	runes := []rune(s)
 	if len(runes) <= max {
 		return s

@@ -685,8 +685,10 @@ func claimsOfSlot(claims []infrav2alpha1.NodeClaim, slotName string) []infrav2al
 	return out
 }
 
-// NodeGroupDecreaseTargetSize cancels up to -delta claims that are in phase **pending**, by deleting
-// them, and reports the size the request actually produced.
+// NodeGroupDecreaseTargetSize cancels up to -delta claims that are in phase **pending**, by recording
+// the request on each of them (spec.request.call: DecreaseTargetSize, spec.request.delta: the delta,
+// spec.requestedBy: the autoscaler) and deleting them, and reports the size the request actually
+// produced.
 //
 // pending is the only cancelable phase (docs/design/nodeclaim.md §3): nothing is in flight, the object
 // goes, and its unit comes off the target size on that write. A booting claim is committed and is
@@ -782,6 +784,28 @@ func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Cont
 
 	for i := range int(toCancel) {
 		nodeClaim := &cancellable[i]
+
+		// Record the request on the claim, then cancel it, exactly as NodeGroupDeleteNodes does. The
+		// write order is not decoration: the claim controller's finalizer ends the episode from
+		// spec.request (reasonForDeletion maps the call to CancelledByDecreaseTargetSize), the digest
+		// the slot keeps is built from the same field, and the pool's `down` column is rendered from
+		// it - a delete that records nothing leaves the IncreaseSize attribution of the pending claim
+		// as the story of the request, and the pool reports a shrink it calls `up`.
+		//
+		// A claim with a deletion timestamp already carries the state this request asked for, so the
+		// write is skipped for it: re-attributing an object on its way out is a second write, not a
+		// cancellation.
+		if nodeClaim.DeletionTimestamp.IsZero() {
+			nodeClaim.Spec.Request.Call = infrav2alpha1.ClaimCallDecreaseTargetSize
+			nodeClaim.Spec.Request.Delta = req.Delta
+			nodeClaim.Spec.RequestedBy = claim.RequestedByAutoscaler
+
+			if err := s.Client.Update(ctx, nodeClaim); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "failed to record the DecreaseTargetSize request on the claim", "claim", nodeClaim.Name, "group", req.Id)
+
+				return nil, status.Errorf(codes.Internal, "failed to record the decrease request on claim %s of group %s: %v", nodeClaim.Name, req.Id, err)
+			}
+		}
 
 		if err := s.Client.Delete(ctx, nodeClaim); err != nil && !errors.IsNotFound(err) {
 			logger.Error(err, "failed to cancel a pending claim", "claim", nodeClaim.Name, "group", req.Id)

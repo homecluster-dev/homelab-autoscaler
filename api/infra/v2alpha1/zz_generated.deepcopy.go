@@ -179,6 +179,10 @@ func (in *LastClaimSummary) DeepCopyInto(out *LastClaimSummary) {
 		in, out := &in.RequestedAt, &out.RequestedAt
 		*out = (*in).DeepCopy()
 	}
+	if in.ScaledDownAt != nil {
+		in, out := &in.ScaledDownAt, &out.ScaledDownAt
+		*out = (*in).DeepCopy()
+	}
 	if in.DeadlineAt != nil {
 		in, out := &in.DeadlineAt, &out.DeadlineAt
 		*out = (*in).DeepCopy()
@@ -507,6 +511,13 @@ func (in *NodeStatus) DeepCopyInto(out *NodeStatus) {
 	if in.RecentTransitions != nil {
 		in, out := &in.RecentTransitions, &out.RecentTransitions
 		*out = make([]NodeTransition, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+	if in.RecentActivations != nil {
+		in, out := &in.RecentActivations, &out.RecentActivations
+		*out = make([]v1.Time, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}

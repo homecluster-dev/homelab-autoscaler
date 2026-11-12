@@ -63,7 +63,7 @@ overwrite a declaration. A machine is wanted exactly when a live
 |-------|------|-------------|
 | `powerState` | `PowerState` | What the provider observes: `on` when the `corev1.Node` reports `NodeReady=True`, `off` otherwise. An observation, and one of the three inputs of every decision |
 | `phase` | `NodePhase` | The **derived report** of the slot: `off`, `pending`, `booting`, `ready`, `draining`. Computed from (live claim, observed power, node usability) and read by nothing that decides. `status.progress` is removed with the model that needed it |
-| `lastClaim` | `LastClaimSummary` | The digest of the slot's most recent claim: `{name, phase, attempt, call, group, reason, requestedAt, deadlineAt, finishedAt}`. It survives the claim's TTL collection, seeds the next claim's `status.attempt`, and answers "who asked, when, how many attempts, why did it end" from `kubectl describe` |
+| `lastClaim` | `LastClaimSummary` | The digest of the slot's most recent claim: `{name, phase, attempt, call, group, reason, requestedAt, scaledDownAt, deadlineAt, finishedAt}`. It survives the claim's TTL collection, seeds the next claim's `status.attempt`, and answers "who asked, when, how many attempts, why did it end" from `kubectl describe`. The two times are the two moments of an episode: `requestedAt` is when the request that owned the slot was made, and `scaledDownAt` - the claim's deletion timestamp - is when a scale-down named it, which is the instant a shrink happened and not the age of the machine it took back ([the Group's `LASTSCALE`](group.md) reads it) |
 | `conditions` | `[]metav1.Condition` | Standard Kubernetes conditions: the autoscaler markers (`AutoscalerDeletionCandidate`, `AutoscalerDeletionRequested`), `NodeReadinessTaints` (the gate this slot is waiting on), lifecycle conditions written by the transitions |
 | `health` | `string` | Health status: `healthy`, `offline`, `unknown` |
 | `lastStartupTime` | `*metav1.Time` | Last successful startup time |
@@ -71,8 +71,9 @@ overwrite a declaration. A machine is wanted exactly when a live
 | `lastTransitionTime` | `*metav1.Time` | The instant `status.phase` last changed value. Written with the phase, by the one writer of it (`phase.Record`), so a resync that records nothing does not move it. The `SINCE` column |
 | `previousPhase` | `NodePhase` | The phase the slot reported before this one, empty for the first report. "`off -> booting`" is a machine coming up, "`ready -> booting`" is a machine the pool lost, and the phase alone cannot tell them apart |
 | `activationsTotal` | `int32` | Monotonic count of the slot's boots: every pass that recorded the report **entering** `booting` counted one. Never resets, so it is a fact about the machine, not about the clock |
-| `activationsLast24H` | `int32` | How many of those boots are inside the last 24 hours: a materialized count of `recentTransitions`, recomputed on every write of the report and on the pass that watches the oldest row leave the window. The `ON24H` column, the churn number |
-| `recentTransitions` | `[]NodeTransition` | The ring of the slot's phase changes: at most 32, pruned to the last 24 hours, newest last. Each row is `{at, from, to, reason}`, the `reason` naming the inputs the report was derived from (live claim, observed power, node usability) |
+| `activationsLast24H` | `int32` | How many of those boots are inside the last 24 hours: the length of `recentActivations`, recomputed on every write of the report and on the pass that watches the oldest boot leave the window. The `ON24H` column, the churn number. Defaults to `0`, so a slot written before the field existed renders a number and not `<none>` |
+| `recentTransitions` | `[]NodeTransition` | The **display** ring of the slot's phase changes: at most 32, pruned to the last 24 hours, newest last. Each row is `{at, from, to, reason}`, the `reason` naming the inputs the report was derived from (live claim, observed power, node usability). The rows are appended by the pass that recorded each change, so their order is the order the writes landed: two writers racing inside a second can be listed out of chronological order, which is a display detail of a churn and not a fact any code reads. The 24 h count is deliberately **not** read through this cap |
+| `recentActivations` | `[]metav1.Time` | The ledger the count is read from: the instant of every boot inside the window, oldest first, at most 512. A second list next to the ring because a bound a count is read through is a bound on the count - a slot that churns 40 times a day writes 80 ring rows and the ring keeps 32, so counting the ring flatlines `ON24H` at 16 exactly where the question starts to matter. A ledger row is one timestamp, so 512 of them cost less than 32 ring rows and the count is honest to 512 boots a day; past that the number is a floor and says so by sitting at the cap. Seeded from the ring on the first pass of a slot upgraded into this release, so an upgrade does not zero a churning pool's column |
 
 #### NodeTransition
 
@@ -86,7 +87,9 @@ type NodeTransition struct {
 ```
 
 The ring is bounded twice over, on purpose: 32 rows and 24 hours, whichever bites first. A day of a
-churning slot is a list an operator can read and etcd can hold. It is written by the passes that
+churning slot is a list an operator can read and etcd can hold. The ring is the history; the boots of
+the day are counted from `recentActivations`, which is pruned by the same cutoff on the same pass and
+is bounded wider (512) because it holds nothing but the instants. It is written by the passes that
 write the phase - the observation path, the lifecycle transition path, the seed of a
 never-provisioned slot - and by nothing else: `phase.Record` is the single writer of every field
 above, so a slot's history is the same list of changes whichever path got there first. Nothing in
@@ -116,7 +119,7 @@ remote-worker-4   on           draining  remote-workers         30m      0
 | `Group` | `.metadata.labels.group` |
 | `Zone` | `.spec.nodeLabels['topology\.kubernetes\.io/zone']` - the key contains dots, so the JSONPath escapes them |
 | `Since` | `.status.lastTransitionTime`, type `date` |
-| `On24h` | `.status.activationsLast24H`, visible by default (`priority: 0`) |
+| `On24h` | `.status.activationsLast24H`, type `integer`, visible by default - the marker carries no `priority`, because `0` is the default and writing it out invites the reading that the column is optional |
 
 The names and casing of `Powerstate` and `Phase` are the ones shipped before this work and are
 frozen by `internal/controller/infra/crd_columns_test.go`, which asserts the columns of the

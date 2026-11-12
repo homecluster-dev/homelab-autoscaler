@@ -309,6 +309,16 @@ func Digest(c *infrav2alpha1.NodeClaim) *infrav2alpha1.LastClaimSummary {
 		summary.RequestedAt = &requested
 	}
 
+	// The instant a scale-down named this claim, recorded next to the request's own: the two are not
+	// the same moment, and the display of a scale-down has to date the shrink and not the boot it
+	// reversed. DeleteNodes rewrites spec.request.call / nodes / requestedBy on a claim that can be
+	// days old and leaves requestedAt alone, so a digest of a scale-down is (requestedAt of the
+	// episode, scaledDownAt of the request) and the pool's LASTSCALE reads the second.
+	if scaled := ScaleDownRequestedAt(c); !scaled.IsZero() {
+		stamp := metav1.NewTime(scaled)
+		summary.ScaledDownAt = &stamp
+	}
+
 	return summary
 }
 

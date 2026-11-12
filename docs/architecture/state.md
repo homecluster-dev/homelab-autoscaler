@@ -32,15 +32,21 @@ left (`status.phase`), it has one formula, and it decides nothing.
 
 ## The observability fields
 
-`Node.status` carries five fields that exist to be read and are inputs to nothing:
-`lastTransitionTime`, `previousPhase`, `recentTransitions` (the bounded ring: 32 rows, 24 hours),
-`activationsTotal` and `activationsLast24H`. `Group.status` carries the same kind of thing one level
-up: `slots`, `on`, `off`, `lastScaleAt`, `lastScaleAction`. They are **derived and materialized**:
+`Node.status` carries six fields that exist to be read and are inputs to nothing:
+`lastTransitionTime`, `previousPhase`, `recentTransitions` (the bounded display ring: 32 rows,
+24 hours, in the order the writes landed), `recentActivations` (the ledger of the boots inside the
+window, 512 rows of one timestamp each), `activationsTotal` and `activationsLast24H`. `Group.status`
+carries the same kind of thing one level up: `slots`, `on`, `off`, `health`, `lastScaleAt`,
+`lastScaleAction`. They are **derived and materialized**:
 derived, because each is a function of facts the model already computes - the phase,
 the live claim, the observation - and materialized, because the answer has to be on the object when
 an operator asks, hours after the Events that recorded it were garbage-collected and after the claim
-that caused it was collected by its TTL. `activationsLast24H` is the pure case of the pattern: a
-window over a list, counted where it is written. A slot's phase and its history have one writer,
+that caused it was collected by its TTL. `activationsLast24H` is the pure case of the pattern, and
+the case that decides where the bound goes: it is the length of a ledger of the window's boots, not a
+count read through the display ring's cap, because a bound a count is read through is a bound on the
+count - a slot that churns 40 times a day writes 80 ring rows, keeps 32 of them, and would report 16.
+
+A slot's phase and its history have one writer,
 `phase.Record`, called by the passes that already own a phase write (the observation, the transition,
 the seed of a never-provisioned slot) and by the pass the window's expiry schedules. Nothing reads
 them to decide: the state machine's input stays the triple, `Derive`'s inputs are the triple, and

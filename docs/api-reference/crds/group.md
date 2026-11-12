@@ -27,38 +27,47 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `health` | `string` | `healthy`, `offline`, `unknown` |
-| `conditions` | `[]metav1.Condition` | The `Loaded` condition the group controller stamps on every pass |
+| `health` | `string` | `healthy`, `offline`, `unknown` - derived on the same pass: `offline` when no slot of the pool has ever reported a phase (no slots committed, or a pool whose slot reconciler has not run on them), `healthy` when at least one has. A pool whose every machine is `off` is a pool that is asleep, which is what a pool is for, and not an outage; `unknown` is a value an operator stamps by hand, and nothing in the controller writes it |
+| `conditions` | `[]metav1.Condition` | The `Loaded` condition the group controller maintains. Its `lastTransitionTime` dates the moment the condition's status last changed, not the last reconcile pass |
 | `slots` | `int32` | The `Node` CRs labelled `group: <name>`: the machines the pool can have, i.e. its max size, the same number the provider reports to cluster-autoscaler as `MaxSize` |
 | `on` | `int32` | The slots reporting a machine the pool is paying for: `booting`, `ready`, `draining` |
 | `off` | `int32` | The rest: `off`, `pending`, and a slot that has never reported. `slots == on + off` always |
-| `lastScaleAt` | `*metav1.Time` | When the pool last grew or shrank |
-| `lastScaleAction` | `string` | That scale in one line, naming the slot and the request: `up remote-worker-2`, `down remote-worker-4`, `ca:DeleteNodes remote-worker-3` |
+| `lastScaleAt` | `*metav1.Time` | When the pool last grew or shrank. A scale-up is dated by the request that made it (`lastClaim.requestedAt`); a scale-down by the instant the scale-down landed (`lastClaim.scaledDownAt`, the deletionTimestamp the request put on the claim), because the request that shrinks a pool names a machine booted by an older request and does not rewrite that request's time |
+| `lastScaleAction` | `string` | That scale in one line, naming the slot and the request: `up remote-worker-2`, `down remote-worker-4`, `ca:DeleteNodes remote-worker-3`. Clipped to the field's bound: the line is composed from a slot name, and a status write the API server refuses for a long name costs the pool's whole report |
 
 The group controller writes all of it, in one pass over the slots of the pool, and the pool
 reconciles when a slot changes (`Owns(&Node{})`, via the controller reference the slot's reconciler
 stamps). The counts are a sum over the slots' `status.phase`; they are a display sum, and no
 decision reads them - the provider's arithmetic counts live claims and slots directly
-([NodeClaim design](../../design/nodeclaim.md)).
+([NodeClaim design](../../design/nodeclaim.md)). The pass compares what it computed with what it
+read and writes nothing when they agree: the slot's own write is what woke the pool, so a
+pass that repeats the pool's numbers is the common case, and a controller that regenerates the
+event it is subscribed to is a pool that never settles in `kubectl get groups -w`.
 
 `lastScaleAt` / `lastScaleAction` are **materialized, not read on demand**, and that is the point.
 The same story is a Kubernetes Event on a slot, Events are garbage-collected in about an hour, and
 the question - "did this pool thrash last night?" - is asked the next morning. The per-slot record
 that outlives a claim's TTL collection is `Node.status.lastClaim` (the digest the claim controller
 stamps), so the newest of those over the pool is copied onto the pool: a scale is legible on the
-Group a day later, with no Event to have kept and nothing to correlate. The timestamp is the
-request's own instant (`lastClaim.requestedAt`), because the question is when the pool moved, not
-when its episode closed.
+Group a day later, with no Event to have kept and nothing to correlate.
+
+The digest carries **two instants and the controller uses the one that matches the verb**, which is
+the whole story of `LASTSCALE`. `requestedAt` is when the request that owned the slot was made;
+`scaledDownAt` is when a scale-down named it. `NodeGroupDeleteNodes` rewrites `spec.request`
+(the call, the nodes, the requester) on a claim that can be days old and never touches
+`spec.requestedAt`, and `NodeGroupDecreaseTargetSize` records its own call and delta on the pending
+claim it is about to delete - so the shrink's instant is the deletion timestamp, and a column that
+read the episode's request time would report a pool that shrank 24 minutes ago as `LASTSCALE = 3d`.
 
 ### The Columns of `kubectl get groups`
 
 ```
 NAME             SLOTS   ON   OFF   LASTSCALE   HEALTH   AGE
-remote-workers   5       2    3     24m                  41d
+remote-workers   5       2    3     24m         healthy  41d
 ```
 
 `NAME` and `AGE` are the built-in columns of a Kubernetes table; the five that come between them are
-this CRD's. A pool that used to answer "it exists" now answers "four slots, two machines up, the
+this CRD's. A pool that used to answer "it exists" now answers "five slots, two machines up, the
 last thing it did was take one back 24 minutes ago". The columns are asserted on the generated CRD
 and on the chart's copy by `internal/controller/infra/crd_columns_test.go`, and their values are
 asserted against a live API server in `internal/controller/infra/group_columns_envtest_test.go`.

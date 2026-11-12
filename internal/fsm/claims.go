@@ -72,21 +72,22 @@ func (nm *NodeStateMachine) reportPhase() {
 			return err
 		}
 
-		// The staleness guard, applied to the object this attempt read. The check above compares the
-		// machine with its own inputs; this one compares the inputs with the slot, and it is the one
-		// that matters for the *history*: a slot that already reports the phase these inputs derive
-		// (the observation path wrote it, a pass of a machine that replaced this one wrote it) has its
-		// change recorded, and appending the same change again would push the oldest real row out of
-		// the ring and count a boot twice. A slot that reports something else is a slot this machine
-		// no longer describes, and the writer of that report is the pass that owns the inputs.
-		if fresh.Status.Phase == derived {
-			nm.node = fresh
-
-			return nil
-		}
-
+		// The writer is the guard, and it is called with the phase this attempt read: phase.Record
+		// appends a ring row, moves lastTransitionTime and counts an activation **only when the phase
+		// it was handed differs from the one the slot reports**, and returns false when it recorded
+		// nothing. That is what keeps a resync - and the other writer landing the same change first -
+		// from appending the change twice, pushing the oldest real row out of the ring and counting
+		// one boot twice, and it is why this path has no check of its own to keep in sync: a caller's
+		// guard is one more place a writer can be wrong. The window prune is the one write that can
+		// still land here on a slot that reports what the inputs derive, and it is idempotent.
+		//
+		// The staleness check above is the one that decides *who* writes: it compares this machine
+		// with its own inputs, and a machine that no longer describes the slot (the async monitor of a
+		// transition that already finished, a state machine built from a Node read before a transition
+		// ran) hands the report to the pass that owns the inputs. A stale machine writing over a live
+		// one is how a slot used to be stranded in a transitional value with nothing driving it.
 		if !stampDerivedPhase(fresh, derived, time.Now(), phase.Reason(nm.input, derived)) {
-			// The slot already reports what the inputs say: nothing to write.
+			// The slot reports what the inputs derive, and its window did not move: nothing to write.
 			nm.node = fresh
 
 			return nil
@@ -111,9 +112,10 @@ func (nm *NodeStateMachine) reportPhase() {
 // matches writes nothing.
 //
 // The history is not written here: phase.Record is its only writer, and the observation path calls
-// it with the same derived value, so a slot's history is the same list of changes whichever path
-// got there first - and the caller's guard ("the slot already reports what my inputs derive") is
-// what keeps the two from each appending the same change.
+// it with the same derived value, so a slot's history is the same list of changes whichever path got
+// there first. The protection against the two writers recording one change twice is inside that
+// writer - Record appends a row, moves lastTransitionTime and counts an activation only on a change
+// of value, and says so by returning false - and not in a check each caller has to remember to make.
 func stampDerivedPhase(node *infrav2alpha1.Node, derived infrav2alpha1.NodePhase, at time.Time, reason string) bool {
 	moved := node.Status.Phase != derived
 

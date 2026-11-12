@@ -38,6 +38,7 @@ import (
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
@@ -641,6 +642,42 @@ func TestLifecycleInputIsTheTriple(t *testing.T) {
 		assert.Equal(t, input, reconciler.lifecycleInput(context.Background(), contradicted, nodeClaim),
 			"the report of a slot is never an input to the pass that writes it")
 	}
+}
+
+// TestLifecycleInputAndObservationInputDeriveOnePhase is half 2 of a pair (the transition path's
+// half): the triple "a claim pending, the machine observed off, a startup Job in flight", assembled
+// by this path, derives `booting`. Its pair,
+// TestObservationInputAndLifecycleInputDeriveOnePhase in
+// internal/controller/core/node_controller_test.go, assembles the same world through the observation
+// path and asserts the same value.
+//
+// The pair is the point: these are the two writers of the derived report, a phase has one formula
+// (phase.Derive), and a formula with one value has one way to assemble its input. An observation that
+// left the lifecycle-Job fields empty derived `pending` for a machine whose boot had already started,
+// the transition path derived `booting` for the same machine, and since the record of the report
+// became a writer's job that disagreement is not a display hiccup - the two paths append two rows to
+// one slot's ring and count one boot twice, once per pass, all day. Both paths fill the fields from
+// fsm.JobsInFlightOfSlot now, and the two tests are the pin that they do.
+func TestLifecycleInputAndObservationInputDeriveOnePhase(t *testing.T) {
+	node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhasePending)
+	nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimPending, nil)
+	reconciler := newFSMReconciler(t, node, createTestGroup(), nodeClaim, startupJobInFlight(node))
+
+	input := reconciler.lifecycleInput(context.Background(), node, nodeClaim)
+
+	require.NotNil(t, input.Claim, "the claim is the first input of the report")
+	assert.True(t, input.StartupJobInFlight, "the startup Job is read here, and not left for the other path to notice")
+	assert.False(t, input.ShutdownJobInFlight)
+
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, phase.Derive(input),
+		"a pending claim, a machine observed off and a startup Job in flight is `booting` - the value of the same world, on both writers' paths")
+
+	// The shape the field is the difference of: with no Job in flight the same triple is `pending`,
+	// the cancelable shape, which is what the provider's DecreaseTargetSize loop is allowed to take
+	// away - and takes away with its own attribution recorded on the claim (see the gRPC test).
+	noJob := newFSMReconciler(t, node, createTestGroup(), nodeClaim)
+
+	assert.Equal(t, infrav2alpha1.NodePhasePending, phase.Derive(noJob.lifecycleInput(context.Background(), node, nodeClaim)))
 }
 
 // TestNodeReconcileClaimMarkedForScaleDownIsDrained is DeleteNodes seen from the slot: the provider
