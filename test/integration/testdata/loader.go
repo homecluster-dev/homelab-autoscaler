@@ -17,18 +17,18 @@ limitations under the License.
 package testdata
 
 import (
-    "embed"
-    "fmt"
-    "strings"
+	"embed"
+	"fmt"
+	"strings"
 
-    corev1 "k8s.io/api/core/v1"
-    "k8s.io/apimachinery/pkg/runtime"
-    "k8s.io/apimachinery/pkg/util/yaml"
-    "sigs.k8s.io/controller-runtime/pkg/client"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/yaml"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-    infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
-    "github.com/homecluster-dev/homelab-autoscaler/internal/config"
-    "github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
+	"github.com/homecluster-dev/homelab-autoscaler/test/integration/mocks"
 )
 
 //go:embed *.yaml
@@ -47,20 +47,20 @@ func NewTestDataLoader(scheme *runtime.Scheme) *TestDataLoader {
 }
 
 // LoadGroups loads all Group CRs from groups.yaml
-func (l *TestDataLoader) LoadGroups() ([]*infrav1alpha1.Group, error) {
-    data, err := testDataFiles.ReadFile("groups.yaml")
-    if err != nil {
-        return nil, fmt.Errorf("failed to read groups.yaml: %w", err)
-    }
-    // Replace template placeholder with actual namespace used by the server.
-    ns := config.NewNamespaceConfig().Get()
-    data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
+func (l *TestDataLoader) LoadGroups() ([]*infrav2alpha1.Group, error) {
+	data, err := testDataFiles.ReadFile("groups.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read groups.yaml: %w", err)
+	}
+	// Replace template placeholder with actual namespace used by the server.
+	ns := config.NewNamespaceConfig().Get()
+	data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
-	var groups []*infrav1alpha1.Group
+	var groups []*infrav2alpha1.Group
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
 
 	for {
-		var group infrav1alpha1.Group
+		var group infrav2alpha1.Group
 		if err := decoder.Decode(&group); err != nil {
 			if err.Error() == "EOF" {
 				break
@@ -80,19 +80,19 @@ func (l *TestDataLoader) LoadGroups() ([]*infrav1alpha1.Group, error) {
 }
 
 // LoadNodes loads all Node CRs from nodes.yaml
-func (l *TestDataLoader) LoadNodes() ([]*infrav1alpha1.Node, error) {
-    data, err := testDataFiles.ReadFile("nodes.yaml")
-    if err != nil {
-        return nil, fmt.Errorf("failed to read nodes.yaml: %w", err)
-    }
-    ns := config.NewNamespaceConfig().Get()
-    data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
+func (l *TestDataLoader) LoadNodes() ([]*infrav2alpha1.Node, error) {
+	data, err := testDataFiles.ReadFile("nodes.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read nodes.yaml: %w", err)
+	}
+	ns := config.NewNamespaceConfig().Get()
+	data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
-	var nodes []*infrav1alpha1.Node
+	var nodes []*infrav2alpha1.Node
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
 
 	for {
-		var node infrav1alpha1.Node
+		var node infrav2alpha1.Node
 		if err := decoder.Decode(&node); err != nil {
 			if err.Error() == "EOF" {
 				break
@@ -113,12 +113,12 @@ func (l *TestDataLoader) LoadNodes() ([]*infrav1alpha1.Node, error) {
 
 // LoadKubernetesNodes loads all Kubernetes Node objects from kubernetes_nodes.yaml
 func (l *TestDataLoader) LoadKubernetesNodes() ([]*corev1.Node, error) {
-    data, err := testDataFiles.ReadFile("kubernetes_nodes.yaml")
-    if err != nil {
-        return nil, fmt.Errorf("failed to read kubernetes_nodes.yaml: %w", err)
-    }
-    ns := config.NewNamespaceConfig().Get()
-    data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
+	data, err := testDataFiles.ReadFile("kubernetes_nodes.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read kubernetes_nodes.yaml: %w", err)
+	}
+	ns := config.NewNamespaceConfig().Get()
+	data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
 
 	var nodes []*corev1.Node
 	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
@@ -143,8 +143,60 @@ func (l *TestDataLoader) LoadKubernetesNodes() ([]*corev1.Node, error) {
 	return nodes, nil
 }
 
+// LoadNodeClaims loads all NodeClaims from nodeclaims.yaml: the requests the slots of nodes.yaml
+// carry. A slot with no claim there is a free slot.
+func (l *TestDataLoader) LoadNodeClaims() ([]*infrav2alpha1.NodeClaim, error) {
+	data, err := testDataFiles.ReadFile("nodeclaims.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read nodeclaims.yaml: %w", err)
+	}
+
+	ns := config.NewNamespaceConfig().Get()
+	data = []byte(strings.ReplaceAll(string(data), "{{ .Namespace }}", ns))
+
+	var nodeClaims []*infrav2alpha1.NodeClaim
+	decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), 4096)
+
+	for {
+		var nodeClaim infrav2alpha1.NodeClaim
+		if err := decoder.Decode(&nodeClaim); err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+
+			return nil, fmt.Errorf("failed to decode node claim: %w", err)
+		}
+
+		// Skip empty objects (from document separators)
+		if nodeClaim.Name == "" {
+			continue
+		}
+
+		nodeClaims = append(nodeClaims, &nodeClaim)
+	}
+
+	return nodeClaims, nil
+}
+
+// addNodeClaims puts the claims of a predicate into the mock client. The claims are the requests
+// the slots carry, so every builder that filters slots by scenario or group filters the claims
+// the same way: a scenario's pool comes with the episodes that produced it.
+func (l *TestDataLoader) addNodeClaims(mockClient *mocks.MockClient, claims []*infrav2alpha1.NodeClaim, keep func(*infrav2alpha1.NodeClaim) bool) error {
+	for _, nodeClaim := range claims {
+		if !keep(nodeClaim) {
+			continue
+		}
+
+		if err := mockClient.AddObject(nodeClaim); err != nil {
+			return fmt.Errorf("failed to add claim %s: %w", nodeClaim.Name, err)
+		}
+	}
+
+	return nil
+}
+
 // LoadAllTestData loads all test data (Groups, Nodes, and Kubernetes Nodes)
-func (l *TestDataLoader) LoadAllTestData() ([]*infrav1alpha1.Group, []*infrav1alpha1.Node, []*corev1.Node, error) {
+func (l *TestDataLoader) LoadAllTestData() ([]*infrav2alpha1.Group, []*infrav2alpha1.Node, []*corev1.Node, error) {
 	groups, err := l.LoadGroups()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load groups: %w", err)
@@ -170,6 +222,11 @@ func (l *TestDataLoader) CreateMockClientWithAllData() (client.Client, error) {
 		return nil, fmt.Errorf("failed to load test data: %w", err)
 	}
 
+	claims, err := l.LoadNodeClaims()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load node claims: %w", err)
+	}
+
 	mockClient := mocks.NewMockClient(l.scheme)
 
 	// Add all groups
@@ -193,6 +250,11 @@ func (l *TestDataLoader) CreateMockClientWithAllData() (client.Client, error) {
 		}
 	}
 
+	// Add all claims: the requests the slots carry.
+	if err := l.addNodeClaims(mockClient, claims, func(*infrav2alpha1.NodeClaim) bool { return true }); err != nil {
+		return nil, err
+	}
+
 	return mockClient, nil
 }
 
@@ -201,6 +263,11 @@ func (l *TestDataLoader) CreateMockClientWithScenario(scenario string) (client.C
 	groups, nodes, kubernetesNodes, err := l.LoadAllTestData()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load test data: %w", err)
+	}
+
+	claims, err := l.LoadNodeClaims()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load node claims: %w", err)
 	}
 
 	mockClient := mocks.NewMockClient(l.scheme)
@@ -232,6 +299,14 @@ func (l *TestDataLoader) CreateMockClientWithScenario(scenario string) (client.C
 		}
 	}
 
+	// Filter and add the claims of the scenario: a scenario's pool is the slots plus the
+	// requests that own them.
+	if err := l.addNodeClaims(mockClient, claims, func(nodeClaim *infrav2alpha1.NodeClaim) bool {
+		return matchesScenario(nodeClaim.Labels, scenario)
+	}); err != nil {
+		return nil, err
+	}
+
 	return mockClient, nil
 }
 
@@ -240,6 +315,11 @@ func (l *TestDataLoader) CreateMockClientWithGroup(groupName string) (client.Cli
 	groups, nodes, kubernetesNodes, err := l.LoadAllTestData()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load test data: %w", err)
+	}
+
+	claims, err := l.LoadNodeClaims()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load node claims: %w", err)
 	}
 
 	mockClient := mocks.NewMockClient(l.scheme)
@@ -272,6 +352,14 @@ func (l *TestDataLoader) CreateMockClientWithGroup(groupName string) (client.Cli
 		}
 	}
 
+	// Add the claims of the group: the slots of a group are capacity exactly while a live claim
+	// of that group names them, so a group's fixture is incomplete without them.
+	if err := l.addNodeClaims(mockClient, claims, func(nodeClaim *infrav2alpha1.NodeClaim) bool {
+		return nodeClaim.Labels["group"] == groupName
+	}); err != nil {
+		return nil, err
+	}
+
 	return mockClient, nil
 }
 
@@ -283,12 +371,12 @@ func (l *TestDataLoader) ValidateDataConsistency() error {
 	}
 
 	// Create maps for efficient lookup
-	groupMap := make(map[string]*infrav1alpha1.Group)
+	groupMap := make(map[string]*infrav2alpha1.Group)
 	for _, group := range groups {
 		groupMap[group.Name] = group
 	}
 
-	nodeMap := make(map[string]*infrav1alpha1.Node)
+	nodeMap := make(map[string]*infrav2alpha1.Node)
 	for _, node := range nodes {
 		nodeMap[node.Spec.KubernetesNodeName] = node
 	}

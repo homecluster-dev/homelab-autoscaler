@@ -1,6 +1,8 @@
 # Architecture
 
 Homelab Autoscaler is a Kubernetes operator with gRPC integration for physical node autoscaling.
+Scale-up intent is an object: `Node` is what a slot *is*, `NodeClaim` is one request for one
+machine, and `Node.status` is what the cluster observes about it.
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
@@ -12,7 +14,8 @@ Homelab Autoscaler is a Kubernetes operator with gRPC integration for physical n
                               ▼
                        ┌──────────────────┐
                        │ Kubernetes API   │
-                       │ (Groups, Nodes)  │
+                       │ (Groups, Nodes,  │
+                       │  NodeClaims)     │
                        └──────────────────┘
 ```
 
@@ -20,62 +23,76 @@ Homelab Autoscaler is a Kubernetes operator with gRPC integration for physical n
 
 ### Custom Resources
 
-**Group CRD** - Defines autoscaling policies:
-- Scaling thresholds
-- Timing parameters
-- Node selection
-- Health status
+**Group CRD** (`infra.homecluster.dev/v2alpha1`) - autoscaling policy for a pool:
+- scaling thresholds and timing (`minSize`, `maxNodeProvisionTime`, scale-down windows)
+- node selection
+- the readiness taints a machine must be free of before it counts as capacity
+- health status
 
-**Node CRD** - Physical machine representation:
-- Power state management
-- Startup/shutdown jobs
-- Health monitoring
-- Pricing information
+**Node CRD** (`infra.homecluster.dev/v2alpha1`) - a slot: the configuration of one machine, and
+nothing about what anyone wants it to do next:
+- `spec.startupPodSpec` / `spec.shutdownPodSpec`, `spec.kubernetesNodeName`, `spec.nodeTaints`,
+  `spec.nodeCapacity`, `spec.pricing`
+- `status.powerState` (observed), `status.phase` (derived report), `status.lastClaim` (the digest
+  of the last request)
+- Git is the only writer of the spec, so an apply can never contradict a scale-up
+
+**NodeClaim CRD** (`infra.homecluster.dev/v2alpha1`) - one request for one machine:
+- `spec.slotRef`, `spec.requestedBy`, `spec.request` (`call` / `delta` / `group` / `nodes`),
+  `spec.deadlineAt`, `spec.maxNodeProvisionTime`, `spec.ttlSecondsAfterFinished`
+- `status.phase` (`pending` / `booting` / `ready` / `failed` / `completed`), `status.attempt`,
+  `status.reason`, `status.finishedAt`, conditions
+- created by the gRPC provider, owned by the slot, collected after its TTL
 
 ### Controllers
 
 **Group Controller** (`internal/controller/infra/group_controller.go`)
 - Manages Group CRDs and autoscaling policies
 - Updates group health status
-- Enforces scaling policies
 
-**Node Controller** (`internal/controller/infra/node_controller.go`)
-- Manages Node CRDs and power state transitions
-- Finite State Machine architecture
-- Coordination locking for race prevention
-- Power operation integration (in development)
-- Progress watchdog (`internal/progress`): reconciles a `status.progress` that names a machine the
-  cluster does not have (no `corev1.Node`, no lifecycle Job in flight, no such Job finished inside the
-  ~7 minute settle grace, no live lock). A slot desired `off` is settled to `off`/`shutdown`
-  (`ProgressReconciled` Warning). A **claim** - `spec.desiredPowerState: on`, the autoscaler asked for
-  the machine - is never settled: it is **re-armed** to `shutdown` with the claim left on, so the FSM
-  can start it again (`ClaimRearmed`). The retries are bounded by **one startup-attempt counter**
-  (3 per claim episode, counted by the `StartNode` transition and cleared when a boot passes the
-  readiness gate) that both failure loops pay into - the watchdog's re-arm, and a startup Job that
-  exits non-zero and rolls the slot back to `shutdown`, which the watchdog never sees. Past the bound
-  the watchdog settles the slot and `StartNode` refuses to start it, with one
-  `ClaimRearmLimitReached` Warning. A ready, claimed slot whose node is cordoned with nothing running
-  on it is uncordoned (`CordonReconciled`). It runs at the top of every pass, before any transition
+**Slot reconciler** (`internal/controller/infra/node_controller.go`, `lifecycle.go`, `claims.go`)
+- Reads the live claim of the slot, the observed power and the node's usability, and fires the one
+  lifecycle transition that input asks for
+- Finite State Machine architecture (`internal/fsm`), seeded from that triple and never from a
+  record
+- Coordination locking for race prevention (kept as a belt over the claim, see
+  [State Management](state.md))
+- Owns the claim moves a transition is the evidence for (`pending → booting` with the startup Job,
+  `booting → ready` with the readiness gate, `→ failed` with a Job failure, a timeout, a stuck
+  transition)
+- ProviderID, declared taints, capacity drift, labels: the slot-level plumbing
 
-**Core Controller** (`internal/controller/core/node_controller.go`)
-- Bridges Kubernetes nodes with Node CRDs
-- Syncs node health status
-- Handles node registration/deregistration
+**Claim controller** (`internal/controller/infra/nodeclaim_controller.go`)
+- Seeds `status.attempt` from the slot's digest, and enforces the consecutive-attempt bound
+- Enforces one live claim per slot where admission cannot see it (`reason: Superseded`)
+- Stamps the finalizer with the boot, runs the scale-down path, and ends the claim when the
+  machine is observed off
+- Fails an overdue claim (`reason: DeadlineExceeded`) — the deadline is the heal the v1alpha1
+  watchdog performed
+- Stamps `Node.status.lastClaim`, and collects a terminal claim after its TTL
+
+**Observation reconciler** (`internal/controller/core/node_controller.go`)
+- Bridges Kubernetes nodes with Node CRDs: `status.powerState`, the derived `status.phase`, health
 - Records what cluster-autoscaler decided about the machine (`internal/autoscaler`): the
-  `DeletionCandidateOfClusterAutoscaler` / `ToBeDeletedByClusterAutoscaler` markers become a
+  `DeletionCandidateOfClusterAutoscaler` / `ToBeDeletedByClusterAutoscaler` markers become an
   `AutoscalerDeletionCandidate` / `AutoscalerDeletionRequested` event on the Node CR, once per
   transition, and the node's taints and `spec.unschedulable` are logged so a cordon is attributable
   without raising the autoscaler's verbosity. The moment of the observation is in the condition's
   message (`observed at ...`), because `lastTransitionTime` does not move on a
   candidate→requested transition (both are `Status: True`) and would date the record early
 
+**Node slot controller** (`internal/controller/core/node_slot_controller.go`)
+- Reports the shape of slots that have never had a machine, so a pool's arithmetic and an
+  operator's `kubectl get` describe them. "Is this slot free" is a claim question
+  (`internal/claim`), so the v1alpha1 job of seeding a status so the target-size arithmetic
+  excludes a never-provisioned slot is gone
+
 ### Scale-up readiness
 
-The **scale-up** transition into `ready` (`JobCompleted` → Ready, the one that writes
-`status.progress: ready`) completes when the node is `Ready` **and** free of every readiness taint the
-pool declares. Pool workloads therefore do not need to tolerate `node.cilium.io/agent-not-ready`: the
-controller waits it out, because declaring a slot ready before its datapath works makes the autoscaler
-look at a Ready node its pending pod cannot land on and buy another machine.
+The **claim** reaches `ready` when the node is `Ready` **and** free of every readiness taint the
+pool declares. Pool workloads therefore do not need to tolerate `node.cilium.io/agent-not-ready`:
+the controller waits it out, because declaring capacity before its datapath works makes the
+autoscaler look at a Ready node its pending pod cannot land on and buy another machine.
 
 The key belongs to the CNI, so it is configuration: `Group.spec.nodeReadinessTaints` is the list the
 gate waits for, defaulted by the CRD to Cilium's `node.cilium.io/agent-not-ready` (stamped by Cilium
@@ -83,127 +100,131 @@ since v1.9; this chart deploys 1.16.x). An empty list gates on `Ready` alone. Th
 the slot as the `NodeReadinessTaints` condition.
 
 The two deadlines are separate: 90s for the node object to register, then 4m for the gate, counted
-from the moment the object appears. On a timeout the controller **uncordons the node**, records a
-`ReadinessGateTimeout` Warning on the slot, and the transition completes - a cordoned machine is
-invisible to scale-down and would be paid for forever. See [State Management](state.md).
+from the moment the object appears. On a timeout the controller **uncordons the node** (a cordoned
+machine is invisible to scale-down and would be paid for forever), records a `ReadinessGateTimeout`
+Warning on the slot, and moves the claim to **`failed`** with that reason: the input law then powers
+the machine off, the slot becomes free, and the next claim on it is attempt N+1. See
+[State Management](state.md).
 
 ### gRPC Server (`internal/grpcserver/server.go`)
 
-Implements Cluster Autoscaler CloudProvider interface:
+Implements the Cluster Autoscaler CloudProvider interface:
 
-**Implemented**:
-- `NodeGroups()` - Lists autoscaling groups
-- `NodeGroupTargetSize()` - Gets current target size
-- `NodeGroupNodes()` - Lists nodes in group
-- `NodeGroupForNode()` - Finds group for node
+- `NodeGroups()`, `NodeGroupForNode()`, `NodeGroupNodes()`, `NodeGroupTemplateNodeInfo()`,
+  `NodeGroupGetOptions()`, pricing
+- `NodeGroupTargetSize()` - the count of the group's **live claims**
+- `NodeGroupIncreaseSize(delta)` - creates `delta` claims on `delta` free slots, each carrying the
+  attribution: `requestedBy`, `request.call`, `request.delta`, `request.group`, and a deadline
+- `NodeGroupDeleteNodes(nodes)` - records the request on the claim of each named slot and cancels
+  it (a `pending` claim is deleted; a `booting`/`ready` claim is deleted through its finalizer,
+  which runs the shutdown)
+- `NodeGroupDecreaseTargetSize(delta)` - cancels `pending` claims, never a `booting` one, and never
+  below the group's `minSize`
 
-**In Development**:
-- `NodeGroupIncreaseSize()` - Scale up nodes
-- `NodeGroupDeleteNodes()` - Scale down nodes
-- `NodeGroupDecreaseTargetSize()` - Target size reduction
+No handler writes a field of a `Node` spec. That is the point: `spec.powerState` was the request,
+the lock, the arithmetic and the history at once, and a GitOps apply with `selfHeal` re-applied it
+over the autoscaler's write on every sync.
 
 **Target size**
 
-The one definition of the target size of a group (`targetSizeOf`, reported by
-`NodeGroupTargetSize`) counts a slot when it is **claimed** - `spec.desiredPowerState: on`, its
-machine booting or running - and does not count a slot that is genuinely being torn down
-(`spec.desiredPowerState: off` with a progress of `shuttingdown`/`shutdown`/`startingup`: a
-machine still up on its way out counts, a cancelled startup doesn't).
+`targetSizeOf` is the count of live claims: `pending` + `booting` + `ready`, excluding a claim a
+scale-down has marked. A `failed` claim stops being counted the moment it is recorded, which
+removes the state "the autoscaler is paying for a machine that never arrived, forever". No progress
+value, and no slot spec field, appears in the arithmetic, and every minSize/maxSize check in the
+provider is judged against this same number.
 
-`spec.desiredPowerState` is the request and `status.progress` is what the machine is doing, and
-the autoscaler reads the request: `NodeGroupIncreaseSize` claims a slot with a spec write, and
-the FSM moves the progress seconds later, after the machine has taken minutes to boot. A target
-size read off the progress alone reports the slot the autoscaler just asked for as shut down, so
-it concludes the group never grew and calls `IncreaseSize` again in the same loop. Every
-minSize/maxSize check in the provider is judged against this same number.
+**Instances**
+
+The `NodeGroupNodes` contract is unchanged: a slot with a `corev1.Node` is `running` while a live
+claim wants it and `deleting` when nothing wants it any more, a slot a live claim names that has
+not joined is `creating`, and a slot no claim names with no machine behind it is not reported. The
+word "wanted" moved from a spec field to the claim. The node template
+(`NodeGroupTemplateNodeInfo`) reads `Node.spec` only, which is what makes it correct in v2: the
+config object is a config object.
 
 ## Data Flow
 
-1. **Group Creation**: User creates Group CRD → Group Controller → Updates status
-2. **Node Management**: Node CRD created → Node Controller → Startup job → K8s node joins
-3. **Autoscaling**: Cluster Autoscaler → gRPC call → Kubernetes API → Scaling action
-4. **Scale Up**: gRPC IncreaseSize → Find powered-off node → Set DesiredPowerState=on → Startup job
-5. **Scale Down**: gRPC DeleteNodes → Set DesiredPowerState=off → Drain node → Shutdown job
+1. **Declaration**: `kubectl apply` of a `Node` → the slot reconciler stamps providerID, taints,
+   the Group ownerRef, and checks the declared capacity
+2. **Scale up**: Cluster Autoscaler → `NodeGroupIncreaseSize` → a `NodeClaim` on a free slot →
+   the slot reconciler takes the lock, creates the startup Job, moves the claim `pending → booting`
+   → the machine boots, the node joins → the readiness gate moves the claim `booting → ready`
+3. **Serving**: a ready claim plus an observed-up, usable node is capacity; the slot reports
+   `ready`
+4. **Scale down**: Cluster Autoscaler drains, then `NodeGroupDeleteNodes` → the request is
+   recorded on the claim and the claim is cancelled → the slot reconciler cordons and runs the
+   shutdown Job → the machine is observed off → the claim ends `completed` and is collected, and
+   the slot keeps the digest
+5. **A stalled attempt**: the claim passes `spec.deadlineAt` → `failed` (`DeadlineExceeded`) → the
+   machine is force-shut-down → the slot is free, and the next claim is attempt N+1
 
 ## Design Patterns
 
 ### Controller Pattern
-Each CRD has dedicated controller:
-- Watch resource changes
-- Reconcile desired vs actual state
-- Update status fields
-- Handle errors and retries
+Each CRD has one owner:
+- the claim controller owns the claim and its lifecycle Jobs' outcome
+- the slot reconciler owns the lifecycle operation on the slot
+- the observation reconciler owns the report of what the cluster sees
 
 ### Job-Based Power Management
 Power operations via Kubernetes Jobs:
-- **Startup jobs**: Execute power-on commands
-- **Shutdown jobs**: Graceful power-off
+- **Startup jobs**: Execute power-on commands, created by the `StartNode` transition
+- **Shutdown jobs**: Graceful power-off, created by the `ShutdownNode` transition
 - **Isolation**: Operations in containers
-- **Monitoring**: Job status indicates success/failure
+- **Monitoring**: the Job monitor of the operation fires the transition, and the claim's phase
+  records its outcome
 
 ### Health Monitoring
 Node health determined by:
-- Power state (on/off)
-- Kubernetes node readiness
-- Progress tracking
-- Periodic health checks
+- observed power (`status.powerState`, from the `corev1.Node` Ready condition)
+- the derived report (`status.phase`)
+- the last episode (`status.lastClaim`)
+- periodic resyncs (5 minutes for a stable slot, at the deadline for a claim)
 
 ## Integration Points
 
 ### Cluster Autoscaler
-Standard gRPC CloudProvider interface for integration.
+Standard gRPC CloudProvider interface. The provider answers its four mutation calls with claims.
 
 ### Kubernetes API
-Controllers use controller-runtime for:
-- Watching CRD changes
-- Updating resource status
-- Creating/managing Jobs
-- Monitoring node events
+Controllers use controller-runtime for watching CRDs, writing status, creating and managing Jobs,
+and monitoring node events. The claim controller's field index is `spec.slotRef.name`.
 
 ### Webhook Validation
-Admission webhooks provide:
-- Validation - Ensure CRD requirements
-- Mutation - Set default values
-- Security - Prevent invalid configurations
+- `Node`: the `group` label must reference a Group CR; a slot whose `corev1.Node` has not joined is
+  admitted with a warning, never denied
+- `NodeClaim`: the slot must exist, and **one live claim per slot**. The message names the slot and
+  the claim that owns it. A terminal status write and a delete are never refused
 
 ## Configuration
 
 ### Namespace
-- Hardcoded to `homelab-autoscaler-system`
-- No custom namespace option yet
+- Defaults to `homelab-autoscaler-system`, overridable with `HOMELAB_AUTOSCALER_NAMESPACE`
 
 ### gRPC Server
-- Enabled on port 50051 by default
-- Configurable via command-line flags
-- TLS not implemented
+- Enabled on port 50051 by default, configurable via command-line flags
 
 ### Health Checks
-- Default: Every 10 seconds
-- Configurable via CronJob schedule
+- Default: every 10 seconds, configurable via the CronJob schedule
 
 ## Security
 
 ### RBAC
-Controllers need permissions for:
-- Group/Node CRD operations
-- Job creation/monitoring
-- Kubernetes node reading
-- CronJob creation
+Controllers need permissions for the Group, Node and **NodeClaim** CRDs (including
+`nodeclaims/status` and `nodeclaims/finalizers`), Jobs, Kubernetes nodes, and events.
 
 ### Job Security
-Startup/shutdown jobs:
-- Minimal required permissions
-- Secrets/ConfigMaps for credentials
-- Network policy isolation
+Startup/shutdown jobs run with minimal permissions, Secrets/ConfigMaps for credentials, and
+network policy isolation.
 
 ## Scalability
-- Controller-runtime leader election
-- gRPC server is stateless (horizontal scaling)
+- controller-runtime leader election
+- the gRPC server is stateless; the claims make the scale-up history an object, not a field
 
 ## Related Documentation
 - [Installation](../getting-started/installation.md) - Helm deployment
 - [Quick Start](../getting-started/quick-start.md) - k3d testing
-- [FSM Architecture](state.md) - State management
-- [NodeClaim Design](../design/nodeclaim.md) - Where scale-up intent goes in v2alpha1
+- [State Management](state.md) - the input law, the claim phases, the lock
+- [NodeClaim CRD](../api-reference/crds/nodeclaim.md) - the request object
+- [NodeClaim Design](../design/nodeclaim.md) - why this model
 - [Known Issues](../troubleshooting/known-issues.md) - Current limitations
-- [API Reference](../api-reference/crds/group.md) - CRD specs

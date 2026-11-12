@@ -420,16 +420,20 @@ func GetJobEvents(namespace string, jobLabel string) (string, error) {
 
 // Node Verification utilities
 
-// WaitForNodeState waits for a Node CR to reach a specific progress state
-func WaitForNodeState(namespace string, nodeName string, state string, timeout time.Duration) bool {
+// WaitForSlotPhase waits for a Node CR (a slot) to report a specific derived phase: off, pending,
+// booting, ready or draining. The report is computed from (the live NodeClaim of the slot, the
+// power the provider observes, the usability of the node), so it is the field to read for what a
+// slot is doing. The v1alpha1 status.progress - the FSM's state and the world's report at once - is
+// gone with the model that needed it (docs/design/nodeclaim.md 11).
+func WaitForSlotPhase(namespace string, nodeName string, phase string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
 		cmd := exec.Command("kubectl", "get", "nodes.infra.homecluster.dev", nodeName,
-			"-n", namespace, "-o", "jsonpath={.status.progress}")
+			"-n", namespace, "-o", "jsonpath={.status.phase}")
 		cmd.Env = append(os.Environ(), "KUBECONFIG="+os.Getenv("KUBECONFIG"))
 		output, err := cmd.CombinedOutput()
-		if err == nil && strings.TrimSpace(string(output)) == state {
+		if err == nil && strings.TrimSpace(string(output)) == phase {
 			return true
 		}
 		time.Sleep(2 * time.Second)

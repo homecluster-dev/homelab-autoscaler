@@ -60,7 +60,7 @@ helm install homelab-autoscaler homelab-autoscaler/homelab-autoscaler \
 
 ```bash
 cat <<EOF | kubectl apply -f -
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: k3d-workers
@@ -76,7 +76,7 @@ EOF
 
 ```bash
 cat <<EOF | kubectl apply -f -
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: k3d-worker-1
@@ -85,7 +85,6 @@ metadata:
     group: k3d-workers
 spec:
   kubernetesNodeName: k3d-homelab-autoscaler-agent-0
-  powerState: "on"
   startupPodSpec:
     image: curlimages/curl:latest
     command: ["/bin/sh"]
@@ -95,7 +94,7 @@ spec:
     command: ["/bin/sh"]
     args: ["-c", "echo 'Stopping node k3d-worker-1' && sleep 5"]
 ---
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: k3d-worker-2
@@ -104,7 +103,6 @@ metadata:
     group: k3d-workers
 spec:
   kubernetesNodeName: k3d-homelab-autoscaler-agent-1
-  powerState: "off"
   startupPodSpec:
     image: curlimages/curl:latest
     command: ["/bin/sh"]

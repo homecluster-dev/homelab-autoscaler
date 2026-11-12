@@ -25,7 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrahomeclusterdevv1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrahomeclusterdevv2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // GroupReconciler reconciles a Group object
@@ -50,7 +50,7 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	logger.Info("Starting reconciliation for Group", "group", req.Name, "namespace", req.Namespace)
 
 	// Get the Group resource from the request
-	group := &infrahomeclusterdevv1alpha1.Group{}
+	group := &infrahomeclusterdevv2alpha1.Group{}
 	if err := r.Get(ctx, req.NamespacedName, group); err != nil {
 		// The object was not found, return early
 		logger.Error(err, "Failed to get Group", "group", req.Name)
@@ -84,7 +84,7 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 func (r *GroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&infrahomeclusterdevv1alpha1.Group{}).
+		For(&infrahomeclusterdevv2alpha1.Group{}).
 		Named("group").
 		Complete(r)
 }

@@ -28,7 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // Reason and action recorded on the Node CR when a declaration is dropped, so that
@@ -62,7 +62,7 @@ const (
 //
 // A missing node object is not a failure: the machine has not registered yet, and the taints
 // land when it does. recorder may be nil, which records nothing (unit tests do that).
-func ApplyToKubernetesNode(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, recorder events.EventRecorder) error {
+func ApplyToKubernetesNode(ctx context.Context, c client.Client, slot *infrav2alpha1.Node, recorder events.EventRecorder) error {
 	logger := log.FromContext(ctx).WithValues("nodeCR", slot.Name)
 
 	if len(slot.Spec.NodeTaints) == 0 {

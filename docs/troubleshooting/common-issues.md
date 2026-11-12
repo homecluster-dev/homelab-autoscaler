@@ -37,19 +37,42 @@ kubectl run grpc-test --rm -it --image=nicolaka/netshoot -- \
 ## 🛠️ Common Operations
 
 ### Manual Node Power Control
+
+There is no field to declare. A request is an object, and a cancellation is the delete of one:
+
 ```bash
-# Power on a specific node
-kubectl patch node.infra.homecluster.dev <node-name> \
-  --type='merge' -p='{"spec":{"powerState":"on"}}'
+# Ask for a machine on a free slot (a slot with no live claim)
+kubectl apply -f - <<'YAML'
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: worker-01-manual
+  namespace: homelab-autoscaler-system
+  labels:
+    group: worker-nodes
+    infra.homecluster.dev/node: worker-01
+spec:
+  slotRef:
+    name: worker-01
+  requestedBy: filippo
+  request:
+    call: IncreaseSize
+    group: worker-nodes
+YAML
 
-# Power off a specific node
-kubectl patch node.infra.homecluster.dev <node-name> \
-  --type='merge' -p='{"spec":{"powerState":"off"}}'
+# Watch it: pending -> booting -> ready, inside spec.deadlineAt
+kubectl get nodeclaim -n homelab-autoscaler-system -w
 
-# Force status refresh
-kubectl annotate node.infra.homecluster.dev <node-name> \
-  homelab-autoscaler.dev/force-reconcile=$(date +%s)
+# Power the machine off: cancel the request that owns it
+kubectl delete nodeclaim claim-worker-01 -n homelab-autoscaler-system
+
+# The slot's side of the same story
+kubectl describe nodes.infra.homecluster.dev worker-01 -n homelab-autoscaler-system
 ```
+
+A `booting`/`ready` claim carries the controller's finalizer, so deleting it is the shutdown request:
+cordon, shutdown Job, power off, and the claim ends `completed` when the machine is observed off. A
+`pending` claim is deleted outright.
 
 ### Stuck Job Cleanup
 ```bash
@@ -133,123 +156,213 @@ kubectl describe node.infra.homecluster.dev <node-name>   # Condition: NodeReadi
 
 The gate has its own 4 minute deadline, counted from the moment the node object registers - the 90s
 registration timeout is a separate budget, so a slow boot does not eat the gate. Past the deadline the
-controller uncordons the node, records a `ReadinessGateTimeout` **Warning** on the slot, and completes
-the transition (a cordoned node is skipped by cluster-autoscaler's scale-down, so it would never be
-drained, never deleted, and the pool would keep paying for it). The taint is visible on the node
-object:
+controller uncordons the node (a cordoned node is skipped by cluster-autoscaler's scale-down, so it
+would never be drained, never deleted, and the pool would keep paying for it), records a
+`ReadinessGateTimeout` **Warning** on the slot, and **fails the claim** with that reason: the machine
+is powered off, the slot is free, and the next claim on it is attempt N+1. The taint is visible on the
+node object:
 
 ```bash
 kubectl get node <node> -o jsonpath='{.spec.taints}' ; echo
 kubectl get node <node> -o jsonpath='{.spec.unschedulable}' ; echo
 ```
 
-### The Slot Reports a Machine That Is Not There
+### A Machine Is Up and Nothing Wants It
 
-`status.progress: ready`, `startingup` or `shuttingdown` on a slot with no `corev1.Node` and no
-lifecycle Job is what a machine deleted out of band leaves behind (a Hetzner server removed from the
-console, a startup whose manager restarted mid-flight). What the node controller does depends on the
-slot's own request, and it waits out a ~7 minute grace around a lifecycle Job that just finished
-(`progress.SettleGracePeriod`, derived from the deadlines the completed Job's own hook can consume):
-
-- `spec.desiredPowerState: off` -> **settled** to `off`/`shutdown`, one `ProgressReconciled` Warning
-  naming the progress it replaced.
-- `spec.desiredPowerState: on` (the autoscaler asked for this machine) -> **re-armed**: same pair, and
-  the claim left on, so the pool starts the machine again. The `ClaimRearmed` event names the attempt
-  the arming leads to. The retries are bounded by one **startup-attempt counter** (3 per claim episode,
-  `progress.ClaimRearmLimit`): it counts the startup attempts of the slot, it is recorded by the
-  `StartNode` transition, and it is cleared when a boot passes the readiness gate. Both loops pay into
-  it - a startup whose machine never registers, and a startup Job that exits non-zero (that one leaves
-  the slot at the stable `off`/`shutdown` pair, so the watchdog never looks at it: the FSM's `StartNode`
-  is what refuses). Past the bound the watchdog **settles** the slot, `StartNode` refuses to start it,
-  and one `ClaimRearmLimitReached` **Warning** is recorded: the slot is counted as requested capacity
-  with no machine behind it, and nothing will retry it again on its own. Scale the group down, or fix
-  what keeps the machine from booting (startup command, image, power API credentials); a boot that
-  passes the readiness gate clears the counter and the 3 attempts with it.
-- `spec.desiredPowerState: on`, at `ready`, and the node is cordoned with no Job, lock, or
-  autoscaler marker on it -> **uncordoned**, with a `CordonReconciled` Warning. This is the residue of
-  a shutdown that timed out or failed: the paths that roll back into `ready` never reach the uncordon
-  hook, and a cordoned node is never a scale-down candidate, so it is never removed.
+A machine the pool no longer wants is a slot with **no live claim** and `status.powerState: on`. The
+input law shuts it down; the report of that shape is `draining`. Read the triple, not one field:
 
 ```bash
-kubectl describe node.infra.homecluster.dev <node-name>
-# Events: ProgressReconciled | ClaimRearmed | ClaimRearmLimitReached | CordonReconciled
-# Conditions: ClaimRearmed (ClaimRearmAttempt<N> while the attempts are being spent, then
-#            ClaimRearmLimitReached) - the startup-attempt record, readable from the slot
+# The slot: observation, report, and the digest of the last request
+kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system \
+  -o jsonpath='{.status.powerState} {.status.phase} {.status.lastClaim.phase} {.status.lastClaim.reason} {.status.lastClaim.attempt}' ; echo
+# The claims of the slot: live ones (pending, booting, ready) own the machine
+kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name> -o wide
+# The machine, as the kubelet reports it. The corev1.Node is cluster-scoped: no -n.
+kubectl get node <kubernetes-node-name> -o jsonpath='{.spec.unschedulable} {.status.conditions[?(@.type=="Ready")].status}' ; echo
 kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
-kubectl get node <kubernetes-node-name> 2>&1              # no machine behind the slot
+kubectl describe nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system
 ```
 
-A slot the watchdog leaves alone is a slot an operation owns: a `corev1.Node` (its status belongs to
-the observation controllers), a startup/shutdown Job in flight, a Job that finished inside the grace,
-a startup stamped inside the grace by `status.lastStartupTime` when the Job object is already gone
-(the TTL collected it), or a live coordination lock.
+What the answers mean:
 
-### The Slot Says Shutdown But The Machine Is Up
+- **No live claim, `status.powerState: on`** → the slot reconciler cordons the node and runs the
+  shutdown Job. If it does not, check for a coordination lock held by the opposite operation
+  (`homelab-autoscaler.dev/operation-lock` on the slot): a scale-down that loses the lock is deferred
+  to the lock's deadline and records a Normal `ScaleDownDeferred`, and the intent is the claim, so
+  nothing has to be asked for again.
+- **A claim in `failed` with the machine up** → that is the force shutdown of an overdue boot, the
+  same branch. `status.reason` says which attempt died and why.
+- **A claim marked for deletion (`DeletionTimestamp` set, finalizer present) with the machine up** →
+  the scale-down is running. The claim ends when the machine is observed off.
+- **A claim in `ready`, the node cordoned** → nothing is shutting it down, because the claim wants
+  the machine: `kubectl describe node <kubernetes-node-name>` shows who put the cordon there (see
+  [Who Cordoned My Node](#who-cordoned-my-node)).
 
-The mirror of the section above: there the progress named a machine the cluster did not have, here the
-progress **denies** a machine the cluster can see. Read the pair:
+The v1alpha1 watchdog (`internal/progress`) that healed these shapes by rewriting
+`status.progress` is gone. A slot is never written back to a stable pair, because it never held the
+request: the claim has a deadline, and the deadline is the heal.
+
+### The Shutdown Job Exits 0 and the Machine Stays Up
+
+A shutdown Job is a script: it exits 0 when its own commands ran, which is not evidence that the
+provider's power-off landed. The controller reads the machine, so the slot keeps reporting
+`draining`, the scale-down claim keeps its finalizer, and the attempts are counted **on that claim**,
+one per shutdown Job — the transition that fires the shutdown writes the count, and the claim
+controller's 15s poll of the observation only reads it:
 
 ```bash
-# The Node CR is namespaced: the slots live in the controller's namespace.
-kubectl get node.infra.homecluster.dev <node-name> -n homelab-autoscaler-system -o jsonpath='{.spec.desiredPowerState} {.status.powerState} {.status.progress} {.status.lastShutdownTime}' ; echo
-# The Kubernetes node is cluster-scoped: no -n.
-kubectl get node <kubernetes-node-name> -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastHeartbeatTime}' ; echo
+kubectl describe nodeclaim claim-<node-name> -n homelab-autoscaler-system
+# Events: ShutdownAttemptLimitReached - the machine is still observed up after the bound (3)
+kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system \
+  -o jsonpath='{.status.lastClaim.shutdownAttempts} {.status.lastClaim.reason} {.status.lastClaim.call}' ; echo
+kubectl logs -n homelab-autoscaler-system job/<shutdown-job>
+```
+
+The attempts are `status.shutdownAttempts`, a counter of its own: `status.attempt` is the record of
+the machines the request bought, and a shutdown that never lands must not spend it.
+
+Past the bound the slot reconciler **stops firing the shutdown** — no fourth Job for a script that
+has had its three — and the machine stays up, cordoned, unwanted, and paid for. That is deliberate:
+the fix is the script. Make `spec.shutdownPodSpec` call the provider's own power-off and exit
+non-zero when the machine is still on.
+
+The pause is bounded, not a sentence: past `claim.ShutdownAttemptResetGrace` (30 minutes from
+`status.lastShutdownAttemptAt`) the streak is spent no longer, the count restarts, and the shutdown
+fires again — so a fixed script is picked up by a pass within 30 minutes, with no hand on a status
+field. Waiting 30 minutes is not the only option: the count lives on the request, and the claim is
+the object that reports it, so the escape hatch is one command, and the next pass of the slot
+reconciler fires.
+
+```bash
+kubectl patch nodeclaim claim-<node-name> -n homelab-autoscaler-system --subresource=status --type=merge \
+  -p '{"status":{"shutdownAttempts":0,"lastShutdownAttemptAt":null}}'
+``` A healthy scale-down pays no second Job either: the guard reads the kubelet's
+heartbeat against the Job's `status.completionTime`, because a node object stays `Ready` for
+`node-monitor-grace-period` (~40s) after a real power-off.
+
+### A Claim Is Stuck Pending
+
+`pending` means the provider answered cluster-autoscaler and **no lifecycle Job has been created
+yet**. The claim is the request, so the whole question is "why has the slot not started booting it":
+
+```bash
+# 1. The claim, and its budget
+kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name> -o wide
+kubectl describe nodeclaim claim-<node-name> -n homelab-autoscaler-system
+# 2. The slot's triple: the live claim, the observed power, the node
+kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system \
+  -o jsonpath='{.status.powerState} {.status.phase}' ; echo
+kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name> \
+  -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase} {.status.reason}{"\n"}{end}'
+# 3. Who owns the slot: the coordination lock, and any lifecycle Job in flight
+kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system \
+  -o jsonpath='{.metadata.annotations}' ; echo
+kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
+# 4. The slot reconciler's own words
+kubectl logs -n homelab-autoscaler-system deployment/homelab-autoscaler-controller-manager \
+  -l control-plane=controller-manager --tail=200 | grep <node-name>
+```
+
+The causes, in the order to check them:
+
+- **The machine is already observed up** (`status.powerState: on`). Law 1 boots a machine that is
+  off; a machine that is up goes through the Job monitor of the operation that started it. A claim
+  in `pending` on a slot that is up is the shape a boot whose Job completed before the phase landed
+  takes, and the report reads `booting`, not `pending`.
+- **The slot reconciler is not running, or the pass is deferred.** A lock held by the opposite
+  operation defers the boot to the lock's deadline (`ScaleUpDeferred` on the slot). Expired locks are
+  cleaned up on every pass, so an annotation older than its own `lock-timeout` is not a cause.
+- **The Group cannot be read.** A slot whose `group` label names no Group CR is requeued every 5s
+  and buys nothing; the log says `Group referenced by node label not found`.
+- **`spec.startupPodSpec` is broken** (image pull, command, RBAC). The Job exists and fails, the
+  claim moves to `failed` with `reason: StartupJobFailed`, and the machine is powered off.
+  `kubectl logs -n homelab-autoscaler-system job/<startup-job>` is the answer.
+- **The deadline arrives.** `spec.deadlineAt` is the budget of the **boot** (12m10s: the startup
+  Job's own timeout, the monitor poll, the registration wait, the readiness gate and a margin —
+  floored by the group's `spec.maxNodeProvisionTime`). When it passes with the claim at `pending`
+  or `booting`, the claim is recorded `failed` with `reason: DeadlineExceeded` and the slot is
+  freed for attempt N+1. A `ready` claim is past the boot window, and the `booting → ready` write
+  clears `spec.deadlineAt`: a healthy machine is never destroyed by a budget it already spent. A
+  claim that reaches `ready` with a deadline in its past (an old object, a hand write) is left
+  alone, and the deadline is cleared by the model, not by a timer.
+
+```bash
+# The claim is overdue and the controller is healthy, and you want the machine now:
+kubectl delete nodeclaim claim-<node-name> -n homelab-autoscaler-system   # cancel: nothing is in flight
+kubectl scale deployment/homelab-autoscaler-cluster-autoscaler -n homelab-autoscaler-system --replicas=1
+```
+
+### A Claim Failed
+
+`failed` is terminal and it is not capacity: the target size dropped when it was recorded, the
+machine was force-shut-down, and the next claim on the slot is attempt N+1. Read the reason before
+you touch anything:
+
+```bash
+kubectl get nodeclaim -n homelab-autoscaler-system --sort-by=.metadata.creationTimestamp | tail
+kubectl describe nodeclaim claim-<node-name> -n homelab-autoscaler-system
+kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system \
+  -o jsonpath='{.status.lastClaim}' ; echo
+kubectl get events -n homelab-autoscaler-system --field-selector involvedObject.name=claim-<node-name> \
+  --sort-by=.lastTimestamp | tail
 kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
 ```
 
-`{status.powerState: on, status.progress: shutdown}` on a slot with `spec.powerState: off` is a
-machine that outlived its record: a shutdown Job exited 0 and the provider's power-off did not land
-(the request was accepted for a server that kept running, the script swallowed the error, a graceful
-ACPI request came back up). The record is not cosmetic. The FSM derives its state from
-`status.progress`, so the slot is `shutdown`; the only event legal from there is `StartNode`, the
-claim is `off`, and `ShutdownNode` - the operation that would satisfy it - is unreachable. Before this
-rule the reconcile logged "Node is in desired state or transitioning" every pass and the machine ran
-for 40 minutes until `status.progress` was patched by hand.
+| `status.reason` | What happened | What to do |
+| --- | --- | --- |
+| `DeadlineExceeded` | the boot outlived `spec.deadlineAt` (the operator budget, floored by the group's `spec.maxNodeProvisionTime`) | read the startup Job's logs and the machine's power API credentials; a pool whose boots are legitimately slow raises `spec.maxNodeProvisionTime` on the Group, which raises the claim's floor |
+| `ReadinessGateTimeout` | the machine booted and never cleared the gate — not `Ready`, or a `spec.nodeReadinessTaints` key still on it | `kubectl get node <kubernetes-node-name> -o jsonpath='{.spec.taints}' ; echo`, check the CNI, and see [A Fresh Node Takes No Pods](#a-fresh-node-takes-no-pods-cilium-bootstrap-taint) |
+| `StartupJobFailed` / `StartupJobTimeout` | the startup script exited non-zero, ran out of time, or could not be created | `kubectl logs -n homelab-autoscaler-system job/<startup-job>`; the image, the command, the credentials, the RBAC of its ServiceAccount |
+| `AttemptLimitExceeded` | the slot spent its consecutive attempts (3), so no machine is bought for it | fix the cause of the streak, then create the next claim (an episode that lands `ready` or `completed` restarts the streak at 1); the record is on the claim and in `status.lastClaim` |
+| `Superseded` | two live claims named one machine and this one is the older | see [One live claim per slot is rejected](#one-live-claim-per-slot-is-rejected) |
+| `SlotDeleted` | the `Node` CR went away under the claim | nothing to fix: the slot is gone, and the claims of a slot are owned by it |
+| `MachineGone` | the node object of a ready claim disappeared while the machine was observed off | the machine was deleted out of band; the slot becomes free and the next request claims it |
 
-The controller now closes it in two places, and both say so on the slot:
+A failed claim is kept for `spec.ttlSecondsAfterFinished` (default 3600s) after `status.finishedAt`,
+so `kubectl get nodeclaim -a` in the pool's namespace shows the episodes while they are readable, and
+`Node.status.lastClaim` keeps the digest after collection.
 
-- the shutdown completion is **conditional** (`internal/fsm/shutdown_completion.go`): a completed
-  shutdown Job on a machine the cluster observes up is not recorded as `shutdown` at all. The slot is
-  recorded `ready`, which is the state the FSM can act on, and a `ShutdownNotObserved` **Warning** is
-  recorded naming the Job that claimed the machine was off. The next reconcile runs the shutdown again,
-  with its Job, its lock and its cordon. The guard reads the kubelet's **heartbeat against the
-  shutdown Job's `status.completionTime`** - a machine that went off during the script stops heartbeating
-  before the Job finishes, a machine the script did not power off keeps heartbeating after it - and not
-  the `Ready` condition, so a healthy scale-down - whose node object stays `Ready` for
-  `node-monitor-grace-period`, ~40s, after the machine goes off - pays no second shutdown Job. Only when
-  the Job object is already gone (a short `spec.ttlSecondsAfterFinished`) does it fall back to
-  `status.lastShutdownTime` plus a 60s window;
-- the precedence is enforced again in the reconcile (`progress.ReconcileObservedPower`): with
-  `status.powerState: on`, a `corev1.Node` reporting `Ready`, and a progress that implies no machine
-  (`shutdown`, `shuttingdown`, or empty), the observation outranks the record, the progress is
-  corrected to `ready`, and - for a claim of `off` - the **same pass** fires `ShutdownNode`. The only
-  grace it waits out is the lifecycle-Job one: a shutdown whose Job is gone because the TTL collected
-  it is measured from `status.lastShutdownTime`, so a machine that went off 20 seconds ago is not
-  "corrected" and shut down a second time. One `MachineObservedUp` **Warning** names the progress it
-  replaced; on a claimed-`on` slot the same correction is a **Normal**, with no Job, because the machine
-  is the one the pool asked for.
+### One Live Claim Per Slot Is Rejected
+
+The refusal is the invariant working, and it is not a bug to work around: a slot answers for one
+request at a time, which is what makes "a live claim exists" mean "the machine is wanted", keeps
+`TargetSize` a count of claims, and keeps the model cancellable.
 
 ```bash
-kubectl describe node.infra.homecluster.dev <node-name> -n homelab-autoscaler-system
-# Events: ShutdownNotObserved | MachineObservedUp | ShutdownAttemptLimitReached
-# Conditions: ShutdownAttempts (ShutdownAttempt<N>, then ShutdownAttemptLimitReached)
-# Events aggregate per reason: what `kubectl describe` shows is the first note of the series plus a
-# count, so read the count and the condition - not the last Job's name - to tell how many attempts ran.
+# Who owns the slot?
+kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name> -o wide
+# The refusal, verbatim, from the admission webhook
+kubectl apply -f my-claim.yaml 2>&1 | grep -i "one live claim per slot"
 ```
 
-Both rules share the lifecycle-Job and coordination-lock gates, so a shutdown that is genuinely in
-flight is left to its own operation. What they cannot fix is the pool's own shutdown script: if
-`spec.shutdownPodSpec` exits 0 without the provider's power-off landing, the slot loops - shutdown
-Job, machine still up, `ShutdownNotObserved`, retry. **The loop is bounded and paced**: the
-shutdown-attempt counter (`fsm.ShutdownAttemptLimit`, 3, on the slot as the `ShutdownAttempts`
-condition) counts the attempts, `ShutdownNode` refuses the fourth before it cordons anything, and one
-`ShutdownAttemptLimitReached` **Warning** says so; between attempts the reconcile backs off
-exponentially (60s, 2m, 4m, capped at 30m) instead of firing at full resync speed. Make the script call
-the provider's own power-off and exit non-zero when the machine is still on - past the bound the
-controller stops trying, and the machine stays up, cordoned, unwanted, and paid for until the script is
-fixed or the machine is powered off out of band. Nothing powers it off for you, and no hand on
-`status.progress` is needed after the fix: from the `ready` the refusal leaves, the next pass runs the
-shutdown.
+The message names the slot and the claim that owns it:
+
+```
+error: metadata: Invalid value: "worker-01": slot "worker-01" already has the live NodeClaim
+"worker-01-7f4b9c" in phase "booting": one live claim per slot
+```
+
+Decide what you meant, and do the matching thing:
+
+```bash
+# You wanted a second machine: claim a slot that has no live claim, not this one
+kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system -l group=<group> -o wide
+
+# You wanted this slot's request replaced: cancel the live claim, then create the new one.
+# A pending claim is deleted outright; a booting/ready claim runs the shutdown path through
+# its finalizer and ends when the machine is observed off.
+kubectl delete nodeclaim <claim-name> -n homelab-autoscaler-system
+kubectl get nodeclaim <claim-name> -n homelab-autoscaler-system   # gone, or draining with a DeletionTimestamp
+
+# The claim you are creating is a terminal status write, not a second request: it is admitted.
+kubectl get nodeclaim -n homelab-autoscaler-system -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,DELETED:.metadata.deletionTimestamp
+```
+
+Two things that are **not** rejections: a `NodeClaim` whose phase is `failed`/`completed` (a
+terminal claim frees its slot), and a delete of any claim. If two live claims are ever found on one
+slot — a webhook that was down, two providers racing, a claim applied by hand — the claim controller
+fails the older one with `reason: Superseded`; the newest live claim is the one the slot answers for.
 
 ### Who Cordoned My Node
 
@@ -265,7 +378,8 @@ kubectl describe node.infra.homecluster.dev <node-name>
 ```
 
 The controller reports the markers; it never adds, edits, or removes one, and it never writes
-`spec.desiredPowerState` - the scale-down request itself is the gRPC provider's to make.
+a slot's spec - the scale-down request itself is the gRPC provider's to make, and it makes it by
+cancelling the `NodeClaim` that owns the machine.
 
 **Date the decision from the condition's message, not from its `lastTransitionTime`.** A condition
 timestamp only moves when the `Status` flips, and both markers are recorded with `Status: True`, so

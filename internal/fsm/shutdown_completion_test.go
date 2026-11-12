@@ -32,7 +32,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
@@ -44,9 +44,9 @@ import (
 // same status write as progress: shuttingdown, so at the *start* of the operation. The tests pass
 // both shapes on purpose: a shutdown that has been under way for ten minutes, and the fast script
 // that finishes in seconds, which is the one the completion window used to misread.
-func shutdownCompletionSlot(stamp time.Time) *infrav1alpha1.Node {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShuttingDown)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+func shutdownCompletionSlot(stamp time.Time) *infrav2alpha1.Node {
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseDraining)
+	node.Status.PowerState = infrav2alpha1.PowerStateOn
 
 	stamped := metav1.NewTime(stamp)
 	node.Status.LastShutdownTime = &stamped
@@ -114,7 +114,7 @@ func completionHookAt(
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	node := shutdownCompletionSlot(stamp)
 	objects = append([]client.Object{node}, objects...)
@@ -149,7 +149,7 @@ func newShutdownCompletedEvent(nm *NodeStateMachine, job *batchv1.Job) *fsm.Even
 // a test that asserts a condition was not stamped cannot use FindStatusCondition's zero value and
 // stay readable. The condition is the one that says "Node is shutdown and powered off", so the
 // refusal of a shutdown the observation contradicts is what its absence pins.
-func shutdownCondition(node *infrav1alpha1.Node) *metav1.Condition {
+func shutdownCondition(node *infrav2alpha1.Node) *metav1.Condition {
 	for i := range node.Status.Conditions {
 		if node.Status.Conditions[i].Type == "Shutdown" {
 			return &node.Status.Conditions[i]
@@ -167,7 +167,7 @@ func shutdownCondition(node *infrav1alpha1.Node) *metav1.Condition {
 //
 // The completion must NOT be recorded as a shutdown. The pair {powerState: on, progress: shutdown}
 // is the state the FSM reads as StateShutdown, from which ShutdownNode is unreachable, which is what
-// made the live slot unhealable for 40 minutes and what left an operator patching status.progress by
+// made the live slot unhealable for 40 minutes and what left an operator patching status.phase by
 // hand. The slot is recorded at the progress the observation says, ready, so the claim that is
 // already off reaches ShutdownNode again on the next pass, and the Warning says which Job claimed
 // the machine was off.
@@ -176,12 +176,12 @@ func TestEnterShutdownDoesNotRecordAShutdownTheObservationContradicts(t *testing
 
 	nm.enterShutdown(context.TODO(), event)
 
-	updated := &infrav1alpha1.Node{}
+	updated := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-	assert.Equal(t, infrav1alpha1.ProgressReady, updated.Status.Progress,
-		"the shutdown is not recorded while the machine is observed up")
-	assert.Equal(t, infrav1alpha1.PowerStateOn, updated.Status.PowerState, "the observation is left to the observation controllers")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
+		"the shutdown is not recorded while the machine is observed up: the report says draining")
+	assert.Equal(t, infrav2alpha1.PowerStateOn, updated.Status.PowerState, "the observation is left to the observation controllers")
 	assert.Equal(t, StateReady, nm.GetCurrentState(), "the machine is moved to the state the observation says, so its own writer agrees")
 
 	// The Shutdown condition says "Node is shutdown and powered off": it is not stamped on a slot
@@ -221,10 +221,10 @@ func TestEnterShutdownRefusesAFastShutdownScript(t *testing.T) {
 
 		nm.enterShutdown(context.TODO(), event)
 
-		updated := &infrav1alpha1.Node{}
+		updated := &infrav2alpha1.Node{}
 		require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-		assert.Equal(t, infrav1alpha1.ProgressReady, updated.Status.Progress,
+		assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
 			"a heartbeat newer than the shutdown Job's completion is a kubelet alive after the script finished")
 		assert.Equal(t, StateReady, nm.GetCurrentState(), "the machine's own state moves with the write")
 		assert.Nil(t, shutdownCondition(updated), "no condition may claim a machine that is up is off")
@@ -265,17 +265,18 @@ func TestAfterJobCompletedDoesNotWriteTheShutdownTheEnterHookRefused(t *testing.
 
 	nm.enterShutdown(context.TODO(), event)
 
-	written := &infrav1alpha1.Node{}
+	written := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), written))
-	require.Equal(t, infrav1alpha1.ProgressReady, written.Status.Progress)
+	require.Equal(t, infrav2alpha1.NodePhaseDraining, written.Status.Phase)
 
 	nm.afterJobCompleted(context.TODO(), event)
 
-	updated := &infrav1alpha1.Node{}
+	updated := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-	assert.Equal(t, infrav1alpha1.ProgressReady, updated.Status.Progress,
-		"the after_ hook writes the progress of its transition (shutdown), and the guard refuses it")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
+		"the after_ hook writes the report of the machine it is in, and the guard refuses the write of "+
+			"a machine the inputs say is up")
 	assert.Equal(t, written.ResourceVersion, updated.ResourceVersion,
 		"the refused completion is one status write, not two")
 	assert.Equal(t, StateReady, nm.GetCurrentState())
@@ -328,10 +329,11 @@ func assertCompletionRecorded(t *testing.T, nm *NodeStateMachine, rec *events.Fa
 
 	nm.enterShutdown(context.TODO(), event)
 
-	updated := &infrav1alpha1.Node{}
+	updated := &infrav2alpha1.Node{}
 	require.NoError(t, nm.client.Get(context.TODO(), client.ObjectKeyFromObject(nm.node), updated))
 
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, updated.Status.Progress)
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
+		"the report is derived from the observation, which is still on in the window the guard answers for")
 	assert.Equal(t, StateShutdown, nm.GetCurrentState())
 	require.NotNil(t, shutdownCondition(updated), "the shutdown condition is stamped as it always was")
 
@@ -480,7 +482,7 @@ func TestShutdownObservationBound(t *testing.T) {
 func TestShutdownCompletionObservations(t *testing.T) {
 	t.Run("powerState off is not an observed on", func(t *testing.T) {
 		nm, _, _ := completionHook(t, kubeNodeWithHeartbeat(t, time.Now(), corev1.ConditionTrue))
-		nm.node.Status.PowerState = infrav1alpha1.PowerStateOff
+		nm.node.Status.PowerState = infrav2alpha1.PowerStateOff
 
 		assert.False(t, nm.machineObservedUp(context.TODO(), nil))
 	})

@@ -1,0 +1,271 @@
+# NodeClaim test data: the scale-up requests of the slots in nodes.yaml.
+#
+# In v2alpha1 a slot is capacity exactly while a live claim (pending, booting, ready) names it,
+# so this file is the fixture that says which of the slots in nodes.yaml are wanted, by which
+# request, and how that request ended. A slot with no claim here is a free slot: IncreaseSize may
+# claim it, TargetSize does not count it.
+
+---
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-test-node-1
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: test-group
+    infra.homecluster.dev/node: test-node-1
+    test-scenario: basic
+spec:
+  slotRef:
+    apiVersion: infra.homecluster.dev/v2alpha1
+    kind: Node
+    name: test-node-1
+  requestedAt: "2024-01-15T09:25:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: test-group
+  deadlineAt: "2024-01-15T09:35:00Z"
+  ttlSecondsAfterFinished: 3600
+status:
+  phase: ready
+  attempt: 1
+
+---
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-test-node-2
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: test-group
+    infra.homecluster.dev/node: test-node-2
+    test-scenario: basic
+spec:
+  slotRef:
+    name: test-node-2
+  requestedAt: "2024-01-15T09:26:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: test-group
+  deadlineAt: "2024-01-15T09:36:00Z"
+status:
+  phase: ready
+  attempt: 1
+
+---
+# gpu-node-1 is running and claimed; gpu-node-2 is the scale-up candidate of the group and has
+# no claim, which is the only shape NodeGroupIncreaseSize may claim.
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-gpu-node-1
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: gpu-group
+    infra.homecluster.dev/node: gpu-node-1
+    test-scenario: gpu-workload
+spec:
+  slotRef:
+    name: gpu-node-1
+  requestedAt: "2024-01-15T08:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: gpu-group
+  deadlineAt: "2024-01-15T08:10:00Z"
+status:
+  phase: ready
+  attempt: 1
+
+---
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-cpu-node-1
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: cpu-group
+    infra.homecluster.dev/node: cpu-node-1
+    test-scenario: cpu-workload
+spec:
+  slotRef:
+    name: cpu-node-1
+  requestedAt: "2024-01-15T08:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: cpu-group
+  deadlineAt: "2024-01-15T08:10:00Z"
+status:
+  phase: ready
+  attempt: 1
+
+---
+# The scale-down the provider has been asked for: the request is recorded on the claim that owns
+# the machine, and the claim is what carries it until the machine is observed off.
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-cpu-node-2
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: cpu-group
+    infra.homecluster.dev/node: cpu-node-2
+    test-scenario: shutting-down
+spec:
+  slotRef:
+    name: cpu-node-2
+  requestedAt: "2024-01-15T08:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: DeleteNodes
+    group: cpu-group
+    nodes:
+    - cpu-node-2
+  deadlineAt: "2024-01-15T08:10:00Z"
+status:
+  phase: ready
+  attempt: 1
+
+---
+# The boot in flight of the pool that is starting up: the claim is booting, the machine has not
+# joined, and the slot reports booting.
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-startup-node-1
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: unknown-group
+    infra.homecluster.dev/node: startup-node-1
+    test-scenario: starting-up
+spec:
+  slotRef:
+    name: startup-node-1
+  requestedAt: "2024-01-15T10:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: unknown-group
+  deadlineAt: "2024-01-15T10:10:00Z"
+status:
+  phase: booting
+  attempt: 1
+
+---
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-offline-node-1
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: offline-group
+    infra.homecluster.dev/node: offline-node-1
+    test-scenario: offline-nodes
+spec:
+  slotRef:
+    name: offline-node-1
+  requestedAt: "2024-01-15T08:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: offline-group
+  deadlineAt: "2024-01-15T08:10:00Z"
+status:
+  phase: ready
+  attempt: 1
+
+---
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-fast-node-1
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: fast-scale-group
+    infra.homecluster.dev/node: fast-node-1
+    test-scenario: fast-scaling
+spec:
+  slotRef:
+    name: fast-node-1
+  requestedAt: "2024-01-15T08:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: fast-scale-group
+  deadlineAt: "2024-01-15T08:10:00Z"
+status:
+  phase: ready
+  attempt: 1
+
+---
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-dev-node-1
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: dev-group
+    infra.homecluster.dev/node: dev-node-1
+    test-scenario: development
+spec:
+  slotRef:
+    name: dev-node-1
+  requestedAt: "2024-01-15T08:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: dev-group
+  deadlineAt: "2024-01-15T08:10:00Z"
+status:
+  phase: ready
+  attempt: 1
+
+---
+# An attempt that ended: the machine it asked for never became usable, so the slot is free again
+# and the request is not counted by TargetSize. `kubectl get nodeclaim` shows the episode until
+# its TTL collects it, and Node.status.lastClaim keeps the story after that.
+apiVersion: infra.homecluster.dev/v2alpha1
+kind: NodeClaim
+metadata:
+  name: claim-gpu-node-2
+  namespace: "{{ .Namespace }}"
+  labels:
+    app.kubernetes.io/name: homelab-autoscaler
+    group: gpu-group
+    infra.homecluster.dev/node: gpu-node-2
+    test-scenario: scale-up-candidate
+spec:
+  slotRef:
+    name: gpu-node-2
+  requestedAt: "2024-01-15T07:00:00Z"
+  requestedBy: cluster-autoscaler
+  request:
+    call: IncreaseSize
+    delta: 1
+    group: gpu-group
+  deadlineAt: "2024-01-15T07:10:00Z"
+status:
+  phase: failed
+  attempt: 2
+  reason: DeadlineExceeded
+  finishedAt: "2024-01-15T07:10:00Z"

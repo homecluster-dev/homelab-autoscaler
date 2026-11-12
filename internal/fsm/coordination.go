@@ -28,7 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // NOTE: Namespace configuration is not needed in the coordination manager.
@@ -190,7 +190,7 @@ func NewCoordinationManager(k8sClient client.Client, owner string) CoordinationM
 }
 
 // AcquireLock attempts to acquire an operation lock on a node using atomic operations
-func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *infrav1alpha1.Node, operation string, timeout time.Duration) error {
+func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *infrav2alpha1.Node, operation string, timeout time.Duration) error {
 	logger := log.Log.WithName("coordination")
 
 	if timeout == 0 {
@@ -212,7 +212,7 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 	// Use optimistic locking with retry to acquire the lock
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := cm.client.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
 			return fmt.Errorf("failed to get fresh node: %w", err)
 		}
@@ -250,7 +250,7 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 			//   lock really present in the API: false
 			//
 			// Re-reading the slot is the only way to tell the two shapes apart.
-			live := &infrav1alpha1.Node{}
+			live := &infrav2alpha1.Node{}
 			if getErr := cm.client.Get(ctx, client.ObjectKeyFromObject(node), live); getErr != nil {
 				// Nothing is known about the lock and the fact in hand is the lost write, so
 				// return it: RetryOnConflict retries a conflict, and anything else - the slot
@@ -295,7 +295,7 @@ func (cm *DefaultCoordinationManager) AcquireLock(ctx context.Context, node *inf
 // it so the shape of a lock - and the expiry every reader of it computes - is written in one
 // place: a re-stamp that ages a lock differently from an acquisition is a lock the next
 // acquisition, the node controller's cleanup and the progress watchdog all read at odds.
-func stampLock(node *infrav1alpha1.Node, owner, operation string, at time.Time, timeout time.Duration) {
+func stampLock(node *infrav2alpha1.Node, owner, operation string, at time.Time, timeout time.Duration) {
 	if node.Annotations == nil {
 		node.Annotations = make(map[string]string)
 	}
@@ -311,7 +311,7 @@ func stampLock(node *infrav1alpha1.Node, owner, operation string, at time.Time, 
 // losing the write, so it takes the object re-read from the API: the copy an acquisition
 // attempt stamped with its own annotations is not evidence about the lock, it is the
 // acquisition.
-func (cm *DefaultCoordinationManager) lockOn(node *infrav1alpha1.Node) *OperationLock {
+func (cm *DefaultCoordinationManager) lockOn(node *infrav2alpha1.Node) *OperationLock {
 	lock, exists := cm.CheckLock(context.TODO(), node)
 	if !exists || cm.IsLockExpired(lock) {
 		return nil
@@ -321,12 +321,12 @@ func (cm *DefaultCoordinationManager) lockOn(node *infrav1alpha1.Node) *Operatio
 }
 
 // ReleaseLock releases an operation lock from a node
-func (cm *DefaultCoordinationManager) ReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
+func (cm *DefaultCoordinationManager) ReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error {
 	logger := log.Log.WithName("coordination")
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := cm.client.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
 			return fmt.Errorf("failed to get fresh node: %w", err)
 		}
@@ -370,7 +370,7 @@ func (cm *DefaultCoordinationManager) ReleaseLock(ctx context.Context, node *inf
 }
 
 // CheckLock checks if a node has an active operation lock and returns the lock details
-func (cm *DefaultCoordinationManager) CheckLock(ctx context.Context, node *infrav1alpha1.Node) (*OperationLock, bool) {
+func (cm *DefaultCoordinationManager) CheckLock(ctx context.Context, node *infrav2alpha1.Node) (*OperationLock, bool) {
 	logger := log.Log.WithName("coordination")
 
 	if node.Annotations == nil {
@@ -449,13 +449,13 @@ func (cm *DefaultCoordinationManager) IsLockExpired(lock *OperationLock) bool {
 //
 // The operation and the timeout of the holder are kept verbatim: only the timestamp moves, so the
 // lock an operator sees in the annotations still names the operation that owns the slot.
-func (cm *DefaultCoordinationManager) RenewLock(ctx context.Context, node *infrav1alpha1.Node) (bool, error) {
+func (cm *DefaultCoordinationManager) RenewLock(ctx context.Context, node *infrav2alpha1.Node) (bool, error) {
 	logger := log.Log.WithName("coordination")
 
 	renewed := false
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := cm.client.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
 			return fmt.Errorf("failed to get fresh node: %w", err)
 		}
@@ -513,10 +513,10 @@ func (cm *DefaultCoordinationManager) RenewLock(ctx context.Context, node *infra
 }
 
 // ForceReleaseLock forcibly removes lock annotations from a node, regardless of ownership
-func (cm *DefaultCoordinationManager) ForceReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
+func (cm *DefaultCoordinationManager) ForceReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := cm.client.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
 			return fmt.Errorf("failed to get fresh node: %w", err)
 		}

@@ -25,7 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 func TestGetFSMTransitions(t *testing.T) {
@@ -565,12 +565,12 @@ func TestGetOperationForEvent(t *testing.T) {
 
 func TestGetFSMCallbacks(t *testing.T) {
 	// Create a minimal NodeStateMachine for testing
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 
 	// Set up proper scheme
 	scheme := runtime.NewScheme()
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 	fakeClient := CreateFakeClient(scheme, node)
 
 	fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)

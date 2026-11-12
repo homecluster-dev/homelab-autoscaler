@@ -41,7 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // Reason and action recorded on the Node CR when a declaration stops matching the machine, so
@@ -87,7 +87,7 @@ const driftTolerancePercent = 5
 // count, not a page of events.
 //
 // recorder may be nil, which records nothing (unit tests and the bare-metal setups do that).
-func CheckDeclaredCapacity(ctx context.Context, c client.Client, slot *infrav1alpha1.Node, recorder events.EventRecorder) error {
+func CheckDeclaredCapacity(ctx context.Context, c client.Client, slot *infrav2alpha1.Node, recorder events.EventRecorder) error {
 	logger := log.FromContext(ctx).WithValues("nodeCR", slot.Name)
 
 	if len(slot.Spec.NodeCapacity) == 0 {

@@ -28,22 +28,26 @@ import (
 
 	"github.com/looplab/fsm"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // Before hooks - executed before state transitions for lock acquisition
 //
 // The hooks are the only place a transition takes the coordination lock, and they run before
 // looplab/fsm applies the state change and calls the enter_ hooks, the writers of
-// status.progress inside the FSM. That ordering is the invariant the lifecycle rests on: a
-// transition refused by the lock never reaches a writer, so status.progress keeps the stable
+// status.phase inside the FSM. That ordering is the invariant the lifecycle rests on: a
+// transition refused by the lock never reaches a writer, so status.phase keeps the stable
 // value it had (ready for a scale-down that lost to a scale-up, shutdown for a scale-up that
-// lost to a scale-down). A progress left in startingup/shuttingdown is not cosmetic: it is
-// excluded from the provider's target size, validateStateTransition gates every transition of
-// the slot out, and nothing in a reconcile heals it - the stuck-transition cleanup the docs
-// used to promise runs on the machine's own backoff record, which a reconciler builds fresh on
-// every pass, so ForceCleanup is never reached from there. The progress of a transitional slot
-// is moved by the operation that put it there, from its own job monitor, and by no one else.
+// lost to a scale-down). A slot left transitional is not cosmetic: the live claim of the slot is
+// the provider's unit of capacity, and an operation in flight is the lifecycle Job this transition
+// created - which is why the transition that refuses has to refuse before it creates, and what it
+// leaves behind is a slot with a Job of the operation that owns the lock, and nothing else. Under
+// v1alpha1 the same shape was a `status.progress` the slot reconciler gated every transition of
+// out (`validateStateTransition`, gone with docs/design/nodeclaim.md §6); under the claim model
+// the state is derived from (claim, observation, Jobs), so a refusal that writes nothing also
+// claims nothing. The transitional slot is moved on by the operation that put it there, from its
+// own job monitor, and - if that monitor died with a manager restart - by the reconcile that reads
+// the Job object (internal/controller/infra/lifecycle.go).
 // That is why a refusal has to happen before a writer, not after it. See
 // cancelLockedTransition and docs/architecture/state.md.
 
@@ -123,9 +127,10 @@ func (nm *NodeStateMachine) cancelLockedTransition(logger logr.Logger, e *fsm.Ev
 // It exists for the one path that holds a slot open longer than the lock's own timeout: the
 // scale-up transition into ready runs setNodeSchedulableWithRetry, which can spend 90s waiting for
 // the node object to register and then 4 minutes on the readiness gate - more than
-// DefaultLockTimeout. A lock that ages out mid-wait is not a lock: the next acquisition takes it
-// over, validateStateTransition cleans it up, and the progress watchdog's lock gate stops
-// protecting the slot while its own grace is measured against the very loop that is running. The
+// DefaultLockTimeout. A lock that ages out mid-wait is not a lock: the next acquisition takes the
+// slot, and a scale-down can then start its Job and its cordon on the machine this loop is still
+// waiting for - the readiness gate and the registration wait together are longer than the lock's
+// own timeout, which is exactly the window the renewal covers. The
 // caller that owns the slot therefore renews it on every pass of that loop, and nothing else does:
 // renewal never acquires, never touches a lock owned by another component, and never resurrects an
 // expired one (see DefaultCoordinationManager.RenewLock).
@@ -168,7 +173,7 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 		//
 		// The gate is the second half of the same loop: the node has to report Ready and be free of
 		// the readiness taints the Group declares (spec.nodeReadinessTaints, by default Cilium's
-		// node.cilium.io/agent-not-ready), because the update of status.progress below is what the
+		// node.cilium.io/agent-not-ready), because the update of status.phase below is what the
 		// autoscaler reads as usable capacity. It has its own deadline
 		// (fsm.DefaultReadinessGateTimeout, 4m), counted from the moment the node object appears:
 		// sharing the 90s registration budget with it means a slow boot leaves no time for the gate
@@ -188,31 +193,24 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 			// (setNodeSchedulableWithRetry), so the only case that leaves the node cordoned is a
 			// write that the API server refused, and the next startup's loop is the one that fixes it.
 			//
-			// A gate that timed out does NOT reset the startup-attempt record. The slot is about to be
-			// recorded ready with the bootstrap taint still on it, which is the machine the pool paid
-			// for and cannot use - the exact failure the bound exists to price. Only a gate that
-			// answered resets, in the else branch below.
+			// A gate that timed out is the evidence that this claim did not produce a usable
+			// machine, and under the claim model that is a failed attempt: the slot is not recorded
+			// ready with the bootstrap taint on it, the machine is force-shut-down, the slot becomes
+			// free, and the next claim on it is attempt N+1. The node is uncordoned on the way out of
+			// the gate either way (abandonReadinessGate), because a cordoned node is skipped by
+			// cluster-autoscaler's scale-down and is paid for forever.
+			nm.moveClaim(infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonReadinessGateTimeout)
 		} else {
 			logger.Info("Successfully uncordoned Kubernetes node", "kubernetesNode", nm.node.Spec.KubernetesNodeName)
 
-			// The gate is satisfied: the node object exists, it reports Ready, it is free of every
-			// readiness taint the Group declares, and it is uncordoned. That is the proof the claim
-			// episode booted a machine the pool can use, and the one place the startup-attempt counter
-			// is reset. JobCompleted alone is not: a startup whose Job succeeded and whose machine never
-			// clears its CNI taint has spent its attempts and must keep them counted, or the bound is
-			// cleared by the failure it bounds and the loop it exists for is unbounded again.
-			//
-			// Resetting here is also what keeps the counter from becoming a lifetime sentence: slots are
-			// long-lived and are reused across claim episodes, so a count that is never cleared makes the
-			// fourth unrelated failure of a machine over its life the last one the pool ever retries.
-			nm.clearStartupAttemptRecord()
-
-			// The same gate clears the *shutdown*-attempt record: a machine that booted, registered and
-			// took the pool's work has ended the episode in which its scale-downs were refused, so the next
-			// scale-down of this slot starts from an unspent bound. A bound cleared only by a shutdown that
-			// lands is a lifetime sentence on a machine whose provider API is flaky, and the reset rule of
-			// the startup counter is the same one for the same reason (internal/fsm/shutdown_attempts.go).
-			nm.clearShutdownAttemptRecord()
+			// The gate is the answer for the claim: the node object exists, it reports Ready, it is
+			// free of every readiness taint the Group declares, and it is uncordoned. That is exactly
+			// the sentence the claim's ready phase asserts - "the machine I asked for can take the
+			// pool's work" (docs/design/nodeclaim.md §3, §7) - and it is the only writer of that
+			// move. The attempt bound needs no reset here: the count lives on the claim, and this
+			// claim ends as a success, so the streak the digest carries restarts at 1 for the next
+			// request of the slot (internal/claim.SeedAttempt).
+			nm.moveClaim(infrav2alpha1.NodeClaimReady, "")
 		}
 	}
 
@@ -223,21 +221,11 @@ func (nm *NodeStateMachine) afterJobCompleted(ctx context.Context, e *fsm.Event)
 		logger.Info("Successfully released coordination lock after job completion", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect new state. The value is the progress of the transition this hook
-	// closes, Progress(e.Dst) - and that is what keeps updateNodeProgress's guard ("refuse a progress
-	// the state machine is not in") a check rather than a tautology. Passing the machine's own state
-	// (nm.GetCurrentState()) asks the guard "is the progress I am about to write the progress of the
-	// state I am in?" with the answer taken from the same field, so it can never fire from here, and a
-	// guard no caller can trip is a guard that documents a rule nothing respects.
-	//
-	// The two spellings differ on exactly one shape, and it is the one the guard is for: the completion
-	// of a shutdown Job whose machine the cluster still observes up. enterShutdown refused that
-	// completion, moved the machine to ready, and wrote ready (refuseUnobservedShutdown returns the
-	// progress it recorded, and that is the only writer of the slot on that completion). This hook's
-	// transition still says shutdown, so the guard refuses the write, the slot is written once, and the
-	// two hooks of one completion cannot disagree about a value the observation contradicts. Every other
-	// completion leaves the machine in e.Dst, so both spellings write the same value.
-	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
+	// Record the slot's derived report. The claim move above is what changes it: the readiness
+	// gate's answer is an input, and phase.Derive is the formula (see internal/fsm/claims.go for
+	// why this writer takes no argument, and for the guard that keeps a stale machine from
+	// writing).
+	nm.reportPhase()
 
 	// Jobs are cleaned up automatically via TTL - no manual cleanup needed
 }
@@ -264,6 +252,15 @@ func (nm *NodeStateMachine) afterJobTimeout(ctx context.Context, e *fsm.Event) {
 	if err := nm.coordinationManager.ForceReleaseLock(ctx, nm.node); err != nil {
 		logger.Error(err, "Failed to release coordination lock after job timeout", "node", nm.node.Name)
 	}
+
+	// The operation is over and it did not produce what it asked for, so the claim that asked for
+	// it ends. This is the v1alpha1 rollback of a timed-out lifecycle Job into a stable progress,
+	// with the end of the attempt recorded on the object that carried the request. The Job of this
+	// operation is finished, so the input stops naming one: the report and the state the same pass
+	// derives are the stable shape the rollback landed on.
+	nm.releaseJobInputs(e)
+	nm.moveClaim(infrav2alpha1.NodeClaimFailed, jobFailureReason(e, true))
+	nm.reportPhase()
 }
 
 func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {
@@ -278,11 +275,15 @@ func (nm *NodeStateMachine) afterJobFailed(ctx context.Context, e *fsm.Event) {
 		logger.Info("Successfully released coordination lock after job failure", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect failure and new state: the progress of the transition this hook
-	// closes, which is what makes updateNodeProgress's guard a check (see afterJobCompleted for why the
-	// machine's own state is not the value to pass, and which shape is the one that differs). A rollback
-	// leaves the machine in e.Dst, so the value written is the one the transition took.
-	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
+	// The attempt is over: a startup Job that exited non-zero is a machine that was bought and did
+	// not work, and the claim says so (reason StartupJobFailed / ShutdownJobFailed). The bound on
+	// the streak of attempts is enforced by the claim controller against the digest the slot keeps,
+	// so the v1alpha1 condition on the slot and its refusal site are gone (§4).
+	nm.releaseJobInputs(e)
+	nm.moveClaim(infrav2alpha1.NodeClaimFailed, jobFailureReason(e, false))
+
+	// Record the slot's derived report against the new claim phase and the observation.
+	nm.reportPhase()
 
 	// Add failure condition
 	nm.addNodeCondition(metav1.Condition{
@@ -315,8 +316,11 @@ func (nm *NodeStateMachine) afterForceCleanup(ctx context.Context, e *fsm.Event)
 		logger.Info("Successfully force released coordination lock", "node", nm.node.Name)
 	}
 
-	// Update node status to reflect cleanup: the progress of the transition, as in afterJobCompleted.
-	nm.updateNodeProgress(infrav1alpha1.Progress(e.Dst))
+	// A transition that got stuck and was force-cleaned produced no usable machine either, so the
+	// claim of the episode ends.
+	nm.releaseJobInputs(e)
+	nm.moveClaim(infrav2alpha1.NodeClaimFailed, infrav2alpha1.ClaimReasonStuckTransition)
+	nm.reportPhase()
 
 	// Add cleanup condition
 	nm.addNodeCondition(metav1.Condition{
@@ -342,26 +346,19 @@ func (nm *NodeStateMachine) enterStartingUp(ctx context.Context, e *fsm.Event) {
 		maxRetries:      MaxRetries,
 	}
 
-	// Update node status
-	nm.updateNodeProgress(infrav1alpha1.ProgressStartingUp)
+	// The pending -> booting edge: this transition is the startup operation beginning, so the claim
+	// moves here, and the write is what the report of the same pass is derived from. The startup Job
+	// is created by the caller a few lines later; if that creation fails, StartNode fires the
+	// JobFailed rollback and afterJobFailed moves the claim to failed - a committed boot that never
+	// got its Job is a failed attempt, not a claim left in pending with a Job nothing owns.
+	nm.moveClaim(infrav2alpha1.NodeClaimBooting, "")
+	nm.reportPhase()
 
-	// Count the startup attempt. This is the one place every startup attempt begins: the
-	// shutdown -> startingup transition is what a lifecycle Job and a power-on of a real machine hang
-	// off, and both entries of the failure loop pass through it - the controller's StartNode after a
-	// JobFailed/JobTimeout rollback, and the re-arm the progress watchdog writes for a claim whose
-	// machine never registered, which hands the slot to that same StartNode. Counting here is what
-	// makes one bound cover both loops; counting the watchdog's re-arms covered one of them and left
-	// the loud one unbounded, buying a machine per pass.
-	//
-	// The record is cleared where an attempt demonstrably succeeded - the readiness gate of
-	// afterJobCompleted - so the bound is a bound on one claim episode, not on the life of a slot
-	// that is reused across claims. See internal/fsm/startup_attempts.go.
-	attempt := nm.recordStartupAttempt()
-
-	logger.V(1).Info("Recorded a startup attempt",
-		"node", nm.node.Name,
-		"attempt", attempt,
-		"limit", StartupAttemptLimit)
+	// The startup attempt is counted on the claim, not on the slot: status.attempt is seeded from
+	// the slot's digest when the claim is created, and the pending -> booting write (StartNode,
+	// commitAttempt) is the edge that buys the machine. There is no counter on the slot to
+	// accumulate, so the reset heuristics of the v1alpha1 ClaimRearmed condition are gone with it
+	// (docs/design/nodeclaim.md §4).
 
 	// Add progressing condition
 	nm.addNodeCondition(metav1.Condition{
@@ -390,29 +387,12 @@ func (nm *NodeStateMachine) enterShuttingDown(ctx context.Context, e *fsm.Event)
 		maxRetries:      MaxRetries,
 	}
 
-	// Update node status
-	nm.updateNodeProgress(infrav1alpha1.ProgressShuttingDown)
+	// Record the report of the slot: with the shutdown operation started, the slot is draining.
+	nm.reportPhase()
 
-	// Count the shutdown attempt, the mirror of enterStartingUp: this is the one place a shutdown
-	// attempt begins. The ready -> shuttingdown transition is what the coordination lock, the cordon
-	// and the shutdown lifecycle Job hang off, and every caller of ShutdownNode passes through it - the
-	// autoscaler's scale-down, the shutdown an observed-power correction releases, and the retry a refused
-	// shutdown completion leads back into.
-	//
-	// Counting it here, and not in the refusal, is what makes one bound cover the loop the refusal
-	// starts (internal/fsm/shutdown_completion.go): a pool whose spec.shutdownPodSpec exits 0 without
-	// the provider's power-off landing cycles Job, refused completion, correction, ShutdownNode, Job -
-	// and every pass of that loop re-cordons a node that is serving pods and spends a power operation on
-	// a real machine. The record is cleared where an attempt demonstrably succeeded: a shutdown
-	// completion the observation agreed with (enterShutdown), and the readiness gate of a boot
-	// (afterJobCompleted) - so the bound prices one scale-down episode, not the life of a slot. See
-	// internal/fsm/shutdown_attempts.go.
-	attempt := nm.recordShutdownAttempt()
-
-	logger.V(1).Info("Recorded a shutdown attempt",
-		"node", nm.node.Name,
-		"attempt", attempt,
-		"limit", ShutdownAttemptLimit)
+	// The shutdown attempt is counted on the claim that asked for the scale-down (a DeleteNodes
+	// claim), and the count ends when that claim ends. The v1alpha1 ShutdownAttempts condition on
+	// the long-lived slot, and its two reset sites, are gone (§4).
 
 	// Add progressing condition
 	nm.addNodeCondition(metav1.Condition{
@@ -436,8 +416,10 @@ func (nm *NodeStateMachine) enterReady(ctx context.Context, e *fsm.Event) {
 	// Clear backoff strategy
 	nm.backoff = nil
 
-	// Update node status
-	nm.updateNodeProgress(infrav1alpha1.ProgressReady)
+	// Record the report of the slot. The claim's booting -> ready move is written by
+	// afterJobCompleted, where the readiness gate's answer is known; this hook records what the
+	// inputs of the transition say.
+	nm.reportPhase()
 
 	// Add ready condition
 	nm.addNodeCondition(metav1.Condition{
@@ -474,29 +456,21 @@ func (nm *NodeStateMachine) enterShutdown(ctx context.Context, e *fsm.Event) {
 	// Clear backoff strategy
 	nm.backoff = nil
 
-	// The completion of a shutdown Job is the one write of status.progress: shutdown this package
+	// The completion of a shutdown Job is the one write of "the machine is off" this package
 	// cannot verify - its evidence is the exit code of a container the operator supplies (see the
 	// audit in shutdown_completion.go, and the live slot it closes). So the completion is conditional
 	// on the observation: a machine the cluster reports up (status.powerState on, and its corev1.Node
-	// Ready with a heartbeat newer than the shutdown Job's completion) is recorded at the progress the
-	// observation says, ready, and is not recorded shut down at all. From ready the claim that is
-	// already off reaches ShutdownNode again on the next pass; from shutdown nothing on this slot is
-	// reachable, which is the dead slot the record alone produced.
+	// Ready with a heartbeat newer than the shutdown Job's completion) is not recorded off at all,
+	// and the report the inputs derive says draining - the machine is up and the pool does not want
+	// it, which is exactly the shape the next pass acts on by firing ShutdownNode again.
 	//
-	// The refusal returns the progress it wrote, and this hook is the only writer of the slot on that
-	// completion: afterJobCompleted then asks for the progress of its own transition (shutdown) and
-	// updateNodeProgress refuses it, because the machine is in ready. That is the shape
-	// updateNodeProgress's guard exists for, and why the hooks pass the transition's destination.
-	//
-	// A startup that died on the way (JobFailed / JobTimeout / ForceCleanup into shutdown) is not
-	// gated: those land on the stable off/shutdown pair by design, and the observation controllers
-	// write the machine they find - the rule that keeps that pair from resting is
-	// progress.ReconcileObservedPower, which applies the same precedence on the far side of its grace.
+	// Under v1alpha1 the same refusal existed to keep the slot out of a progress the state machine
+	// could not act on; here it keeps the *report* honest, and the action is derived from the
+	// observation, not from the record.
 	if e != nil && e.Event == EventJobCompleted {
 		job := jobFromArgs(e)
 
-		if recorded := nm.refuseUnobservedShutdown(ctx, job); recorded != "" {
-			attempts := ShutdownAttemptsOf(nm.node)
+		if nm.refuseUnobservedShutdown(ctx, job) {
 			_, boundNote := shutdownObservationBound(nm.node, job)
 
 			logger.Info("Not recording the shutdown completion: the machine is observed up",
@@ -505,25 +479,29 @@ func (nm *NodeStateMachine) enterShutdown(ctx context.Context, e *fsm.Event) {
 				"kubernetesNode", kubernetesNodeTarget(nm.node),
 				"powerstate", string(nm.node.Status.PowerState),
 				"measuredAgainst", boundNote,
-				"shutdownAttempts", attempts,
-				"shutdownAttemptLimit", ShutdownAttemptLimit,
-				"recorded", string(recorded),
+				"recorded", string(nm.node.Status.Phase),
 				"why", "the shutdown Job exited 0 and the provider's observation says the machine is up: "+
-					"recording shutdown would strand the slot in a state the FSM cannot act on")
+					"recording the slot off would be a report the cluster contradicts")
 
 			nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonShutdownNotObserved, ActionPowerOff,
-				shutdownNotObservedNote(nm, job, boundNote, attempts))
+				shutdownNotObservedNote(nm, job, boundNote))
+
+			// The scale-down attempt did not land, so the claim that asked for it is not completed:
+			// the claim controller keeps it (bounded by its deadline and the attempt streak the
+			// digest carries) and the next pass runs the shutdown again.
+			nm.reportPhase()
 
 			return
 		}
 
-		// The completion is recorded, and the observation agreed the machine is off: that shutdown
-		// attempt landed, so the bound starts over for the next scale-down of this slot.
-		nm.clearShutdownAttemptRecord()
+		// The completion is recorded and the observation agreed the machine is off. The scale-down
+		// claim of this slot - the object DeleteNodes named and marked for deletion - has done its
+		// job, and ends completed. The claim controller removes its finalizer on the same evidence.
+		nm.completeScaleDownClaim(infrav2alpha1.ClaimReasonNodeDeleted)
 	}
 
-	// Update node status
-	nm.updateNodeProgress(infrav1alpha1.ProgressShutdown)
+	// Record the report of the slot: no live claim plus an observation that says off is a free slot.
+	nm.reportPhase()
 
 	// Add shutdown condition
 	nm.addNodeCondition(metav1.Condition{

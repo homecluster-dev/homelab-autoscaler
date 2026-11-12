@@ -30,11 +30,11 @@ spec:
       jsonPath: .status.powerState
       name: Powerstate
       type: string
-    - description: Current power progress
-      jsonPath: .status.progress
-      name: Progress
+    - description: Derived phase of the slot (live claim + observed power + node usability)
+      jsonPath: .status.phase
+      name: Phase
       type: string
-    name: v1alpha1
+    name: v2alpha1
     schema:
       openAPIV3Schema:
         description: Node is the Schema for the nodes API
@@ -175,29 +175,6 @@ spec:
                   - key
                   type: object
                 type: array
-              powerState:
-                default: "off"
-                description: |-
-                  DesiredPowerState is the desired *claim* for this slot: "on" asks the operator to bring the
-                  machine up, "off" asks it to shut the machine down. "off" is the CRD default, so a Node that
-                  is created, or applied, without the field is claimed off by the API server.
-
-                  The autoscaler owns the write. Scale-up claims a slot "on", scale-down and slot cleanup drop
-                  the claim to "off". The Node controller never writes it, it only acts on it: claim "on" with
-                  the machine off boots the machine, claim "off" with the machine on shuts it down. Nobody else
-                  writes the field, and nothing in Git declares it.
-
-                  A GitOps manifest must not carry this field. Argo CD with selfHeal re-applies the value that
-                  is in git every sync (~2-3 minutes), so a manifest that says powerState: off reverts the
-                  autoscaler's claim ~2.5 minutes after it was written: the FSM shuts the machine down while a
-                  pod is using it, the pending pod triggers the next scale-up, and the slot churns forever. An
-                  applied field is a claim the autoscaler can never win, which is why the field is optional and
-                  defaulted rather than Required: a Node that omits it gets "off" from the API server, git stops
-                  being a writer, and the last claim stands.
-                enum:
-                - "on"
-                - "off"
-                type: string
               pricing:
                 properties:
                   hourlyRate:
@@ -424,6 +401,79 @@ spec:
                 - offline
                 - unknown
                 type: string
+              lastClaim:
+                description: |-
+                  LastClaim is the digest of the most recent NodeClaim of this slot. Claims are collected
+                  after they land (TTL), and this is what survives the collection, so that
+                  `kubectl describe node.infra.homecluster.dev <slot>` still answers "who asked, when, how
+                  many attempts, why did it end". Written by the claim controller, read by nobody to decide
+                  an action; the next claim's status.attempt is seeded from it.
+                properties:
+                  attempt:
+                    description: |-
+                      Attempt is the attempt number the claim carried (1..N for the slot). Seeding the next
+                      claim reads it; see the reset rule in internal/claim.SeedAttempt.
+                    format: int32
+                    type: integer
+                  call:
+                    description: |-
+                      Call is the gRPC entry point that created the claim (IncreaseSize, DecreaseTargetSize,
+                      DeleteNodes) - the attribution of the request that owned this slot.
+                    type: string
+                  deadlineAt:
+                    description: DeadlineAt is the budget the claim carried.
+                    format: date-time
+                    type: string
+                  finishedAt:
+                    description: FinishedAt is when the claim reached its terminal
+                      phase.
+                    format: date-time
+                    type: string
+                  group:
+                    description: Group is the node group the request was for.
+                    type: string
+                  lastShutdownAttemptAt:
+                    description: |-
+                      LastShutdownAttemptAt is when the last of those attempts was counted. The streak reset's grace is
+                      measured from it, so a slot whose pool script has been fixed is not sentenced by the attempts of
+                      the episodes that ended (docs/design/nodeclaim.md §4).
+                    format: date-time
+                    type: string
+                  name:
+                    description: Name is the name of the claim, so an operator can
+                      find it while it still exists.
+                    type: string
+                  phase:
+                    description: |-
+                      Phase is the phase the claim ended in: failed and completed are terminal, and this is the
+                      sentence "the last attempt of this slot ended like this".
+                    enum:
+                    - pending
+                    - booting
+                    - ready
+                    - failed
+                    - completed
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is the one-line outcome: DeadlineExceeded, StartupJobFailed, ReadinessGateTimeout,
+                      CancelledByDecreaseTargetSize, NodeDeleted, AttemptLimitExceeded.
+                    type: string
+                  requestedAt:
+                    description: RequestedAt is when the request was made.
+                    format: date-time
+                    type: string
+                  shutdownAttempts:
+                    description: |-
+                      ShutdownAttempts is the scale-down attempts the claim had spent when the episode ended. It is
+                      the record the slot reconciler reads to decide whether to keep firing a shutdown on a machine
+                      that stays up when no claim of the slot is left to carry the count (see
+                      claim.ScaleDownStreakSpent), and it is a counter of its own: the boot attempts of the episode are
+                      in Attempt, and a shutdown that will not land must not spend them.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
               lastShutdownTime:
                 description: LastShutdownTime is the last time the node was successfully
                   shut down.
@@ -434,13 +484,28 @@ spec:
                   started up.
                 format: date-time
                 type: string
+              phase:
+                description: |-
+                  Phase is the derived report of the slot: see NodePhase. Written from
+                  (live claim, observed power, node usability), read by nobody in the operator, and
+                  present so that `kubectl get nodes.infra.homecluster.dev` keeps one column that tells an
+                  operator what the slot is doing.
+                enum:
+                - "off"
+                - pending
+                - booting
+                - ready
+                - draining
+                type: string
               powerState:
+                description: |-
+                  PowerState is the power the provider observes for this slot's machine: on when the
+                  corev1.Node reports NodeReady=True, off otherwise. It is an observation, not an intent, and
+                  it is the input the state machine reads ("observed power") next to the live claim.
+                enum:
+                - "on"
+                - "off"
                 type: string
-              progress:
-                type: string
-            required:
-            - powerState
-            - progress
             type: object
         required:
         - spec

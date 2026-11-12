@@ -27,7 +27,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 // MockCoordinationManager implements CoordinationManager for testing
@@ -46,27 +48,27 @@ type MockCoordinationManager struct {
 }
 
 type AcquireCall struct {
-	Node      *infrav1alpha1.Node
+	Node      *infrav2alpha1.Node
 	Operation string
 	Timeout   time.Duration
 }
 
 type ReleaseCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 type CheckCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 type ForceCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 // RenewCall records a re-stamp of the coordination lock, which is how a test asserts that the
 // readiness gate keeps the lock it holds alive (see NodeStateMachine.renewOperationLock).
 type RenewCall struct {
-	Node *infrav1alpha1.Node
+	Node *infrav2alpha1.Node
 }
 
 // NewMockCoordinationManager creates a new mock coordination manager
@@ -81,7 +83,7 @@ func NewMockCoordinationManager() *MockCoordinationManager {
 	}
 }
 
-func (m *MockCoordinationManager) AcquireLock(ctx context.Context, node *infrav1alpha1.Node, operation string, timeout time.Duration) error {
+func (m *MockCoordinationManager) AcquireLock(ctx context.Context, node *infrav2alpha1.Node, operation string, timeout time.Duration) error {
 	m.acquireCalls = append(m.acquireCalls, AcquireCall{
 		Node:      node,
 		Operation: operation,
@@ -103,7 +105,7 @@ func (m *MockCoordinationManager) AcquireLock(ctx context.Context, node *infrav1
 	return nil
 }
 
-func (m *MockCoordinationManager) ReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
+func (m *MockCoordinationManager) ReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error {
 	m.releaseCalls = append(m.releaseCalls, ReleaseCall{Node: node})
 
 	if m.releaseError != nil {
@@ -115,7 +117,7 @@ func (m *MockCoordinationManager) ReleaseLock(ctx context.Context, node *infrav1
 	return nil
 }
 
-func (m *MockCoordinationManager) CheckLock(ctx context.Context, node *infrav1alpha1.Node) (*OperationLock, bool) {
+func (m *MockCoordinationManager) CheckLock(ctx context.Context, node *infrav2alpha1.Node) (*OperationLock, bool) {
 	m.checkCalls = append(m.checkCalls, CheckCall{Node: node})
 
 	if m.checkError != nil {
@@ -134,7 +136,7 @@ func (m *MockCoordinationManager) IsLockExpired(lock *OperationLock) bool {
 }
 
 // ForceReleaseLock forcibly removes lock annotations from a node, regardless of ownership
-func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
+func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error {
 	m.forceCalls = append(m.forceCalls, ForceCall{Node: node})
 
 	if m.forceError != nil {
@@ -149,7 +151,7 @@ func (m *MockCoordinationManager) ForceReleaseLock(ctx context.Context, node *in
 // RenewLock re-stamps the timestamp of the mock's lock, mirroring the real manager's rules: no
 // lock, a lock owned by someone else, or an expired lock is left alone and reported as not
 // renewed.
-func (m *MockCoordinationManager) RenewLock(ctx context.Context, node *infrav1alpha1.Node) (bool, error) {
+func (m *MockCoordinationManager) RenewLock(ctx context.Context, node *infrav2alpha1.Node) (bool, error) {
 	m.renewCalls = append(m.renewCalls, RenewCall{Node: node})
 
 	if m.renewError != nil {
@@ -234,9 +236,13 @@ func (m *MockCoordinationManager) Reset() {
 	m.renewCalls = make([]RenewCall, 0)
 }
 
-// CreateTestNode creates a test node with the given parameters
-func CreateTestNode(name, namespace string, powerState infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+// CreateTestNode creates a test node with the given observed power and reported phase.
+//
+// The phase argument is the report the slot carries, and it is NOT the input of the state machine:
+// v2alpha1 derives the state from (live claim, observed power, node usability), so a test that needs
+// a transitional state passes a live claim, or the input itself, with WithClaim / WithInput.
+func CreateTestNode(name, namespace string, powerState infrav2alpha1.PowerState, nodePhase infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
@@ -244,23 +250,22 @@ func CreateTestNode(name, namespace string, powerState infrav1alpha1.PowerState,
 				"group": "test-group",
 			},
 		},
-		Spec: infrav1alpha1.NodeSpec{
-			DesiredPowerState:  powerState,
+		Spec: infrav2alpha1.NodeSpec{
 			KubernetesNodeName: name + "-k8s",
-			StartupPodSpec: infrav1alpha1.MinimalPodSpec{
+			StartupPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/startup:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'starting node'"},
 			},
-			ShutdownPodSpec: infrav1alpha1.MinimalPodSpec{
+			ShutdownPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/shutdown:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'shutting down node'"},
 			},
 		},
-		Status: infrav1alpha1.NodeStatus{
+		Status: infrav2alpha1.NodeStatus{
 			PowerState: powerState,
-			Progress:   progress,
+			Phase:      nodePhase,
 		},
 	}
 }
@@ -338,7 +343,7 @@ func CreateFakeClient(scheme *runtime.Scheme, objects ...client.Object) client.C
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).
-		WithStatusSubresource(&infrav1alpha1.Node{}).
+		WithStatusSubresource(&infrav2alpha1.Node{}).
 		Build()
 }
 
@@ -393,4 +398,170 @@ func CreateTestKubernetesNode(name string, unschedulable bool) *corev1.Node {
 // progress.
 func (nm *NodeStateMachine) PrimeEnterState(state string) {
 	nm.fsm.SetState(state)
+}
+
+// TestClaim builds the live claim of a test slot. The claim is the input the state machine derives
+// its state from in v2alpha1, so a test of a transitional slot names a claim, not a progress string.
+// marked is the scale-down shape: a claim a DeleteNodes request has marked for deletion.
+func TestClaim(slotName, name string, claimPhase infrav2alpha1.NodeClaimPhase, marked bool) *infrav2alpha1.NodeClaim {
+	nodeClaim := &infrav2alpha1.NodeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: infrav2alpha1.GroupVersion.String(),
+			Kind:       "NodeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: config.NewNamespaceConfig().Get(),
+			Labels:    map[string]string{"infra.homecluster.dev/node": slotName, "group": "test-group"},
+			Finalizers: []string{
+				"infra.homecluster.dev/nodeclaim-finalizer",
+			},
+		},
+		Spec: infrav2alpha1.NodeClaimSpec{
+			SlotRef: corev1.ObjectReference{
+				APIVersion: infrav2alpha1.GroupVersion.String(),
+				Kind:       "Node",
+				Name:       slotName,
+			},
+			RequestedBy: "cluster-autoscaler",
+			Request: infrav2alpha1.ClaimRequest{
+				Call:  infrav2alpha1.ClaimCallIncreaseSize,
+				Delta: 1,
+				Group: "test-group",
+			},
+		},
+		Status: infrav2alpha1.NodeClaimStatus{
+			Phase:   claimPhase,
+			Attempt: 1,
+		},
+	}
+
+	if marked {
+		now := metav1.Now()
+		nodeClaim.DeletionTimestamp = &now
+	}
+
+	return nodeClaim
+}
+
+// InputOf is the FSM input of a shape under test: the claim, the observed power, the usability of
+// the node, and the lifecycle Jobs in flight.
+func InputOf(nodeClaim *infrav2alpha1.NodeClaim, powerState infrav2alpha1.PowerState, usable bool) phase.Input {
+	return phase.Input{
+		Claim:         nodeClaim,
+		ObservedPower: powerState,
+		NodeUsable:    usable,
+	}
+}
+
+// claimTestWriter is the fsm.ClaimWriter the hook tests move claims through. It writes the phase onto
+// the object the fake client holds, and enforces nothing: the phase table is internal/claim's own
+// test subject, and a hook test wants the evidence a transition produced, not the policy around it.
+type claimTestWriter struct {
+	client client.Client
+}
+
+func newClaimTestWriter(c client.Client) ClaimWriter {
+	return &claimTestWriter{client: c}
+}
+
+func (w *claimTestWriter) MoveClaim(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase, reason string) error {
+	if nodeClaim == nil {
+		return nil
+	}
+
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := w.client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		return err
+	}
+
+	fresh.Status.Phase = to
+	fresh.Status.Reason = reason
+
+	if err := w.client.Update(ctx, fresh); err != nil {
+		return err
+	}
+
+	nodeClaim.Status.Phase = to
+
+	return nil
+}
+
+// RecordShutdownAttempt counts the shutdown on the claim, the way the controller's writer does: the
+// hook tests assert the streak the bound reads, so the fake writes the same two fields the real
+// writer stamps, with the same reset rule.
+func (w *claimTestWriter) RecordShutdownAttempt(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error {
+	if nodeClaim == nil {
+		return nil
+	}
+
+	fresh := &infrav2alpha1.NodeClaim{}
+	if err := w.client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), fresh); err != nil {
+		return err
+	}
+
+	if fresh.Status.ShutdownAttempts >= maxConsecutiveAttemptsOfClaim {
+		fresh.Status.ShutdownAttempts = 0
+	}
+
+	fresh.Status.ShutdownAttempts++
+
+	now := metav1.Now()
+	fresh.Status.LastShutdownAttemptAt = &now
+
+	if err := w.client.Update(ctx, fresh); err != nil {
+		return err
+	}
+
+	nodeClaim.Status.ShutdownAttempts = fresh.Status.ShutdownAttempts
+
+	return nil
+}
+
+// maxConsecutiveAttemptsOfClaim mirrors claim.MaxConsecutiveAttempts. internal/fsm cannot import
+// internal/claim - the claim package measures the boot budget from these constants, and an edge the
+// other way is a cycle - so a test helper that applies the bound names the number it mirrors.
+const maxConsecutiveAttemptsOfClaim = int32(3)
+
+// SlotInput is the input triple whose derivation puts a state machine in the state a slot's report
+// describes. A test that needs a transitional slot names the shape of the slot - the claim it carries
+// and the power its machine is observed at - and this helper turns that shape into the input; the
+// state is never written by the test.
+func SlotInput(node *infrav2alpha1.Node) phase.Input {
+	in := phase.Input{ObservedPower: node.Status.PowerState}
+
+	switch node.Status.Phase {
+	case infrav2alpha1.NodePhasePending:
+		in.Claim = TestClaim(node.Name, "claim-"+node.Name, infrav2alpha1.NodeClaimPending, false)
+		in.ObservedPower = infrav2alpha1.PowerStateOff
+	case infrav2alpha1.NodePhaseBooting:
+		in.Claim = TestClaim(node.Name, "claim-"+node.Name, infrav2alpha1.NodeClaimBooting, false)
+	case infrav2alpha1.NodePhaseReady:
+		in.ObservedPower = infrav2alpha1.PowerStateOn
+		in.NodeUsable = true
+
+		if in.Claim == nil {
+			in.Claim = TestClaim(node.Name, "claim-"+node.Name, infrav2alpha1.NodeClaimReady, false)
+		}
+	case infrav2alpha1.NodePhaseDraining:
+		in.ObservedPower = infrav2alpha1.PowerStateOn
+		in.ShutdownJobInFlight = true
+	case infrav2alpha1.NodePhaseOff:
+		in.ObservedPower = infrav2alpha1.PowerStateOff
+	}
+
+	if node.Status.PowerState == infrav2alpha1.PowerStateOn && in.ObservedPower == "" {
+		in.ObservedPower = infrav2alpha1.PowerStateOn
+	}
+
+	return in
+}
+
+// MachineForState builds a state machine for a test slot, seeded from the input its shape describes.
+// The v1alpha1 tests got their state from status.progress; the v2alpha1 tests get it from the claim
+// and the observation, through the same formula production code uses.
+func MachineForState(node *infrav2alpha1.Node, c client.Client, scheme *runtime.Scheme, coord CoordinationManager, opts ...Option) *NodeStateMachine {
+	in := SlotInput(node)
+
+	return NewNodeStateMachine(node, c, scheme, coord, append([]Option{WithInput(in)}, opts...)...)
 }

@@ -57,7 +57,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // The cluster-autoscaler node markers this controller reports. They are cluster-autoscaler's keys
@@ -106,7 +106,7 @@ const ConditionReadinessTaints = "NodeReadinessTaints"
 // returned as declared, so an empty list - a CNI that stamps no bootstrap taint, the documented way
 // to turn the gate off - means the gate is the Ready condition alone. The keys are deduplicated and
 // blank entries dropped, so a Group that repeats a key does not make the gate log twice.
-func ReadinessTaintKeys(group *infrav1alpha1.Group) []string {
+func ReadinessTaintKeys(group *infrav2alpha1.Group) []string {
 	if group == nil {
 		return nil
 	}
@@ -119,7 +119,7 @@ func ReadinessTaintKeys(group *infrav1alpha1.Group) []string {
 // The record is what makes "the slot has been booting for 10 minutes" answerable from the slot: the
 // keys belong to the Group and to the CNI, and a slot whose Group cannot be read is reconciled from
 // this record (see ReadinessTaintKeysOfSlot).
-func StampReadinessTaints(slot *infrav1alpha1.Node, keys []string) bool {
+func StampReadinessTaints(slot *infrav2alpha1.Node, keys []string) bool {
 	message := renderKeys(keys)
 
 	stored := meta.FindStatusCondition(slot.Status.Conditions, ConditionReadinessTaints)
@@ -144,7 +144,7 @@ func StampReadinessTaints(slot *infrav1alpha1.Node, keys []string) bool {
 // (ConditionReadinessTaints), whose message lists them comma-separated. It is the fallback for a
 // pass that could not read its Group, so the gate keeps the budget the Group configured for the
 // slot rather than silently becoming Ready-only for one pass.
-func ReadinessTaintKeysOfSlot(slot *infrav1alpha1.Node) []string {
+func ReadinessTaintKeysOfSlot(slot *infrav2alpha1.Node) []string {
 	if slot == nil {
 		return nil
 	}
@@ -245,7 +245,7 @@ type Decision struct {
 // observed, so a pass that sees the marker it already recorded reports no change and writes
 // nothing. A slot with no marker and no condition is left untouched, so the first pass over a
 // pool cluster-autoscaler never touched adds no status noise.
-func ApplyMarker(slot *infrav1alpha1.Node, k8sNode *corev1.Node, observedAt time.Time) (Decision, bool) {
+func ApplyMarker(slot *infrav2alpha1.Node, k8sNode *corev1.Node, observedAt time.Time) (Decision, bool) {
 	marker := markerKey(k8sNode)
 	reason, status := markerReason(marker)
 
@@ -287,7 +287,7 @@ func ApplyMarker(slot *infrav1alpha1.Node, k8sNode *corev1.Node, observedAt time
 // A marker that disappeared is not an event: the condition records it, the autoscaler's own
 // log has the unmarking, and the operator asking "who cordoned my node" is asking about the
 // appearance.
-func Emit(ctx context.Context, recorder events.EventRecorder, slot *infrav1alpha1.Node, k8sNode *corev1.Node, decision Decision) {
+func Emit(ctx context.Context, recorder events.EventRecorder, slot *infrav2alpha1.Node, k8sNode *corev1.Node, decision Decision) {
 	logger := log.FromContext(ctx).WithValues("node", slot.Name, "kubernetesNode", k8sNode.Name)
 
 	logger.Info("Recorded the cluster-autoscaler decision for the slot",
@@ -366,7 +366,7 @@ func markerMessage(k8sNode *corev1.Node, marker string, observedAt time.Time) st
 // markerNote renders the Event's message. It names the node, the marker, and the schedulability
 // the autoscaler is enforcing with it, because the cordon that goes with a scale-down is the half
 // of the story an operator is missing when a node stops taking pods.
-func markerNote(slot *infrav1alpha1.Node, k8sNode *corev1.Node, decision Decision) string {
+func markerNote(slot *infrav2alpha1.Node, k8sNode *corev1.Node, decision Decision) string {
 	note := fmt.Sprintf(
 		"cluster-autoscaler marked node %s (slot %s) as %s: taint %s on the node, spec.unschedulable=%v, node taints=[%s]. "+
 			"Recorded on the slot as condition %s; the scale-down request itself is spec.desiredPowerState, which this controller does not write.",

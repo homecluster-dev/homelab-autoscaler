@@ -8,7 +8,7 @@ Conservative scaling settings suitable for production environments:
 
 ```yaml
 # Production Group with conservative scaling settings
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: worker-nodes
@@ -16,25 +16,18 @@ metadata:
 spec:
   # Conservative maximum size for production
   maxSize: 5
-  
   # Scale down when utilization is below 30% (conservative)
   scaleDownUtilizationThreshold: 0.3
-  
   # Wait 30 minutes before scaling down (production safety)
   scaleDownUnneededTime: "30m"
-  
   # Wait 20 minutes before scaling down unready nodes
   scaleDownUnreadyTime: "20m"
-  
   # Allow up to 15 minutes for node provisioning
   maxNodeProvisionTime: "15m"
-  
   # Ignore DaemonSet pods when calculating utilization
   ignoreDaemonSetsUtilization: true
-  
   # Allow partial scaling
   zeroOrMaxNodeScaling: false
-  
   # GPU utilization threshold (if using GPU nodes)
   scaleDownGpuUtilizationThreshold: "20"
 ```
@@ -45,7 +38,7 @@ Physical node with Wake-on-LAN startup and SSH shutdown:
 
 ```yaml
 # Physical node with Wake-on-LAN startup
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: worker-01
@@ -56,12 +49,9 @@ metadata:
     zone: rack-1
 spec:
   kubernetesNodeName: worker-01.homelab.local
-  powerState: "off"
-  
   pricing:
     hourlyRate: "2.50"  # Actual power cost calculation
     podRate: "0.01"     # Small per-pod cost
-  
   # Wake-on-LAN startup using network broadcast
   startupPodSpec:
     image: homelab/wake-on-lan:latest
@@ -79,7 +69,6 @@ spec:
       requests:
         cpu: 10m
         memory: 32Mi
-  
   # SSH-based graceful shutdown
   shutdownPodSpec:
     image: homelab/ssh-shutdown:latest
@@ -114,7 +103,7 @@ Physical node with IPMI power management:
 
 ```yaml
 # Physical node with IPMI power management
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: worker-02
@@ -125,12 +114,9 @@ metadata:
     zone: rack-1
 spec:
   kubernetesNodeName: worker-02.homelab.local
-  powerState: "off"
-  
   pricing:
     hourlyRate: "3.00"  # Higher power consumption
     podRate: "0.01"
-  
   # IPMI power on
   startupPodSpec:
     image: gemtest/ipmi-tool:latest
@@ -155,7 +141,6 @@ spec:
       requests:
         cpu: 10m
         memory: 32Mi
-  
   # IPMI graceful shutdown
   shutdownPodSpec:
     image: gemtest/ipmi-tool:latest
@@ -188,7 +173,7 @@ GPU worker node with smart PDU power control:
 
 ```yaml
 # GPU worker node with specialized configuration
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: gpu-worker-01
@@ -199,12 +184,9 @@ metadata:
     gpu-type: nvidia-rtx-4090
 spec:
   kubernetesNodeName: gpu-worker-01.homelab.local
-  powerState: "off"
-  
   pricing:
     hourlyRate: "5.00"  # High power consumption for GPU
     podRate: "0.05"     # Higher per-pod cost for GPU usage
-  
   # Smart PDU power control
   startupPodSpec:
     image: homelab/pdu-control:latest
@@ -228,7 +210,6 @@ spec:
       requests:
         cpu: 10m
         memory: 32Mi
-  
   shutdownPodSpec:
     image: homelab/pdu-control:latest
     command: ["pdu-control"]

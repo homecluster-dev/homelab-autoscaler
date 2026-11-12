@@ -1,611 +1,398 @@
 # State Management
 
-Homelab Autoscaler uses a finite state machine (FSM) for reliable node power state management.
-
-## FSM Overview
-
-The FSM manages node power transitions using the `looplab/fsm` library with coordination locks to prevent race conditions.
+The operator decides nothing from a record. A machine is wanted exactly when a live `NodeClaim`
+names its slot, and every power decision reads the same three facts:
 
 ```
-Shutdown ←→ StartingUp ←→ Ready ←→ ShuttingDown
-                      \\              /
-                       \\            /
-                        JobFailed
+machine is wanted  ⇔  a live NodeClaim (pending, booting, ready) exists for the slot
+
+input of every decision = (live claim phase, observed power, node usability)
 ```
 
-## States
+`Node.spec` has no field for an intent in `v2alpha1`, and `Node.status.phase` is a report computed
+from that triple. The model and the reasoning behind it are in
+[the NodeClaim design](../design/nodeclaim.md); this file is what the running code does.
 
-| State | Description |
-|-------|-------------|
-| **Shutdown** | Node is powered off, ready for startup |
-| **StartingUp** | Node startup operation in progress |
-| **Ready** | Node is powered on and operational. The scale-up transition that lands here (`JobCompleted` → Ready) additionally requires the node to be Ready and free of the pool's readiness taints - see [Ready means the machine can take the pool's work](#ready-means-the-machine-can-take-the-pools-work) |
-| **ShuttingDown** | Node shutdown operation in progress |
+## The authority table
 
-## State Transitions
+Two writers, with disjoint jobs. Nothing else decides anything.
 
-### Startup Flow
-1. **StartNode** event → Shutdown → StartingUp
-2. Startup job creates Kubernetes Job
-3. **JobCompleted** → StartingUp → Ready
-4. **JobFailed** → StartingUp → Shutdown (retry)
+| Question | Who answers | Where | What it may write |
+| --- | --- | --- | --- |
+| Is a machine wanted on this slot, and how did the request end? | the **claim** | the claim controller (`internal/controller/infra/nodeclaim_controller.go`) and the lifecycle transitions, both through `internal/claim/recorder.go` | `NodeClaim.status` (phase, reason, attempt, conditions, finishedAt) |
+| What is the cluster observing about that machine? | the **observation** | `internal/controller/core/node_controller.go` (and the transition path, through `phase.Derive`) | `Node.status.powerState`, `Node.status.phase`, the autoscaler marker conditions |
+| What lifecycle operation runs on the slot next? | the **input law**, derived, never stored | `internal/phase/phase.go` + `internal/controller/infra/lifecycle.go` | lifecycle Jobs, cordons, the coordination lock, the claim moves listed above |
 
-### Shutdown Flow
-1. **ShutdownNode** event → Ready → ShuttingDown
-2. Shutdown job creates Kubernetes Job
-3. **JobCompleted** → ShuttingDown → Shutdown
-4. **JobFailed** → ShuttingDown → Ready (retry)
+The claim decides. The observation reports. A report is never an input: `Node.status.phase`,
+`Node.status.lastClaim` and every `Node.status.conditions` entry are outputs, and no reconciler
+reads them to choose an action. That is the whole answer to the class of bug the 0.1.20 watchdog
+and the 0.1.22 observed-power precedence rule existed to patch — a field that was both the state
+machine's own state and the world's report, written by four controllers. There is one such field
+left (`status.phase`), it has one formula, and it decides nothing.
 
-## Coordination Locks
+## The input law
 
-The FSM uses Kubernetes annotations for coordination:
+`phase.Input` is the whole input. `phase.State` turns it into the state the node state machine
+starts a pass in; `phase.Derive` turns it into the value of `Node.status.phase`. Both are pure
+functions of the same triple, so the state and the report cannot disagree, and a test of one is a
+test of the other.
+
+| Live claim | Observed power | Node usable | Report (`status.phase`) | State | Fires |
+| --- | --- | --- | --- | --- | --- |
+| none | off | — | `off` | `shutdown` | nothing |
+| none | on | — | `draining` | `ready` | `ShutdownNode` |
+| `pending` | off | — | `pending` | `shutdown` | `StartNode` |
+| `pending` | on | — | `booting` | `startingup` | nothing (the Job monitor owns it) |
+| `booting` | any | any | `booting` | `startingup` | nothing (the Job monitor owns it) |
+| `ready` | on | yes | `ready` | `ready` | nothing |
+| `ready` | on | no | `booting` | `startingup` | nothing (the readiness gate owns it) |
+| `ready` | off | — | `booting` | `startingup` | nothing fires here; the claim controller ends the claim `failed` / `MachineGone` past one boot window ("A ready claim whose machine is gone") |
+| live, marked for deletion | on | — | `draining` | `ready` / `shuttingdown` | `ShutdownNode`, then the claim's finalizer releases |
+| live, marked for deletion | off | — | `off` | `shutdown` | the claim ends `completed`, the finalizer comes off |
+| `failed` / `completed` | on | — | `draining` | `ready` | `ShutdownNode` (a terminal claim is not a want) |
+| `failed` / `completed` | off | — | `off` | `shutdown` | nothing |
+
+Three rules fall out of the table, and they are the rules the v1alpha1 docs stated as a precedence
+order:
+
+- **A record never outranks an observation.** "Observed `on` outranks a recorded `shutdown`" was
+  rule 2 of four. Now the record is not an input at all, so there is nothing to rank.
+- **A transitional slot is identified by objects, not by a string.** "An operation owns this slot"
+  is a claim in `booting` plus a lifecycle Job with the slot's label
+  (`lifecycleJobsInFlight`), so the old `validateStateTransition` gate on a transitional
+  `status.progress` is gone.
+- **A machine with no claim is unwanted**, including a machine whose claim just failed, and
+  including one the provider observation found after its claim was collected. The force shutdown
+  of an overdue boot is not a special case: a terminal claim is not live, which is the same row.
+
+`phase.Unusable` is the single predicate for "the node can take the pool's work": the
+`corev1.Node` exists, reports `NodeReady=True`, carries none of the Group's
+`spec.nodeReadinessTaints`, and is not cordoned. The readiness gate, the claim's `ready` phase and
+the derived report all ask it the same way.
+
+## The node state machine
+
+The states and events are unchanged; what changed is where the machine starts.
+
+| State | Meaning |
+| --- | --- |
+| `shutdown` | no machine: a free slot, a claim in `pending` that has not started, or a machine that just went off |
+| `startingup` | the startup operation is in flight (`JobCompleted` / `JobFailed` / `JobTimeout` are reachable) |
+| `ready` | the machine is up, and the transition to fire from here is `ShutdownNode` |
+| `shuttingdown` | the shutdown operation is in flight |
+
+```
+StartNode:     shutdown     -> startingup      (creates the startup Job, moves the claim pending -> booting)
+ShutdownNode:  ready        -> shuttingdown    (cordons, creates the shutdown Job)
+JobCompleted:  startingup   -> ready           (the readiness gate answers for the claim)
+JobCompleted:  shuttingdown -> shutdown        (the machine is observed off; the scale-down claim ends)
+JobFailed:     startingup   -> shutdown        (the claim ends failed, reason StartupJobFailed)
+JobFailed:     shuttingdown -> ready           (the claim stays, and its attempt is counted)
+JobTimeout:    startingup   -> shutdown        (reason StartupJobTimeout)
+JobTimeout:    shuttingdown -> ready           (reason ShutdownJobTimeout)
+ForceCleanup:  transitional -> shutdown        (reason StuckTransition)
+```
+
+`NewNodeStateMachine` seeds the state from `phase.State(input)`
+(`internal/fsm/node_state_machine.go`).
+A caller that passes no input gets the observation alone — a slot with no claim. The v1alpha1
+`getCurrentState`, which read `status.progress` back off the slot, is gone.
+
+The transitions run in `handleStateTransitionsWithFSM`, in the order of the law:
+
+1. a live claim that wants a machine, the machine off → `StartNode`;
+2. a live claim, the machine on, the node usable → nothing (capacity serving pods);
+3. no live claim (or a marked one), the machine observed on → `ShutdownNode`;
+4. a terminal claim with the machine on → the same branch as 3.
+
+Law 1 uses `claim.WantsMachine`: a claim a scale-down marked is live and owns the slot, and it is
+not a want. That is the difference between "the boot is committed and is being reversed" and "the
+next thing to do is boot".
+
+## Claim phases, and who writes each move
+
+The phase table of the design, as the running code enforces it
+(`claim.LegalMoves`, `internal/claim/recorder.go`
+— a move the table refuses is `ErrIllegalMove`, and nothing is written):
+
+| Phase | Meaning | Legal next | Written by |
+| --- | --- | --- | --- |
+| `pending` | claimed, no lifecycle Job yet. The only cancelable phase. | `booting`, `ready`, `completed`, `failed` | created by the provider (the gRPC handler), stamped live by the CRD default |
+| `booting` | the startup Job exists and the power-on has been asked for. Committed. | `ready`, `completed`, `failed` | the `StartNode` transition: the `pending → booting` write is the same write that created the startup Job and incremented `status.attempt` |
+| `ready` | the machine is up, joined, and free of the pool's readiness taints | `completed`, `failed` | `afterJobCompleted` in the startup direction, i.e. the readiness gate (`fsm.setNodeSchedulableWithRetry`) |
+| `failed` | the attempt produced no usable machine and never will. Terminal. | — | the claim controller (deadline, attempt bound, superseded, slot deleted), the Job monitor (`JobFailed` / `JobTimeout`), the readiness-gate timeout, a force cleanup |
+| `completed` | the claim ended with the machine available. Terminal. | — | the claim controller's finalizer path, once the machine is observed off |
+
+Two consequences worth stating plainly:
+
+- **Canceling a `pending` claim is deleting it.** Nothing is in flight, no finalizer is on the
+  object, and the unit comes off the target size on that write.
+- **Canceling a `booting` claim is not possible.** The finalizer arrives with the boot, so a
+  delete is the request that reverses it: cordon, shutdown Job, power off, then `completed`. A
+  boot is reversed, never interrupted. `NodeGroupDecreaseTargetSize` therefore cancels `pending`
+  claims only, and `NodeGroupDeleteNodes` cancels a `booting`/`ready` claim through its finalizer.
+
+## Deadlines and attempts
+
+`spec.deadlineAt` is born with the claim, measured from `spec.requestedAt`
+(`claim.AttemptBudget` / `claim.DeadlineAt`):
+
+```
+budget = DefaultJobTimeout (5m) + JobMonitorPollInterval (30s)
+       + DefaultUncordonTimeout (90s) + DefaultReadinessGateTimeout (4m)
+       + MaxUncordonRetryInterval (10s) + 1m
+       = 12m10s
+deadlineAt = requestedAt + max(budget, group.spec.maxNodeProvisionTime)
+```
+
+The startup Job's own timeout is in the sum because the clock runs from `spec.requestedAt`, i.e.
+from before the Job exists: one attempt can spend the Job's whole 5m, then the 90s it takes the
+node to register, then the 4m of the readiness gate — 10m30s of deadlines, in series. A
+budget of 7m10s (the first sketch of §4) fails the claim in the middle of the machine it is still
+buying, and the machine that boots an instant later is force-shut-down as overdue. The 0.1.20
+progress watchdog excluded the Job timeout for exactly this reason — its grace applied only to a
+Job that had already finished — and a claim's deadline has no such restriction to inherit.
+
+The floor is not decoration: cluster-autoscaler is told the group's number as its own scale-up
+termination deadline (`NodeGroupGetOptions` → `MaxNodeProvisionDuration`), so a claim that died
+before that instant is a slot the autoscaler is still waiting for, and its answer is another
+`IncreaseSize`. The number in force is copied onto the claim (`spec.maxNodeProvisionTime`) so a
+pool that changes it does not rewrite history.
+
+**Overdue means `failed`, and `failed` means force shutdown — inside the boot window.** The claim
+controller records `failed` with `reason: DeadlineExceeded`; the next pass of the slot reads "no
+live claim, machine observed on" and powers the machine off. The bound applies to `pending` and
+`booting` (`phase.InBootWindow`), and the `booting → ready` write clears `spec.deadlineAt`: a
+claim that reached `ready` owns a machine, and a boot budget measured 12 minutes earlier is not a
+licence to destroy capacity that is serving. The same window bounds the attempt check; a claim
+that landed on `ready` with attempt 4 is a success, not a fifth attempt. This is the whole
+replacement for the v1alpha1 progress watchdog: the settle / re-arm / uncordon trio healed a
+long-lived slot left pointing at a machine that is not there, and a claim that produced nothing
+has a deadline that does the same thing with a record attached.
+
+Attempts live on the request, not on the slot:
+
+- `status.attempt` is seeded once, on the claim's first pass, from `Node.status.lastClaim.attempt`
+  (`claim.SeedAttempt`): +1 while the slot keeps failing, and back to 1 after an episode that
+  ended `ready` or `completed`.
+- it is incremented by the `pending → booting` write, so it counts machines bought;
+- `claim.MaxConsecutiveAttempts` (3) is the bound. Past it, the claim controller fails the claim
+  with `reason: AttemptLimitExceeded` before a machine is bought.
+- a scale-down's attempts are counted on the claim that asked for the scale-down, on
+  `status.shutdownAttempts`, by the transition that fires the shutdown (`fsm.ShutdownNode` →
+  `recordShutdownAttempt` → `BumpScaleDownAttempt`) — one per shutdown Job, never per reconcile
+  pass, because the claim controller's finalizer poll of the observation runs every 15s and a
+  streak counted there is 45s of polling with one Job behind it. It is a counter of its own, so a
+  shutdown script that never lands does not spend the boot attempts of the episode it is
+  draining. The slot
+  reconciler stops firing a shutdown that will not land once the streak is spent, and the streak
+  resets when the machine is observed off (the claim ends with the observation) or after
+  `claim.ShutdownAttemptResetGrace` (30m), which is what picks up a pool whose script has been
+  fixed. See "A shutdown Job that succeeded is not a machine that is off".
+
+The v1alpha1 machinery for the same two bounds — the `ClaimRearmed` and `ShutdownAttempts`
+conditions on the long-lived slot, `fsm.StartupAttemptLimit`, `fsm.ShutdownAttemptLimit`, and the
+reset heuristics each of them needed (the readiness gate of `afterJobCompleted`, and two more
+sites for the shutdown counter) — is gone. The object that carries the count dies with the
+episode, which is why there is nothing to reset.
+
+## A ready claim whose machine is gone
+
+`ready` with the machine observed off is the one row of the table that fires nothing:
+`phase.Derive` reports `booting` (law 1's `StartNode` is not reachable from `startingup`), law 3
+needs the machine observed up, and the boot deadline closed on the write that made the claim
+ready. A machine deleted in a provider console, a deprovisioned server, or a `kubectl delete node`
+therefore leaves a live claim, a slot reported `booting` forever, and a unit cluster-autoscaler is
+paying for.
+
+The claim controller owns the case, bounded by an observation, not by a pass
+(`NodeClaimReconciler.watchMachine`):
+
+- the first pass that sees the machine off stamps `MachineObservedOff=True` on the claim, and its
+  `lastTransitionTime` is the clock;
+- the machine coming back flips the condition off, and the claim stays `ready` — a reboot shows
+  the same shape for minutes, and is not an attempt that ends;
+- an observation that outlasts `claim.MachineGoneGrace` — one boot window, the same horizon as the
+  deadline — ends the claim `failed` with `reason: MachineGone`, and the input law makes the slot
+  free again.
+
+The bound lives on the object, so a manager restart does not restart the clock.
+
+## The coordination lock is a belt
+
+A live claim is intended to be the mutual exclusion; it is not that yet, so the annotations stay
+for one more release
+(`internal/fsm/coordination.go`,
+`fsm.DefaultLockTimeout` 5m, `RenewLock` across the readiness gate, `cleanupExpiredLocks`, force
+release at `fsm.StuckTransitionThreshold` 15m):
 
 ```yaml
 annotations:
   homelab-autoscaler.dev/operation-lock: "scale-up"
   homelab-autoscaler.dev/lock-owner: "node-controller"
   homelab-autoscaler.dev/lock-timestamp: "2024-01-01T00:00:00Z"
-  homelab-autoscaler.dev/lock-timeout: "5m"
+  homelab-autoscaler.dev/lock-timeout: "300"
 ```
 
-### Lock Lifecycle
-- Acquired in `before_` hooks before state transitions
-- Released in `after_` hooks after successful transitions
-- Prevents race conditions between controllers
-- 5-minute timeout for stuck operations
+Two guarantees the lock provides and a claim does not yet:
+
+- **Atomicity of the handover.** The lock is taken in the `before_` hook, before the state change
+  and before the `enter_` hooks. The claim equivalent is "create the claim and stamp the finalizer
+  atomically with taking the slot", which needs one-live-claim-per-slot to be airtight under
+  concurrent writes.
+- **A bounded ownership window.** A lock has a timeout and is force-released at 15m. A claim has a
+  deadline, and a claim whose controller died is collected only when something reads its deadline.
 
 ### What a refused transition leaves behind
 
-A transition that loses the lock is a deferral, not a failure of the slot, and the rules below
-are what keep it from stranding one:
+- The acquisition runs in the `before_` hook, so a refused transition writes nothing: no lifecycle
+  Job, no cordon, no claim move, no report.
+- The refused operation is not lost. Its intent is the live claim of the slot, which is what the
+  reconciler drives the machine from, so the same branch runs again on the requeue
+  (`deferTransitionOnLockConflict` requeues at the deadline the lock itself names) and records a
+  Normal `ScaleUpDeferred` / `ScaleDownDeferred` event. In v1alpha1 the intent was
+  `spec.desiredPowerState`; the scalar is gone and the claim replaced it.
+- Every transition that ends an operation releases the lock, `JobTimeout` included: a lock must
+  not outlive the operation that wrote it.
 
-- The acquisition happens in the `before_` hook, before `looplab/fsm` applies the state change
-  and before the `enter_` hooks, the writers of `status.progress` inside the FSM. A refused
-  transition writes nothing: the slot keeps the stable progress it had (`ready` for a
-  scale-down that lost to a scale-up, `shutdown` the other way round).
-- The lifecycle entry points (`StartNode`, `ShutdownNode`) trigger the event, and so take the
-  lock, before touching anything: cordoning the Kubernetes node, clearing the
-  `ToBeDeletedByClusterAutoscaler` taint and deleting the pending lifecycle Job all happen
-  only on a slot the operation owns. A refused operation takes nothing apart on a slot it
-  doesn't own.
-- The refusal is reported as a `LockConflictError` carrying the remaining lifetime of the lock.
-  The node controller requeues for that deadline and records a `ScaleUpDeferred` /
-  `ScaleDownDeferred` event, a Normal one: a collision is the lock doing its job, not an
-  incident. The intent of the refused operation is `spec.desiredPowerState` - written by
-  cluster-autoscaler's `DeleteNodes` / `DecreaseTargetSize` - so the transition runs on the next
-  pass without a second request from the autoscaler.
-- Every transition that ends an operation releases the lock, including `JobTimeout`: a lock
-  must not outlive the operation that wrote it, or the next operation on the slot is refused
-  by a lock nothing is running under.
+## Ready means the machine can take the pool's work
 
-### Why a transitional progress has to come from a transition
+`Group.spec.nodeReadinessTaints` (defaulted to Cilium's `node.cilium.io/agent-not-ready:NoExecute`)
+gates the claim's `ready` phase. `fsm.setNodeSchedulableWithRetry` holds the transition into
+`ready` open with two separate budgets — `fsm.DefaultUncordonTimeout` (90s) for the node object to
+register, `fsm.DefaultReadinessGateTimeout` (4m) for the gate from the moment it appears — and
+renews the coordination lock on every pass, because the gate can outlast the lock's timeout.
 
-`status.progress: startingup`/`shuttingdown` says a power operation is in flight, and that isn't
-cosmetic: the provider leaves those slots out of the target size (`countsTowardsTargetSize`),
-and `validateStateTransition` in the node controller gates every transition of a transitional
-slot out, so no lifecycle operation starts on one.
+The gate's answer is the claim's move (`internal/fsm/hooks.go`):
 
-Nothing in a reconcile fixes a transitional slot that nothing is driving, either:
+- satisfied → the node is uncordoned, the declared `spec.nodeTaints` are stamped, and the claim
+  moves `booting → ready`;
+- timed out → the node is uncordoned anyway (a cordoned node is invisible to cluster-autoscaler's
+  scale-down and is paid for forever), a `ReadinessGateTimeout` warning is recorded on the slot,
+  and **the claim moves to `failed` with that reason**. The machine is then force-shut-down by the
+  input law, the slot becomes free, and the next claim on it is attempt N+1.
 
-- `applyObservedPowerState` (core node controller) never overwrites a transitional progress;
-- the FSM can't fire `ShutdownNode`/`StartNode` from `startingup`/`shuttingdown`;
-- the stuck-transition cleanup (`ForceCleanup` at `StuckTransitionThreshold`, 15m) reads the
-  backoff record of the state machine that ran the transition. The reconciler builds a fresh
-  machine on every pass, so `IsTransitionStuck()` is false there and `ForceCleanup` is never
-  reached from a reconcile. Past 15m `validateStateTransition` force-releases the coordination
-  lock and lets the pass run - it doesn't move the progress.
+The satisfied branch records its own read of the node into the machine's input
+(`fsm.recordGateAnswer`), and that is not a detail: the machine that answers for a boot is the Job
+monitor of the pass that **started** it, and the triple that pass read is the machine observed
+**off** with no node object - the shape every real boot starts in. The claim move is recorded into
+the input, and so must the other two inputs the gate spent its time establishing: the node object
+the uncordon left behind, asked with the one predicate the report uses (`phase.Unusable`), and its
+`Ready` condition, which is the definition `status.powerState` is written from.
 
-The writer that moves a transitional progress is the operation that wrote it: the lifecycle Job
-monitor of the machine that started it fires `JobCompleted`, `JobFailed` or `JobTimeout`. That's
-the whole recovery story, and it's why the rules above matter:
+Deriving the report from the boot's snapshot instead is the bug this closes. The staleness guard of
+`reportPhase` refuses the write - correctly, that machine's inputs describe a machine that is not
+up - and the writer that would correct it is the observation reconciler, which runs on
+`corev1.Node` events, and a kubelet that has settled into `Ready` writes no more of them (its
+heartbeats go to its Lease, its status posts every five minutes). What is left is a live `ready`
+claim, a machine observed on, a `Ready` uncordoned node, and a slot reporting `booting` for the
+life of the machine - the autoscaler reading the pool as buying a machine it already has, and the
+pass that reads the true triple (`claimPhase=ready observed=on usable=true state=ready`) logging
+that it is in a stable state and writing nothing, which is what a stable state does.
 
-- a transition refused by the lock must not write a progress it will never drive;
-- a writer outside the FSM must not write one at all. `NodeGroupDecreaseTargetSize` cancels a
-  starting slot with a `spec.desiredPowerState: off` write and leaves `status.progress` to the
-  FSM, so the shutdown runs through `ShutdownNode` with its Job, its lock and its timestamps.
-  It used to write `status.progress: shuttingdown` directly - no transition, no Job, no lock -
-  and the slot was only freed by the monitor of the startup it collided with, a goroutine a
-  manager restart takes away.
+Under v1alpha1 a gate that timed out completed the transition and recorded the slot `ready`. Under
+the claim model a slot is not reported as capacity that can take the pool's work when the request
+that bought it failed to produce it.
 
-`updateNodeProgress` guards the writes that go through the FSM: it persists only the progress of
-the state the machine is in. `status.progress` has writers outside the FSM (the gRPC server, the
-core node controller, the node slot controller provisioning a slot), and none of them runs under
-that check.
+## A shutdown Job that succeeded is not a machine that is off
 
-### The authority order for status.progress
+The shutdown Job is a script. It exits 0 when its own commands ran, which is not evidence about a
+machine: the power-off can be a no-op, the BMC can be unreachable behind a wrapper that swallows
+it, and the node object stays `Ready` for `node-monitor-grace-period` (~40s) after a real
+`shutdown -h now`.
 
-`status.progress` has several writers, and they are ordered. From most to least authoritative:
+So the shutdown completion (`internal/fsm/shutdown_completion.go`) reads the machine, and the
+report follows the machine:
 
-1. **The state machine owns a transition.** The FSM writes the progress of the state it moves
-   into, and only the operation that wrote a transitional progress moves it again
-   (`updateNodeProgress` refuses the progress of any state the machine is not in). A slot with a
-   lifecycle Job in flight, a live coordination lock, or a Kubernetes node behind it is owned by
-   its operation, and nothing else writes it.
-2. **Observed provider power outranks a recorded progress**
-   (`progress.ReconcileObservedPower`, `internal/progress/observed_power.go`, run by the node
-   controller at the top of every pass, above every branch that reads `status.progress`). The
-   invariant: **a slot must never rest with an observed power that contradicts its FSM state.** The
-   shape the rule exists for is the live one - `{spec.desiredPowerState: off, status.powerState: on,
-   status.progress: shutdown}`: the FSM derives `StateShutdown` from the progress, the only event
-   legal from there is `StartNode`, the claim is `off`, so the reconcile logs "Node is in desired
-   state or transitioning" and the machine - up, serving pods, paid for - stays there until an
-   operator patches `status.progress` by hand.
-   - The evidence is the pair the observation controllers publish: `status.powerState: on` **and**
-     the slot's `corev1.Node` reporting `Ready` (the reading `core.getNodeStatus` maps onto the `on`).
-     A slot with no node object, or a NotReady one, is not "observed up" - that is rule 3's ground.
-   - The progress must imply no machine: `shutdown`, `shuttingdown`, and the empty progress of a slot
-     that was never seeded, the three values `getCurrentState` reads as `StateShutdown`.
-   - The lifecycle-Job grace and the coordination-lock gate are the watchdog's, verbatim
-     (`jobWindow`): the completion of a shutdown Job records `shutdown` while the machine's node
-     object stays `Ready` for node-monitor-grace-period (~40s), and correcting in that window is the
-     duplicate shutdown Job rule 4 refuses to write for. **With no Job object to measure against** -
-     `spec.ttlSecondsAfterFinished: 0` collects it the moment the script exits, a short TTL makes it
-     routine - the same grace is measured from `status.lastShutdownTime`, the stamp the transition into
-     `shuttingdown` leaves (`shutdownGrace`, the watchdog's `startupGrace` mirrored, at the same place
-     in the rule). Without that fallback a healthy scale-down of a pool with a short TTL was read as a
-     machine that outlived its record 20 seconds after it went off, corrected to `ready`, and shut down
-     a second time on the same pass.
-   - The write is the observed progress, `ready`, one status update, the claim untouched. For
-     `spec.desiredPowerState: off` the machine is up and unwanted, so `ShutdownNode` is legal from
-     there and the **same pass fires it** - no grace is waited for, the claim is already off - with a
-     `MachineObservedUp` **Warning** naming the progress it replaced. For a claim of `on` the machine
-     is wanted, the progress was the only thing wrong, and the same correction is a **Normal**: no
-     Job, no power operation.
-   - **The correction releases a shutdown, so the loop it can start is bounded and paced.** A pool
-     whose `spec.shutdownPodSpec` exits 0 without the provider's power-off landing cycles shutdown Job,
-     refused completion, correction, `ShutdownNode`, Job - re-cordoning a node that serves pods on every
-     pass. The bound is the **shutdown-attempt counter** the FSM owns
-     (`fsm.ShutdownAttemptLimit`, 3, `internal/fsm/shutdown_attempts.go`): it counts the attempts where
-     they begin (`enterShuttingDown`), it is cleared where one lands (a completion the observation
-     agreed with) and where the slot boots a machine that passes the readiness gate, and
-     `ShutdownNode` refuses past it - before the lock, the cordon and the Job - with exactly one
-     `ShutdownAttemptLimitReached` **Warning**. The pace is this rule's: a slot with refused completions
-     is looked at again on an exponentially growing deadline (`observedPowerRetryBackoff`, doubling from
-     `ObservedPowerRetryBase`, capped at 30m), so the loop slows as it repeats. **The hole this leaves is
-     deliberate and documented**: past the bound the slot rests at the pair the observation says -
-     `ready`, `powerState: on`, claim `off` - on a machine that is up, cordoned, unwanted and paid for.
-     Nothing powers it off; the pool's script does, and the pair is healable the moment the script is
-     fixed, which is the difference from the frozen pair this rule exists to close.
-3. **The progress watchdog reconciles a slot that nothing is driving** (`internal/progress`, run
-   by the node controller at the top of every pass, before any FSM branch). One gate, three
-   outcomes: the slot has no `corev1.Node`, no startup/shutdown Job in flight, no such Job finished
-   in the last `SettleGracePeriod` (~7 minutes, see below), carries no live coordination lock, and
-   its progress implies a machine (`ready`, `startingup`, `shuttingdown`). Then
-   - `spec.desiredPowerState: off` -> **settle** to the stable `off`/`shutdown` pair, with a
-     `ProgressReconciled` Warning naming the progress it replaced;
-   - `spec.desiredPowerState: on` (a claim) -> **re-arm**: the same pair, and the claim left alone,
-     which is the shape `StartNode` is legal from, so the pool retries the machine. A `ClaimRearmed`
-     Normal event names the attempt the arming leads to. The retries are bounded by the
-     **startup-attempt counter** the FSM owns (`fsm.StartupAttemptLimit`, 3): it counts startup
-     attempts, not watchdog passes, and past the bound the re-arming stops and the slot is **settled**
-     to the stable pair with one `ClaimRearmLimitReached` Warning, so a slot whose machine will not
-     boot is never left at `ready` with nothing behind it;
-   - the slot has a node object, is at `ready`, is claimed on, is cordoned, and carries no
-     cluster-autoscaler marker -> **uncordon** it, with a `CordonReconciled` Warning. That is the
-     residue of the paths that land in `ready` without the uncordon hook (`JobTimeout`, `JobFailed`).
-4. **Observation updates the stable values.** `core.KubernetesNodeReconciler.applyObservedPowerState`
-   corrects `powerState`/`progress` to what the node object reports, and
-   `core.NodeSlotReconciler` seeds a slot that never had a machine. Neither writes a transitional
-   value, and neither runs on a slot that has no node object at all - which is exactly the case
-   rule 3 exists for.
+- the shutdown Job completed and the machine is observed **up** → the slot keeps reporting
+  `draining`, the scale-down claim keeps its finalizer, and the transition that fired the Job
+  counts the attempt on `status.shutdownAttempts` (`fsm.recordShutdownAttempt`) — a counter of its
+  own, counted on shutdown Jobs, because `status.attempt` is the record of the machines the request
+  bought and a shutdown that will not land must not spend it. The claim controller's poll of the
+  observation is read-only.
+  Past `claim.MaxConsecutiveAttempts` the slot reconciler stops firing a shutdown that will not
+  land, the record is the `ShutdownAttemptLimitReached` warning on the claim, and the refusal
+  requeues.
 
-The order is the design. Rule 1 is what can strand a slot; rule 2 exists because a record of what
-the FSM last did is not evidence about a machine, and a progress that outlives the machine it
-describes freezes a slot rule 1 cannot leave; rule 3 exists because of rule 1 and because rule 4
-cannot reach a slot with no node object; rule 4 is the writer that was never allowed to fix the
-transitional values, and still is not.
+  The pause is bounded, not a sentence: past `claim.ShutdownAttemptResetGrace` (30m) the streak is
+  spent no longer, the count restarts, and the shutdown fires again. A pool whose shutdown script
+  has been fixed is therefore picked up by a later pass, with no hand intervention — **30 minutes
+  later**, not on the next one, and the next pass after the bound is paced to that deadline. The
+  escape hatch for an operator who will not wait for the grace is the one the claim model makes
+  possible, the counter living on the request:
 
-**Rules 2 and 3 have distinct jobs, and on the two shapes they own they cannot both act on one
-slot.** The watchdog settles a *claim that produced nothing*: its progress names a machine (`ready`,
-`startingup`, `shuttingdown`) and the cluster has none - no `corev1.Node`, no lifecycle Job, no lock.
-Rule 2 corrects a *machine that outlived its recorded state*: its progress names no machine and the
-cluster has one it observes up. The first needs a slot with no node object, the second needs one that
-reports `Ready`: the two gates are disjoint, and they share the Job-grace gate - including the
-stamp-measured fallback for a Job the TTL already collected, `startupGrace` on one side and
-`shutdownGrace` on the other - and the lock gate, so they can never disagree about whether an
-operation owns the slot.
+  ```bash
+  kubectl patch nodeclaim <claim> -n homelab-autoscaler-system --subresource=status --type=merge \
+    -p '{"status":{"shutdownAttempts":0,"lastShutdownAttemptAt":null}}'
+  ```
 
-**Disjoint is not exhaustive, and one shape is nobody's.** `{status.progress: shuttingdown, a
-`corev1.Node` that is present and `NotReady`, no lifecycle Job, no live lock}` - a shutdown whose
-operation died, on a machine whose node object is there and reporting down - is refused by rule 3 (its
-gates want a slot with no node object at all: the status of a slot with a node belongs to the
-observation controllers), refused by rule 2 (`NotReady` is not positive evidence that a machine is up,
-so nothing outranks the progress), and untouched by rule 4, which writes the `off` and **never** writes
-a transitional progress. Nothing in the controller moves that slot: `validateStateTransition` gates
-every transition of a transitional slot out, and the stuck-transition cleanup is not reached from a
-reconcile (a fresh state machine per pass, so `IsTransitionStuck` is false). It is stated here, and in
-the split's test, as a known hole: closing it means reading `NotReady` as "the machine is off", the
-reading rule 4 refuses to make because the same shape is every boot window. An operator frees the slot
-today by patching `status.progress` to `shutdown`.
+  The next pass of the slot reconciler fires the shutdown again.
+- the machine is observed **off** → the scale-down claim ends `completed` (reason
+  `NodeDeleted` / `CancelledByDecreaseTargetSize` / `DeletedByHand`, from the request that made
+  it), the finalizer comes off, and the slot reports `off`.
 
-The two gates that are not obvious:
+That is the row the v1alpha1 docs stated as "a `shuttingdown` progress is moved only by the
+operation that wrote it", with the addition the model makes possible: the episode has an object to
+say which attempt this was, and an end.
 
-- **The claim.** A slot with `spec.desiredPowerState: on` is never settled *out of the claim*: the
-  claim is the request, and dropping it, or telling the provider its requested capacity does not
-  exist, is the autoscaler's arithmetic (`NodeGroupDecreaseTargetSize`) and not this controller's
-  answer to a scale-up. A claim whose machine never booted is not left pointing at one either: it is
-  re-armed (progress and power state made true, `spec.desiredPowerState` untouched), because the
-  alternative is a slot that `StartNode` cannot leave, that `NodeGroupTargetSize` counts forever, that
-  `NodeGroupDecreaseTargetSize` cannot cancel, and that no other writer in the system heals. Past the
-  startup-attempt bound the same pair is written as a **settlement** - the progress is made true and
-  the claim is still left on - because the bound is the point where retrying stops and an operator has
-  to say why. What the settlement changes is the progress, which is what every other writer reads: from
-  `shutdown` the FSM can start the machine again the moment an operator fixes the template, and a
-  scale-down lands on a slot that is already off instead of building a shutdown Job for a server that is
-  gone. What it does not change is the arithmetic - a claimed slot counts toward the target size whatever
-  its progress says, because the request is what the autoscaler asked for, and dropping it stays
-  `NodeGroupDecreaseTargetSize` / `NodeGroupDeleteNodes`, never the watchdog's. The
-  `ClaimRearmLimitReached` Warning is what tells an operator the request is standing and will not be
-  filled.
-- **The startup-attempt bound.** A re-arm is a machine the pool is about to pay for, so the retries
-  are bounded - by one counter, shared by both failure loops, owned by the FSM
-  (`internal/fsm/startup_attempts.go`):
-  - it counts **startup attempts**, incremented where an attempt begins: the `StartNode` transition
-    (`enterStartingUp`, `shutdown -> startingup`), which is where the lifecycle Job and the power-on
-    hang off, and the one place the watchdog's re-arm and a `JobFailed` rollback both lead into;
-  - it is cleared where an attempt **demonstrably succeeded**: the readiness gate of
-    `afterJobCompleted`, the same place that decides the slot may be recorded `ready`. A completed
-    startup Job is not the proof - a machine that boots, registers and never clears its CNI bootstrap
-    taint has spent its attempts and keeps them counted - and a slot is reused across claim episodes,
-    so a count that is never cleared is a lifetime bound, not a bound on the failure;
-  - it is enforced on **both** paths: the watchdog refuses to re-arm past the limit, and
-    `fsm.NodeStateMachine.StartNode` refuses to start (the loud loop - a startup Job that exits
-    non-zero - leaves the slot at the stable `off`/`shutdown` pair, which implies no machine, so the
-    watchdog never sees it at all and the FSM is the only writer in front of it). Past the bound the
-    slot is settled to the stable pair, its claim is kept, and exactly one `ClaimRearmLimitReached`
-    Warning is recorded.
-- **The shutdown-attempt bound.** The shutdown completion guard (below) turns a shutdown Job that
-  exits 0 on a machine that is still up into a *retry*, and a retry that fires on every pass is a loop:
-  Job, refused completion, correction to `ready`, `ShutdownNode`, Job - each pass re-cordoning a node
-  that serves pods. It is bounded by one counter, the mirror of the startup one, owned by the FSM
-  (`internal/fsm/shutdown_attempts.go`, `fsm.ShutdownAttemptLimit`, 3):
-  - it counts **shutdown attempts**, incremented where an attempt begins: the `ready -> shuttingdown`
-    transition (`enterShuttingDown`), which is where the coordination lock, the cordon and the shutdown
-    Job hang off, and the one place every caller of `ShutdownNode` passes through - the autoscaler's
-    scale-down, the shutdown rule 2's correction releases, and the retry a refused completion leads back
-    into;
-  - it is cleared where an attempt **landed**: a shutdown completion the observation agreed with
-    (`enterShutdown` records `shutdown`), and the **readiness gate** of a boot, the same gate that
-    resets the startup counter - so the bound prices one scale-down episode, not the life of a slot that
-    is reused across claims;
-  - it is enforced by `fsm.NodeStateMachine.ShutdownNode`, before the lock, the cordon and the Job, so
-    the refused attempt cordons nothing and buys nothing, and it records exactly one
-    `ShutdownAttemptLimitReached` **Warning** (the record is the deduplication). The node controller
-    turns that refusal into an idle resync, not a reconcile failure.
-  The rule that releases the loop paces it: `progress.ReconcileObservedPower` reports the count and asks
-  to be looked at again on an exponentially growing deadline (`observedPowerRetryBackoff`). Past the
-  bound the slot rests at the pair the observation says - `ready`, `powerState: on`, claim `off` - on a
-  machine that is up and paid for: **the known hole**, and the pair is healable (from `ready`,
-  `ShutdownNode` is legal), which is what separates it from the shape rule 2 exists for.
-- **The grace.** `SettleGracePeriod` (~7 minutes) is how long a *finished* lifecycle Job keeps its
-  slot out of reach. The Job is the operation and the state machine that started it is the writer
-  that settles the progress it moved, and the hook that settles it is not instantaneous: it runs
-  `setNodeSchedulableWithRetry`, which can spend one monitor poll (`fsm.JobMonitorPollInterval`,
-  30s) noticing the Job, the whole registration budget (`fsm.DefaultUncordonTimeout`, 90s) waiting
-  for the node object, the whole readiness gate (`fsm.DefaultReadinessGateTimeout`, 4m) waiting for
-  it to become usable, and one sleep (`fsm.MaxUncordonRetryInterval`, 10s) past its own deadline.
-  The grace is that sum plus a minute, and a test computes the same expression, so growing any of
-  those four constants without growing the grace fails. Stomping the progress inside that window
-  writes over a transition its owner is about to record, and the FSM reads its state from the
-  progress, so the write is how a duplicate lifecycle Job is born. The grace is *not* measured
-  against the 5m Job timeout: it applies only to a finished Job, and a Job that is pending or
-  running is never acted on at all, at any length. The bound it does respect is the 15m
-  `StuckTransitionThreshold`: a slot whose monitor died with its manager - the shape the watchdog
-  exists for - is healed well inside the horizon an operator calls stuck. With no Job object left at
-  all - the TTL collected it, which a short `spec.ttlSecondsAfterFinished` makes routine - the same
-  window is measured from `status.lastStartupTime`, the stamp the FSM's own progress write leaves on
-  the transition into `startingup`: the absence of a Job is not evidence that the operation is over,
-  and a grace that only exists while the Job object does would open inside the hook that owns the
-  progress. Rule 2 mirrors the fallback exactly (`shutdownGrace`, over `status.lastShutdownTime`, at the
-  same place in its rule): a shutdown Job collected by a TTL of 0 is gone the moment the script exits,
-  and the machine it did power off keeps its node object `Ready` for node-monitor-grace-period - so
-  without the stamp, every scale-down of such a pool was corrected to `ready` and shut down a second
-  time, in the pass that read it.
+## One live claim per slot
 
-### A shutdown Job that succeeded is not a machine that is off
+The invariant the whole model rests on, enforced twice:
 
-`progress: shutdown` is written by the completion of a shutdown Job, and the Job's evidence is the
-exit code of a container the operator supplies (`spec.shutdownPodSpec`): a script that calls the
-provider's power API, SSHes to the machine, pulls a plug. A script that exits 0 on a path where the
-power-off did not land - the provider accepted the request for a server that keeps running, an error
-was swallowed, a graceful ACPI request came back up - records the slot as off while the machine is
-up. `updateNodeProgress` writes `status.progress` and never `status.powerState`, so the write leaves
-the pair `{powerState: on, progress: shutdown}` standing, and the pair is what the live 40-minute
-stuck slot rests on: the observation controller that owns a slot with a node object refuses to
-correct a progress from an observed `on` unless the claim is `on` (see
-`core.applyObservedPowerState`), and the FSM reads `StateShutdown` from the progress, so
-`ShutdownNode` - the operation the claim wants - is unreachable. The slot heals only by hand.
+- at admission, `NodeClaimCustomValidator`
+  (`internal/webhook/infra/v2alpha1/nodeclaim_webhook.go`):
+  a second live claim on a slot is refused, and the message names the slot and the live claim. A
+  terminal write is never refused, and a delete is never refused;
+- in the controller, `refuseExtraLiveClaims`: the newest live claim owns the slot, every older one
+  fails itself with `reason: Superseded`. This is the path admission cannot see — two providers
+  racing, a hand-applied claim, a webhook that was down.
 
-Two guards, in the order the evidence arrives:
+Relaxing it means reconciling a *set* of requests against one machine, which is the ambiguity this
+model removes.
 
-- **The completion is conditional** (`fsm.refuseUnobservedShutdown`,
-  `internal/fsm/shutdown_completion.go`). `enterShutdown` on a `JobCompleted` transition records
-  `shutdown` only when the machine is not observed up: not observed up is no `corev1.Node`, a node
-  that is not `Ready`, a node that has no heartbeat recorded, or a Ready condition whose
-  `lastHeartbeatTime` is **not newer than the bound the shutdown leaves**. The bound is the shutdown
-  Job's `status.completionTime` - the lifecycle Job monitor passes the Job it read in the event's
-  arguments, so the hook has it - and the heartbeat is the whole discriminator: a machine that went off
-  during the script stops heartbeating *before* the Job finishes, a machine the script did not power off
-  keeps heartbeating *after* it. `status.lastShutdownTime` + `shutdownObservationFreshness` (60s) is
-  only the fallback, for a completion with no Job object to read (a short
-  `spec.ttlSecondsAfterFinished`), because that stamp is written at the *start* of the shutdown and the
-  hook runs at most one `JobMonitorPollInterval` (30s) later: a window measured from the stamp accepts
-  a genuinely live machine's ~30s-later heartbeat as "shut down", which is the incident's pair. The
-  freshness window is also what keeps a healthy scale-down paying nothing where no better timestamp
-  exists: a `Ready` node is normal for node-monitor-grace-period (~40s) after its kubelet dies, so
-  refusing the completion on the `Ready` condition alone would fire a second shutdown Job on every
-  scale-down. When the observation does contradict the completion, the hook writes the observed progress
-  (`ready`), moves its own machine to `ready`, stamps no `Shutdown` condition, records a
-  `ShutdownNotObserved` **Warning** naming the Job, and leaves the slot in the one state the FSM can act
-  on: the claim that is already off reaches `ShutdownNode` on the next pass.
-  The hooks of one completion write in a fixed order and the slot is written **once**:
-  `refuseUnobservedShutdown` returns the progress it recorded, and `after_JobCompleted` asks for the
-  progress of *its* transition (`Progress(e.Dst)`, which is `shutdown`), so `updateNodeProgress`'s guard
-  refuses that write - a guard whose callers can only pass the value the guard reads is a tautology, and
-  passing `nm.GetCurrentState()` from the hooks is exactly that.
-- **The retry the refusal releases is bounded, and paced.** A pool whose shutdown script exits 0 without
-  the power-off landing cycles Job, refused completion, correction, `ShutdownNode`, Job - each pass
-  re-cordons a node that serves pods and spends a power operation, and pre-PR the same broken script
-  produced a *static* frozen slot, so the loop is a cost of this fix. The bound is one counter, the
-  **shutdown-attempt counter** (`fsm.ShutdownAttemptLimit`, 3, `internal/fsm/shutdown_attempts.go`), the
-  mirror of the startup one: incremented on the `ready -> shuttingdown` transition
-  (`enterShuttingDown`), cleared by a completion the observation agreed with and by a boot that passes
-  the readiness gate, and enforced by `ShutdownNode` itself - before the lock, the cordon and the Job -
-  with exactly one `ShutdownAttemptLimitReached` **Warning**. Rule 2 sets the pace between attempts:
-  a slot with refused completions is looked at again on an exponentially growing deadline
-  (`progress.observedPowerRetryBackoff`, doubling from 60s, capped at 30m). **The accepted trade, and the
-  hole:** past the bound the slot rests at `ready` / `powerState: on` / claim `off` - the machine is up,
-  cordoned, unwanted, and paid for, and nothing in the controller powers it off. That pair is not the
-  frozen pair: from `ready`, `ShutdownNode` is legal, so a fixed script shuts the machine down on the
-  next pass with no hand on the slot. The other accepted trade is on the bound itself: a provider whose
-  power-off is asynchronous and lands *after* the script exited presents a heartbeat older than the
-  completion, looks "shut down", and is recorded off - a machine the observation says is up is corrected
-  by rule 2 on the far side of its grace, one bounded retry later.
-- **What the hook cannot do is wait.** It runs inside a completion whose monitor has already
-  returned, with an observation that is at most a node-monitor-grace-period stale, so the precedence
-  is enforced a second time, with a horizon a hook does not have, by rule 2
-  (`progress.ReconcileObservedPower`): once the slot's lifecycle Job - or, with no Job object left,
-  its `status.lastShutdownTime` - has aged out of `SettleGracePeriod`, an observed on outranks the
-  recorded progress. That is the backstop, and the split is the watchdog's own: the hook keeps a
-  provable lie out of the completion write, rule 2 corrects a lie that rested, and rule 3 settles the
-  claim that produced nothing. The three are disjoint on the shapes they own and **not exhaustive**: the
-  fourth shape (`shuttingdown`, a node object that is `NotReady`, no Job, no lock) is nobody's, and is
-  listed as a known hole above.
+## Collection
 
-A startup that died on the way into `shutdown` (`JobFailed`, `JobTimeout`, `ForceCleanup`) is not
-gated: those land on the stable `off`/`shutdown` pair by design, and a `ready` slot is what the
-readiness gate exists to stop the pool from declaring. What has to be true about that pair is that it
-does not rest, and rule 2 is what makes it true.
+A claim is owned by its slot, so deleting a slot from Git takes its claims with it. A terminal
+claim is deleted after `spec.ttlSecondsAfterFinished` (default 3600s) from `status.finishedAt`.
+The story survives the collection in `Node.status.lastClaim`: `{name, phase, attempt, call, group,
+reason, requestedAt, deadlineAt, finishedAt}`.
 
-### Ready means the machine can take the pool's work
-
-The **scale-up transition** into `ready` - `JobCompleted` → Ready, the one that writes
-`status.progress: ready` - completes when the node object is `Ready` **and** free of every readiness
-taint the pool declares. `fsm.setNodeSchedulableWithRetry` waits for both, and the transition's
-`after_` hook runs after it.
-
-The gate is the startup path's only: a slot can also reach `ready` through `JobFailed` and
-`JobTimeout`, which are rollbacks of a shutdown, and through the observation controller's correction
-of a machine that is Ready. Those paths do not run the gate. The cordon safety net in
-`internal/progress` is what covers the residue they leave (a ready, claimed slot whose node is
-cordoned with no operation on it).
-
-The kubelet marks a node Ready minutes before the CNI has programmed its datapath, and the pool's
-workloads do not tolerate the bootstrap taint, so **a pool's workloads do not need to tolerate
-`node.cilium.io/agent-not-ready`**: the operator declares the taint nowhere, the controller waits it
-out. Declaring the slot ready while the taint is on the node tells the autoscaler the slot is
-capacity, the pending pod still cannot be placed on it, and the pool buys a second machine for a node
-that is about to work - the churn this gate closes.
-
-Which key to wait for belongs to the CNI, so it is configuration, not a constant:
-`Group.spec.nodeReadinessTaints` is the exact list the gate waits for, and the CRD defaults it to
-`{key: node.cilium.io/agent-not-ready, effect: NoExecute}` (Cilium has stamped that key since v1.9;
-the pool this chart deploys runs Cilium 1.16.x, Stable channel). A pool on a CNI that stamps no
-bootstrap taint declares an empty list, and the gate is the `Ready` condition alone. The keys a slot
-is gated on are recorded on it as the `NodeReadinessTaints` condition, so a slot that has been
-booting for ten minutes says what it is waiting for.
-
-The two halves of the wait have their own deadlines, because a cold boot spends nearly all of its
-time in the first: registration (the node object appearing) is bounded by 90s
-(`fsm.DefaultUncordonTimeout`), and the readiness gate by 4m (`fsm.DefaultReadinessGateTimeout`) -
-started when the node object first appears, not when the loop starts. One shared budget is the bug
-this split closes: a machine that registers in 80s has 10s left for a gate that needs minutes, so the
-gate times out on the boot it exists to protect, the slot is declared ready with the taint on it, and
-the churn survives with a 90s hook and an ERROR line per scale-up.
-
-A timeout does not wedge anything. The loop uncordons the node, records a **`ReadinessGateTimeout`
-Warning** on the slot naming the half that ran out and the taint it was waiting for, logs the same,
-and the transition completes as it always has: a readiness gate nothing can answer for must not block
-teardown, must not leave the slot transitional, and must not leave the machine cordoned, because
-cluster-autoscaler skips cordoned nodes when it picks scale-down candidates - a cordoned node is
-never drained, never deleted, and keeps the pool paying for it. Because the gate can outlast the
-coordination lock's 5m timeout, the loop re-stamps the lock on every pass (`RenewLock`): a lock that
-ages out mid-gate protects nothing, and the watchdog, the next acquisition and the expired-lock
-cleanup all conclude from it that the operation is over.
-
-### What the autoscaler decided, recorded on the slot
-
-cluster-autoscaler marks the nodes it is about to remove with its own taints:
-`DeletionCandidateOfClusterAutoscaler` (soft, a candidate under evaluation) then
-`ToBeDeletedByClusterAutoscaler` (hard, a delete requested and the node draining). The core node
-controller watches the node objects, so it records each transition of those markers on the Node CR
-as a Normal event - `AutoscalerDeletionCandidate` / `AutoscalerDeletionRequested` - and logs the
-node's full taint list with `spec.unschedulable`, which is what makes a cordon attributable without
-raising the autoscaler's verbosity. The last marker observed is kept on the slot as the
-`ClusterAutoscalerMarkedForDeletion` condition, and that record is the deduplication: a pass that
-sees the marker it already recorded writes nothing and records nothing, an unmarking is a status
-update with no event, and a reappearance is a new event. The controller only reports the markers, it
-never adds, edits, or removes one, and it never writes `spec.desiredPowerState`: the scale-down
-request is the gRPC provider's to make.
-
-Read the observation from the condition's **message**, not from its `lastTransitionTime`:
-`meta.SetStatusCondition` only takes the supplied timestamp when the `Status` flips, and both
-deletion markers are recorded with `Status: True`. `True/DeletionCandidate` becoming
-`True/DeletionRequested` therefore keeps the *candidate's* time on a condition whose reason is now
-the delete request, and the interval between the two markers - minutes, in a real drain - is missing
-from the one field that reads like a timestamp. The message carries the instant the pass read the
-node (`observed at <RFC3339>`), and that is the record that is true.
-
-## Async Operations
-
-Power operations use Kubernetes Jobs for async execution:
-
-### Startup Job
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: node-startup-{node-name}
-spec:
-  template:
-    spec:
-      containers:
-      - name: power-manager
-        image: homelab/power-manager:latest
-        command: ["wake-on-lan"]
-        args: ["00:11:22:33:44:55"]
+```bash
+kubectl get nodeclaim -n homelab-autoscaler-system -o wide
+kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<slot>
+kubectl describe nodes.infra.homecluster.dev <slot> -n homelab-autoscaler-system   # status.lastClaim
 ```
 
-### Shutdown Job
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: node-shutdown-{node-name}
-spec:
-  template:
-    spec:
-      containers:
-      - name: power-manager
-        image: homelab/power-manager:latest
-        command: ["ssh-shutdown"]
-        args: ["worker-01.local"]
+## Async operations
+
+Both lifecycle Jobs are created by the transition that takes the lock, carry the slot's name and
+the lifecycle phase as labels, and are cleaned up by `spec.ttlSecondsAfterFinished` of the
+`MinimalPodSpec` the slot declares.
+
+```bash
+kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<slot>
+kubectl get jobs -n homelab-autoscaler-system -l type=startup
 ```
 
-## Error Handling
+`monitorJobCompletion` is the goroutine that fires `JobCompleted` / `JobFailed` / `JobTimeout` for
+the operation that started it, and it is the writer of the claim's `booting → ready` and
+`booting → failed` moves. It is the only writer of a transitional state's exit, which is why a
+transition refused by the lock may not write one.
 
-The FSM provides robust error recovery:
+## Integration points
 
-### Job Failures
-- Failed startup jobs → Shutdown state (ready for retry)
-- Failed shutdown jobs → Ready state (ready for retry)
-- Automatic retry with backoff strategy
-
-### Timeout Handling
-- 5-minute timeout for job completion
-- State-aware backoff (30s → 2m → 5m)
-- A transition older than 15m gets its coordination lock force-released, and the next pass runs
-  (see [Why a transitional progress has to come from a transition](#why-a-transitional-progress-has-to-come-from-a-transition))
-
-### Coordination Conflicts
-- FSM prevents invalid concurrent transitions
-- A lost lock is a deferral: a `ScaleUpDeferred`/`ScaleDownDeferred` event and a requeue at the
-  lock's remaining lifetime
-- Clear error reporting and retry logic
-- Automatic lock cleanup
-
-### Slots With No Machine
-
-The mirror of this section is [A shutdown Job that succeeded is not a machine that is
-off](#a-shutdown-job-that-succeeded-is-not-a-machine-that-is-off): the bullets below are a progress
-that names a machine the cluster does not have, those are a machine the cluster has and a progress
-that denies it.
-- The progress watchdog settles a slot whose `status.progress` names a machine the cluster does not
-  have, with a `ProgressReconciled` Warning naming the progress it replaced (see
-  [The authority order for status.progress](#the-authority-order-for-statusprogress))
-- A **claim** (a slot with `spec.desiredPowerState: on`) whose machine never booted is re-armed, not
-  settled: the progress and the power state are made true, the claim stays, and the pool retries the
-  machine (`ClaimRearmed`, naming the attempt)
-- The retries are bounded by **one startup-attempt counter** (`fsm.StartupAttemptLimit`, 3) that both
-  failure loops pay into, because they spend the same thing - a machine:
-  - it is incremented where an attempt begins, the `StartNode` transition
-    (`enterStartingUp` -> `shutdown -> startingup`), which is what the lifecycle Job and the power-on
-    hang off, and what both the watchdog's re-arm and a `JobFailed` rollback lead back into;
-  - it is cleared where an attempt demonstrably succeeded: the **readiness gate** of
-    `afterJobCompleted`, the place that decides the slot may be recorded `ready`. A completed startup
-    Job is not the proof - a machine that boots, registers and never clears its CNI bootstrap taint
-    has spent its attempts and keeps them counted - and slots are reused across claim episodes, so a
-    count that never resets is a lifetime sentence;
-  - it is enforced on both paths: the watchdog refuses to re-arm, and `StartNode` refuses to start, so
-    the loud loop (a startup Job that exits non-zero, which lands at the stable `off`/`shutdown` pair
-    the watchdog never looks at) is bounded too. Past the bound the slot is settled to that pair, the
-    claim is kept, and exactly one `ClaimRearmLimitReached` Warning is recorded, so a claim that cannot
-    boot buys a bounded number of machines and an operator sees it
-- A ready, claimed slot whose node is cordoned with no Job, no lock and no autoscaler marker on it is
-  uncordoned (`CordonReconciled`): the paths that roll back into `ready` never call the uncordon hook,
-  and a cordoned node is invisible to scale-down, so it is never removed and never stops costing
-- A lifecycle Job in flight, a Job that finished inside the settle grace - measured from
-  `status.lastStartupTime` when no Job object is left, so a short `ttlSecondsAfterFinished` cannot open
-  the gate inside a running hook (and from `status.lastShutdownTime`, by the same rule mirrored in
-  `progress.shutdownGrace`, for the observed-power correction) - a live coordination lock, or a node
-  object (whose status belongs to the observation controllers) keeps the watchdog away from the slot:
-  the operation owns it
-- A scale-down whose shutdown Job keeps exiting 0 on a machine the cluster reports up is retried
-  **bounded**: the shutdown-attempt counter (`fsm.ShutdownAttemptLimit`, 3) counts the attempts where
-  they begin, `ShutdownNode` refuses the fourth before it cordons anything, one
-  `ShutdownAttemptLimitReached` Warning says so, and rule 2 spaces the retries with an exponential
-  requeue. The machine stays up and paid for - that is the documented hole, and the pool's
-  `spec.shutdownPodSpec` is the thing to fix
-
-## Integration Points
-
-### Controller Integration
-```go
-// NodeReconciler uses FSM for state management
-func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) {
-    fsm := fsm.NewNodeStateMachine(node, r.Client)
-
-    if node.Spec.DesiredPowerState == "on" {
-        fsm.StartNode()
-    } else {
-        fsm.ShutdownNode()
-    }
-}
-```
-
-### gRPC Server Integration
-```go
-// Cluster Autoscaler triggers FSM events
-func (s *Server) NodeGroupIncreaseSize(ctx context.Context, req *pb.Request) {
-    fsm := fsm.NewNodeStateMachine(node, s.Client)
-    fsm.StartNode()
-}
-```
-
-## Benefits
-
-### Reliability
-- Formal state transitions prevent invalid operations
-- Coordination locks prevent race conditions
-- Automatic error recovery and retry
-
-### Observability
-- Clear current state and valid transitions
-- State transition logging and metrics
-- Easy debugging of stuck operations
-
-### Flexibility
-- Extensible FSM architecture
-- Customizable timeout and backoff
-- Support for various power management methods
-
-## Configuration
-
-### Timeout Settings
-- Job timeout: 5 minutes (configurable)
-- Lock timeout: 5 minutes (configurable)
-- Backoff strategy: 30s → 2m → 5m
-
-### Power Methods
-Supported power control methods:
-- Wake-on-LAN
-- IPMI/BMC interfaces
-- Smart PDUs
-- Custom scripts via SSH
-- Hardware-specific protocols
+| Component | Reads | Writes |
+| --- | --- | --- |
+| gRPC provider (`internal/grpcserver`) | the claims of a group, the slots of a group | claims: create, record, cancel. **Nothing in a slot spec, ever.** |
+| Slot reconciler (`internal/controller/infra`) | the live claim, `Node.status.powerState`, the `corev1.Node`, the lifecycle Jobs | lifecycle Jobs, cordons, the lock, the report, the claim moves of a transition |
+| Claim controller (`internal/controller/infra`) | the claim, its slot, the clock | `NodeClaim.status`, `Node.status.lastClaim`, the finalizer, collection |
+| Observation reconciler (`internal/controller/core`) | the `corev1.Node`, the live claim | `Node.status.powerState`, `Node.status.phase`, the autoscaler conditions |
+| Cluster-autoscaler | the gRPC provider | the gRPC provider |
 
 ## Related Documentation
-- [Architecture Overview](overview.md) - System design
-- [NodeClaim Design](../design/nodeclaim.md) - The v2alpha1 model, which removes the field this page's authority order exists to arbitrate
-- [Node CRD](../api-reference/crds/node.md) - Node resource definition
-- [Development Setup](../development/setup.md) - FSM implementation details
+
+- [The NodeClaim design](../design/nodeclaim.md) — why this model, and what it replaced
+- [Architecture overview](overview.md) — the components
+- [Node CRD](../api-reference/crds/node.md), [NodeClaim CRD](../api-reference/crds/nodeclaim.md),
+  [Group CRD](../api-reference/crds/group.md)
+- [Common issues](../troubleshooting/common-issues.md) — a claim stuck pending, a claim failed

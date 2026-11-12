@@ -19,7 +19,6 @@ package grpcserver
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strconv"
 	"time"
 
@@ -36,7 +35,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
@@ -81,8 +81,8 @@ func (s *HomeClusterProviderServer) initializeMockData() {
 // groupNodes lists the slots (Node CRs) committed to a group. The number of slots is the
 // max size of the group: maxSize is not a field of the Group CR, it is how many Node CRs
 // carry the group label.
-func (s *HomeClusterProviderServer) groupNodes(ctx context.Context, groupName string) ([]infrav1alpha1.Node, error) {
-	nodes := &infrav1alpha1.NodeList{}
+func (s *HomeClusterProviderServer) groupNodes(ctx context.Context, groupName string) ([]infrav2alpha1.Node, error) {
+	nodes := &infrav2alpha1.NodeList{}
 	listOpts := &client.ListOptions{LabelSelector: labels.SelectorFromSet(map[string]string{"group": groupName})}
 	if err := s.Client.List(ctx, nodes, listOpts); err != nil {
 		return nil, err
@@ -91,87 +91,27 @@ func (s *HomeClusterProviderServer) groupNodes(ctx context.Context, groupName st
 	return nodes.Items, nil
 }
 
-// countsTowardsTargetSize reports whether a slot counts as capacity the provider is
-// serving: a slot that is claimed (spec.desiredPowerState on) or running counts, a slot
-// that is genuinely being torn down (desired off plus a progress of shuttingdown, shutdown
-// or startingup) does not, which is what leaves the group headroom for cluster-autoscaler.
-//
-// The claimed half of that rule is what stops cluster-autoscaler from provisioning the
-// pool over its max size, and it is subtle, so here is the whole reason it is here:
-// NodeGroupIncreaseSize claims a slot by writing spec.desiredPowerState = on, and that
-// write is the entire record of the request. status.progress is owned by the FSM and
-// stays shutdown until the node controller gets to the slot - seconds later, and the
-// machine then takes minutes to boot. If the target size were read off status.progress
-// alone, the slot the autoscaler just asked for would keep reporting "shut down" for that
-// whole window, NodeGroupTargetSize would keep answering with the old number, the
-// autoscaler would conclude the group never grew and call IncreaseSize again in the same
-// loop. Live trace, one pending pod, one group:
-//
-//	09:38:15  Scale-up: setting group remote-workers size to 1
-//	09:38:15  Scale-up: setting group remote-workers size to 2   (250ms later)
-//	09:42:35  size to 1 -> size to 2 -> size to 3
-//
-// spec.desiredPowerState is the request, status.progress is what the machine is doing: a
-// slot is capacity the moment it is requested. Slots really going away stay excluded
-// because a shutdown always sets desired off before (NodeGroupDeleteNodes,
-// NodeGroupDecreaseTargetSize) the FSM moves progress into shuttingdown, so the
-// exclusions below keep their full effect for them.
-//
-// A desired-off slot that is mid startup (the third exclusion) is a startup that was
-// cancelled: the request is off and the machine never came up, so it is not capacity. The
-// exclusion has to live here, because NodeGroupDecreaseTargetSize no longer writes
-// progress: shuttingdown itself to take a cancelled slot off the target size - it writes the
-// spec only, and the FSM moves the progress when its ShutdownNode runs. The unit comes off
-// the number on the write that asks for it, the same instant it used to, with no progress
-// written outside a transition.
-func countsTowardsTargetSize(node infrav1alpha1.Node) bool {
-	if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn {
-		return true
-	}
-
-	return node.Status.Progress != infrav1alpha1.ProgressShuttingDown &&
-		node.Status.Progress != infrav1alpha1.ProgressShutdown &&
-		node.Status.Progress != infrav1alpha1.ProgressStartingUp
+// groupClaims lists the claims created for one node group. The provider counts them, cancels them
+// and creates them, and the group's label on the claim is what makes all three one list
+// (`kubectl get nodeclaim -l group=<group>` is the same view).
+func (s *HomeClusterProviderServer) groupClaims(ctx context.Context, groupName string) ([]infrav2alpha1.NodeClaim, error) {
+	return claim.ListInGroup(ctx, s.Client, namespaceConfig.Get(), groupName)
 }
 
-// targetSizeOf counts the slots that make up the target size of a group: the slots that
-// are claimed (spec.desiredPowerState on, running or booting) plus the machines the
-// provider is still serving. This is the one definition of "target size" in the provider:
-// it is what NodeGroupTargetSize reports to cluster-autoscaler, and every minSize/maxSize
-// check must be compared against this same number, because the autoscaler sizes the group
-// from it. Do not derive the size from a
-// subset of the slots (powered on plus starting up, say): that is a different quantity and
-// a floor judged against it refuses requests that do not cross the floor, which
-// cluster-autoscaler then retries forever.
-func targetSizeOf(nodes []infrav1alpha1.Node) int32 {
-	var targetSize int32
-	for _, node := range nodes {
-		if countsTowardsTargetSize(node) {
-			targetSize++
-		}
-	}
-
-	return targetSize
-}
-
-// isStartingUpSlot reports the one slot shape NodeGroupDecreaseTargetSize can cancel: a
-// slot that is desired on, has not powered on yet and is mid startup. Cancelling it takes
-// it out of the target size, which is what makes starting up slots the only capacity this
-// entry point can decrease. Two consequences of the target size counting claimed slots
-// (see countsTowardsTargetSize), both honoured by the cancellation below:
-//   - a claim that has not been picked up by the FSM yet (desired on, progress still
-//     shutdown) is not a cancel target: it is a scale-up in flight, not a startup to abort,
-//     and the autoscaler's own min-size / DeleteNodes paths own it from there on;
-//   - cancelling has to clear spec.desiredPowerState, and must not touch status.progress.
-//     The spec is the request: with it left on, the slot keeps counting towards the target
-//     size whatever its progress says, and the desired-off + startingup shape it lands in is
-//     excluded from the target size, so one unit comes off the number the autoscaler reads.
-//     The progress belongs to the FSM, which powers the slot off through ShutdownNode - with
-//     its lifecycle Job, its coordination lock and its timestamps - on the next reconcile.
-func isStartingUpSlot(node infrav1alpha1.Node) bool {
-	return node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
-		node.Status.PowerState == infrav1alpha1.PowerStateOff &&
-		node.Status.Progress == infrav1alpha1.ProgressStartingUp
+// targetSizeOf is the count of live claims: the target size of a group, and the number
+// cluster-autoscaler sizes the group from. No progress value, and no spec field of a slot, appears
+// in the arithmetic (docs/design/nodeclaim.md §5).
+//
+// The v1alpha1 rule this replaces counted a slot when spec.desiredPowerState was on **or** its
+// status.progress was not one of shuttingdown / shutdown / startingup, and the "on" half of it
+// existed because the write that asked for a machine was the only record of the request: a slot the
+// autoscaler had just claimed kept reporting "shut down" until the node controller got to it, so a
+// target size read off the progress alone made cluster-autoscaler call IncreaseSize again in the same
+// loop. A claim is the request and the record, so the count of claims is the number, and a failed
+// claim stops being counted the moment it is recorded - which is what removes the state "the
+// autoscaler is paying for a machine that never arrived, forever".
+func targetSizeOf(claims []infrav2alpha1.NodeClaim) int32 {
+	return claim.TargetSize(claims)
 }
 
 // effectiveMinSize returns the floor cluster-autoscaler must not scale the group below,
@@ -181,7 +121,7 @@ func isStartingUpSlot(node infrav1alpha1.Node) bool {
 // boundary. A floor the provider cannot fill is clamped instead of reported: telling
 // cluster-autoscaler it needs more slots than exist makes it scale up and fail on "no
 // powered off nodes found".
-func effectiveMinSize(group *infrav1alpha1.Group, maxSize int32) (int32, bool) {
+func effectiveMinSize(group *infrav2alpha1.Group, maxSize int32) (int32, bool) {
 	if group == nil || group.Spec.MinSize <= 0 {
 		return 0, false
 	}
@@ -199,7 +139,7 @@ func effectiveMinSize(group *infrav1alpha1.Group, maxSize int32) (int32, bool) {
 func (s *HomeClusterProviderServer) groupMinSize(ctx context.Context, groupName string, maxSize int32) int32 {
 	logger := log.Log.WithName("grpc-server")
 
-	group := &infrav1alpha1.Group{}
+	group := &infrav2alpha1.Group{}
 	if err := s.Client.Get(ctx, client.ObjectKey{Name: groupName, Namespace: namespaceConfig.Get()}, group); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			logger.V(1).Info("Group not found, no minimum size to enforce", "group", groupName)
@@ -223,7 +163,7 @@ func (s *HomeClusterProviderServer) groupMinSize(ctx context.Context, groupName 
 func (s *HomeClusterProviderServer) NodeGroups(ctx context.Context, req *pb.NodeGroupsRequest) (*pb.NodeGroupsResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 
-	groups := &infrav1alpha1.GroupList{}
+	groups := &infrav2alpha1.GroupList{}
 	err := s.Client.List(ctx, groups, &client.ListOptions{})
 	if err != nil {
 		logger.Error(err, "Failed to list groups")
@@ -294,7 +234,7 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 		}, nil
 	}
 
-	group := &infrav1alpha1.Group{}
+	group := &infrav2alpha1.Group{}
 	err = s.Client.Get(ctx, client.ObjectKey{Name: groupName, Namespace: namespaceConfig.Get()}, group)
 	if err != nil {
 		// Node not found in any group, return empty string
@@ -317,7 +257,7 @@ func (s *HomeClusterProviderServer) NodeGroupForNode(ctx context.Context, req *p
 	}
 
 	for _, node := range nodes {
-		if node.Name == req.Node.Name && node.Status.PowerState == infrav1alpha1.PowerStateOn {
+		if node.Name == req.Node.Name && node.Status.PowerState == infrav2alpha1.PowerStateOn {
 			return &pb.NodeGroupForNodeResponse{
 				NodeGroup: &pb.NodeGroup{Id: groupName},
 			}, nil
@@ -348,7 +288,7 @@ func (s *HomeClusterProviderServer) PricingNodePrice(ctx context.Context, req *p
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("PricingNodePrice called", "node", req.Node.Name)
 
-	node := &infrav1alpha1.Node{}
+	node := &infrav2alpha1.Node{}
 	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Node.Name, Namespace: namespaceConfig.Get()}, node)
 	if err != nil {
 		// Node not found in any group
@@ -384,7 +324,7 @@ func (s *HomeClusterProviderServer) PricingPodPrice(ctx context.Context, req *pb
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("PricingPodPrice called", "podBytes", len(req.PodBytes))
 
-	nodes := &infrav1alpha1.NodeList{}
+	nodes := &infrav2alpha1.NodeList{}
 	if err := s.Client.List(ctx, nodes); err != nil {
 		logger.Error(err, "failed to list nodes for pod pricing")
 		return nil, status.Errorf(codes.Internal, "failed to list nodes: %v", err)
@@ -447,7 +387,12 @@ func (s *HomeClusterProviderServer) Refresh(ctx context.Context, req *pb.Refresh
 	return &pb.RefreshResponse{}, nil
 }
 
-// NodeGroupTargetSize returns the current target size of the node group
+// NodeGroupTargetSize returns the current target size of the node group: the number of live claims
+// (pending, booting, ready) of the group, at this instant.
+//
+// A claim marked for scale-down is not counted, and a failed claim is not counted, so the two states
+// the v1alpha1 arithmetic could not express - "a startup the autoscaler has cancelled" and "a machine
+// that never arrived, paid for forever" - have no place to exist in this number.
 func (s *HomeClusterProviderServer) NodeGroupTargetSize(ctx context.Context, req *pb.NodeGroupTargetSizeRequest) (*pb.NodeGroupTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupTargetSize called", "nodeGroup", req.Id)
@@ -457,336 +402,439 @@ func (s *HomeClusterProviderServer) NodeGroupTargetSize(ctx context.Context, req
 		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
 	}
 
+	// The slots are read for the same reason every entry point reads them: a group with no slots has
+	// nothing to size, and a read that fails is the error the autoscaler should see.
 	nodes, err := s.groupNodes(ctx, req.Id)
 	if err != nil {
-		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		logger.Error(err, "failed to list nodes for group", "nodeGroup", req.Id)
+
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
 	}
 
-	// The target size is the slots the provider is committed to serve: the claimed ones
-	// (spec.desiredPowerState on, including the ones whose machine has not been picked up by
-	// the FSM yet) and the machines still running. See countsTowardsTargetSize - counting
-	// only what status.progress reports as up is what made cluster-autoscaler ask for the
-	// same slot over and over.
-	targetSize := targetSizeOf(nodes)
+	claims, err := s.groupClaims(ctx, req.Id)
+	if err != nil {
+		logger.Error(err, "failed to list the claims of group", "nodeGroup", req.Id)
 
-	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id, "targetSize", targetSize, "totalNodes", len(nodes))
+		return nil, status.Errorf(codes.Internal, "failed to list the claims of node group %s: %v", req.Id, err)
+	}
+
+	targetSize := targetSizeOf(claims)
+
+	logger.Info("NodeGroupTargetSize response completed", "nodeGroup", req.Id,
+		"targetSize", targetSize, "liveClaims", targetSize, "claims", len(claims), "slots", len(nodes))
+
 	return &pb.NodeGroupTargetSizeResponse{
 		TargetSize: targetSize,
 	}, nil
 }
 
-// NodeGroupIncreaseSize increases the size of the node group by finding an unhealthy node and starting a new job
+// NodeGroupIncreaseSize claims delta free slots of the group by creating delta NodeClaims, each
+// carrying the request that made it: the call, the delta, the group, the deadline of the attempt, and
+// the caller's identity.
+//
+// The v1alpha1 handler claimed the *first* slot matching a three-field scan and returned, one slot
+// per call whatever delta said, and the whole record of the request was the scalar it wrote. Here a
+// slot is free exactly when no live claim names it (no scan, no status seeding, no observation), the
+// max-size check is liveClaims + delta > slots, and the request is attributable from the claim.
 func (s *HomeClusterProviderServer) NodeGroupIncreaseSize(ctx context.Context, req *pb.NodeGroupIncreaseSizeRequest) (*pb.NodeGroupIncreaseSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupIncreaseSize called", "nodeGroup", req.Id, "delta", req.Delta)
 
-	// Check for context cancellation
 	if ctx.Err() != nil {
 		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
 	}
 
-	// Validate delta is positive
 	if req.Delta <= 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "delta must be positive, got %d", req.Delta)
 	}
 
 	nodes, err := s.groupNodes(ctx, req.Id)
 	if err != nil {
-		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		logger.Error(err, "failed to list nodes for group", "nodeGroup", req.Id)
+
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
 	}
 
-	// The max size of the group is the number of slots committed to it. Refuse a scale up
-	// that would exceed it explicitly: cluster-autoscaler sizes the group from this same
-	// count, so a request that crosses it means its view is stale and powering a slot on
-	// anyway would take the pool over the machines the operator committed. currentSize is
-	// targetSizeOf, so slots that are claimed and not booted yet are already spent against
-	// the max: that is what makes a burst of IncreaseSize calls in one autoscaler loop stop
-	// at the max instead of running past it (see countsTowardsTargetSize).
+	claims, err := s.groupClaims(ctx, req.Id)
+	if err != nil {
+		logger.Error(err, "failed to list the claims of group", "nodeGroup", req.Id)
+
+		return nil, status.Errorf(codes.Internal, "failed to list the claims of node group %s: %v", req.Id, err)
+	}
+
+	// The max size of the group is the number of slots committed to it, and the current size is the
+	// live claims: slots that are claimed and not booted yet are already spent against the max, which
+	// is what makes a burst of IncreaseSize calls in one autoscaler loop stop at the max.
 	maxSize := int32(len(nodes))
-	currentSize := targetSizeOf(nodes)
+	currentSize := targetSizeOf(claims)
 	if currentSize+req.Delta > maxSize {
 		logger.Info("Refusing to increase the size of the group beyond its max size",
 			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize, "maxSize", maxSize)
+
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"increasing node group %s by %d would exceed its max size %d (current target size %d)",
 			req.Id, req.Delta, maxSize, currentSize)
 	}
 
-	// Find an unhealthy node
-	var node *infrav1alpha1.Node
-	var nodeName string
+	free := claim.FreeSlots(nodes, claims)
+	if int32(len(free)) < req.Delta {
+		logger.Info("Refusing to increase the size of the group, not enough free slots",
+			"nodeGroup", req.Id, "delta", req.Delta, "freeSlots", len(free), "slots", len(nodes))
 
-	for _, nodeCR := range nodes {
-		desiredPowerState := nodeCR.Spec.DesiredPowerState
-		powerState := nodeCR.Status.PowerState
-		progress := nodeCR.Status.Progress
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"no free node slot found in group %s: %d requested, %d of %d slots are free",
+			req.Id, req.Delta, len(free), len(nodes))
+	}
 
-		// Look for nodes that are desired to be off and are actually off and shutdown
-		if desiredPowerState == infrav1alpha1.PowerStateOff && powerState == infrav1alpha1.PowerStateOff && progress == infrav1alpha1.ProgressShutdown {
-			node = &nodeCR
-			nodeName = nodeCR.Name
-			break
+	group := s.groupOf(ctx, req.Id)
+	created := make([]string, 0, req.Delta)
+
+	for i := range int(req.Delta) {
+		slot := free[i]
+
+		nodeClaim, err := s.newClaim(ctx, &slot, group, infrav2alpha1.ClaimRequest{
+			Call:  infrav2alpha1.ClaimCallIncreaseSize,
+			Delta: req.Delta,
+			Group: req.Id,
+		}, claim.RequestedByAutoscaler)
+		if err != nil {
+			logger.Error(err, "failed to create the claim of a free slot", "node", slot.Name, "group", req.Id, "created", created)
+
+			return nil, status.Errorf(codes.Internal, "failed to create a NodeClaim for node %s of group %s: %v", slot.Name, req.Id, err)
 		}
+
+		created = append(created, nodeClaim.Name)
+
+		logger.Info("Created a NodeClaim for a free slot",
+			"node", slot.Name, "claim", nodeClaim.Name, "group", req.Id,
+			"deadline", nodeClaim.Spec.DeadlineAt, "maxNodeProvisionTime", nodeClaim.Spec.MaxNodeProvisionTime)
 	}
 
-	if node == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "no powered off nodes found in group %s", req.Id)
-	}
-
-	logger.Info("Found powered off node, setting desired state", "node", nodeName, "group", req.Id)
-
-	node.Spec.DesiredPowerState = infrav1alpha1.PowerStateOn
-
-	if err := s.Client.Update(ctx, node); err != nil {
-		logger.Error(err, "failed to update node DesiredPowerState", "node", nodeName)
-		return nil, status.Errorf(codes.Internal, "failed to update node %s DesiredPowerState to on: %v", nodeName, err)
-	}
-
-	logger.Info("Successfully updated node DesiredPowerState to PowerStateOn", "node", nodeName)
+	logger.Info("NodeGroupIncreaseSize completed", "nodeGroup", req.Id, "delta", req.Delta, "claims", created)
 
 	return &pb.NodeGroupIncreaseSizeResponse{}, nil
 }
 
-// NodeGroupDeleteNodes deletes nodes from this node group. The floor of the group
-// (spec.minSize) is judged against the target size that results from the request, using
-// targetSizeOf, the same number NodeGroupTargetSize reports. A request that deletes
-// nothing takes no capacity away, so it is answered as a no-op success: the group can
-// already be at or below its floor while a shutdown from an earlier request is still in
-// flight, and a FailedPrecondition there is a refusal the autoscaler retries forever for
-// an operation that would change nothing.
+// NodeGroupDeleteNodes cancels the claims of the slots the request names, after recording the request
+// on each of them (spec.request.call: DeleteNodes, spec.request.nodes: the names).
+//
+// cluster-autoscaler evicts before it calls DeleteNodes, so the drain stays its work; what the
+// provider owns is the machine. A pending claim is deleted, and the object goes: nothing is in
+// flight. A booting or ready claim is deleted through the claim controller's finalizer, which keeps
+// the request alive until the machine is observed off, so the boot is reversed (cordon, shutdown Job,
+// power off) and never interrupted. A slot with no live claim has nothing to cancel, and the input
+// law powers its machine off on the next pass (no live claim + machine on = shutdown).
+//
+// The floor of the group (spec.minSize) is judged against the target size that results from the
+// request, using the same targetSizeOf that NodeGroupTargetSize reports. A request that deletes
+// nothing takes no capacity away, so it is answered as a no-op success: the group can already be at
+// or below its floor while a shutdown from an earlier request is still in flight, and a
+// FailedPrecondition there is a refusal the autoscaler retries forever for an operation that changes
+// nothing.
 func (s *HomeClusterProviderServer) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDeleteNodesRequest) (*pb.NodeGroupDeleteNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDeleteNodes called", "nodeGroup", req.Id, "nodes", len(req.Nodes))
 
-	// Check for context cancellation
 	if ctx.Err() != nil {
 		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
 	}
 
-	// Enforce the floor of the group before touching anything. cluster-autoscaler keeps its
-	// own min-size check, but a provider that accepts a scale down below minSize silently
-	// powers machines off, so refuse here and say why in the log.
 	nodes, err := s.groupNodes(ctx, req.Id)
 	if err != nil {
-		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		logger.Error(err, "failed to list nodes for group", "nodeGroup", req.Id)
+
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
+	}
+
+	claims, err := s.groupClaims(ctx, req.Id)
+	if err != nil {
+		logger.Error(err, "failed to list the claims of group", "nodeGroup", req.Id)
+
+		return nil, status.Errorf(codes.Internal, "failed to list the claims of node group %s: %v", req.Id, err)
+	}
+
+	requested := make(map[string]string, len(req.Nodes))
+	for _, node := range req.Nodes {
+		requested[node.Name] = node.Name
 	}
 
 	maxSize := int32(len(nodes))
 	minSize := s.groupMinSize(ctx, req.Id, maxSize)
-	currentSize := targetSizeOf(nodes)
+	currentSize := targetSizeOf(claims)
 
-	requested := make(map[string]bool, len(req.Nodes))
-	for _, node := range req.Nodes {
-		requested[node.Name] = true
+	// The slots the request names: a DeleteNodes name is a Kubernetes node name, and the slot is
+	// found by its name (the identity cluster-autoscaler keys on, and what the providerID homelab://
+	// <slot> is built from) or by spec.kubernetesNodeName, which can differ.
+	slots := make([]infrav2alpha1.Node, 0, len(req.Nodes))
+
+	for _, node := range nodes {
+		if _, ok := requested[node.Name]; ok {
+			slots = append(slots, node)
+
+			continue
+		}
+
+		if node.Spec.KubernetesNodeName != "" {
+			if _, ok := requested[node.Spec.KubernetesNodeName]; ok {
+				slots = append(slots, node)
+			}
+		}
 	}
 
-	// Only the slots that count towards the target size are capacity that goes away; a slot
-	// that is already shut down is off the books and can be "deleted" again. A claimed slot
-	// (desired on, machine not up yet) is capacity that goes away, so a delete that cancels a
-	// claim is judged against the floor like any other: the claim counts on both sides of the
-	// arithmetic, which is the point of counting it in targetSizeOf at all.
+	// Only a slot with a live claim is capacity that goes away: a slot whose machine is off, or whose
+	// claim already ended, is off the books and can be "deleted" again.
 	var deleting int32
-	for _, node := range nodes {
-		if requested[node.Name] && countsTowardsTargetSize(node) {
+
+	for i := range slots {
+		if live := claim.LiveOfSlot(claimsOfSlot(claims, slots[i].Name)); live != nil && claim.CountsTowardTargetSize(live) {
 			deleting++
 		}
 	}
 
-	// Only a request that actually takes capacity away can cross the floor. A slot that is
-	// already shut down is off the target size, so a request that deletes nothing projects
-	// the current size: when the group is already at or below its floor (a shutdown from an
-	// earlier delete is still in flight) that is not a request crossing the floor and
-	// refusing it would wedge the autoscaler over a no-op.
 	if projected := currentSize - deleting; deleting > 0 && projected < minSize {
 		logger.Info("Refusing to delete nodes, the group would fall below its minSize",
 			"nodeGroup", req.Id, "nodesRequested", len(req.Nodes), "deleting", deleting,
 			"currentSize", currentSize, "projectedSize", projected, "minSize", minSize)
+
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"deleting %d node(s) from node group %s would take it below its minSize %d (current target size %d)",
 			deleting, req.Id, minSize, currentSize)
 	}
 
-	// Process each node to be deleted
+	names := make([]string, 0, len(req.Nodes))
 	for _, node := range req.Nodes {
-		// Check for context cancellation before processing each node
+		names = append(names, node.Name)
+	}
+
+	for i := range slots {
 		if ctx.Err() != nil {
 			return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded while processing nodes: %v", ctx.Err())
 		}
 
-		// Get the Node CR
-		nodeCR := &infrav1alpha1.Node{}
-		err := s.Client.Get(ctx, client.ObjectKey{Name: node.Name, Namespace: namespaceConfig.Get()}, nodeCR)
-		if err != nil {
-			logger.Error(err, "failed to get nodeCR", "node", node.Name)
-			return nil, status.Errorf(codes.Internal, "failed to get node %s: %v", node.Name, err)
+		slot := &slots[i]
+		live := claim.LiveOfSlot(claimsOfSlot(claims, slot.Name))
+
+		// A claim the request already marked is the state the request asked for: its finalizer is
+		// running the machine down. Re-deleting it is not a cancellation, it is a second write on
+		// an object that is on its way out, so the request is idempotent by construction.
+		if live != nil && !live.DeletionTimestamp.IsZero() {
+			logger.V(1).Info("The claim of the slot is already cancelled and draining", "claim", live.Name, "node", slot.Name)
+
+			continue
 		}
 
-		logger.Info("Found node to delete", "node", node.Name, "group", req.Id)
-		nodeCR.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
+		if live == nil {
+			// Nothing to cancel. A machine that is standing on this slot is powered off by the input
+			// law on the slot's next pass; a free slot is already off.
+			logger.V(1).Info("Slot has no live claim, nothing to cancel", "node", slot.Name, "group", req.Id)
 
-		if err := s.Client.Update(ctx, nodeCR); err != nil {
-			logger.Error(err, "failed to update node DesiredPowerState", "node", node.Name)
-			return nil, status.Errorf(codes.Internal, "failed to update node %s DesiredPowerState to off: %v", node.Name, err)
+			continue
 		}
 
+		// Record the request on the claim, then cancel it. The write order matters: the finalizer path
+		// reports the claim's end from spec.request, so the attribution has to be on the object before
+		// the delete that marks it.
+		if live.Spec.Request.Call != infrav2alpha1.ClaimCallDeleteNodes {
+			live.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
+			live.Spec.Request.Nodes = names
+			live.Spec.RequestedBy = claim.RequestedByAutoscaler
+
+			if err := s.Client.Update(ctx, live); err != nil {
+				logger.Error(err, "failed to record the DeleteNodes request on the claim", "claim", live.Name, "node", slot.Name)
+
+				return nil, status.Errorf(codes.Internal, "failed to record the delete request on claim %s: %v", live.Name, err)
+			}
+		}
+
+		if err := s.Client.Delete(ctx, live); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "failed to cancel the claim of a deleted node", "claim", live.Name, "node", slot.Name)
+
+			return nil, status.Errorf(codes.Internal, "failed to cancel the claim %s of node %s: %v", live.Name, slot.Name, err)
+		}
+
+		logger.Info("Cancelled the claim of a node named for deletion", "node", slot.Name, "claim", live.Name,
+			"phase", string(live.Status.Phase), "group", req.Id)
 	}
 
 	logger.Info("NodeGroupDeleteNodes completed successfully", "nodeGroup", req.Id, "nodesDeleted", len(req.Nodes))
+
 	return &pb.NodeGroupDeleteNodesResponse{}, nil
 }
 
-// NodeGroupDecreaseTargetSize decreases the target size of the node group by cancelling
-// the slots that are still starting. The floor of the group (spec.minSize) is judged
-// against the target size that this request can actually produce, using the same
-// targetSizeOf that NodeGroupTargetSize reports, and a request that cannot take any
-// capacity away is a no-op success: cluster-autoscaler retries a FailedPrecondition
-// forever and never corrects its own view of the target size.
+// claimsOfSlot filters a group's claim list down to one slot. The provider already holds the group's
+// claims, and a slot's live claim is one pass over that list: no second read per slot, and one
+// consistent snapshot for the whole request.
+func claimsOfSlot(claims []infrav2alpha1.NodeClaim, slotName string) []infrav2alpha1.NodeClaim {
+	out := make([]infrav2alpha1.NodeClaim, 0, 1)
+
+	for i := range claims {
+		if claim.SlotNameOf(&claims[i]) == slotName {
+			out = append(out, claims[i])
+		}
+	}
+
+	return out
+}
+
+// NodeGroupDecreaseTargetSize cancels up to -delta claims that are in phase **pending**, by deleting
+// them, and reports the size the request actually produced.
 //
-// A cancellation writes spec.desiredPowerState and nothing else, exactly like
-// NodeGroupDeleteNodes. status.progress belongs to the FSM: the cancelled slot is powered
-// off by the node controller's ShutdownNode, with its lifecycle Job, its coordination lock
-// and its timestamps, on the next reconcile. This handler used to write progress:
-// shuttingdown itself, and that is the one out-of-band writer of a transitional progress:
-// with no transition, no Job and no lock behind it, the slot is only healed by the state
-// machine it collided with, and a manager restart takes that writer away with it.
+// pending is the only cancelable phase (docs/design/nodeclaim.md §3): nothing is in flight, the object
+// goes, and its unit comes off the target size on that write. A booting claim is committed and is
+// never a cancel target - the startup Job, the coordination lock, the cordon, the node object and the
+// machine are all in flight, and a cancel leaves the Job in a state nothing owns, which is the residue
+// the 0.1.19 fix removed. A ready claim's machine is running work; cluster-autoscaler scales that
+// path with DeleteNodes, not with this one.
+//
+// The floor (spec.minSize) is judged against the target size this request can produce: the current
+// size minus the pending claims it is able to cancel, capped to what exists.
+//
+// What the request cannot carry out is not answered with success. The response of the RPC carries no
+// size, so a success is the provider asserting "the size you asked for is in force", and the
+// autoscaler's next move is built on that: it stops asking, and its pending pods sit on a group that
+// is one unit bigger than it believes, while the slot the same autoscaler wants to scale into answers
+// IncreaseSize with FailedPrecondition, no free node slot, for as long as the committed boot takes -
+// up to one boot deadline (12m10s), plus the TTL of the claim that carried it. A group that is
+// already at the requested size is a no-op success; a group whose every live claim is past the
+// cancelable phase is answered with codes.Unavailable, the retryable code: the state is transient by
+// construction (the boot deadline closes every boot, and DeleteNodes closes every ready machine), and
+// the autoscaler's own retry is what picks the decrease up when it becomes possible.
 func (s *HomeClusterProviderServer) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.NodeGroupDecreaseTargetSizeRequest) (*pb.NodeGroupDecreaseTargetSizeResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupDecreaseTargetSize called", "nodeGroup", req.Id, "delta", req.Delta)
 
-	// Check for context cancellation
 	if ctx.Err() != nil {
 		return nil, status.Errorf(codes.DeadlineExceeded, "context deadline exceeded: %v", ctx.Err())
 	}
 
-	// Validate delta is negative
 	if req.Delta >= 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "delta must be negative, got %d", req.Delta)
 	}
 
 	nodes, err := s.groupNodes(ctx, req.Id)
 	if err != nil {
-		logger.Error(err, "failed to list nodes for group", "group", req.Id)
+		logger.Error(err, "failed to list nodes for group", "nodeGroup", req.Id)
+
 		return nil, status.Errorf(codes.Internal, "failed to list nodes for group %s: %v", req.Id, err)
 	}
 
-	// The only capacity this entry point can take away is slots that are still starting:
-	// a running machine is left to NodeGroupDeleteNodes, a slot that is already going away is
-	// off the target size, and a claim the FSM has not picked up yet is not a startup to
-	// abort (see isStartingUpSlot). Cancelling one clears spec.desiredPowerState, and a
-	// cancelled startup is not capacity (see countsTowardsTargetSize): exactly one unit off
-	// targetSizeOf, on the write that asks for it.
-	var startingUpNodes []infrav1alpha1.Node
-	for _, node := range nodes {
-		if isStartingUpSlot(node) {
-			startingUpNodes = append(startingUpNodes, node)
-		}
+	claims, err := s.groupClaims(ctx, req.Id)
+	if err != nil {
+		logger.Error(err, "failed to list the claims of group", "nodeGroup", req.Id)
+
+		return nil, status.Errorf(codes.Internal, "failed to list the claims of node group %s: %v", req.Id, err)
 	}
 
-	// The target size is the single definition from targetSizeOf, the number
-	// NodeGroupTargetSize reports. cluster-autoscaler calls this entry point precisely when
-	// its view of the target size is stale, so a request that lands on the floor has to be
-	// accepted. The arithmetic that decides the floor has been wrong twice: it first
-	// compared the floor against the running slots only, dropping the ones that are starting
-	// (minSize 1, one running + one starting, delta -1 lands on the floor, was refused), and
-	// then against the uncapped delta, so a request that can only reach the floor was
-	// refused as well (see the nodesToShutdown cap below).
-	currentSize := targetSizeOf(nodes)
+	currentSize := targetSizeOf(claims)
+	cancellable := claim.PendingOfGroup(claims, req.Id)
 
-	// Nothing to cancel means the request cannot take any capacity away: answer it as a
-	// no-op success rather than an error, so the autoscaler is not stuck retrying a
-	// request the provider can never carry out, and moves on to reconcile its view.
-	if len(startingUpNodes) == 0 {
-		logger.Info("Nothing to cancel, the target size of the group cannot be decreased by this request",
-			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize, "resultingSize", currentSize)
-		return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
+	// Cancelling one pending claim is one unit off the target size, so carrying out the delta means
+	// cancelling -delta of them, and a request that asks for more than exist cancels all of them: the
+	// provider reports success for what it actually did, and cluster-autoscaler reads the new target
+	// size back from NodeGroupTargetSize.
+	toCancel := -req.Delta
+	if available := int32(len(cancellable)); toCancel > available {
+		toCancel = available
 	}
 
 	minSize := s.groupMinSize(ctx, req.Id, int32(len(nodes)))
+	resultingSize := currentSize - toCancel
 
-	// How many slots this request will actually cancel. Cancelling one starting slot is one
-	// unit off the target size, so carrying out the delta means cancelling -delta of them,
-	// and a request that asks for more than exist cancels all of them: the provider reports
-	// success for what it actually did, and cluster-autoscaler reads the new target size back
-	// from NodeGroupTargetSize.
-	nodesToShutdown := -req.Delta
-	if available := int32(len(startingUpNodes)); nodesToShutdown > available {
-		nodesToShutdown = available
-	}
-
-	// The floor is judged against the size the request will produce, which is the current
-	// target size minus the slots it can cancel, not minus the delta it was asked for. With
-	// minSize 1, one running + two starting slots and delta -3 the achievable result is 1,
-	// exactly the floor: refusing that (the uncapped arithmetic produced 0) is the same class
-	// of unrecoverable FailedPrecondition as the case above, one level down.
-	resultingSize := currentSize - nodesToShutdown
 	if resultingSize < minSize {
 		logger.Info("Refusing to decrease the target size below the minSize of the group",
-			"nodeGroup", req.Id, "delta", req.Delta, "cancellable", int32(len(startingUpNodes)),
-			"nodesToShutdown", nodesToShutdown, "currentSize", currentSize,
-			"resultingSize", resultingSize, "minSize", minSize)
+			"nodeGroup", req.Id, "delta", req.Delta, "cancellable", int32(len(cancellable)),
+			"toCancel", toCancel, "currentSize", currentSize, "resultingSize", resultingSize, "minSize", minSize)
+
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"decreasing node group %s by %d would take it below its minSize %d (current target size %d, %d slot(s) can be cancelled)",
-			req.Id, req.Delta, minSize, currentSize, nodesToShutdown)
+			"decreasing node group %s by %d would take it below its minSize %d (current target size %d, %d claim(s) can be cancelled)",
+			req.Id, req.Delta, minSize, currentSize, toCancel)
 	}
 
-	// Sort starting up nodes by last startup time (oldest first)
-	sort.Slice(startingUpNodes, func(i, j int) bool {
-		if startingUpNodes[i].Status.LastStartupTime == nil {
-			return false
-		}
-		if startingUpNodes[j].Status.LastStartupTime == nil {
-			return true
-		}
-		return startingUpNodes[i].Status.LastStartupTime.Before(startingUpNodes[j].Status.LastStartupTime)
-	})
+	if len(cancellable) == 0 {
+		if currentSize == 0 {
+			logger.Info("Nothing to cancel, and the group is already at the size the request asks for",
+				"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize)
 
-	// Shut down the required number of starting up nodes
-	for i := 0; i < int(nodesToShutdown) && i < len(startingUpNodes); i++ {
-		node := &startingUpNodes[i]
-
-		// Update spec (desired state). This is the whole cancellation: the request is the
-		// spec, the progress is the FSM's, and the shutdown that moves it runs under the
-		// coordination lock with its lifecycle Job behind it. See the entry point doc.
-		node.Spec.DesiredPowerState = infrav1alpha1.PowerStateOff
-		if err := s.Client.Update(ctx, node); err != nil {
-			logger.Error(err, "failed to update node spec", "node", node.Name)
-			return nil, status.Errorf(codes.Internal, "failed to update node %s spec: %v", node.Name, err)
+			return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 		}
 
-		logger.Info("Successfully marked node for shutdown", "node", node.Name, "group", req.Id)
+		booting, ready := countPhase(claims, infrav2alpha1.NodeClaimBooting), countPhase(claims, infrav2alpha1.NodeClaimReady)
+
+		logger.Info("Nothing cancellable right now: every live claim of the group is past the pending phase",
+			"nodeGroup", req.Id, "delta", req.Delta, "currentSize", currentSize,
+			"bootingClaims", booting, "readyClaims", ready)
+
+		return nil, status.Errorf(codes.Unavailable,
+			"node group %s cannot be decreased by %d right now: its %d live claim(s) are past the cancelable pending phase (%d booting, %d ready) and every one of them is committed - a boot is reversed by its own deadline, a ready machine by DeleteNodes; the request is worth retrying, and the autoscaler's next loop is what picks it up",
+			req.Id, req.Delta, currentSize, booting, ready)
 	}
 
-	// The size reported here is the target size after the cancellations that were actually
-	// carried out (the cap above), not the one the delta asked for. Each cancellation is one
-	// unit off targetSizeOf from the spec write on, so a request that cancels N slots lands
-	// on currentSize - N, which is what cluster-autoscaler reads back from NodeGroupTargetSize.
+	cancelled := make([]string, 0, toCancel)
+
+	for i := range int(toCancel) {
+		nodeClaim := &cancellable[i]
+
+		if err := s.Client.Delete(ctx, nodeClaim); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "failed to cancel a pending claim", "claim", nodeClaim.Name, "group", req.Id)
+
+			return nil, status.Errorf(codes.Internal, "failed to cancel the pending claim %s of group %s: %v", nodeClaim.Name, req.Id, err)
+		}
+
+		cancelled = append(cancelled, nodeClaim.Name)
+	}
+
 	logger.Info("NodeGroupDecreaseTargetSize completed", "nodeGroup", req.Id, "delta", req.Delta,
-		"nodesShutdown", nodesToShutdown, "currentSize", currentSize, "newSize", currentSize-nodesToShutdown)
+		"claimsCancelled", cancelled, "currentSize", currentSize, "resultingSize", currentSize-toCancel,
+		"bootingClaimsUntouched", countPhase(claims, infrav2alpha1.NodeClaimBooting))
 
 	return &pb.NodeGroupDecreaseTargetSizeResponse{}, nil
 }
 
+// countPhase is the log rendering of how many claims of a group sit in one phase, and exists so that
+// a decrease that declined to cancel a boot says so: "the autoscaler asked for -2 and the provider
+// cancelled 1" is the question an operator asks next.
+func countPhase(claims []infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase) int32 {
+	var count int32
+
+	for i := range claims {
+		if claims[i].Status.Phase == to {
+			count++
+		}
+	}
+
+	return count
+}
+
 // NodeGroupNodes returns a list of all nodes that belong to this node group.
 //
-// The instances mirror the machines the provider has: a slot with a Kubernetes node object is
-// reported running when it is desired to be on and deleting when it is desired to be off, a slot
-// that is desired to be on but has not joined yet is reported as creating, and a slot that is
-// desired to be off without a machine behind it is not reported at all.
+// The instances mirror the machines the provider has, and the contract is unchanged from v1alpha1:
+// a slot with a Kubernetes node object is reported running while a live claim wants it and deleting
+// when nothing wants it any more, a slot a live claim names that has not joined yet is reported as
+// creating, and a slot no claim names and with no machine behind it is not reported at all.
+//
+// The word "wanted" is what moved: v1alpha1 read it off spec.desiredPowerState, v2alpha1 reads it off
+// the live claim of the slot (docs/design/nodeclaim.md §5). The states keep their names, and the
+// boundary the autoscaler depends on - every corev1.Node maps to exactly one instance, and an instance
+// exists exactly when a machine exists or is on its way - is the same boundary.
 func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.NodeGroupNodesRequest) (*pb.NodeGroupNodesResponse, error) {
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupNodes called", "nodeGroup", req.Id)
 
 	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
 	listOpts := &client.ListOptions{LabelSelector: labelSelector}
-	nodes := &infrav1alpha1.NodeList{}
+	nodes := &infrav2alpha1.NodeList{}
 	err := s.Client.List(ctx, nodes, listOpts)
 	if err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			return nil, status.Errorf(codes.InvalidArgument, "group not found: %s", req.Id)
 		}
+	}
+
+	claims, err := s.groupClaims(ctx, req.Id)
+	if err != nil {
+		logger.Error(err, "failed to list the claims of group", "nodeGroup", req.Id)
+
+		return nil, status.Errorf(codes.Internal, "failed to list the claims of node group %s: %v", req.Id, err)
 	}
 
 	// Convert nodes to instances.
@@ -798,7 +846,10 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 	// when the machine is desired off) and a slot without one must not.
 	instances := make([]*pb.Instance, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
-		desiredOn := node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn
+		// The slot is wanted exactly when a live claim names it. A claim marked for scale-down is not
+		// a want: the machine is going away, which is the deleting state.
+		live := claim.LiveOfSlot(claimsOfSlot(claims, node.Name))
+		wanted := claim.WantsMachine(live)
 
 		// The Kubernetes node only exists once the machine has joined the cluster. Slots
 		// without spec.kubernetesNodeName have never been provisioned, so the lookup is
@@ -815,19 +866,19 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 			}
 		}
 
-		if !hasKubernetesNode && !desiredOn {
-			// A slot that is not desired to be on and has no machine is capacity the
-			// provider could create, not an instance that exists. Reporting it inflates
-			// the current size of the group, which makes the autoscaler provision extra
-			// machines.
+		if !hasKubernetesNode && !wanted {
+			// A slot no live claim names, with no machine behind it, is capacity the provider could
+			// create, not an instance that exists. Reporting it inflates the current size of the group,
+			// which makes the autoscaler provision extra machines.
 			continue
 		}
 
-		// A desired-on slot whose node has not joined yet is still provisioning; a desired-off
-		// slot whose node object is left over is a machine that is being powered off.
+		// A claimed slot whose node has not joined yet is still provisioning; a slot whose machine is
+		// left over with nothing wanting it (no claim, or a claim a scale-down marked) is being powered
+		// off.
 		instanceState := pb.InstanceStatus_instanceCreating
 		if hasKubernetesNode {
-			if desiredOn {
+			if wanted {
 				instanceState = pb.InstanceStatus_instanceRunning
 			} else {
 				instanceState = pb.InstanceStatus_instanceDeleting
@@ -871,7 +922,7 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	// Get nodes from this group
 	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
 	listOpts := &client.ListOptions{LabelSelector: labelSelector}
-	nodes := &infrav1alpha1.NodeList{}
+	nodes := &infrav2alpha1.NodeList{}
 	err := s.Client.List(ctx, nodes, listOpts)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list nodes: %v", err)
@@ -1022,20 +1073,20 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 //     does not exist" is reported instead of being turned into an empty template.
 //
 // The returned Node CR is never nil when the error is nil.
-func (s *HomeClusterProviderServer) pickTemplateSource(ctx context.Context, items []infrav1alpha1.Node) (*infrav1alpha1.Node, *corev1.Node, error) {
+func (s *HomeClusterProviderServer) pickTemplateSource(ctx context.Context, items []infrav2alpha1.Node) (*infrav2alpha1.Node, *corev1.Node, error) {
 	logger := log.Log.WithName("grpc-server")
 
 	var (
-		best       *infrav1alpha1.Node
+		best       *infrav2alpha1.Node
 		bestNode   *corev1.Node
 		bestReady  bool
-		poweredOff *infrav1alpha1.Node
+		poweredOff *infrav2alpha1.Node
 		lastErr    error
 	)
 
 	for i := range items {
 		candidate := &items[i]
-		if poweredOff == nil && candidate.Status.PowerState == infrav1alpha1.PowerStateOff {
+		if poweredOff == nil && candidate.Status.PowerState == infrav2alpha1.PowerStateOff {
 			poweredOff = candidate
 		}
 
@@ -1085,7 +1136,7 @@ func (s *HomeClusterProviderServer) pickTemplateSource(ctx context.Context, item
 // kubernetesNodeNameOf returns the name of the corev1.Node object that backs a slot. The
 // operator fills spec.kubernetesNodeName in when the machine is provisioned; the Node CR name
 // is the fallback, which is the rule NodeGroupNodes uses too.
-func kubernetesNodeNameOf(node *infrav1alpha1.Node) string {
+func kubernetesNodeNameOf(node *infrav2alpha1.Node) string {
 	if node.Spec.KubernetesNodeName != "" {
 		return node.Spec.KubernetesNodeName
 	}
@@ -1162,7 +1213,7 @@ var defaultTemplateCapacity = corev1.ResourceList{
 // two is judged by the other. A template machine has no system daemons to subtract, so on the
 // placeholder path the two lists end up identical; on the live path each keeps its own numbers,
 // overlaid resource by resource.
-func applyTemplateCapacity(templateNode *corev1.Node, slot *infrav1alpha1.Node) {
+func applyTemplateCapacity(templateNode *corev1.Node, slot *infrav2alpha1.Node) {
 	overlayDeclaredCapacity(&templateNode.Status.Capacity, slot.Spec.NodeCapacity)
 	overlayDeclaredCapacity(&templateNode.Status.Allocatable, slot.Spec.NodeCapacity)
 }
@@ -1205,7 +1256,7 @@ func overlayDeclaredCapacity(list *corev1.ResourceList, declared corev1.Resource
 // number that is not a fact about the hardware, and it is defaulted so the scheduler can place a
 // pod on the template at all. The call here is what makes the placeholder a complete object on its
 // own.
-func placeholderTemplateNode(slot *infrav1alpha1.Node) *corev1.Node {
+func placeholderTemplateNode(slot *infrav2alpha1.Node) *corev1.Node {
 	placeholder := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: slot.Name,
@@ -1233,7 +1284,7 @@ func (s *HomeClusterProviderServer) NodeGroupGetOptions(ctx context.Context, req
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupGetOptions called", "nodeGroup", req.Id)
 
-	group := &infrav1alpha1.Group{}
+	group := &infrav2alpha1.Group{}
 	err := s.Client.Get(ctx, client.ObjectKey{Name: req.Id, Namespace: namespaceConfig.Get()}, group)
 	if err != nil {
 		logger.Info("Group not found, returning nil to use CA defaults", "group", req.Id)

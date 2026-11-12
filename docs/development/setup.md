@@ -104,8 +104,8 @@ homelab-autoscaler/
 | File | Purpose |
 |------|---------|
 | `cmd/main.go` | Application entry point |
-| `api/infra/v1alpha1/group_types.go` | Group CRD definition |
-| `api/infra/v1alpha1/node_types.go` | Node CRD definition |
+| `api/infra/v2alpha1/group_types.go` | Group CRD definition |
+| `api/infra/v2alpha1/node_types.go` | Node CRD definition |
 | `internal/grpcserver/server.go` | gRPC server implementation |
 | `Makefile` | Build automation |
 

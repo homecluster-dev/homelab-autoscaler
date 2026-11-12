@@ -28,15 +28,20 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
-// FSM States - map directly to Progress enum values
+// FSM States. The names are the identifiers of the internal state machine and live in
+// internal/phase, which owns the mapping from (live claim, observed power, node usability) to a
+// state (phase.State). They used to be the values of the Node's status.progress enum, because the
+// state machine read its own state out of that field; v2alpha1 has no such field, and the input of
+// a pass is derived, not recorded (docs/design/nodeclaim.md §6).
 const (
-	StateShutdown     = "shutdown"
-	StateStartingUp   = "startingup"
-	StateReady        = "ready"
-	StateShuttingDown = "shuttingdown"
+	StateShutdown     = phase.StateShutdown
+	StateStartingUp   = phase.StateStartingUp
+	StateReady        = phase.StateReady
+	StateShuttingDown = phase.StateShuttingDown
 )
 
 // FSM Events
@@ -125,9 +130,9 @@ const (
 
 	// MaxUncordonRetryInterval is the ceiling of the exponential backoff the uncordon / readiness
 	// loop sleeps between passes (see setNodeSchedulableWithRetry). It is a named constant because
-	// progress.SettleGracePeriod is derived from it: the grace has to outlast every deadline that
-	// loop can consume, plus one sleep at this ceiling, or the watchdog writes over a progress its
-	// owner is about to record.
+	// claim.AttemptBudget is built from it: the budget of one attempt has to outlast every deadline
+	// that loop can consume, plus one sleep at this ceiling, or a claim is failed at the instant its
+	// own writer is about to record the machine it bought.
 	MaxUncordonRetryInterval = 10 * time.Second
 
 	// StuckTransitionThreshold is how long a transitional state (startingup,
@@ -137,10 +142,9 @@ const (
 
 	// JobMonitorPollInterval is how often the lifecycle Job monitor of a state machine reads
 	// its Job (see monitorJobCompletion), and so how long after a Job finishes the
-	// JobCompleted transition can be. It is a named constant because progress.SettleGracePeriod
-	// is measured against it: the watchdog that settles a slot with no machine and no Job has to
-	// wait out the polls of the writer it defers to, or it stomps a transition that is about to
-	// be recorded by its owner.
+	// JobCompleted transition can be. It is a named constant because claim.AttemptBudget is built
+	// from it: the deadline of a claim has to outlast the polls of the writer it defers to, or it
+	// fails a claim whose transition is about to be recorded by its owner.
 	JobMonitorPollInterval = 30 * time.Second
 )
 
@@ -150,7 +154,7 @@ type NodeStateMachine struct {
 	fsm *fsm.FSM
 
 	// Kubernetes resources
-	node   *infrav1alpha1.Node
+	node   *infrav2alpha1.Node
 	client client.Client
 	scheme *runtime.Scheme
 
@@ -177,6 +181,22 @@ type NodeStateMachine struct {
 	// node object first appears (see setNodeSchedulableWithRetry and DefaultReadinessGateTimeout).
 	readinessGateTimeout time.Duration
 
+	// input is the whole input of this state machine, per the input law of the NodeClaim model:
+	// (live claim phase, observed power, kubelet liveness / node readiness). It is never seeded
+	// from a record of what the FSM last did - the derived Node.status.phase is this machine's
+	// output, and reading it back as an input is the ambiguity the 0.1.20 watchdog and the 0.1.22
+	// observed-power precedence rule existed to patch.
+	input phase.Input
+
+	// claim is the live NodeClaim the transition is buying a machine for, and the object whose
+	// phase the transition moves. nil means the slot has no live claim: the transitions that run
+	// with none are the shutdowns of a machine the pool no longer wants.
+	claim *infrav2alpha1.NodeClaim
+
+	// claimWriter moves the phase of the claim. nil writes nothing, which is what the unit tests
+	// use; the controllers pass claim.Recorder through the adapter in internal/controller/infra.
+	claimWriter ClaimWriter
+
 	// readinessTaintKeys are the taint keys the readiness gate waits for the node to be free of, on
 	// top of the Ready condition. They come from the slot's Group (spec.nodeReadinessTaints): the
 	// key belongs to the CNI of the cluster and is not verifiable from this repository, so an empty
@@ -194,11 +214,11 @@ type BackoffStrategy struct {
 // FSMCallbacks defines the interface for FSM callbacks
 type FSMCallbacks struct {
 	// Job management
-	CreateStartupJob  func(*infrav1alpha1.Node) (*batchv1.Job, error)
-	CreateShutdownJob func(*infrav1alpha1.Node) (*batchv1.Job, error)
+	CreateStartupJob  func(*infrav2alpha1.Node) (*batchv1.Job, error)
+	CreateShutdownJob func(*infrav2alpha1.Node) (*batchv1.Job, error)
 
 	// Status updates
-	UpdateNodeStatus func(*infrav1alpha1.Node, string, metav1.Condition) error
+	UpdateNodeStatus func(*infrav2alpha1.Node, string, metav1.Condition) error
 
 	// Coordination
 	AcquireLock func(string, time.Duration) error
@@ -210,16 +230,34 @@ type FSMCallbacks struct {
 
 // CoordinationManager interface for managing coordination locks
 type CoordinationManager interface {
-	AcquireLock(ctx context.Context, node *infrav1alpha1.Node, operation string, timeout time.Duration) error
-	ReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error
-	CheckLock(ctx context.Context, node *infrav1alpha1.Node) (*OperationLock, bool)
+	AcquireLock(ctx context.Context, node *infrav2alpha1.Node, operation string, timeout time.Duration) error
+	ReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error
+	CheckLock(ctx context.Context, node *infrav2alpha1.Node) (*OperationLock, bool)
 	IsLockExpired(lock *OperationLock) bool
-	ForceReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error
+	ForceReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error
 	// RenewLock re-stamps the timestamp of the live lock this manager owns, so an operation that
 	// runs longer than the lock's timeout keeps the slot it already holds (see the implementation
 	// for the exact rules). It acquires nothing and takes nothing over; it reports whether a stamp
 	// was written.
-	RenewLock(ctx context.Context, node *infrav1alpha1.Node) (bool, error)
+	RenewLock(ctx context.Context, node *infrav2alpha1.Node) (bool, error)
+}
+
+// ClaimWriter moves the phase of a NodeClaim, with the reason that goes with the move. The
+// state machine is the one that knows a startup Job exists, a readiness gate passed, a Job failed
+// or a transition was force-cleaned, and those are the evidence for the claim's moves
+// (pending -> booting, booting -> ready, -> failed). It writes nothing itself: the claim's phase
+// table (internal/claim.LegalMoves) and its status writer live behind this interface, so the
+// state machine does not import the claim package and the table has one enforcement point.
+type ClaimWriter interface {
+	MoveClaim(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhase, reason string) error
+
+	// RecordShutdownAttempt counts one shutdown attempt on the claim a scale-down named. It is a
+	// method of this interface and not a write the state machine makes, because the claim's status
+	// writer (and the bound the count feeds) lives behind it, and it is called where the shutdown is
+	// fired: the path that created the shutdown Job. A reconcile pass that only looked at the machine
+	// is not an attempt, and a streak counted per pass spends the bound on polling the observation
+	// (docs/design/nodeclaim.md §4).
+	RecordShutdownAttempt(ctx context.Context, nodeClaim *infrav2alpha1.NodeClaim) error
 }
 
 // OperationLock represents a coordination lock on a node

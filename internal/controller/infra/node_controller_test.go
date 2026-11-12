@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +28,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -37,18 +35,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/progress"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
 // taintNodeCR returns the shared test Node CR with spec.nodeTaints declared.
-func taintNodeCR(declared ...corev1.Taint) *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+func taintNodeCR(declared ...corev1.Taint) *infrav2alpha1.Node {
+	// An idle slot: observed off, and no live claim names it. That is the shape a pass over it
+	// leaves alone (law: a machine is wanted exactly when a live claim wants it), so the reconcile
+	// level tests below assert the plumbing they are about, and not a lifecycle action.
+	node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	node.Spec.NodeTaints = declared
 
 	return node
@@ -74,7 +72,7 @@ func newTaintReconciler(t *testing.T, objects ...client.Object) *NodeReconciler 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).
-		WithStatusSubresource(&infrav1alpha1.Node{}).
+		WithStatusSubresource(&infrav2alpha1.Node{}).
 		Build()
 
 	return &NodeReconciler{Client: fakeClient, Scheme: scheme}
@@ -310,9 +308,10 @@ func TestApplyNodeTaintsRecordsNoEventWhenNothingIsSkipped(t *testing.T) {
 // capacityNodeCR returns the shared test Node CR that declares spec.nodeCapacity: the shape a
 // 2 vCPU / 4 GiB machine reports once the kubelet subtracted its system reservation, 1950m of cpu
 // and 3.2Gi of memory.
-func capacityNodeCR() *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
+func capacityNodeCR() *infrav2alpha1.Node {
+	// An idle slot again: the declaration is read on a pass that takes no lifecycle action, so the
+	// reconcile-level assertion below is about the check, not about a shutdown.
+	node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	node.Spec.NodeCapacity = corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("1950m"),
 		corev1.ResourceMemory: resource.MustParse("3.2Gi"),
@@ -386,7 +385,7 @@ func TestDeclaredNodeCapacityDriftWarns(t *testing.T) {
 func TestDeclaredNodeCapacityRecordsNothing(t *testing.T) {
 	tests := []struct {
 		name     string
-		declared *infrav1alpha1.Node
+		declared *infrav2alpha1.Node
 		live     *corev1.Node
 	}{
 		{
@@ -401,8 +400,10 @@ func TestDeclaredNodeCapacityRecordsNothing(t *testing.T) {
 		},
 		{
 			name:     "the slot declares nothing, so nothing can be stale",
-			declared: createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-			live:     capacityK8sNode("1", "1Gi", true),
+			declared: createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+			// A live claim of this slot is what makes the machine it reports wanted; the check
+			// itself reads the declaration and the node object only.
+			live: capacityK8sNode("1", "1Gi", true),
 		},
 		{
 			name:     "the node is not Ready, so its allocatable is not a measurement",
@@ -471,16 +472,6 @@ func drainEvents(recorder *events.FakeRecorder) []string {
 	}
 }
 
-// machinelessSlot is a slot of a pool that churns: the Hetzner server behind it is deleted, so no
-// corev1.Node points at it and no lifecycle Job is behind it, and cluster-autoscaler has asked for
-// it to be off. The status still says the machine is up and the progress names one.
-func machinelessSlot(previous infrav1alpha1.Progress) *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOff, previous)
-	node.Status.PowerState = infrav1alpha1.PowerStateOn
-
-	return node
-}
-
 // listLifecycleJobs returns every startup/shutdown Job the controller created.
 func listLifecycleJobs(t *testing.T, c client.Client) []batchv1.Job {
 	t.Helper()
@@ -489,519 +480,6 @@ func listLifecycleJobs(t *testing.T, c client.Client) []batchv1.Job {
 	require.NoError(t, c.List(context.Background(), jobs))
 
 	return jobs.Items
-}
-
-// TestNodeReconcileSettlesAProgressThatOutlivedItsMachine is the live failure wired through
-// Reconcile: a slot at ready, desired off, no Kubernetes node and no lifecycle Job. Pre-fix this
-// pass fired ShutdownNode on a machine that does not exist - a shutdown Job for a deleted server,
-// a cordon of a node object that is not there, and a slot that lands back at ready when the Job
-// fails, so the pool pays for the loop. The watchdog settles the slot before any FSM branch looks
-// at it, and the settlement is the one Warning that says so.
-func TestNodeReconcileSettlesAProgressThatOutlivedItsMachine(t *testing.T) {
-	for _, previous := range []infrav1alpha1.Progress{
-		infrav1alpha1.ProgressReady,
-		infrav1alpha1.ProgressStartingUp,
-		infrav1alpha1.ProgressShuttingDown,
-	} {
-		t.Run(string(previous), func(t *testing.T) {
-			recorder := events.NewFakeRecorder(16)
-
-			node := machinelessSlot(previous)
-
-			// The stamp of a transition that is over. A slot with no lifecycle Job object left -
-			// the Job was collected by its TTL - has its grace measured from status.lastStartupTime
-			// (progress.startupGrace), so a startup stamped now is a startup whose hook may still be
-			// running and is requeued, not settled. A slot of a pool that churned is stamped long
-			// past the grace, and that is what this pass acts on.
-			stale := metav1.NewTime(time.Now().Add(-progress.SettleGracePeriod - time.Minute))
-
-			if previous == infrav1alpha1.ProgressStartingUp {
-				node.Status.LastStartupTime = &stale
-			} else {
-				stamp := metav1.Now()
-				node.Status.LastShutdownTime = &stamp
-			}
-
-			reconciler := newTaintReconciler(t, node, createTestGroup())
-			reconciler.EventRecorder = recorder
-
-			_, err := reconciler.Reconcile(context.Background(), reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
-			})
-			require.NoError(t, err)
-
-			after := &infrav1alpha1.Node{}
-			require.NoError(t, reconciler.Get(context.Background(),
-				types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
-
-			assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress,
-				"a progress naming a machine the cluster does not have is settled")
-			assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState)
-			assert.Empty(t, listLifecycleJobs(t, reconciler.Client),
-				"no lifecycle Job is built for a machine that is gone, that is the churn this closes")
-
-			var settled []string
-
-			for _, event := range drainEvents(recorder) {
-				if strings.Contains(event, progress.ReasonProgressReconciled) {
-					settled = append(settled, event)
-				}
-			}
-
-			require.Len(t, settled, 1, "one settlement, one Warning")
-			assert.Contains(t, settled[0], "Warning")
-			assert.Contains(t, settled[0], string(previous), "the event names the progress it replaced")
-		})
-	}
-}
-
-// TestNodeReconcileSettlementIsIdempotent runs the reconcile on a slot that is already settled:
-// nothing is written, nothing is recorded. A slot of a healthy off pool is reconciled on every
-// resync, and a settlement that fires every time is an event storm on a pool at rest.
-func TestNodeReconcileSettlementIsIdempotent(t *testing.T) {
-	recorder := events.NewFakeRecorder(16)
-
-	node := machinelessSlot(infrav1alpha1.ProgressReady)
-	reconciler := newTaintReconciler(t, node, createTestGroup())
-	reconciler.EventRecorder = recorder
-
-	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"}}
-
-	require.NoError(t, firstReconcile(reconciler, request))
-	drainEvents(recorder)
-
-	for range 3 {
-		require.NoError(t, firstReconcile(reconciler, request))
-	}
-
-	after := &infrav1alpha1.Node{}
-	require.NoError(t, reconciler.Get(context.Background(),
-		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
-
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress)
-	assert.Zero(t, len(drainEvents(recorder)), "a settled slot records nothing on the passes after the settlement")
-}
-
-// firstReconcile is the Reconcile call of the tests above, with the error surfaced.
-func firstReconcile(reconciler *NodeReconciler, request reconcile.Request) error {
-	_, err := reconciler.Reconcile(context.Background(), request)
-
-	return err
-}
-
-// TestNodeReconcileLeavesASlotWithALiveJobAlone is the FSM's ownership, seen from the reconcile:
-// a slot whose lifecycle Job is pending is an operation in flight, and the watchdog must not
-// write over it. The FSM's own transitional progress is what the pass leaves behind.
-func TestNodeReconcileLeavesASlotWithALiveJobAlone(t *testing.T) {
-	recorder := events.NewFakeRecorder(16)
-
-	node := machinelessSlot(infrav1alpha1.ProgressShuttingDown)
-	stamp := metav1.Now()
-	node.Status.LastShutdownTime = &stamp
-
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-node-shutdown-1700000000",
-			Namespace: "default",
-			Labels: map[string]string{
-				fsm.LabelApp:        fsm.LifecycleAppName,
-				fsm.LabelType:       fsm.PhaseShutdown,
-				fsm.LabelNodeCR:     "test-node",
-				fsm.LabelNodeLegacy: "test-node-k8s",
-			},
-		},
-	}
-
-	reconciler := newTaintReconciler(t, node, createTestGroup(), job)
-	reconciler.EventRecorder = recorder
-
-	result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
-	})
-	require.NoError(t, err)
-
-	after := &infrav1alpha1.Node{}
-	require.NoError(t, reconciler.Get(context.Background(),
-		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
-
-	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, after.Status.Progress, "the operation owns the progress")
-	assert.Zero(t, len(drainEvents(recorder)), "a pass that settles nothing records nothing")
-	assert.LessOrEqual(t, result.RequeueAfter, progress.SettleGracePeriod, "the slot is looked at again, not forgotten")
-}
-
-// TestNodeReconcileHonoursTheWatchdogDeadline: a transitional slot is on the FSM's progressive
-// backoff (2 minutes at 5 minutes of transition age). When the watchdog has a tighter deadline -
-// a lifecycle Job that finished 90s ago, so it leaves the grace in 30s - the pass comes back on
-// the earlier one, and the settlement is scheduled rather than left to the next resync.
-func TestNodeReconcileHonoursTheWatchdogDeadline(t *testing.T) {
-	node := machinelessSlot(infrav1alpha1.ProgressShuttingDown)
-	stamp := metav1.NewTime(time.Now().Add(-5 * time.Minute))
-	node.Status.LastShutdownTime = &stamp
-
-	// The Job finished 30s before the settle grace runs out, so the watchdog asks for 30s. Derived from
-	// progress.SettleGracePeriod: the row says "30s before the grace", not a number that only made
-	// sense next to the value the constant used to carry.
-	completed := metav1.NewTime(time.Now().Add(-(progress.SettleGracePeriod - 30*time.Second)))
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-node-shutdown-1700000000",
-			Namespace: "default",
-			Labels: map[string]string{
-				fsm.LabelApp:        fsm.LifecycleAppName,
-				fsm.LabelType:       fsm.PhaseShutdown,
-				fsm.LabelNodeCR:     "test-node",
-				fsm.LabelNodeLegacy: "test-node-k8s",
-			},
-		},
-		Status: batchv1.JobStatus{
-			Failed:         1,
-			CompletionTime: &completed,
-		},
-	}
-
-	reconciler := newTaintReconciler(t, node, createTestGroup(), job)
-
-	result, err := reconciler.Reconcile(context.Background(), reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
-	})
-	require.NoError(t, err)
-
-	assert.InDelta(t, (30 * time.Second).Seconds(), result.RequeueAfter.Seconds(), 2,
-		"the grace expires in 30s, so the pass comes back then, not on the 2m transition backoff")
-	assert.Less(t, result.RequeueAfter, 2*time.Minute, "earlier than the FSM's backoff for this transition")
-
-	after := &infrav1alpha1.Node{}
-	require.NoError(t, reconciler.Get(context.Background(),
-		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
-	assert.Equal(t, infrav1alpha1.ProgressShuttingDown, after.Status.Progress, "the Job is still inside its grace")
-}
-
-// TestShortenRequeue is the caller-side rule of the watchdog, tested directly: the pass honours a
-// deadline the watchdog asked for, and it never becomes later, never empty, and never a hot loop.
-//
-// The three properties that matter:
-//   - a deadline the FSM asked for (a lock to come back on, a transition backoff) is earlier, so it
-//     wins - the watchdog's grace is a look, not a mandate;
-//   - a result that asks to requeue *now* (Requeue: true, no RequeueAfter) is never turned into a
-//     delayed one: that is how a settlement makes a controller slow;
-//   - a non-positive watchdog deadline changes nothing, so the common path (no deadline) cannot
-//     produce a zero RequeueAfter with Requeue: true, which is an immediate re-dispatch.
-func TestShortenRequeue(t *testing.T) {
-	const (
-		watchdog = progress.SettleGracePeriod
-		fsmSoon  = 30 * time.Second
-	)
-
-	tests := []struct {
-		name         string
-		result       ctrl.Result
-		requeueAfter time.Duration
-		want         ctrl.Result
-	}{
-		{
-			name:         "no watchdog deadline: the result passes through untouched",
-			result:       ctrl.Result{RequeueAfter: 5 * time.Minute},
-			requeueAfter: 0,
-			want:         ctrl.Result{RequeueAfter: 5 * time.Minute},
-		},
-		{
-			name:         "a negative deadline is not a deadline",
-			result:       ctrl.Result{RequeueAfter: 5 * time.Minute},
-			requeueAfter: -time.Second,
-			want:         ctrl.Result{RequeueAfter: 5 * time.Minute},
-		},
-		{
-			name:         "the result requeues now: the watchdog does not delay it",
-			result:       ctrl.Result{Requeue: true},
-			requeueAfter: watchdog,
-			want:         ctrl.Result{Requeue: true},
-		},
-		{
-			name:         "an empty result takes the watchdog's deadline",
-			result:       ctrl.Result{},
-			requeueAfter: watchdog,
-			want:         ctrl.Result{RequeueAfter: watchdog},
-		},
-		{
-			name:         "a tighter FSM deadline wins",
-			result:       ctrl.Result{RequeueAfter: fsmSoon},
-			requeueAfter: watchdog,
-			want:         ctrl.Result{RequeueAfter: fsmSoon},
-		},
-		{
-			name:         "an equal deadline is left as the caller wrote it",
-			result:       ctrl.Result{RequeueAfter: watchdog},
-			requeueAfter: watchdog,
-			want:         ctrl.Result{RequeueAfter: watchdog},
-		},
-		{
-			name:         "a looser FSM deadline is shortened",
-			result:       ctrl.Result{RequeueAfter: 15 * time.Minute},
-			requeueAfter: watchdog,
-			want:         ctrl.Result{RequeueAfter: watchdog},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := shortenRequeue(tc.result, tc.requeueAfter)
-
-			assert.Equal(t, tc.want, got)
-
-			if tc.result.RequeueAfter > 0 {
-				assert.LessOrEqual(t, got.RequeueAfter, tc.result.RequeueAfter,
-					"the watchdog never extends a deadline the caller already asked for")
-			}
-
-			//nolint:staticcheck // SA1019: Requeue is deprecated, and the property under test is about
-			// the pair of fields: shortening must never leave a result that asks to requeue now *and*
-			// names a deadline, which controller-runtime refuses.
-			assert.False(t, got.Requeue && got.RequeueAfter > 0,
-				"a shortened result is not also an immediate requeue: %v", got)
-		})
-	}
-}
-
-// claimedMachinelessSlot is the M3 shape seen from the reconcile: cluster-autoscaler asked for this
-// slot (spec.desiredPowerState: on), its startup Job completed, and its node never registered, so it
-// sits at {desired: on, powerState: off, progress: ready}. The FSM cannot StartNode from ready, the
-// provider counts it as capacity forever, and the autoscaler plans against a machine that does not
-// exist.
-func claimedMachinelessSlot(previous infrav1alpha1.Progress) *infrav1alpha1.Node {
-	node := createTestNode(infrav1alpha1.PowerStateOn, previous)
-	node.Status.PowerState = infrav1alpha1.PowerStateOff
-
-	return node
-}
-
-// TestNodeReconcileRearmsAClaimAndRetriesTheMachine is the phantom-claim hole closed at the reconcile
-// level: the watchdog re-arms the slot (progress: shutdown, powerState: off, desired: on) and the very
-// same pass then runs the FSM, which can StartNode from shutdown, so the pool retries the machine.
-// The claim is not dropped, and the retry is bounded: the startup Job of the attempt is the operation
-// that owns the slot on the next pass.
-func TestNodeReconcileRearmsAClaimAndRetriesTheMachine(t *testing.T) {
-	recorder := events.NewFakeRecorder(16)
-
-	node := claimedMachinelessSlot(infrav1alpha1.ProgressReady)
-	reconciler := newTaintReconciler(t, node, createTestGroup())
-	reconciler.EventRecorder = recorder
-
-	_, err := reconciler.Reconcile(context.Background(), reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
-	})
-	require.NoError(t, err)
-
-	after := &infrav1alpha1.Node{}
-	require.NoError(t, reconciler.Get(context.Background(),
-		types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
-
-	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "the claim stands: it is the request")
-	assert.Equal(t, infrav1alpha1.ProgressStartingUp, after.Status.Progress,
-		"the pass re-armed the slot (shutdown) and the FSM then started it again (startingup)")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState, "the machine is off, and the status says so")
-
-	jobs := listLifecycleJobs(t, reconciler.Client)
-	require.Len(t, jobs, 1, "the retry is a real startup: one Job for one attempt")
-	assert.Equal(t, fsm.PhaseStartup, jobs[0].Labels[fsm.LabelType], "the pool retries the machine, it does not delete one")
-
-	var rearmed []string
-
-	for _, event := range drainEvents(recorder) {
-		if strings.Contains(event, progress.ReasonClaimRearmed) {
-			rearmed = append(rearmed, event)
-		}
-	}
-
-	require.Len(t, rearmed, 1, "one re-arm, one event")
-	assert.Contains(t, rearmed[0], "Normal", "a re-arm is the system healing itself")
-	assert.Contains(t, rearmed[0], "startup attempt 1 of "+fmt.Sprint(progress.ClaimRearmLimit),
-		"and the event names the attempt the arming leads to")
-	assert.NotContains(t, strings.Join(rearmed, "\n"), progress.ReasonProgressReconciled,
-		"a re-arm is not a settlement: the events distinguish the two, so an operator can tell a claim that is being retried from a machine that is gone")
-
-	condition := meta.FindStatusCondition(after.Status.Conditions, progress.ConditionClaimRearmed)
-	require.NotNil(t, condition, "the attempt count lives on the slot, so the bound survives a manager restart")
-	assert.Equal(t, progress.ReasonClaimRearmAttempt+"1", condition.Reason,
-		"the attempt is counted by the startup the pass started, not by the re-arm that armed it")
-}
-
-// TestNodeReconcileRearmIsBoundedAtTheReconcileLevel walks the whole shared mechanism through
-// Reconcile: each pass re-arms a claimed slot whose machine never registered, the FSM then starts
-// one machine for it, and the attempt is counted by the transition the pass ran. At
-// progress.ClaimRearmLimit the re-arming stops, the slot settles to the stable pair, one Warning goes
-// out, and the pass builds nothing. A claim whose machine cannot boot must not buy a machine per
-// resync, forever.
-//
-// The bound is one counter for both failure loops, and the test asserts whose counter it is: the
-// number on the slot is written by the startup (fsm.enterStartingUp), not by the watchdog's re-arm,
-// so the loud loop - a startup Job that exits non-zero, which this package never sees - pays into the
-// same account. A counter the watchdog kept for its own passes left that loop unbounded.
-func TestNodeReconcileRearmIsBoundedAtTheReconcileLevel(t *testing.T) {
-	node := claimedMachinelessSlot(infrav1alpha1.ProgressReady)
-	reconciler := newTaintReconciler(t, node, createTestGroup())
-
-	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"}}
-	recorder := events.NewFakeRecorder(64)
-	reconciler.EventRecorder = recorder
-
-	stale := metav1.NewTime(time.Now().Add(-progress.SettleGracePeriod - time.Minute))
-
-	for attempt := 1; attempt <= progress.ClaimRearmLimit; attempt++ {
-		require.NoErrorf(t, firstReconcile(reconciler, request), "attempt %d of %d is inside the bound",
-			attempt, progress.ClaimRearmLimit)
-
-		current := readReconciledSlot(t, reconciler)
-		assert.Equal(t, infrav1alpha1.ProgressStartingUp, current.Status.Progress,
-			"the pass re-armed the slot and the FSM started the machine again")
-		assert.Equal(t, attempt, fsm.StartupAttemptsOf(current),
-			"the startup counts the attempt, not the re-arm that armed it")
-		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1, "one machine per attempt")
-
-		// The startup of the attempt finished and its machine never registered: the Job is gone (the
-		// TTL collects it), the operation's lock is released, and the slot is left at a progress that
-		// names a machine. All three are what the watchdog's gates read.
-		for i := range listLifecycleJobs(t, reconciler.Client) {
-			require.NoError(t, reconciler.Delete(context.Background(), &listLifecycleJobs(t, reconciler.Client)[i]))
-		}
-
-		releaseLock(t, reconciler, current)
-		current.Status.Progress = infrav1alpha1.ProgressReady
-		current.Status.PowerState = infrav1alpha1.PowerStateOff
-
-		// The attempt is over: its Job was collected by the TTL, and the startup stamp the FSM left
-		// on the slot is what the watchdog measures its grace from when no Job object is left
-		// (progress.startupGrace). An attempt that finished a while ago is stamped past the grace,
-		// which is the shape between two attempts of a pool that churns; the test says so in
-		// milliseconds, so the stamp is moved by hand.
-		current.Status.LastStartupTime = &stale
-
-		require.NoError(t, reconciler.Status().Update(context.Background(), current))
-	}
-
-	// One more pass: the bound is used up. The slot settles to the stable pair with its claim kept, one
-	// Warning goes out, the FSM refuses the start the arming would have led to, and no server is built.
-	require.NoError(t, firstReconcile(reconciler, request))
-
-	current := readReconciledSlot(t, reconciler)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, current.Status.Progress,
-		"no machine, so no ready: the phantom is closed, not reported")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, current.Status.PowerState)
-	assert.Equal(t, infrav1alpha1.PowerStateOn, current.Spec.DesiredPowerState, "the claim is the provider's to drop")
-
-	condition := meta.FindStatusCondition(current.Status.Conditions, progress.ConditionClaimRearmed)
-	require.NotNil(t, condition)
-	assert.Equal(t, progress.ReasonClaimRearmLimitReached, condition.Reason)
-
-	assert.Empty(t, listLifecycleJobs(t, reconciler.Client),
-		"at the bound the controller creates no further server for the slot")
-
-	var warnings []string
-
-	for _, event := range drainEvents(recorder) {
-		if strings.Contains(event, progress.ReasonClaimRearmLimitReached) {
-			warnings = append(warnings, event)
-		}
-	}
-
-	require.Len(t, warnings, 1, "the bound is reported once, not on every resync")
-	assert.Contains(t, warnings[0], "Warning")
-	assert.Contains(t, warnings[0], fmt.Sprint(progress.ClaimRearmLimit), "the Warning names the attempts it spent")
-
-	require.NoError(t, firstReconcile(reconciler, request))
-	assert.Zero(t, len(drainEvents(recorder)), "and the passes after it are silent")
-	assert.Equal(t, current.ResourceVersion, readReconciledSlot(t, reconciler).ResourceVersion,
-		"a settled slot that will not boot writes nothing, so a broken pool costs no API traffic")
-}
-
-// TestNodeReconcileRefusesAStartOnASlotThatUsedItsAttempts is the second entry of the bound at the
-// reconcile level: the loud loop. A startup Job that exits non-zero leaves the slot at the stable
-// {desired: on, powerState: off, progress: shutdown} pair (afterJobFailed writes the progress and
-// nothing else), which is exactly the state the controller's StartNode branch fires from, and the
-// progress watchdog never looks at it: a progress of shutdown implies no machine. The bound is
-// therefore enforced by the FSM's StartNode, and the pass that finds the attempts spent must build no
-// Job, leave the slot at the stable pair, and record one Warning.
-//
-// It is also the steady-state case: the refusal is not a retry, so a slot that is permanently broken
-// writes and records nothing after the first pass, and the reconcile does not fail (the operator's
-// signal is the event, not controller-runtime's rate limiter).
-func TestNodeReconcileRefusesAStartOnASlotThatUsedItsAttempts(t *testing.T) {
-	node := claimedMachinelessSlot(infrav1alpha1.ProgressShutdown)
-	stamp := metav1.Now()
-	node.Status.LastStartupTime = &stamp
-
-	reconciler := newTaintReconciler(t, node, createTestGroup())
-
-	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"}}
-	recorder := events.NewFakeRecorder(32)
-	reconciler.EventRecorder = recorder
-
-	current := readReconciledSlot(t, reconciler)
-	meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
-		Type:   progress.ConditionClaimRearmed,
-		Status: metav1.ConditionTrue,
-		Reason: progress.ReasonClaimRearmAttempt + fmt.Sprint(progress.ClaimRearmLimit),
-		Message: fmt.Sprintf("startup attempt %d recorded by the FSM: every startup Job of this slot exited non-zero",
-			progress.ClaimRearmLimit),
-	})
-	require.NoError(t, reconciler.Status().Update(context.Background(), current))
-
-	require.NoError(t, firstReconcile(reconciler, request),
-		"a refusal is not a reconcile failure: the slot is stable and the record is the event")
-
-	after := readReconciledSlot(t, reconciler)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, after.Status.Progress, "the slot stays at the stable pair")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, after.Status.PowerState)
-	assert.Equal(t, infrav1alpha1.PowerStateOn, after.Spec.DesiredPowerState, "and keeps the claim")
-	assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "the fourth StartNode is refused, so no machine is bought")
-
-	condition := meta.FindStatusCondition(after.Status.Conditions, progress.ConditionClaimRearmed)
-	require.NotNil(t, condition)
-	assert.Equal(t, progress.ReasonClaimRearmLimitReached, condition.Reason,
-		"the refusal stamps the note, which is what the deduplication reads")
-
-	recorded := drainEvents(recorder)
-	require.Len(t, recorded, 1, "one Warning for the bound")
-	assert.Contains(t, recorded[0], "Warning")
-	assert.Contains(t, recorded[0], progress.ReasonClaimRearmLimitReached)
-
-	before := readReconciledSlot(t, reconciler)
-
-	require.NoError(t, firstReconcile(reconciler, request))
-	assert.Zero(t, len(drainEvents(recorder)), "and every later pass is silent")
-	assert.Equal(t, before.ResourceVersion, readReconciledSlot(t, reconciler).ResourceVersion,
-		"with no status write at all")
-	assert.Empty(t, listLifecycleJobs(t, reconciler.Client))
-}
-
-// readReconciledSlot reads the slot the reconciler's client holds.
-func readReconciledSlot(t *testing.T, reconciler *NodeReconciler) *infrav1alpha1.Node {
-	t.Helper()
-
-	node := &infrav1alpha1.Node{}
-	require.NoError(t, reconciler.Get(context.Background(),
-		types.NamespacedName{Name: "test-node", Namespace: "default"}, node))
-
-	return node
-}
-
-// releaseLock removes the coordination lock annotations of a slot, which is what the completion of an
-// operation does: the lock is not the watchdog's to clear, and a test that leaves one on the slot
-// tests the lock gate instead of the attempt bound.
-func releaseLock(t *testing.T, reconciler *NodeReconciler, node *infrav1alpha1.Node) {
-	t.Helper()
-
-	for _, key := range []string{
-		fsm.OperationLockAnnotation, fsm.LockOwnerAnnotation,
-		fsm.LockTimestampAnnotation, fsm.LockTimeoutAnnotation,
-	} {
-		delete(node.Annotations, key)
-	}
-
-	if len(node.Annotations) == 0 {
-		node.Annotations = nil
-	}
-
-	require.NoError(t, reconciler.Update(context.Background(), node))
 }
 
 // TestReadinessTaintKeysStampedFromTheGroup is the wiring of the configurable gate key: the key belongs
@@ -1028,7 +506,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+			node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 			group := createTestGroup()
 			group.Spec.NodeReadinessTaints = tc.spec
 
@@ -1037,7 +515,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 			keys := reconciler.readinessTaintKeys(context.Background(), node, group)
 			assert.Equal(t, tc.want, keys, "the FSM gets exactly the list the Group declares")
 
-			stamped := &infrav1alpha1.Node{}
+			stamped := &infrav2alpha1.Node{}
 			require.NoError(t, reconciler.Get(context.Background(),
 				types.NamespacedName{Name: "test-node", Namespace: "default"}, stamped))
 
@@ -1058,7 +536,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 			// The steady state: the same Group, the same record, no write.
 			assert.Equal(t, tc.want, reconciler.readinessTaintKeys(context.Background(), stamped, group))
 
-			after := &infrav1alpha1.Node{}
+			after := &infrav2alpha1.Node{}
 			require.NoError(t, reconciler.Get(context.Background(),
 				types.NamespacedName{Name: "test-node", Namespace: "default"}, after))
 			assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "a resync of an unchanged Group writes nothing")
@@ -1066,7 +544,7 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 	}
 
 	t.Run("no group to read falls back to the slot's record", func(t *testing.T) {
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 		autoscalerpkg.StampReadinessTaints(node, []string{"node.cilium.io/agent-not-ready"})
 
 		reconciler := newTaintReconciler(t, node, createTestGroup())
@@ -1074,4 +552,123 @@ func TestReadinessTaintKeysStampedFromTheGroup(t *testing.T) {
 		assert.Equal(t, []string{"node.cilium.io/agent-not-ready"}, reconciler.readinessTaintKeys(context.Background(), node, nil),
 			"a pass without its Group keeps the gate the Group configured, it does not quietly become Ready-only")
 	})
+}
+
+// TestNodeReconcileIdleSlotIsIdleAndDoesNothing is the shape a homelab pool rests in: a slot with no
+// live claim and a machine the provider observes off. Nothing is wanted, nothing is in flight, so
+// the pass fires no lifecycle transition, buys no Job, and comes back on the idle resync - the
+// resync being what notices a machine that was powered on out of band.
+func TestNodeReconcileIdleSlotIsIdleAndDoesNothing(t *testing.T) {
+	node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+	reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+	result, err := reconcileTestSlot(t, reconciler)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueFiveMinutes}, result)
+
+	assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "a free slot buys nothing")
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, readSlot(t, reconciler).Status.Phase,
+		"the report of a slot with no claim and no machine is off")
+}
+
+// TestLiveClaimOfIgnoresTerminalClaims is the arithmetic of "the machine is wanted" at the reconcile:
+// pending, booting and ready are live, failed and completed are not. A terminal claim whose machine
+// is observed up is the force-shutdown case of the input law, so reading it as live would be the
+// model keeping a machine the pool has given up on.
+func TestLiveClaimOfIgnoresTerminalClaims(t *testing.T) {
+	node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+
+	tests := []struct {
+		claimPhase infrav2alpha1.NodeClaimPhase
+		wantLive   bool
+	}{
+		{claimPhase: infrav2alpha1.NodeClaimPending, wantLive: true},
+		{claimPhase: infrav2alpha1.NodeClaimBooting, wantLive: true},
+		{claimPhase: infrav2alpha1.NodeClaimReady, wantLive: true},
+		{claimPhase: infrav2alpha1.NodeClaimFailed, wantLive: false},
+		{claimPhase: infrav2alpha1.NodeClaimCompleted, wantLive: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(string(tc.claimPhase), func(t *testing.T) {
+			nodeClaim := claimOnSlot(node, tc.claimPhase, nil)
+			reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
+
+			live, err := reconciler.liveClaimOf(context.Background(), node)
+			require.NoError(t, err)
+
+			if tc.wantLive {
+				require.NotNil(t, live, "a %s claim names a machine that is wanted", tc.claimPhase)
+				assert.Equal(t, nodeClaim.Name, live.Name)
+
+				return
+			}
+
+			assert.Nil(t, live, "a %s claim is terminal: it is not capacity, and it stops being capacity the moment it is recorded", tc.claimPhase)
+		})
+	}
+}
+
+// TestLifecycleInputIsTheTriple is the input of one pass, assembled: the live claim, the observed
+// power, the usability of the node object, and the lifecycle Jobs of the slot. The assertion that
+// matters for the model is the last one: two slots whose records disagree, with the same claim, the
+// same observation and the same node, produce the same input, so the record cannot reach a decision.
+func TestLifecycleInputIsTheTriple(t *testing.T) {
+	node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+	nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimBooting, nil)
+	reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, startupJobInFlight(node))
+
+	input := reconciler.lifecycleInput(context.Background(), node, nodeClaim)
+	require.NotNil(t, input.Claim)
+	assert.Equal(t, infrav2alpha1.NodeClaimBooting, input.Claim.Status.Phase)
+	assert.Equal(t, infrav2alpha1.PowerStateOff, input.ObservedPower)
+	assert.True(t, input.StartupJobInFlight, "the startup Job of the slot is a fact about an object that exists")
+	assert.False(t, input.ShutdownJobInFlight)
+	assert.True(t, input.NodeUsable, "the shared test node is Ready, uncordoned and carries no readiness taint")
+
+	// The record, contradicted five ways: the input does not change, because the input has no field
+	// that a record can fill.
+	for _, report := range []infrav2alpha1.NodePhase{
+		infrav2alpha1.NodePhaseReady,
+		infrav2alpha1.NodePhaseDraining,
+		infrav2alpha1.NodePhasePending,
+		infrav2alpha1.NodePhaseBooting,
+		infrav2alpha1.NodePhaseOff,
+	} {
+		contradicted := node.DeepCopy()
+		contradicted.Status.Phase = report
+
+		assert.Equal(t, input, reconciler.lifecycleInput(context.Background(), contradicted, nodeClaim),
+			"the report of a slot is never an input to the pass that writes it")
+	}
+}
+
+// TestNodeReconcileClaimMarkedForScaleDownIsDrained is DeleteNodes seen from the slot: the provider
+// recorded the request on the claim and deleted it, so the claim carries a deletion timestamp and
+// the controller's finalizer. The machine is wanted no longer, which is law 3 with an owner: the
+// shutdown runs, the node is cordoned, and the claim stays live and marked until the claim controller
+// sees the machine off (the boot is reversed, never interrupted).
+func TestNodeReconcileClaimMarkedForScaleDownIsDrained(t *testing.T) {
+	node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+	nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+		c.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
+		c.Spec.Request.Nodes = []string{"test-node-k8s"}
+	})
+	reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
+	markDeleted(t, reconciler.Client, nodeClaim)
+
+	_, err := reconcileTestSlot(t, reconciler)
+	require.NoError(t, err)
+
+	jobs := listLifecycleJobs(t, reconciler.Client)
+	require.Len(t, jobs, 1, "a marked claim is the scale-down request that owns this machine")
+	assert.Contains(t, jobs[0].Name, "test-node-shutdown-")
+
+	assert.True(t, getK8sNode(t, reconciler.Client).Spec.Unschedulable, "the machine is cordoned before it is powered off")
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, readSlot(t, reconciler).Status.Phase)
+
+	live, err := reconciler.liveClaimOf(context.Background(), node)
+	require.NoError(t, err)
+	require.NotNil(t, live, "a live claim marked for deletion is still the claim of the slot: it ends when the machine is off")
+	assert.Equal(t, infrav2alpha1.NodeClaimReady, live.Status.Phase)
 }

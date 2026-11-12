@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 const slotNamespace = "homelab-autoscaler-system"
@@ -40,26 +40,25 @@ func slotScheme(t *testing.T) *runtime.Scheme {
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	return scheme
 }
 
-// slot builds a Node CR (a slot) with the given desired power state and status.
-func slot(name string, desired infrav1alpha1.PowerState, powerState infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+// slot builds a Node CR (a slot) with the given observed power and reported phase.
+func slot(name string, powerState infrav2alpha1.PowerState, nodePhase infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: slotNamespace,
 			Labels:    map[string]string{"group": "remote-workers"},
 		},
-		Spec: infrav1alpha1.NodeSpec{
-			DesiredPowerState:  desired,
+		Spec: infrav2alpha1.NodeSpec{
 			KubernetesNodeName: name,
 		},
-		Status: infrav1alpha1.NodeStatus{
+		Status: infrav2alpha1.NodeStatus{
 			PowerState: powerState,
-			Progress:   progress,
+			Phase:      nodePhase,
 		},
 	}
 }
@@ -72,7 +71,7 @@ func newSlotReconciler(t *testing.T, objects ...client.Object) *NodeSlotReconcil
 		Client: fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(objects...).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build(),
 		Scheme: scheme,
 	}
@@ -87,22 +86,28 @@ func reconcileSlot(t *testing.T, r *NodeSlotReconciler, name string) {
 	require.NoError(t, err)
 }
 
-func getNodeCR(t *testing.T, r *NodeSlotReconciler, name string) *infrav1alpha1.Node {
+func getNodeCR(t *testing.T, r *NodeSlotReconciler, name string) *infrav2alpha1.Node {
 	t.Helper()
 
-	node := &infrav1alpha1.Node{}
+	node := &infrav2alpha1.Node{}
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: name, Namespace: slotNamespace}, node))
 
 	return node
 }
 
-// TestNodeSlotReconcilerSeedsFreshPool reproduces the live symptom of a committed pool:
-// every slot has spec.powerState "off" and an empty status, so the cloud provider
-// reports the whole pool as target size and the cluster-autoscaler never scales up.
+// TestNodeSlotReconcilerSeedsFreshPool covers the report of a committed pool: every slot has an
+// empty status, and `kubectl get nodes.infra.homecluster.dev` on a pool that is idle by design must
+// read as idle slots, not as broken ones.
+//
+// Under v1alpha1 this seeding was load-bearing for the arithmetic - the provider counted every slot
+// whose progress was not shuttingdown/shutdown/startingup, so an unseeded pool reported targetSize ==
+// the number of slots and cluster-autoscaler never asked for a scale up. v2alpha1 counts live claims,
+// so nothing here is load-bearing: "no live claim" is the free slot, and this controller only writes
+// the report.
 func TestNodeSlotReconcilerSeedsFreshPool(t *testing.T) {
 	r := newSlotReconciler(t,
-		slot("omni-remote-1", infrav1alpha1.PowerStateOff, "", ""),
-		slot("omni-remote-2", infrav1alpha1.PowerStateOff, "", ""),
+		slot("omni-remote-1", infrav2alpha1.PowerStateOff, ""),
+		slot("omni-remote-2", infrav2alpha1.PowerStateOff, ""),
 	)
 
 	reconcileSlot(t, r, "omni-remote-1")
@@ -110,8 +115,8 @@ func TestNodeSlotReconcilerSeedsFreshPool(t *testing.T) {
 
 	for _, name := range []string{"omni-remote-1", "omni-remote-2"} {
 		node := getNodeCR(t, r, name)
-		assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState, "slot %s power state", name)
-		assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress, "slot %s progress", name)
+		assert.Equal(t, infrav2alpha1.PowerStateOff, node.Status.PowerState, "slot %s power state", name)
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, node.Status.Phase, "slot %s progress", name)
 	}
 
 	// Re-running must be a no-op (idempotent).
@@ -132,35 +137,35 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		node     *infrav1alpha1.Node
+		node     *infrav2alpha1.Node
 		extra    []client.Object
-		expected infrav1alpha1.NodeStatus
+		expected infrav2alpha1.NodeStatus
 	}{
 		{
-			name:     "slot that is desired to be on keeps its empty status",
-			node:     slot("slot-on", infrav1alpha1.PowerStateOn, "", ""),
-			expected: infrav1alpha1.NodeStatus{PowerState: "", Progress: ""},
+			name:     "slot whose machine is observed on keeps its status",
+			node:     slot("slot-on", infrav2alpha1.PowerStateOn, ""),
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase: ""},
 		},
 		{
 			name:     "slot that is on keeps its real status",
-			node:     slot("slot-powered-on", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady),
-			expected: infrav1alpha1.NodeStatus{PowerState: infrav1alpha1.PowerStateOn, Progress: infrav1alpha1.ProgressReady},
+			node:     slot("slot-powered-on", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady),
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase: infrav2alpha1.NodePhaseReady},
 		},
 		{
 			name:     "starting up slot is not touched",
-			node:     slot("slot-starting", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp),
-			expected: infrav1alpha1.NodeStatus{PowerState: infrav1alpha1.PowerStateOff, Progress: infrav1alpha1.ProgressStartingUp},
+			node:     slot("slot-starting", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting),
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOff, Phase: infrav2alpha1.NodePhaseBooting},
 		},
 		{
 			name:     "shutting down slot is not touched",
-			node:     slot("slot-stopping", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown),
-			expected: infrav1alpha1.NodeStatus{PowerState: infrav1alpha1.PowerStateOn, Progress: infrav1alpha1.ProgressShuttingDown},
+			node:     slot("slot-stopping", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining),
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOn, Phase: infrav2alpha1.NodePhaseDraining},
 		},
 		{
 			name:     "slot with a matching kubernetes node is left to the node controller",
-			node:     slot("omni-remote-3", infrav1alpha1.PowerStateOff, "", ""),
+			node:     slot("omni-remote-3", infrav2alpha1.PowerStateOff, ""),
 			extra:    []client.Object{readyK8sNode},
-			expected: infrav1alpha1.NodeStatus{PowerState: "", Progress: ""},
+			expected: infrav2alpha1.NodeStatus{PowerState: infrav2alpha1.PowerStateOff, Phase: ""},
 		},
 	}
 
@@ -172,7 +177,7 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 			reconcileSlot(t, r, tc.node.Name)
 
 			node := getNodeCR(t, r, tc.node.Name)
-			assert.Equal(t, tc.expected, infrav1alpha1.NodeStatus{PowerState: node.Status.PowerState, Progress: node.Status.Progress})
+			assert.Equal(t, tc.expected, infrav2alpha1.NodeStatus{PowerState: node.Status.PowerState, Phase: node.Status.Phase})
 		})
 	}
 }
@@ -184,7 +189,7 @@ func TestNodeSlotReconcilerLeavesRealStatesAlone(t *testing.T) {
 // earlier status write failed. Seeding off/shutdown would drop a running machine from the
 // target size, so the seeder leaves such a slot alone.
 func TestNodeSlotReconcilerSkipsSeedAfterFSMRan(t *testing.T) {
-	emptyStatusSlot := slot("slot-ever-started", infrav1alpha1.PowerStateOff, "", "")
+	emptyStatusSlot := slot("slot-ever-started", "", "")
 	started := metav1.Now()
 	emptyStatusSlot.Status.LastStartupTime = &started
 
@@ -194,7 +199,7 @@ func TestNodeSlotReconcilerSkipsSeedAfterFSMRan(t *testing.T) {
 
 	node := getNodeCR(t, r, "slot-ever-started")
 	assert.Empty(t, node.Status.PowerState, "a slot the state machine has started must not be seeded")
-	assert.Empty(t, node.Status.Progress)
+	assert.Empty(t, node.Status.Phase)
 	assert.NotNil(t, node.Status.LastStartupTime)
 }
 
@@ -202,30 +207,30 @@ func TestNodeSlotReconcilerSkipsSeedAfterFSMRan(t *testing.T) {
 // recorded startup and without a Kubernetes node is a never-provisioned placeholder and is
 // seeded.
 func TestNodeSlotReconcilerSeedsSlotNeverStarted(t *testing.T) {
-	r := newSlotReconciler(t, slot("slot-never-started", infrav1alpha1.PowerStateOff, "", ""))
+	r := newSlotReconciler(t, slot("slot-never-started", infrav2alpha1.PowerStateOff, ""))
 
 	reconcileSlot(t, r, "slot-never-started")
 
 	node := getNodeCR(t, r, "slot-never-started")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress)
+	assert.Equal(t, infrav2alpha1.PowerStateOff, node.Status.PowerState)
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, node.Status.Phase)
 }
 
 func TestNodeSlotReconcilerCompletesPartialStatus(t *testing.T) {
 	// progress already shutdown, power state never observed: only the power state is filled in.
-	r := newSlotReconciler(t, slot("slot-partial", infrav1alpha1.PowerStateOff, "", infrav1alpha1.ProgressShutdown))
+	r := newSlotReconciler(t, slot("slot-partial", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff))
 
 	reconcileSlot(t, r, "slot-partial")
 
 	node := getNodeCR(t, r, "slot-partial")
-	assert.Equal(t, infrav1alpha1.PowerStateOff, node.Status.PowerState)
-	assert.Equal(t, infrav1alpha1.ProgressShutdown, node.Status.Progress)
+	assert.Equal(t, infrav2alpha1.PowerStateOff, node.Status.PowerState)
+	assert.Equal(t, infrav2alpha1.NodePhaseOff, node.Status.Phase)
 }
 
 func TestNodeSlotReconcilerDeletedNodeCR(t *testing.T) {
-	r := newSlotReconciler(t, slot("slot-gone", infrav1alpha1.PowerStateOff, "", ""))
+	r := newSlotReconciler(t, slot("slot-gone", infrav2alpha1.PowerStateOff, ""))
 
-	require.NoError(t, r.Delete(context.Background(), &infrav1alpha1.Node{
+	require.NoError(t, r.Delete(context.Background(), &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "slot-gone", Namespace: slotNamespace},
 	}))
 
@@ -235,18 +240,18 @@ func TestNodeSlotReconcilerDeletedNodeCR(t *testing.T) {
 func TestNeedsStatusSeed(t *testing.T) {
 	tests := []struct {
 		name     string
-		node     *infrav1alpha1.Node
+		node     *infrav2alpha1.Node
 		expected bool
 	}{
-		{"fresh off slot", slot("n", infrav1alpha1.PowerStateOff, "", ""), true},
-		{"off slot, empty progress, power state off", slot("n", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, ""), true},
-		{"already seeded", slot("n", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown), false},
-		{"desired on", slot("n", infrav1alpha1.PowerStateOn, "", ""), false},
-		{"desired on and off status", slot("n", infrav1alpha1.PowerStateOn, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown), false},
-		{"power state on", slot("n", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, ""), false},
-		{"progress ready", slot("n", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady), false},
-		{"progress starting up", slot("n", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp), false},
-		{"progress shutting down", slot("n", infrav1alpha1.PowerStateOff, infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShuttingDown), false},
+		{"fresh off slot", slot("n", infrav2alpha1.PowerStateOff, ""), true},
+		{"off slot, empty progress, power state off", slot("n", infrav2alpha1.PowerStateOff, ""), true},
+		{"already seeded", slot("n", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff), false},
+		{"desired on", slot("n", infrav2alpha1.PowerStateOn, ""), false},
+		{"desired on and off status", slot("n", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff), false},
+		{"power state on", slot("n", infrav2alpha1.PowerStateOn, ""), false},
+		{"progress ready", slot("n", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseReady), false},
+		{"progress starting up", slot("n", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting), false},
+		{"progress shutting down", slot("n", infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining), false},
 	}
 
 	for _, tc := range tests {

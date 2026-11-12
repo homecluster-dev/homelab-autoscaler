@@ -11,12 +11,12 @@ metadata:
   labels:
     {{- include "chart.labels" . | nindent 4 }}
 webhooks:
-  - name: vnode-v1alpha1.kb.io
+  - name: vnode-v2alpha1.kb.io
     clientConfig:
       service:
         name: homelab-autoscaler-webhook-service
         namespace: {{ .Release.Namespace }}
-        path: /validate-infra-homecluster-dev-v1alpha1-node
+        path: /validate-infra-homecluster-dev-v2alpha1-node
     failurePolicy: Fail
     sideEffects: None
     admissionReviewVersions:
@@ -28,7 +28,27 @@ webhooks:
         apiGroups:
           - infra.homecluster.dev
         apiVersions:
-          - v1alpha1
+          - v2alpha1
         resources:
           - nodes
+  - name: nodeclaim-v2alpha1.kb.io
+    clientConfig:
+      service:
+        name: homelab-autoscaler-webhook-service
+        namespace: {{ .Release.Namespace }}
+        path: /validate-infra-homecluster-dev-v2alpha1-nodeclaim
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions:
+      - v1
+    rules:
+      - operations:
+          - CREATE
+          - UPDATE
+        apiGroups:
+          - infra.homecluster.dev
+        apiVersions:
+          - v2alpha1
+        resources:
+          - nodeclaims
 {{- end }}

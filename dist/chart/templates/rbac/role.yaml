@@ -97,6 +97,7 @@ rules:
   - infra.homecluster.dev
   resources:
   - groups
+  - nodeclaims
   - nodes
   verbs:
   - create
@@ -110,6 +111,7 @@ rules:
   - infra.homecluster.dev
   resources:
   - groups/finalizers
+  - nodeclaims/finalizers
   - nodes/finalizers
   verbs:
   - update
@@ -117,6 +119,7 @@ rules:
   - infra.homecluster.dev
   resources:
   - groups/status
+  - nodeclaims/status
   - nodes/status
   verbs:
   - get

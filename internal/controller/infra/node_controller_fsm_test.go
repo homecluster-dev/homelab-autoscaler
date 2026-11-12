@@ -34,19 +34,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 func setupTestScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
-	_ = infrav1alpha1.AddToScheme(scheme)
+	_ = infrav2alpha1.AddToScheme(scheme)
+
 	return scheme
 }
 
-func createTestNode(powerState infrav1alpha1.PowerState, progress infrav1alpha1.Progress) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+// createTestNode builds the shared test slot.
+//
+// The signature is the model: in v2alpha1 the spec of a slot carries no intent at all, so the only
+// two power-ish fields a test can set are the observation (status.powerState) and the report
+// (status.phase). What the machine is *wanted* to do is not a field of the slot: it is the
+// NodeClaim the test puts next to it (see claimOnSlot).
+func createTestNode(observed infrav2alpha1.PowerState, report infrav2alpha1.NodePhase) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-node",
 			Namespace: "default",
@@ -54,34 +63,33 @@ func createTestNode(powerState infrav1alpha1.PowerState, progress infrav1alpha1.
 				"group": "test-group",
 			},
 		},
-		Spec: infrav1alpha1.NodeSpec{
-			DesiredPowerState:  powerState,
+		Spec: infrav2alpha1.NodeSpec{
 			KubernetesNodeName: "test-node-k8s",
-			StartupPodSpec: infrav1alpha1.MinimalPodSpec{
+			StartupPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/startup:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'starting node'"},
 			},
-			ShutdownPodSpec: infrav1alpha1.MinimalPodSpec{
+			ShutdownPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/shutdown:latest",
 				Command: []string{"/bin/sh"},
 				Args:    []string{"-c", "echo 'shutting down node'"},
 			},
 		},
-		Status: infrav1alpha1.NodeStatus{
-			PowerState: powerState,
-			Progress:   progress,
+		Status: infrav2alpha1.NodeStatus{
+			PowerState: observed,
+			Phase:      report,
 		},
 	}
 }
 
-func createTestGroup() *infrav1alpha1.Group {
-	return &infrav1alpha1.Group{
+func createTestGroup() *infrav2alpha1.Group {
+	return &infrav2alpha1.Group{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-group",
 			Namespace: "default",
 		},
-		Spec: infrav1alpha1.GroupSpec{
+		Spec: infrav2alpha1.GroupSpec{
 			ScaleDownUtilizationThreshold:    "0.5",
 			ScaleDownGpuUtilizationThreshold: "0.5",
 			ZeroOrMaxNodeScaling:             false,
@@ -109,524 +117,826 @@ func createTestKubernetesNode() *corev1.Node {
 	}
 }
 
-func TestNodeReconciler_FSMIntegration(t *testing.T) {
-	scheme := setupTestScheme()
-
-	t.Run("successful node startup", func(t *testing.T) {
-		// Create test objects
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff // Current state is off, desired is on
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
-
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
-
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
+// claimOnSlot is the live NodeClaim of a slot: the label the controllers list on, the phase the
+// input law reads, and the attribution IncreaseSize stamps. mutate is the test's way to name the
+// parts of the request it cares about (the deadline, the attempt, a deletion timestamp).
+func claimOnSlot(slot *infrav2alpha1.Node, claimPhase infrav2alpha1.NodeClaimPhase,
+	mutate func(*infrav2alpha1.NodeClaim),
+) *infrav2alpha1.NodeClaim {
+	nodeClaim := &infrav2alpha1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "claim-" + slot.Name,
+			Namespace: slot.Namespace,
+			Labels: map[string]string{
+				claimLabelSlot:  slot.Name,
+				claimLabelGroup: "test-group",
 			},
-		}
+		},
+		Spec: infrav2alpha1.NodeClaimSpec{
+			SlotRef: corev1.ObjectReference{
+				APIVersion: infrav2alpha1.GroupVersion.String(),
+				Kind:       "Node",
+				Name:       slot.Name,
+			},
+			RequestedBy: "cluster-autoscaler",
+			Request: infrav2alpha1.ClaimRequest{
+				Call:  infrav2alpha1.ClaimCallIncreaseSize,
+				Delta: 1,
+				Group: "test-group",
+			},
+		},
+		Status: infrav2alpha1.NodeClaimStatus{
+			Phase:   claimPhase,
+			Attempt: 1,
+		},
+	}
 
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.NoError(t, err)
+	if mutate != nil {
+		mutate(nodeClaim)
+	}
+
+	return nodeClaim
+}
+
+// The label keys of a claim, spelled out so a test that seeds the inventory does not import the
+// claim package just to name them (it is imported where its arithmetic is the subject).
+const (
+	claimLabelSlot  = "infra.homecluster.dev/node"
+	claimLabelGroup = "group"
+)
+
+// newFSMReconciler builds the slot reconciler over a fake client with the claim status subresource
+// enabled: the transitions the reconciler runs move a claim through its Recorder, and a test that
+// cannot read the phase back would be asserting nothing.
+func newFSMReconciler(t *testing.T, objects ...client.Object) *NodeReconciler {
+	t.Helper()
+
+	scheme := setupTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).
+		WithStatusSubresource(&infrav2alpha1.Node{}, &infrav2alpha1.NodeClaim{}).
+		Build()
+
+	return &NodeReconciler{Client: fakeClient, Scheme: scheme}
+}
+
+// reconcileTestSlot runs one pass over the shared test slot.
+func reconcileTestSlot(t *testing.T, reconciler *NodeReconciler) (ctrl.Result, error) {
+	t.Helper()
+
+	return reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "test-node", Namespace: "default"},
+	})
+}
+
+// readClaim reads a claim back from the reconciler's client.
+func readClaim(t *testing.T, reconciler *NodeReconciler, name string) *infrav2alpha1.NodeClaim {
+	t.Helper()
+
+	nodeClaim := &infrav2alpha1.NodeClaim{}
+	require.NoError(t, reconciler.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, nodeClaim))
+
+	return nodeClaim
+}
+
+// readSlot reads the slot back from the reconciler's client.
+func readSlot(t *testing.T, reconciler *NodeReconciler) *infrav2alpha1.Node {
+	t.Helper()
+
+	slot := &infrav2alpha1.Node{}
+	require.NoError(t, reconciler.Get(context.Background(), types.NamespacedName{Name: "test-node", Namespace: "default"}, slot))
+
+	return slot
+}
+
+// TestNodeReconciler_FSMIntegration is the input law driven through Reconcile:
+//
+//	(live claim phase, observed power, kubelet liveness) in, one lifecycle action out
+//
+// Every case names the shape of the slot and the claim it carries, and asserts what the pass did -
+// which lifecycle Job it bought, which phase the claim landed in, what the slot reports. No case
+// writes an intent onto the slot, because in v2alpha1 there is no field to write it to, and no case
+// reads status.phase as an input, because that field is this pass's output.
+func TestNodeReconciler_FSMIntegration(t *testing.T) {
+	t.Run("a live pending claim with the machine off boots it", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimPending, nil)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
+
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
 		assert.Equal(t, ctrl.Result{}, result)
 
-		// Verify job was created
-		jobs := &batchv1.JobList{}
-		err = fakeClient.List(ctx, jobs)
-		assert.NoError(t, err)
-		assert.Len(t, jobs.Items, 1)
+		jobs := listLifecycleJobs(t, reconciler.Client)
+		require.Len(t, jobs, 1, "law 1: a live claim with the machine off buys the machine")
 
-		job := jobs.Items[0]
+		job := jobs[0]
 		assert.Contains(t, job.Name, "test-node-startup-")
 		assert.Equal(t, "startup", job.Labels["type"])
 		assert.Equal(t, "test/startup:latest", job.Spec.Template.Spec.Containers[0].Image)
 
-		// Verify node status was updated
-		updatedNode := &infrav1alpha1.Node{}
-		err = fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
-		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.ProgressStartingUp, updatedNode.Status.Progress)
+		// The pending -> booting edge is the write that bought the machine, so the claim moved.
+		assert.Equal(t, infrav2alpha1.NodeClaimBooting, readClaim(t, reconciler, nodeClaim.Name).Status.Phase)
+		assert.Equal(t, infrav2alpha1.NodePhaseBooting, readSlot(t, reconciler).Status.Phase)
 	})
 
-	t.Run("successful node shutdown", func(t *testing.T) {
-		// Create test objects
-		node := createTestNode(infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressReady)
-		node.Status.PowerState = infrav1alpha1.PowerStateOn // Current state is on, desired is off
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
+	t.Run("no live claim with the machine observed on powers it off", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
 
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
-
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.NoError(t, err)
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
 		assert.Equal(t, ctrl.Result{}, result)
 
-		// Verify job was created
-		jobs := &batchv1.JobList{}
-		err = fakeClient.List(ctx, jobs)
-		assert.NoError(t, err)
-		assert.Len(t, jobs.Items, 1)
+		jobs := listLifecycleJobs(t, reconciler.Client)
+		require.Len(t, jobs, 1, "law 3: a machine nothing wants is shut down")
+		assert.Contains(t, jobs[0].Name, "test-node-shutdown-")
+		assert.Equal(t, "shutdown", jobs[0].Labels["type"])
+		assert.Equal(t, "test/shutdown:latest", jobs[0].Spec.Template.Spec.Containers[0].Image)
 
-		job := jobs.Items[0]
-		assert.Contains(t, job.Name, "test-node-shutdown-")
-		assert.Equal(t, "shutdown", job.Labels["type"])
-		assert.Equal(t, "test/shutdown:latest", job.Spec.Template.Spec.Containers[0].Image)
+		updated := getK8sNode(t, reconciler.Client)
+		assert.True(t, updated.Spec.Unschedulable, "the shutdown cordons the machine it is powering off")
 
-		// Verify node status was updated
-		updatedNode := &infrav1alpha1.Node{}
-		err = fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
-		assert.NoError(t, err)
-		assert.Equal(t, infrav1alpha1.ProgressShuttingDown, updatedNode.Status.Progress)
+		slot := readSlot(t, reconciler)
+		assert.Equal(t, infrav2alpha1.NodePhaseDraining, slot.Status.Phase)
+		assert.Nil(t, slot.Status.LastClaim, "a shutdown with no claim behind it records no episode")
 	})
 
-	t.Run("node already in desired state", func(t *testing.T) {
-		// Create test objects - node already in desired state
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-		node.Status.PowerState = infrav1alpha1.PowerStateOn // Already on and ready
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
+	t.Run("a failed claim's machine is force-shut-down, because a terminal claim is not a want", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimFailed, func(c *infrav2alpha1.NodeClaim) {
+			c.Status.Reason = infrav2alpha1.ClaimReasonDeadlineExceeded
+		})
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
 
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{}, result)
 
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
+		jobs := listLifecycleJobs(t, reconciler.Client)
+		require.Len(t, jobs, 1, "law 4: an overdue boot lands on a machine the pool has given up on")
+		assert.Contains(t, jobs[0].Name, "test-node-shutdown-")
 
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.NoError(t, err)
-		assert.Equal(t, ctrl.Result{RequeueAfter: 5 * time.Minute}, result)
-
-		// Verify no job was created
-		jobs := &batchv1.JobList{}
-		err = fakeClient.List(ctx, jobs)
-		assert.NoError(t, err)
-		assert.Len(t, jobs.Items, 0)
+		assert.Equal(t, infrav2alpha1.NodeClaimFailed, readClaim(t, reconciler, nodeClaim.Name).Status.Phase,
+			"the claim stays failed: a terminal phase has no outgoing edge")
+		assert.Equal(t, infrav2alpha1.NodePhaseDraining, readSlot(t, reconciler).Status.Phase)
 	})
 
-	t.Run("node in transitional state", func(t *testing.T) {
-		// Create test objects - node in transitional state
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
+	t.Run("a ready claim on a usable node fires nothing", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, nil)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
 
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueFiveMinutes}, result, "law 2: capacity serving pods is left alone")
 
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.NoError(t, err)
-		// Should requeue with FSM backoff timing
-		assert.True(t, result.RequeueAfter > 0)
-
-		// Verify no new job was created (already transitioning)
-		jobs := &batchv1.JobList{}
-		err = fakeClient.List(ctx, jobs)
-		assert.NoError(t, err)
-		assert.Len(t, jobs.Items, 0)
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client))
+		assert.Equal(t, infrav2alpha1.NodeClaimReady, readClaim(t, reconciler, nodeClaim.Name).Status.Phase)
 	})
 
-	t.Run("coordination lock conflict defers the transition instead of failing it", func(t *testing.T) {
-		// Create test objects with existing coordination lock
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
+	t.Run("a startup Job already in flight owns the slot, so no second machine is bought", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimBooting, nil)
+		job := startupJobInFlight(node)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, job)
+
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Greater(t, result.RequeueAfter, time.Duration(0), "a transitional slot is looked at again on the backoff")
+
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1, "the Job in flight is the operation; nothing new starts")
+		assert.Equal(t, infrav2alpha1.NodeClaimBooting, readClaim(t, reconciler, nodeClaim.Name).Status.Phase)
+	})
+
+	t.Run("a coordination lock held by the opposite operation defers the boot", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		node.Annotations = map[string]string{
 			"homelab-autoscaler.dev/operation-lock": "scale-up",
 			"homelab-autoscaler.dev/lock-owner":     "cluster-autoscaler",
 			"homelab-autoscaler.dev/lock-timestamp": time.Now().Format(time.RFC3339),
-			"homelab-autoscaler.dev/lock-timeout":   "300", // 5 minutes
+			"homelab-autoscaler.dev/lock-timeout":   "300",
 		}
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimPending, nil)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
 
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
-
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		// A transition that lost the coordination lock is a deferral, not a terminal failure.
-		// The lock is held by the opposite operation on the same slot; the request is retried
-		// on the deadline the lock itself names, and the intent that produced it -
-		// spec.desiredPowerState, written by cluster-autoscaler - is left in place, so nothing
-		// has to be asked for again. Returning the error instead handed the retry to
-		// controller-runtime's rate-limited queue, with only a ScaleDownDeferred event as the
-		// record that a shutdown was requested at all.
-		require.NoError(t, err)
-		assert.Greater(t, result.RequeueAfter, time.Duration(0), "the deferred transition is requeued")
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err, "a transition that lost the lock is a deferral, not a failure")
+		assert.Greater(t, result.RequeueAfter, time.Duration(0), "the deferred operation is requeued at the lock's own deadline")
 		assert.LessOrEqual(t, result.RequeueAfter, 5*time.Minute, "never later than the lock timeout")
 
-		// Verify no job was created due to lock conflict
-		jobs := &batchv1.JobList{}
-		err = fakeClient.List(ctx, jobs)
-		assert.NoError(t, err)
-		assert.Len(t, jobs.Items, 0)
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "the refused operation bought nothing")
 
-		// ...and the slot is untouched: a refused transition leaves no transitional progress
-		// behind, which is what keeps the next reconcile from being gated out of the slot by
-		// validateStateTransition - nothing in a reconcile undoes a transitional progress, only
-		// the operation that wrote it does.
-		updated := &infrav1alpha1.Node{}
-		require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: "test-node", Namespace: "default"}, updated))
-		assert.Equal(t, infrav1alpha1.ProgressShutdown, updated.Status.Progress)
-		assert.Equal(t, infrav1alpha1.PowerStateOn, updated.Spec.DesiredPowerState)
-
-		// The lock of the operation in flight survived the refusal: scale-up and scale-down of
-		// one slot stay mutually exclusive.
-		assert.Equal(t, "scale-up", updated.Annotations[fsm.OperationLockAnnotation])
-		assert.Equal(t, "cluster-autoscaler", updated.Annotations[fsm.LockOwnerAnnotation])
-	})
-
-	t.Run("invalid transition", func(t *testing.T) {
-		// Create test objects with invalid transition (try to start already running node)
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
-		node.Status.PowerState = infrav1alpha1.PowerStateOn // Already on and ready, can't start again
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
-
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
-
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.NoError(t, err)
-		// Should requeue normally since node is already in desired state
-		assert.Equal(t, ctrl.Result{RequeueAfter: 5 * time.Minute}, result)
-
-		// Verify no job was created
-		jobs := &batchv1.JobList{}
-		err = fakeClient.List(ctx, jobs)
-		assert.NoError(t, err)
-		assert.Len(t, jobs.Items, 0)
+		// The refusal leaves nothing behind: not on the slot, and not on the claim. The intent
+		// lives in the claim, so the requeue runs the same branch and the boot starts when the
+		// lock is free - no second IncreaseSize, no operator intervention.
+		slot := readSlot(t, reconciler)
+		assert.Equal(t, infrav2alpha1.NodePhaseOff, slot.Status.Phase)
+		assert.Equal(t, infrav2alpha1.NodeClaimPending, readClaim(t, reconciler, nodeClaim.Name).Status.Phase)
+		assert.Equal(t, "scale-up", slot.Annotations[fsm.OperationLockAnnotation], "the lock of the operation in flight survived the refusal")
 	})
 }
 
+// startupJobInFlight is a lifecycle Job of the slot that has not finished: the fact that separates
+// "a boot is in flight" from "a claim exists and nothing has started", and a fact about an object,
+// not about a string on the slot.
+func startupJobInFlight(slot *infrav2alpha1.Node) *batchv1.Job {
+	return lifecycleJob(slot, fsm.PhaseStartup)
+}
+
+// lifecycleJob builds a running startup/shutdown Job of a slot, with the labels the reconciler
+// lists on (fsm.LabelNodeCR / fsm.LabelPhase).
+func lifecycleJob(slot *infrav2alpha1.Node, jobPhase string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      slot.Name + "-" + jobPhase + "-inflight",
+			Namespace: slot.Namespace,
+			Labels: map[string]string{
+				fsm.LabelNodeCR: slot.Name,
+				fsm.LabelPhase:  jobPhase,
+				"type":          jobPhase,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{{
+						Name:    "lifecycle",
+						Image:   "test/" + jobPhase + ":latest",
+						Command: []string{"/bin/sh", "-c", "true"},
+					}},
+				},
+			},
+		},
+	}
+}
+
+// TestNodeReconciler_ScaleDownAttemptBound is the bound on a scale-down that cannot land, read off
+// the claim digest of the slot. A shutdown script that exits 0 while the machine stays up is the
+// pool's bug, not a reason for the controller to fire the same shutdown every resync; and the count
+// that decides it lives on the claim that asked for the scale-down, so it ends with that episode and
+// needs no reset heuristic on the long-lived slot (docs/design/nodeclaim.md §4, the removal of the
+// v1alpha1 ShutdownAttempts condition).
+func TestNodeReconciler_ScaleDownAttemptBound(t *testing.T) {
+	// scaleDownDigest is the record of an episode that left a machine up: the scale-down call, the
+	// terminal phase, and the shutdown attempts it spent, with the clock the reset grace is measured
+	// from. The boot attempts (Attempt) are deliberately not the bound: a shutdown that will not
+	// land must not spend the record of the machines the request bought (M4).
+	scaleDownDigest := func(shutdownAttempts int32, lastAttempt time.Duration) *infrav2alpha1.LastClaimSummary {
+		stamp := metav1.NewTime(time.Now().Add(-lastAttempt))
+
+		return &infrav2alpha1.LastClaimSummary{
+			Name:                  "claim-test-node",
+			Phase:                 infrav2alpha1.NodeClaimCompleted,
+			Attempt:               1,
+			ShutdownAttempts:      shutdownAttempts,
+			LastShutdownAttemptAt: &stamp,
+			Call:                  infrav2alpha1.ClaimCallDeleteNodes,
+			Group:                 "test-group",
+		}
+	}
+
+	t.Run("the shutdown attempts spent on this scale-down stop the retries", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts, time.Minute)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err, "the refusal is not an error: the machine is up, the pool does not want it, and the record is on the claim")
+		assert.Equal(t, ctrl.Result{RequeueAfter: refusedResync}, result)
+
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "no fourth shutdown Job for a script that keeps exiting 0")
+	})
+
+	t.Run("the bound spent on the boot attempts is not a shutdown bound", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		digest := scaleDownDigest(0, time.Minute)
+		digest.Attempt = 9
+		node.Status.LastClaim = digest
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1,
+			"the attempts a slot spent buying machines do not stop the shutdown of the machine it wants off")
+	})
+
+	t.Run("one attempt short of the bound fires", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts-1, time.Minute)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1, "the bound is 3, so attempt 3 is fired")
+	})
+
+	t.Run("the grace of a spent streak passed, and the shutdown fires again", func(t *testing.T) {
+		// M4: the refusal is a bounded pause, not a sentence. A pool whose shutdown script has been
+		// fixed is picked up by a later pass, with no hand edit, and the bound keeps its teeth
+		// against a script that fails every time (it is re-spent, and re-paused).
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts, claim.ShutdownAttemptResetGrace+time.Minute)
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1,
+			"past claim.ShutdownAttemptResetGrace the streak is spent no longer, so the shutdown of the fixed script runs")
+	})
+
+	t.Run("a live claim is never refused: its own attempts are counted on it", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		node.Status.LastClaim = scaleDownDigest(claim.MaxConsecutiveAttempts, time.Minute)
+
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+			c.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
+			c.Spec.Request.Nodes = []string{"test-node-k8s"}
+		})
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
+		markDeleted(t, reconciler.Client, nodeClaim)
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1,
+			"a scale-down that names a claim owns the machine, and its attempts are counted on that claim")
+	})
+
+	t.Run("a live claim that spent its own shutdown attempts is refused, for the grace at most", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+			c.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
+			c.Spec.Request.Nodes = []string{"test-node-k8s"}
+		})
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
+		markDeleted(t, reconciler.Client, nodeClaim)
+
+		// The streak the claim controller counts (reconcileDeletion -> BumpScaleDownAttempt), landed
+		// the way that writer lands it.
+		spent := &infrav2alpha1.NodeClaim{}
+		require.NoError(t, reconciler.Get(context.Background(), client.ObjectKeyFromObject(nodeClaim), spent))
+		spent.Status.ShutdownAttempts = claim.MaxConsecutiveAttempts
+		stamp := metav1.NewTime(time.Now())
+		spent.Status.LastShutdownAttemptAt = &stamp
+		require.NoError(t, reconciler.Client.Status().Update(context.Background(), spent))
+
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Equal(t, refusedResync, result.RequeueAfter,
+			"the refusal is paced: no later than the end of the reset grace, and the resync below it")
+
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client),
+			"a claim whose machine will not go off is not re-fired every 15s of its finalizer's poll")
+	})
+}
+
+// markDeleted is the shape a NodeGroupDeleteNodes / DecreaseTargetSize cancel leaves behind on a
+// claim that carries the controller's finalizer: the stamp arrives with the boot, and the delete
+// the provider issues sets metadata.deletionTimestamp and leaves the object for the claim
+// controller to finish. Deleting without the finalizer would make the object disappear, and the
+// test would be asserting a shape the model never reaches.
+func markDeleted(t *testing.T, c client.Client, nodeClaim *infrav2alpha1.NodeClaim) {
+	t.Helper()
+
+	fresh := &infrav2alpha1.NodeClaim{}
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(nodeClaim), fresh))
+
+	if !contains(fresh.Finalizers, claimFinalizerName) {
+		fresh.Finalizers = append(fresh.Finalizers, claimFinalizerName)
+		require.NoError(t, c.Update(context.Background(), fresh))
+	}
+
+	require.NoError(t, c.Delete(context.Background(), fresh))
+}
+
+// claimFinalizerName is the finalizer the claim controller puts on a claim whose boot started; the
+// constant lives in the controller package, which is this package, so the test spells nothing.
+const claimFinalizerName = ClaimFinalizer
+
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestNodeReconciler_RecordedPhaseIsNotAnInput is the law of §6 at the reconcile level: the derived
+// Node.status.phase is this pass's output, and writing a value that contradicts the claim and the
+// observation changes nothing about what the pass does. The v1alpha1 reconciler gated every
+// transition on the recorded progress (validateStateTransition), which is why a record that
+// outlived its machine stranded a slot; the record has no such power here.
+func TestNodeReconciler_RecordedPhaseIsNotAnInput(t *testing.T) {
+	everyReport := []infrav2alpha1.NodePhase{
+		infrav2alpha1.NodePhaseOff,
+		infrav2alpha1.NodePhasePending,
+		infrav2alpha1.NodePhaseBooting,
+		infrav2alpha1.NodePhaseReady,
+		infrav2alpha1.NodePhaseDraining,
+	}
+
+	t.Run("a pending claim boots the machine whatever the slot reports", func(t *testing.T) {
+		for _, report := range everyReport {
+			t.Run(string(report), func(t *testing.T) {
+				node := createTestNode(infrav2alpha1.PowerStateOff, report)
+				nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimPending, nil)
+				reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim)
+
+				_, err := reconcileTestSlot(t, reconciler)
+				require.NoError(t, err)
+
+				assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1,
+					"the claim decides, and it says a machine is wanted: startup runs whatever the record said")
+				assert.Equal(t, infrav2alpha1.NodePhaseBooting, readSlot(t, reconciler).Status.Phase,
+					"the report is rewritten from the inputs, not defended")
+			})
+		}
+	})
+
+	t.Run("an observed machine with no claim is powered off whatever the slot reports", func(t *testing.T) {
+		for _, report := range everyReport {
+			t.Run(string(report), func(t *testing.T) {
+				node := createTestNode(infrav2alpha1.PowerStateOn, report)
+				reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode())
+
+				_, err := reconcileTestSlot(t, reconciler)
+				require.NoError(t, err)
+
+				jobs := listLifecycleJobs(t, reconciler.Client)
+				require.Len(t, jobs, 1, "no live claim + observed on is law 3, whatever the record said")
+				assert.Contains(t, jobs[0].Name, "test-node-shutdown-")
+			})
+		}
+	})
+}
+
+// TestNodeReconciler_BackoffBehavior covers the pacing of a transitional slot: a boot and a
+// shutdown in flight are operations, and the pass that finds one running owns the machine's next
+// look. The transitional shape is a fact about objects - the claim's phase and the lifecycle Job -
+// not about a string on the slot.
 func TestNodeReconciler_BackoffBehavior(t *testing.T) {
-	scheme := setupTestScheme()
+	t.Run("a boot in flight is polled on the backoff, not on the idle resync", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
+		node.Status.LastStartupTime = ptr(metav1.Now())
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimBooting, nil)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, startupJobInFlight(node))
 
-	t.Run("backoff calculation for transitional states", func(t *testing.T) {
-		// Create test objects in transitional state with recent timestamp
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
-		now := metav1.Now()
-		node.Status.LastStartupTime = &now
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
-
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
-
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.NoError(t, err)
-		// Should use backoff timing (early phase = 30 seconds)
-		assert.True(t, result.RequeueAfter > 0)
-		assert.True(t, result.RequeueAfter <= time.Minute) // Should be short backoff for early phase
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Greater(t, result.RequeueAfter, time.Duration(0))
+		assert.Less(t, result.RequeueAfter, requeueFiveMinutes, "a transitional slot is not left to the idle resync")
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client)[1:], "the pass adds no second startup Job")
 	})
 
-	t.Run("stuck state detection and cleanup", func(t *testing.T) {
-		// Create test objects in transitional state with old timestamp (stuck)
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
-		oldTime := metav1.NewTime(time.Now().Add(-20 * time.Minute)) // Very old timestamp
-		node.Status.LastStartupTime = &oldTime
-		group := createTestGroup()
-		k8sNode := createTestKubernetesNode()
+	t.Run("a shutdown in flight is polled on the backoff", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, nil)
+		job := lifecycleJob(node, fsm.PhaseShutdown)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, job)
+		markDeleted(t, reconciler.Client, nodeClaim)
 
-		// Create fake client
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
-
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.NoError(t, err)
-		// Should detect stuck state and use backoff (not immediate retry)
-		assert.True(t, result.RequeueAfter > 0)
-
-		// Verify no new job was created (still in transitional state)
-		jobs := &batchv1.JobList{}
-		err = fakeClient.List(ctx, jobs)
-		assert.NoError(t, err)
-		assert.Len(t, jobs.Items, 0)
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Greater(t, result.RequeueAfter, time.Duration(0), "the claim's finalizer waits for the machine to go off")
+		assert.Len(t, listLifecycleJobs(t, reconciler.Client), 1, "the shutdown Job in flight owns the slot")
 	})
 }
 
+// ptr is the address-of helper for the optional status fields a test stamps.
+func ptr[T any](v T) *T { return &v }
+
+// TestNodeReconciler_ErrorHandling covers the passes that do not reach the input law.
 func TestNodeReconciler_ErrorHandling(t *testing.T) {
-	scheme := setupTestScheme()
+	t.Run("a slot with no group label is an error, not a silently skipped slot", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		node.Labels = nil
+		reconciler := newFSMReconciler(t, node, createTestKubernetesNode())
 
-	t.Run("missing group reference", func(t *testing.T) {
-		// Create node without group
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-		node.Labels = nil // Remove group label
-		k8sNode := createTestKubernetesNode()
-
-		// Create fake client without group
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, k8sNode).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
-
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
-
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
-
-		result, err := reconciler.Reconcile(ctx, req)
-		assert.Error(t, err)
+		result, err := reconcileTestSlot(t, reconciler)
+		require.Error(t, err)
 		assert.Contains(t, err.Error(), "has no group label")
 		assert.Equal(t, ctrl.Result{}, result)
 	})
 
-	t.Run("missing kubernetes node", func(t *testing.T) {
-		// Create test objects without kubernetes node
-		node := createTestNode(infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressShutdown)
-		node.Status.PowerState = infrav1alpha1.PowerStateOff
-		group := createTestGroup()
+	t.Run("a slot whose Group is not readable is requeued, and buys nothing", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimPending, nil)
+		reconciler := newFSMReconciler(t, node, createTestKubernetesNode(), nodeClaim)
 
-		// Create fake client without kubernetes node
-		fakeClient := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(node, group).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
-			Build()
+		result, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: 5 * time.Second}, result)
+		assert.Empty(t, listLifecycleJobs(t, reconciler.Client), "a pass with no Group takes no lifecycle action")
+	})
 
-		// Create reconciler
-		reconciler := &NodeReconciler{
-			Client: fakeClient,
-			Scheme: scheme,
-		}
+	t.Run("a machine that has not joined the cluster is still booted by a live claim", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimPending, nil)
+		reconciler := newFSMReconciler(t, node, createTestGroup(), nodeClaim)
 
-		// Reconcile
-		ctx := context.TODO()
-		req := reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      "test-node",
-				Namespace: "default",
-			},
-		}
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
 
-		result, err := reconciler.Reconcile(ctx, req)
-		// The FSM creates the job first, then the job will fail when it tries to run
-		if err != nil {
-			assert.Contains(t, err.Error(), "FSM transition failed")
-			// an error is returned as an error only, controller-runtime ignores the Result
-			assert.Equal(t, ctrl.Result{}, result)
-		} else {
-			// FSM successfully creates the job, but the job will fail during execution
-			// This is the expected behavior - the FSM doesn't pre-validate k8s node existence
-			jobs := &batchv1.JobList{}
-			listErr := fakeClient.List(ctx, jobs)
-			assert.NoError(t, listErr)
-			assert.Len(t, jobs.Items, 1) // Job is created by FSM
-
-			job := jobs.Items[0]
-			assert.Contains(t, job.Name, "test-node-startup-")
-			assert.Equal(t, "startup", job.Labels["type"])
-		}
+		jobs := listLifecycleJobs(t, reconciler.Client)
+		require.Len(t, jobs, 1, "the lifecycle Job is what boots the machine, so a missing corev1.Node is not a reason to skip it")
+		assert.Contains(t, jobs[0].Name, "test-node-startup-")
 	})
 }
 
-func TestNodeReconciler_StateConsistency(t *testing.T) {
-	scheme := setupTestScheme()
-
-	t.Run("state matches node progress", func(t *testing.T) {
-		testCases := []struct {
-			name        string
-			progress    infrav1alpha1.Progress
-			expectedFSM string
-		}{
-			{
-				name:        "shutdown progress maps to shutdown state",
-				progress:    infrav1alpha1.ProgressShutdown,
-				expectedFSM: fsm.StateShutdown,
+// TestNodeReconciler_InputLawStates is the state half of the input law, as a table: every shape of
+// (live claim, observed power, usability, lifecycle Jobs) maps to exactly one state, and the
+// slot's recorded report is not an input to that mapping. It is the phase state table of
+// docs/architecture/state.md, asserted on the state the machine starts a pass in.
+func TestNodeReconciler_InputLawStates(t *testing.T) {
+	tests := []struct {
+		name  string
+		input phase.Input
+		want  string
+	}{
+		{
+			name:  "no claim, machine off: a free slot",
+			input: phase.Input{ObservedPower: infrav2alpha1.PowerStateOff},
+			want:  fsm.StateShutdown,
+		},
+		{
+			name: "pending claim, machine off, no Job yet: boot pending, StartNode is the event",
+			input: phase.Input{
+				Claim:         claimOnSlot(&infrav2alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}, infrav2alpha1.NodeClaimPending, nil),
+				ObservedPower: infrav2alpha1.PowerStateOff,
 			},
-			{
-				name:        "starting up progress maps to starting up state",
-				progress:    infrav1alpha1.ProgressStartingUp,
-				expectedFSM: fsm.StateStartingUp,
+			want: fsm.StateShutdown,
+		},
+		{
+			name: "booting claim: the startup is in flight, JobCompleted is reachable",
+			input: phase.Input{
+				Claim:              claimOnSlot(&infrav2alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}, infrav2alpha1.NodeClaimBooting, nil),
+				ObservedPower:      infrav2alpha1.PowerStateOff,
+				StartupJobInFlight: true,
 			},
-			{
-				name:        "ready progress maps to ready state",
-				progress:    infrav1alpha1.ProgressReady,
-				expectedFSM: fsm.StateReady,
+			want: fsm.StateStartingUp,
+		},
+		{
+			name: "ready claim, machine on, usable: capacity serving pods",
+			input: phase.Input{
+				Claim:         claimOnSlot(&infrav2alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}, infrav2alpha1.NodeClaimReady, nil),
+				ObservedPower: infrav2alpha1.PowerStateOn,
+				NodeUsable:    true,
 			},
-			{
-				name:        "shutting down progress maps to shutting down state",
-				progress:    infrav1alpha1.ProgressShuttingDown,
-				expectedFSM: fsm.StateShuttingDown,
+			want: fsm.StateReady,
+		},
+		{
+			name: "ready claim, machine on, not usable: still in the boot window",
+			input: phase.Input{
+				Claim:         claimOnSlot(&infrav2alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}, infrav2alpha1.NodeClaimReady, nil),
+				ObservedPower: infrav2alpha1.PowerStateOn,
+				NodeUsable:    false,
 			},
-		}
+			want: fsm.StateStartingUp,
+		},
+		{
+			name: "ready claim, machine off: the machine vanished under it, boot it again",
+			input: phase.Input{
+				Claim:         claimOnSlot(&infrav2alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}, infrav2alpha1.NodeClaimReady, nil),
+				ObservedPower: infrav2alpha1.PowerStateOff,
+			},
+			want: fsm.StateStartingUp,
+		},
+		{
+			name: "failed claim, machine on: the machine is not wanted, and is observed up",
+			input: phase.Input{
+				Claim:         claimOnSlot(&infrav2alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}, infrav2alpha1.NodeClaimFailed, nil),
+				ObservedPower: infrav2alpha1.PowerStateOn,
+			},
+			want: fsm.StateReady,
+		},
+	}
 
-		for _, tc := range testCases {
-			t.Run(tc.name, func(t *testing.T) {
-				// Create test objects
-				node := createTestNode(infrav1alpha1.PowerStateOn, tc.progress)
-				group := createTestGroup()
-				k8sNode := createTestKubernetesNode()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := createTestNode(tc.input.ObservedPower, infrav2alpha1.NodePhaseReady)
+			nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, nil)
 
-				// Create fake client
-				fakeClient := fake.NewClientBuilder().
-					WithScheme(scheme).
-					WithObjects(node, group, k8sNode).
-					WithStatusSubresource(&infrav1alpha1.Node{}).
-					Build()
+			// The record of a ready slot is the deliberate contradiction: the input says
+			// something else, and the state follows the input.
+			stateMachine := fsm.NewNodeStateMachine(node, newFSMReconciler(t, node, nodeClaim).Client, setupTestScheme(),
+				fsm.NewCoordinationManager(newFSMReconciler(t, node, nodeClaim).Client, fsm.NodeControllerOwner),
+				fsm.WithInput(tc.input))
 
-				// Create FSM directly to verify state mapping
-				coordMgr := fsm.NewCoordinationManager(fakeClient, fsm.NodeControllerOwner)
-				stateMachine := fsm.NewNodeStateMachine(node, fakeClient, scheme, coordMgr)
+			assert.Equal(t, tc.want, stateMachine.GetCurrentState(), "the input law, not the record, picks the state")
+			assert.Equal(t, phase.State(tc.input), stateMachine.GetCurrentState())
+		})
+	}
+}
 
-				assert.Equal(t, tc.expectedFSM, stateMachine.GetCurrentState())
-			})
-		}
+// TestNodeReconciler_RecoveryIsCorrelatedToTheClaim is M3's correlation at the reconcile level: a
+// finished lifecycle Job is evidence about the operation the slot's live claim is running, and about
+// no other operation. Every case seeds a slot whose derived state is the one a recovery listens on
+// (startingup), and names the fact that is supposed to refuse the re-fire. The envtest suite covers
+// the two shapes the fake client cannot build a Job for; this one covers the predating bound, which
+// needs a Job whose creationTimestamp a test chose - the API server stamps the instant itself, so an
+// envtest cannot put an object in the past.
+func TestNodeReconciler_RecoveryIsCorrelatedToTheClaim(t *testing.T) {
+	commitAt := time.Now().Add(-5 * time.Minute)
+	claimMade := commitAt.Add(-time.Minute)
+
+	// The claim of a boot in flight, committed at commitAt: the shape the recovery listens on.
+	bootingClaim := func(mutate func(*infrav2alpha1.NodeClaim)) *infrav2alpha1.NodeClaim {
+		return claimOnSlot(createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting), infrav2alpha1.NodeClaimBooting, func(c *infrav2alpha1.NodeClaim) {
+			c.CreationTimestamp = metav1.NewTime(claimMade)
+			c.Status.Conditions = []metav1.Condition{{
+				Type:               infrav2alpha1.ClaimConditionMachineCommitted,
+				Status:             metav1.ConditionTrue,
+				Reason:             string(infrav2alpha1.NodeClaimBooting),
+				LastTransitionTime: metav1.NewTime(commitAt),
+			}}
+
+			if mutate != nil {
+				mutate(c)
+			}
+		})
+	}
+
+	t.Run("a startup Job older than the claim's boot belongs to an earlier episode", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := bootingClaim(nil)
+
+		// The startup Job of the episode before: finished, and created before this claim was made.
+		older := seedLifecycleJob(t, nodeClaim, fsm.PhaseStartup, commitAt.Add(-time.Hour), true, false)
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, older)
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		after := readClaim(t, reconciler, nodeClaim.Name)
+		assert.Equal(t, infrav2alpha1.NodeClaimBooting, after.Status.Phase,
+			"the recovery fires the event of this claim's Job, and a Job that predates its boot is not that")
+		assert.Empty(t, after.Status.Reason, "no ReadinessGateTimeout from somebody else's attempt")
+
+		k8sNode := getK8sNode(t, reconciler.Client)
+		assert.False(t, k8sNode.Spec.Unschedulable, "the gate of an attempt that already ended does not run, and cordons nothing")
 	})
+
+	t.Run("the newest Job of the phase is the operation, and a running one hides an older finished one", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := bootingClaim(nil)
+
+		failed := seedLifecycleJob(t, nodeClaim, fsm.PhaseStartup, commitAt.Add(time.Second), false, true)
+		running := seedLifecycleJob(t, nodeClaim, fsm.PhaseStartup, commitAt.Add(time.Minute), false, false)
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, failed, running)
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		after := readClaim(t, reconciler, nodeClaim.Name)
+		assert.Equal(t, infrav2alpha1.NodeClaimBooting, after.Status.Phase,
+			"the attempt running now is not failed by the verdict of an attempt that ended")
+		assert.Empty(t, after.Status.Reason, "no StartupJobFailed from the older Job")
+	})
+
+	t.Run("a ready claim with the machine observed off is watched, not re-booted", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+			c.CreationTimestamp = metav1.NewTime(claimMade)
+		})
+
+		// The startup Job of the boot that made this claim ready, finished and consumed by the
+		// readiness gate: created after the claim, so only the boot-window gate refuses it.
+		job := seedLifecycleJob(t, nodeClaim, fsm.PhaseStartup, commitAt, true, false)
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, job)
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		after := readClaim(t, reconciler, nodeClaim.Name)
+		assert.Equal(t, infrav2alpha1.NodeClaimReady, after.Status.Phase,
+			"a machine observed off for a pass is a machine that may be rebooting; the recovery of a consumed boot does not get a vote")
+		assert.Empty(t, after.Status.Reason, "no ReadinessGateTimeout on a serving machine")
+		assert.Nil(t, after.Status.FinishedAt, "the episode is not over")
+
+		assert.Empty(t, jobsOfPhase(t, reconciler.Client, fsm.PhaseShutdown), "a momentary blip powers nothing off")
+		assert.False(t, getK8sNode(t, reconciler.Client).Spec.Unschedulable, "the serving node is not cordoned by a recovery")
+	})
+
+	t.Run("a running shutdown Job is the operation, and an older finished one is a scale-down that ended", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		nodeClaim := claimOnSlot(node, infrav2alpha1.NodeClaimReady, func(c *infrav2alpha1.NodeClaim) {
+			c.CreationTimestamp = metav1.NewTime(claimMade)
+			c.Finalizers = []string{ClaimFinalizer}
+
+			c.Spec.Request.Call = infrav2alpha1.ClaimCallDeleteNodes
+			c.Spec.Request.Nodes = []string{"test-node-k8s"}
+
+			// The mark of the scale-down that named this claim: its clock, and the bound a shutdown
+			// Job of an earlier scale-down cannot be correlated to.
+			mark := metav1.NewTime(commitAt)
+			c.DeletionTimestamp = &mark
+		})
+
+		// A shutdown Job of the scale-down before: finished, and older than the request that named
+		// this claim. And the shutdown Job of this one, running.
+		older := seedLifecycleJob(t, nodeClaim, fsm.PhaseShutdown, commitAt.Add(-time.Hour), true, false)
+		running := seedLifecycleJob(t, nodeClaim, fsm.PhaseShutdown, commitAt.Add(time.Minute), false, false)
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, older, running)
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		after := readClaim(t, reconciler, nodeClaim.Name)
+		assert.Equal(t, infrav2alpha1.NodeClaimReady, after.Status.Phase,
+			"the scale-down running now is not landed by the completion of a shutdown somebody else fired")
+		assert.Nil(t, after.Status.FinishedAt, "the finalizer's request is still open, and it stays open")
+
+		assert.Equal(t, infrav2alpha1.NodePhaseDraining, readSlot(t, reconciler).Status.Phase,
+			"the machine is observed up and the pool does not want it: the slot keeps reporting draining, and the shutdown path owns it")
+	})
+
+	t.Run("the claim's own finished startup Job is the evidence the gate answers for", func(t *testing.T) {
+		node := createTestNode(infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+		nodeClaim := bootingClaim(nil)
+
+		// The positive control: the Job this claim's boot created, finished. The recovery is the
+		// whole point of M3, and the gates above must not swallow it.
+		job := seedLifecycleJob(t, nodeClaim, fsm.PhaseStartup, commitAt.Add(time.Minute), true, false)
+
+		reconciler := newFSMReconciler(t, node, createTestGroup(), createTestKubernetesNode(), nodeClaim, job)
+
+		_, err := reconcileTestSlot(t, reconciler)
+		require.NoError(t, err)
+
+		after := readClaim(t, reconciler, nodeClaim.Name)
+		assert.Equal(t, infrav2alpha1.NodeClaimReady, after.Status.Phase,
+			"a booting claim whose own startup Job completed lands ready on the pass that reads the Job")
+		assert.Equal(t, infrav2alpha1.NodePhaseReady, readSlot(t, reconciler).Status.Phase)
+	})
+}
+
+// seedLifecycleJob is a lifecycle Job of a slot with a creationTimestamp the test chose and a terminal
+// status it names (succeeded, failed, or neither for a Job that is running). The fake client keeps the
+// timestamp it is handed, which is what makes "the Job predates the boot" buildable here and not
+// against an API server.
+func seedLifecycleJob(t *testing.T, nodeClaim *infrav2alpha1.NodeClaim, jobPhase string, created time.Time, succeeded, failed bool) *batchv1.Job {
+	t.Helper()
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              nodeClaim.Name + "-" + jobPhase + "-" + created.UTC().Format("150405"),
+			Namespace:         nodeClaim.Namespace,
+			CreationTimestamp: metav1.NewTime(created),
+			Labels: map[string]string{
+				fsm.LabelNodeCR: claim.SlotNameOf(nodeClaim),
+				fsm.LabelPhase:  jobPhase,
+				"type":          jobPhase,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{{Name: "lifecycle", Image: "test/" + jobPhase + ":latest"}},
+				},
+			},
+		},
+	}
+
+	if succeeded {
+		job.Status.Succeeded = 1
+	}
+
+	if failed {
+		job.Status.Failed = 1
+	}
+
+	return job
+}
+
+// jobsOfPhase lists the lifecycle Jobs of one phase the reconciler's client holds.
+func jobsOfPhase(t *testing.T, c client.Client, jobPhase string) []batchv1.Job {
+	t.Helper()
+
+	matches := []batchv1.Job{}
+
+	for _, job := range listLifecycleJobs(t, c) {
+		if job.Labels[fsm.LabelPhase] == jobPhase {
+			matches = append(matches, job)
+		}
+	}
+
+	return matches
 }

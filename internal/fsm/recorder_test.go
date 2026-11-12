@@ -37,7 +37,7 @@ import (
 
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // drainEvents returns every event the fake recorder has accepted. The recorder is a
@@ -92,17 +92,17 @@ func (c *createJobFailingClient) Create(ctx context.Context, obj client.Object, 
 	return c.Client.Create(ctx, obj, opts...)
 }
 
-func newRecordingStateMachine(t *testing.T, node *infrav1alpha1.Node, mockCoord *MockCoordinationManager, objects ...client.Object) (*NodeStateMachine, *events.FakeRecorder) {
+func newRecordingStateMachine(t *testing.T, node *infrav2alpha1.Node, mockCoord *MockCoordinationManager, objects ...client.Object) (*NodeStateMachine, *events.FakeRecorder) {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	fakeClient := CreateFakeClient(scheme, append([]client.Object{node}, objects...)...)
 
 	rec := events.NewFakeRecorder(20)
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
+	nm := MachineForState(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
 	nm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -110,7 +110,7 @@ func newRecordingStateMachine(t *testing.T, node *infrav1alpha1.Node, mockCoord 
 }
 
 func TestNodeStateMachine_Events_ScaleUp(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 	nm, rec := newRecordingStateMachine(t, node, mockCoord)
 
@@ -148,7 +148,7 @@ func TestNodeStateMachine_Events_ScaleUp(t *testing.T) {
 }
 
 func TestNodeStateMachine_Events_ScaleDown(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	kubeNode := CreateTestKubernetesNode("test-node-k8s", false)
 	mockCoord := NewMockCoordinationManager()
 	nm, rec := newRecordingStateMachine(t, node, mockCoord, kubeNode)
@@ -174,12 +174,12 @@ func TestNodeStateMachine_Events_ScaleDown(t *testing.T) {
 }
 
 func TestNodeStateMachine_Events_ScaleUpFailure(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	// The API server refuses the startup Job; the FSM rolls back startingup -> shutdown.
 	jobErr := errors.New("admission webhook denied the request: no free power slot")
@@ -187,13 +187,13 @@ func TestNodeStateMachine_Events_ScaleUpFailure(t *testing.T) {
 		Client: fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(node).
-			WithStatusSubresource(&infrav1alpha1.Node{}).
+			WithStatusSubresource(&infrav2alpha1.Node{}).
 			Build(),
 		err: jobErr,
 	}
 
 	rec := events.NewFakeRecorder(20)
-	nm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
+	nm := MachineForState(node, fakeClient, scheme, mockCoord, WithEventRecorder(rec))
 	nm.uncordonTimeout = 100 * time.Millisecond
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -217,7 +217,7 @@ func TestNodeStateMachine_Events_ScaleUpFailure(t *testing.T) {
 }
 
 func TestNodeStateMachine_Events_ScaleDownFailure(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	mockCoord := NewMockCoordinationManager()
 	mockCoord.SetAcquireError(errors.New("cluster autoscaler holds the scale-down lock"))
 	nm, rec := newRecordingStateMachine(t, node, mockCoord)
@@ -242,7 +242,7 @@ func TestNodeStateMachine_Events_ScaleDownFailure(t *testing.T) {
 // branch starts from opens with a Warning for exactly this case, on a slot that is fine, and
 // the autoscaler emits one per collision on a busy pool.
 func TestNodeStateMachine_Events_LockConflictIsADeferral(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	mockCoord := NewMockCoordinationManager()
 	mockCoord.SetAcquireError(newLockConflict(OperationScaleDown, &OperationLock{
 		Operation: OperationScaleUp,
@@ -270,7 +270,7 @@ func TestNodeStateMachine_Events_LockConflictIsADeferral(t *testing.T) {
 }
 
 func TestNodeStateMachine_Events_ObservedJobFailure(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 
 	failedJob := CreateTestJob("test-node-startup-1", node.Namespace, PhaseStartup)
 	failedJob.Status.Failed = 1
@@ -298,7 +298,7 @@ func TestNodeStateMachine_Events_ObservedJobFailure(t *testing.T) {
 }
 
 func TestNodeStateMachine_Events_ForceCleanupIsAFailure(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressStartingUp)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
 	mockCoord := NewMockCoordinationManager()
 	nm, rec := newRecordingStateMachine(t, node, mockCoord)
 
@@ -315,12 +315,12 @@ func TestNodeStateMachine_Events_ForceCleanupIsAFailure(t *testing.T) {
 }
 
 func TestNodeStateMachine_Events_NilRecorderIsSilent(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 	mockCoord := NewMockCoordinationManager()
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 	fakeClient := CreateFakeClient(scheme, node)
 
 	// No option at all, and an explicit nil recorder: both must be safe no-ops.
@@ -389,12 +389,12 @@ func (c *capturingRecorder) reasonCalls(reason string) []capturedEvent {
 	return found
 }
 
-func newCapturingStateMachine(t *testing.T, node *infrav1alpha1.Node, mockCoord *MockCoordinationManager, objects ...client.Object) (*NodeStateMachine, *capturingRecorder) {
+func newCapturingStateMachine(t *testing.T, node *infrav2alpha1.Node, mockCoord *MockCoordinationManager, objects ...client.Object) (*NodeStateMachine, *capturingRecorder) {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	rec := &capturingRecorder{}
 	nm := NewNodeStateMachine(node, CreateFakeClient(scheme, append([]client.Object{node}, objects...)...),
@@ -410,7 +410,7 @@ func newCapturingStateMachine(t *testing.T, node *infrav1alpha1.Node, mockCoord 
 // migration is wiring the right objects and verbs, not just the right text.
 func TestNodeStateMachine_Events_NewAPICallShape(t *testing.T) {
 	t.Run("scale down is about the Node CR with the PowerOff action", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 		kubeNode := CreateTestKubernetesNode("test-node-k8s", false)
 		nm, rec := newCapturingStateMachine(t, node, NewMockCoordinationManager(), kubeNode)
 
@@ -424,7 +424,7 @@ func TestNodeStateMachine_Events_NewAPICallShape(t *testing.T) {
 
 		// regarding is the Node CR, related stays nil: the lifecycle transition is about
 		// the slot, the Job it ran is named in the note.
-		regarding, ok := requested[0].regarding.(*infrav1alpha1.Node)
+		regarding, ok := requested[0].regarding.(*infrav2alpha1.Node)
 		require.True(t, ok, "regarding must be the Node CR, got %T", requested[0].regarding)
 		assert.Equal(t, "test-node", regarding.Name)
 		assert.Nil(t, requested[0].related)
@@ -439,7 +439,7 @@ func TestNodeStateMachine_Events_NewAPICallShape(t *testing.T) {
 	})
 
 	t.Run("scale up and its failure use the PowerOn action", func(t *testing.T) {
-		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		nm, rec := newCapturingStateMachine(t, node, NewMockCoordinationManager())
 
 		require.NoError(t, nm.StartNode())
@@ -454,12 +454,12 @@ func TestNodeStateMachine_Events_NewAPICallShape(t *testing.T) {
 
 		// A failed scale up is a Warning that names the operation that died, so it keeps
 		// the PowerOn action even though the slot rolled back to shutdown.
-		failedNode := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		failedNode := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		failRec := &capturingRecorder{}
 
 		scheme := runtime.NewScheme()
 		require.NoError(t, clientgoscheme.AddToScheme(scheme))
-		require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+		require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 		failing := &createJobFailingClient{
 			Client: CreateFakeClient(scheme, failedNode),
@@ -483,7 +483,7 @@ func TestNodeStateMachine_Events_NewAPICallShape(t *testing.T) {
 // renders the note with Sprintf, so the already-rendered message must arrive as an
 // argument to "%s". A webhook denial quoting usage carries a literal '%'.
 func TestNodeStateMachine_Events_NoteIsNotAFormatString(t *testing.T) {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressReady)
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseReady)
 	mockCoord := NewMockCoordinationManager()
 	mockCoord.SetAcquireError(errors.New("admission webhook denied the request: 90% of pods must stay evictable"))
 	nm, rec := newRecordingStateMachine(t, node, mockCoord)
@@ -512,10 +512,10 @@ func TestTruncateEventMessage(t *testing.T) {
 func TestLifecycleTarget(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	t.Run("unnamed kubernetes node is called out", func(t *testing.T) {
-		node := CreateTestNode("slot-3", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("slot-3", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		node.Spec.KubernetesNodeName = ""
 
 		nm := NewNodeStateMachine(node, CreateFakeClient(scheme, node), scheme, NewMockCoordinationManager())
@@ -524,7 +524,7 @@ func TestLifecycleTarget(t *testing.T) {
 	})
 
 	t.Run("missing group label", func(t *testing.T) {
-		node := CreateTestNode("slot-4", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOff, infrav1alpha1.ProgressShutdown)
+		node := CreateTestNode("slot-4", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
 		delete(node.Labels, "group")
 
 		nm := NewNodeStateMachine(node, CreateFakeClient(scheme, node), scheme, NewMockCoordinationManager())

@@ -1,4 +1,4 @@
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   labels:
@@ -7,7 +7,6 @@ metadata:
   name: node-sample
 spec:
   kubernetesNodeName: "example-node"
-  powerState: "on"
   pricing:
     hourlyRate: "1.0"
     podRate: "0.1"

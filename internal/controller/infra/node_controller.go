@@ -33,11 +33,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
-	"github.com/homecluster-dev/homelab-autoscaler/internal/progress"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
@@ -64,11 +62,9 @@ type NodeReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// EventRecorder publishes Kubernetes Events on the Node CR for the scale up/down
-	// transitions the FSM runs and for the status.progress corrections the two rules of
-	// internal/progress make (the settlement of a progress that outlived its machine, and the
-	// observed power that outranks a recorded progress - see internal/progress).
-	// nil records nothing, which is what the unit tests use.
+	// EventRecorder publishes Kubernetes Events on the Node CR for the scale up/down transitions the
+	// FSM runs, and for the corrections the model records on a slot whose report and whose
+	// observation disagree. nil records nothing, which is what the unit tests use.
 	// Built once in cmd/main.go with mgr.GetEventRecorder, the new events API.
 	EventRecorder events.EventRecorder
 }
@@ -76,6 +72,13 @@ type NodeReconciler struct {
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes/finalizers,verbs=update
+
+// The input law of this reconciler is the live claim of the slot, and the recovery of a finished
+// lifecycle Job is correlated to the claim that owns the operation (claim.BootCommittedAt,
+// claim.ScaleDownRequestedAt), so it lists and reads NodeClaims. The rule is not decoration: the
+// aggregated role picks the verbs up from the claim controller's markers today, and a deployment that
+// ships this controller's rules on their own would run a reconciler that cannot read its input.
+// +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodeclaims,verbs=get;list;watch
 
 // Needed to record why a slot was powered on/off on the Node CR, so that
 // `kubectl describe node.infra.homecluster.dev <name>` shows the lifecycle transitions.
@@ -102,7 +105,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	// Get the Node resource from the request
-	node := &infrav1alpha1.Node{}
+	node := &infrav2alpha1.Node{}
 	if err := r.Get(ctx, req.NamespacedName, node); err != nil {
 		// The object was not found, return early
 		return ctrl.Result{}, err
@@ -124,7 +127,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	// Get the Group CR referenced by the label
-	group := &infrav1alpha1.Group{}
+	group := &infrav2alpha1.Group{}
 	if err := r.Get(ctx, types.NamespacedName{Name: groupName, Namespace: node.Namespace}, group); err != nil {
 		if errors.IsNotFound(err) {
 			logger.Info("Group referenced by node label not found, requeuing", "group", groupName, "node", node.Name)
@@ -162,110 +165,24 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return r.handleNodeDeletion(ctx, node, groupName, req.Name)
 	}
 
-	// Settle a status.progress that the cluster's observation contradicts, before any FSM branch can
-	// act on it, and settle a status.progress that outlived the machine behind it. Both rules run
-	// first on purpose: the slot below is the live failure, and every branch that reads a progress
-	// reads it as the FSM's state (fsm.getCurrentState).
+	// The input law of the NodeClaim model: the state machine is driven by
 	//
-	//   - progress: shutdown on a slot whose machine is observed up is the shape a 40-minute stuck
-	//     scale-down lives in: ShutdownNode is unreachable from it, so correcting the progress to
-	//     ready is what lets the same pass fire the shutdown the claim asks for (see
-	//     internal/progress/observed_power.go);
-	//   - a progress of ready / startingup / shuttingdown with no corev1.Node and no lifecycle Job is
-	//     the shape a machine deleted out of band leaves behind: from ready the FSM fires a
-	//     ShutdownNode and builds a Job for a server that was already deleted, and a transitional
-	//     progress is gated out of every transition by validateStateTransition. Neither shape heals
-	//     itself - see internal/progress for why not.
+	//	(live claim phase, observed power, kubelet liveness / node readiness)
 	//
-	// The wrapper returns the deadline the rules asked to be looked at again for (a Job in flight, a
-	// Job that just finished inside the grace), which is folded into the result below so the
-	// correction is scheduled and not left to the next resync.
-	watchdogRequeue := r.reconcileObservedProgress(ctx, node)
+	// and by nothing else. The slot's spec carries no intent in v2alpha1 (spec.powerState is gone),
+	// and status.phase is this pass's output, never its input (see internal/phase).
+	live, err := r.liveClaimOf(ctx, node)
+	if err != nil {
+		logger.Error(err, "Failed to read the live claim of the slot", "node", node.Name)
 
-	// Validate state before attempting transitions with smart backoff
-	if result, err := r.validateStateTransition(ctx, node); err != nil {
-		logger.Error(err, "Invalid state transition", "node", node.Name)
 		return ctrl.Result{}, err
-	} else if result.RequeueAfter > 0 {
-		// Smart backoff is requesting a requeue
-		return shortenRequeue(result, watchdogRequeue), nil
 	}
 
-	// Handle power state transitions using FSM
-	result, err := r.handleStateTransitionsWithFSM(ctx, node, group)
+	input := r.lifecycleInput(ctx, node, live)
 
-	return shortenRequeue(result, watchdogRequeue), err
-}
+	result, err := r.handleStateTransitionsWithFSM(ctx, node, group, input)
 
-// reconcileObservedProgress applies the two status rules of internal/progress, in order, and
-// returns how long they want to be looked at again (0 = no deadline):
-//
-//  1. progress.ReconcileObservedPower corrects a status.progress that the observed power of the
-//     slot contradicts - an on the machine reports, a shutdown the FSM recorded - and writes the
-//     caller's copy in place, so the FSM branch of this same pass can fire the ShutdownNode the
-//     corrected progress makes legal. See internal/progress/observed_power.go for the rule and for
-//     the live slot it closes.
-//  2. progress.Settle settles a slot whose status.progress names a machine the cluster does not
-//     have, re-arms a claimed slot whose machine never arrived, or uncordons a ready slot whose node
-//     is cordoned with nothing running on it. See internal/progress for the rule, the grace period
-//     it is built on, and the events it records.
-//
-// The two have distinct jobs, and on the two shapes they own they cannot both act on one slot: 1
-// requires a corev1.Node that reports Ready, 2's settle and re-arm require a slot with no corev1.Node
-// at all. "Cannot both act" is not "covers every pair": there is a third shape neither rule owns - a
-// progress of shuttingdown on a slot whose node object is present and NotReady, with no Job and no lock
-// - and it is stated, with why, in internal/progress's package doc and in docs/architecture/state.md.
-// They share the gates that are not about the machine - the lifecycle Job grace, the stamp-measured
-// fallback for a Job the TTL already collected, and the coordination lock - so they cannot disagree
-// about whether an operation owns the slot.
-//
-// The deadline returned is the earliest of the two rules asked for, and rule 1 asks for an
-// exponentially growing one for a slot whose shutdown completions keep being refused: the correction
-// releases a ShutdownNode, and a pool whose shutdown script never powers off must be paced, not run at
-// full resync speed (see progress.observedPowerRetryBackoff and fsm.ShutdownAttemptLimit).
-//
-// A failure of either rule is never fatal to the pass: it means the reconciliation did not happen,
-// and the next pass is the next attempt. Failing a reconcile because a slot that is already broken
-// could not be repaired would hide the reason it is broken.
-func (r *NodeReconciler) reconcileObservedProgress(ctx context.Context, node *infrav1alpha1.Node) time.Duration {
-	logger := log.FromContext(ctx)
-
-	correction, err := progress.ReconcileObservedPower(ctx, r.Client, node, r.EventRecorder, progress.SettleGracePeriod)
-	if err != nil {
-		logger.Error(err, "Failed to reconcile status.progress against the observed power state",
-			"node", node.Name, "progress", string(node.Status.Progress), "powerstate", string(node.Status.PowerState))
-	}
-
-	outcome, err := progress.Settle(ctx, r.Client, node, r.EventRecorder, progress.SettleGracePeriod)
-	if err != nil {
-		logger.Error(err, "Failed to reconcile status.progress against observed reality",
-			"node", node.Name, "progress", string(node.Status.Progress))
-
-		// A failed Settle is not a deadline it computed: it is this package's own fallback, so the slot
-		// is looked at again on the grace. The correction's deadline is folded in, because a rule that
-		// succeeded gets its say, and the earliest of the two is the one the caller honours.
-		return earliestRequeue(correction.RequeueAfter, progress.SettleGracePeriod)
-	}
-
-	return earliestRequeue(correction.RequeueAfter, outcome.RequeueAfter)
-}
-
-// earliestRequeue folds the deadlines the two status rules asked for into the one the caller
-// honours: the earliest of them, since acting on a slot at the later deadline leaves the correction
-// the earlier one asked for to the next resync. A rule that asked for nothing (0) is not a deadline,
-// and a rule that failed asks for nothing - its Outcome is the zero value, so an error contributes no
-// deadline of its own, and only the rule that computed one gets a say. earliestRequeue never extends a
-// deadline: the value it returns is never later than a non-zero argument it was given.
-func earliestRequeue(a, b time.Duration) time.Duration {
-	if a <= 0 {
-		return b
-	}
-
-	if b <= 0 || a < b {
-		return a
-	}
-
-	return b
+	return result, err
 }
 
 // readinessTaintKeys returns the taint keys the scale-up readiness gate of this slot's Group waits
@@ -281,7 +198,7 @@ func earliestRequeue(a, b time.Duration) time.Duration {
 //
 // With no Group to read (the pass has none in hand), the slot's own record is the fallback, so the
 // gate keeps the keys the Group configured for the slot instead of quietly becoming Ready-only.
-func (r *NodeReconciler) readinessTaintKeys(ctx context.Context, node *infrav1alpha1.Node, group *infrav1alpha1.Group) []string {
+func (r *NodeReconciler) readinessTaintKeys(ctx context.Context, node *infrav2alpha1.Node, group *infrav2alpha1.Group) []string {
 	if group == nil {
 		return autoscalerpkg.ReadinessTaintKeysOfSlot(node)
 	}
@@ -293,7 +210,7 @@ func (r *NodeReconciler) readinessTaintKeys(ctx context.Context, node *infrav1al
 	}
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
 			return err
 		}
@@ -316,221 +233,6 @@ func (r *NodeReconciler) readinessTaintKeys(ctx context.Context, node *infrav1al
 	return keys
 }
 
-// shortenRequeue moves a reconcile result forward to an earlier deadline the caller was asked to
-// honour, and never delays one: a requeue the FSM asked for, a transition that finished and wants
-// to run now, wins over the watchdog's deadline.
-//
-// A result that asks to requeue immediately is returned untouched, twice over: "now" is already
-// earlier than any grace, and controller-runtime refuses a Result that sets Requeue and
-// RequeueAfter together, so writing a deadline onto that result would fail the reconcile.
-func shortenRequeue(result ctrl.Result, requeueAfter time.Duration) ctrl.Result {
-	if requeueAfter <= 0 {
-		return result
-	}
-
-	//nolint:staticcheck // SA1019: Requeue is deprecated, and reading it is the point: a caller
-	// that asks to requeue now must not get a deadline stamped onto the result, because
-	// controller-runtime refuses a Result that sets both fields. No caller in this repository
-	// returns Requeue today, and the guard is what keeps that true if one does.
-	if result.Requeue {
-		return result
-	}
-
-	if result.RequeueAfter > 0 && result.RequeueAfter <= requeueAfter {
-		return result
-	}
-
-	result.RequeueAfter = requeueAfter
-
-	return result
-}
-
-// handleStateTransitionsWithFSM runs the lifecycle transition the slot's spec asks for.
-//
-// The state machine is built with the readiness taint keys of the slot's Group, because the key the
-// scale-up gate waits for belongs to the CNI of the cluster (spec.nodeReadinessTaints, whose CRD
-// default is Cilium's node.cilium.io/agent-not-ready) and is not verifiable from this repository.
-func (r *NodeReconciler) handleStateTransitionsWithFSM(ctx context.Context, node *infrav1alpha1.Node, group *infrav1alpha1.Group) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	// Create coordination manager
-	coordMgr := fsm.NewCoordinationManager(r.Client, fsm.NodeControllerOwner)
-
-	// Create FSM instance, recording the lifecycle transitions on the Node CR.
-	stateMachine := fsm.NewNodeStateMachine(node, r.Client, r.Scheme, coordMgr,
-		fsm.WithEventRecorder(r.EventRecorder),
-		fsm.WithReadinessTaintKeys(r.readinessTaintKeys(ctx, node, group)))
-
-	logger.Info("Using FSM for state management",
-		"node", node.Name,
-		"currentState", stateMachine.GetCurrentState(),
-		"desiredPowerState", node.Spec.DesiredPowerState)
-
-	// Handle desired state transitions
-	if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOn &&
-		(node.Status.PowerState == infrav1alpha1.PowerStateOff || node.Status.PowerState == "") &&
-		stateMachine.CanTransition(fsm.EventStartNode) {
-
-		if err := stateMachine.StartNode(); err != nil {
-			if result, deferred := deferTransitionOnLockConflict(ctx, node, err); deferred {
-				return result, nil
-			}
-
-			if result, refused := deferStartupAttemptLimit(ctx, node, err); refused {
-				return result, nil
-			}
-
-			// controller-runtime discards the Result when the error is non-nil, the requeue
-			// backoff is decided by the controller, so only the error is returned here.
-			return ctrl.Result{}, err
-		}
-
-	} else if node.Spec.DesiredPowerState == infrav1alpha1.PowerStateOff &&
-		node.Status.PowerState == infrav1alpha1.PowerStateOn &&
-		stateMachine.CanTransition(fsm.EventShutdownNode) {
-
-		if err := stateMachine.ShutdownNode(); err != nil {
-			if result, deferred := deferTransitionOnLockConflict(ctx, node, err); deferred {
-				return result, nil
-			}
-
-			if result, refused := deferShutdownAttemptLimit(ctx, node, err); refused {
-				return result, nil
-			}
-			// controller-runtime discards the Result when the error is non-nil, the requeue
-			// backoff is decided by the controller, so only the error is returned here.
-			return ctrl.Result{}, err
-		}
-
-	} else {
-		// Check for stuck transitions
-		stateMachine.CheckStuckState()
-
-		// Node is already in desired state or transitioning
-		logger.Info("Node is in desired state or transitioning",
-			"node", node.Name,
-			"desiredState", node.Spec.DesiredPowerState,
-			"currentState", node.Status.PowerState,
-			"progress", node.Status.Progress,
-			"fsmState", stateMachine.GetCurrentState())
-
-		// Use FSM backoff if in transitional state, otherwise standard requeue
-		if fsm.IsTransitionalState(stateMachine.GetCurrentState()) {
-			return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, nil
-		}
-		return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
-	}
-
-	logger.Info("Successfully processed FSM state transition", "node", node.Name)
-	return ctrl.Result{}, nil
-}
-
-// deferTransitionOnLockConflict turns a lifecycle transition that lost the coordination lock
-// into a requeue at the deadline the lock itself names, and reports whether it did.
-//
-// The refused operation is not lost. Its intent lives in spec.desiredPowerState, which is what
-// cluster-autoscaler writes through NodeGroupDeleteNodes and NodeGroupDecreaseTargetSize, so
-// the very same branch that produced the transition runs again on the requeue and the shutdown
-// fires as soon as the scale-up in flight releases the slot - no second DeleteNodes from the
-// autoscaler, no operator intervention. Returning the error instead hands that retry to
-// controller-runtime's rate-limited queue, and the only record that a shutdown was asked for
-// at all is a warning on the Node CR: the live shape this closes.
-//
-// Only a lock conflict is deferred this way. Any other failure of a transition is a real
-// failure and is returned as an error, so it keeps the controller's backoff, its log line and
-// its metrics.
-func deferTransitionOnLockConflict(ctx context.Context, node *infrav1alpha1.Node, err error) (ctrl.Result, bool) {
-	conflict := fsm.AsLockConflict(err)
-	if conflict == nil {
-		return ctrl.Result{}, false
-	}
-
-	// The lifecycle transitions in fsm record the deferral as a Normal Scale*Deferred event
-	// on the Node CR; the reason is the coordination lock, so the log says which operation
-	// owns the slot and when the retry runs, at V(1): a collision between a scale-up and a
-	// scale-down is a scheduled event on a homelab, not an incident.
-	log.FromContext(ctx).V(1).Info("FSM transition deferred by the coordination lock",
-		"node", node.Name,
-		"deferredOperation", conflict.Operation,
-		"heldOperation", conflict.HolderOperation(),
-		"heldOwner", conflict.HolderOwner(),
-		"requeueAfter", conflict.RetryAfter().String(),
-		"reason", err.Error())
-
-	return ctrl.Result{RequeueAfter: conflict.RetryAfter()}, true
-}
-
-// deferStartupAttemptLimit turns a startup the FSM refused because the slot has used the startup
-// attempts of its claim episode into a result, and reports whether it did. It is the mirror of
-// deferTransitionOnLockConflict for the other refusal this controller knows how to read, and the
-// enforcement lives in the FSM (fsm.NodeStateMachine.StartNode), which is the one place every path
-// that starts a machine passes - so the count is checked once, on both entries of the failure loop,
-// and not re-implemented per caller.
-//
-// No error is returned, and that is deliberate twice over. The slot is at the stable pair the refusal
-// left it at - status.powerState off, status.progress shutdown, spec.desiredPowerState on - and
-// nothing a resync can do changes that: returning the error hands a permanent, operator-shaped
-// condition to controller-runtime's rate limiter, prints a failure on every pass, and buries the one
-// record that matters, the ClaimRearmLimitReached Warning on the slot. And no immediate requeue: the
-// pass that refused would refuse again. The idle resync is kept so the slot stays in the loop - a
-// Group whose template is fixed, or a claim the autoscaler drops, is picked up as it always is.
-func deferStartupAttemptLimit(ctx context.Context, node *infrav1alpha1.Node, err error) (ctrl.Result, bool) {
-	refusal := fsm.AsStartupAttemptLimit(err)
-	if refusal == nil {
-		return ctrl.Result{}, false
-	}
-
-	log.FromContext(ctx).Info("Startup refused: the slot has used its startup attempts",
-		"node", node.Name,
-		"attempts", refusal.Attempts,
-		"limit", refusal.Limit,
-		"state", "settled at the stable off/shutdown pair with its claim kept",
-		"recorded", "ClaimRearmLimitReached Warning on the slot")
-
-	return ctrl.Result{RequeueAfter: startupAttemptRefusalRequeue}, true
-}
-
-// startupAttemptRefusalRequeue is how long a slot whose startup attempts are spent waits before the
-// controller looks at it again. It is the idle resync of a stable slot, not a retry: the refusal is
-// not a transient failure, the record on the slot is the signal, and the pass that comes back finds
-// the same count and writes nothing.
-const startupAttemptRefusalRequeue = 5 * time.Minute
-
-// deferShutdownAttemptLimit turns a shutdown the FSM refused because the slot has used the shutdown
-// attempts of its scale-down episode into a result, and reports whether it did. It is the mirror of
-// deferStartupAttemptLimit for the other bound this controller knows how to read, and the enforcement
-// lives in the FSM (fsm.NodeStateMachine.ShutdownNode) - the one place every path that fires a
-// shutdown passes, the autoscaler's scale-down, the shutdown an observed-power correction releases, and
-// the retry a refused shutdown completion leads back into.
-//
-// No error is returned, and the reasons are the same as deferStartupAttemptLimit's: the slot is at the
-// pair the correction wrote (status.progress ready, status.powerState on, spec.desiredPowerState off),
-// nothing a resync can do changes that, and handing a permanent, operator-shaped condition to
-// controller-runtime's rate limiter prints a failure per pass and buries the one record that matters,
-// the ShutdownAttemptLimitReached Warning on the slot. The idle resync is kept, because a pool whose
-// shutdown script has been fixed must be picked up without a human touching the slot.
-func deferShutdownAttemptLimit(ctx context.Context, node *infrav1alpha1.Node, err error) (ctrl.Result, bool) {
-	refusal := fsm.AsShutdownAttemptLimit(err)
-	if refusal == nil {
-		return ctrl.Result{}, false
-	}
-
-	log.FromContext(ctx).Info("Shutdown refused: the slot has used its shutdown attempts",
-		"node", node.Name,
-		"attempts", refusal.Attempts,
-		"limit", refusal.Limit,
-		"state", "left at the observed pair - progress ready, powerState on, claim off - on a machine that is up",
-		"recorded", "ShutdownAttemptLimitReached Warning on the slot")
-
-	return ctrl.Result{RequeueAfter: shutdownAttemptRefusalRequeue}, true
-}
-
-// shutdownAttemptRefusalRequeue is the idle resync of a slot that cannot be powered off: not a retry
-// (the bound has been reached, and the next firing of the same shutdown is exactly what the refusal is
-// refusing), and not a stop (a fixed spec.shutdownPodSpec, or a machine powered off out of band, is
-// picked up without an operator touching the slot).
-const shutdownAttemptRefusalRequeue = 5 * time.Minute
-
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Register field index for pods by node name
@@ -542,13 +244,20 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&infrav1alpha1.Node{}).
+		For(&infrav2alpha1.Node{}).
+		// A NodeClaim is owned by the slot it asks for (the ownerReference internal/claim.New stamps),
+		// so every request, every phase move and every collection enqueues the slot. The input law reads
+		// the claim, so a pass must run when the claim changes: a claim created while the manager was
+		// down boots when it is created and not when something incidentally writes the Node, and a claim
+		// whose lifecycle Job finished during a restart gets the pass that re-fires its event (see
+		// recoverFinishedLifecycleJob).
+		Owns(&infrav2alpha1.NodeClaim{}).
 		Named("node").
 		Complete(r)
 }
 
 // handleNodeDeletion handles the deletion of a node
-func (r *NodeReconciler) handleNodeDeletion(ctx context.Context, node *infrav1alpha1.Node, groupName, nodeName string) (ctrl.Result, error) {
+func (r *NodeReconciler) handleNodeDeletion(ctx context.Context, node *infrav2alpha1.Node, groupName, nodeName string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	logger.Info("Node is being deleted", "node", nodeName)
@@ -587,7 +296,7 @@ func (r *NodeReconciler) addLabelToKubernetesNodeWithPatch(ctx context.Context, 
 	return nil
 }
 
-func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
+func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, node *infrav2alpha1.Node) error {
 	logger := log.FromContext(ctx)
 
 	// Get the Kubernetes node
@@ -642,7 +351,7 @@ func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, nod
 // Spec.TaintsToRemove is unrelated to this field: it filters taints out of the node template
 // the provider reports to the autoscaler, it never touches the live node. Do not conflate
 // them.
-func (r *NodeReconciler) applyNodeTaintsToKubernetesNode(ctx context.Context, node *infrav1alpha1.Node) error {
+func (r *NodeReconciler) applyNodeTaintsToKubernetesNode(ctx context.Context, node *infrav2alpha1.Node) error {
 	return taints.ApplyToKubernetesNode(ctx, r.Client, node, r.EventRecorder)
 }
 
@@ -661,126 +370,15 @@ func (r *NodeReconciler) applyNodeTaintsToKubernetesNode(ctx context.Context, no
 //
 // Thin wrapper over capacity.CheckDeclaredCapacity, which holds the rules (no declaration, no
 // node object, and a node that is not Ready all record nothing).
-func (r *NodeReconciler) checkDeclaredNodeCapacity(ctx context.Context, node *infrav1alpha1.Node) error {
+func (r *NodeReconciler) checkDeclaredNodeCapacity(ctx context.Context, node *infrav2alpha1.Node) error {
 	return capacity.CheckDeclaredCapacity(ctx, r.Client, node, r.EventRecorder)
 }
-
-// validateStateTransition validates that a state transition is valid and implements smart backoff strategy
-// Returns ctrl.Result with appropriate requeue timing instead of errors for transitional states
-func (r *NodeReconciler) validateStateTransition(ctx context.Context, node *infrav1alpha1.Node) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	// Check for context cancellation
-	if ctx.Err() != nil {
-		return ctrl.Result{}, ctx.Err()
-	}
-
-	// Validate that we have required fields
-	if node.Spec.DesiredPowerState == "" {
-		return ctrl.Result{}, fmt.Errorf("node %s has empty DesiredPowerState", node.Name)
-	}
-
-	// Validate that DesiredPowerState is a valid value
-	if node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOn &&
-		node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOff {
-		return ctrl.Result{}, fmt.Errorf("node %s has invalid DesiredPowerState: %s", node.Name, node.Spec.DesiredPowerState)
-	}
-
-	// Check if node is in a transitional state and apply smart backoff
-	if node.Status.Progress == infrav1alpha1.ProgressStartingUp ||
-		node.Status.Progress == infrav1alpha1.ProgressShuttingDown {
-
-		// Check for existing operation locks before allowing transitions
-		if existingLock, exists := r.checkOperationLock(ctx, node); exists {
-			if !r.isLockExpired(existingLock) {
-				// Respect locks from other controllers (like cluster autoscaler)
-				if existingLock.Owner != NodeControllerOwner {
-					logger.Info("Respecting coordination lock from other controller",
-						"node", node.Name,
-						"lockOwner", existingLock.Owner,
-						"operation", existingLock.Operation,
-						"age", time.Since(existingLock.Timestamp))
-					return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
-				}
-			} else {
-				// Clean up expired locks automatically
-				logger.Info("Cleaning up expired coordination lock",
-					"node", node.Name,
-					"operation", existingLock.Operation,
-					"owner", existingLock.Owner,
-					"age", time.Since(existingLock.Timestamp))
-				if err := r.forceReleaseLock(ctx, node); err != nil {
-					logger.Error(err, "Failed to cleanup expired lock", "node", node.Name)
-				}
-			}
-		}
-
-		// Calculate transition duration based on the appropriate timestamp
-		var transitionStart time.Time
-		if node.Status.Progress == infrav1alpha1.ProgressStartingUp && node.Status.LastStartupTime != nil {
-			transitionStart = node.Status.LastStartupTime.Time
-		} else if node.Status.Progress == infrav1alpha1.ProgressShuttingDown && node.Status.LastShutdownTime != nil {
-			transitionStart = node.Status.LastShutdownTime.Time
-		} else {
-			// Fallback to a reasonable default if timestamps are missing
-			transitionStart = time.Now().Add(-1 * time.Minute)
-		}
-
-		transitionDuration := time.Since(transitionStart)
-
-		// Implement progressive backoff strategy
-		var backoffDuration time.Duration
-		var logMessage string
-
-		switch {
-		case transitionDuration <= 2*time.Minute:
-			// Early transitions (0-2 min): 30-second backoff, allow monitoring
-			backoffDuration = 30 * time.Second
-			logMessage = "Early transition phase - monitoring with short backoff"
-		case transitionDuration <= 10*time.Minute:
-			// Normal transitions (2-10 min): 2-minute backoff
-			backoffDuration = 2 * time.Minute
-			logMessage = "Normal transition phase - standard backoff"
-		case transitionDuration <= 15*time.Minute:
-			// Late transitions (10-15 min): 5-minute backoff
-			backoffDuration = 5 * time.Minute
-			logMessage = "Late transition phase - extended backoff"
-		default:
-			// Stuck transitions (>15 min): Force retry/cleanup
-			logger.Info("Transition appears stuck, forcing cleanup and retry",
-				"node", node.Name,
-				"progress", node.Status.Progress,
-				"transitionDuration", transitionDuration)
-
-			// Clean up any existing locks and allow the transition to proceed
-			if _, exists := r.checkOperationLock(ctx, node); exists {
-				if err := r.forceReleaseLock(ctx, node); err != nil {
-					logger.Error(err, "Failed to force release stuck lock", "node", node.Name)
-				}
-			}
-
-			// Return no requeue to allow immediate retry
-			return ctrl.Result{}, nil
-		}
-
-		logger.Info(logMessage,
-			"node", node.Name,
-			"progress", node.Status.Progress,
-			"transitionDuration", transitionDuration,
-			"backoffDuration", backoffDuration)
-
-		return ctrl.Result{RequeueAfter: backoffDuration}, nil
-	}
-
-	// Node is not in transitional state, allow normal processing
-	return ctrl.Result{}, nil
-}
-func (r *NodeReconciler) SetControllerReference(ctx context.Context, node *infrav1alpha1.Node, group *infrav1alpha1.Group) error {
+func (r *NodeReconciler) SetControllerReference(ctx context.Context, node *infrav2alpha1.Node, group *infrav2alpha1.Group) error {
 	logger := log.FromContext(ctx)
 
 	// Check if the Node already has an owner reference to this Group
 	for _, ownerRef := range node.OwnerReferences {
-		if ownerRef.UID == group.UID && ownerRef.Kind == "Group" && ownerRef.APIVersion == "infra.homecluster.dev/v1alpha1" {
+		if ownerRef.UID == group.UID && ownerRef.Kind == "Group" && ownerRef.APIVersion == "infra.homecluster.dev/v2alpha1" {
 			return nil
 		}
 	}
@@ -804,7 +402,7 @@ func (r *NodeReconciler) SetControllerReference(ctx context.Context, node *infra
 
 // checkOperationLock checks if a node has an active operation lock and returns the lock details.
 // Returns (lock, true) if an active lock exists, (nil, false) otherwise.
-func (r *NodeReconciler) checkOperationLock(ctx context.Context, node *infrav1alpha1.Node) (*OperationLock, bool) {
+func (r *NodeReconciler) checkOperationLock(ctx context.Context, node *infrav2alpha1.Node) (*OperationLock, bool) {
 	logger := log.FromContext(ctx)
 
 	if node.Annotations == nil {
@@ -871,7 +469,7 @@ func (r *NodeReconciler) cleanupExpiredLocks(ctx context.Context) error {
 	logger := log.FromContext(ctx)
 
 	// List all nodes to check for expired locks
-	nodes := &infrav1alpha1.NodeList{}
+	nodes := &infrav2alpha1.NodeList{}
 	if err := r.List(ctx, nodes); err != nil {
 		return fmt.Errorf("failed to list nodes for lock cleanup: %w", err)
 	}
@@ -905,10 +503,10 @@ func (r *NodeReconciler) cleanupExpiredLocks(ctx context.Context) error {
 
 // forceReleaseLock forcibly removes lock annotations from a node, regardless of ownership.
 // This is used for cleanup of expired locks and should be used with caution.
-func (r *NodeReconciler) forceReleaseLock(ctx context.Context, node *infrav1alpha1.Node) error {
+func (r *NodeReconciler) forceReleaseLock(ctx context.Context, node *infrav2alpha1.Node) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get fresh copy of the node
-		fresh := &infrav1alpha1.Node{}
+		fresh := &infrav2alpha1.Node{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
 			return fmt.Errorf("failed to get fresh node: %w", err)
 		}

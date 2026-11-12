@@ -31,14 +31,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
 // slot returns a Node CR that declares spec.nodeCapacity, the shared fixture of this package.
-func slot(declared corev1.ResourceList) *infrav1alpha1.Node {
-	return &infrav1alpha1.Node{
+func slot(declared corev1.ResourceList) *infrav2alpha1.Node {
+	return &infrav2alpha1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "worker-01", Namespace: "default"},
-		Spec: infrav1alpha1.NodeSpec{
+		Spec: infrav2alpha1.NodeSpec{
 			KubernetesNodeName: "worker-01",
 			NodeCapacity:       declared,
 		},
@@ -80,7 +80,7 @@ func newClient(t *testing.T, objects ...client.Object) client.Client {
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }
@@ -242,7 +242,7 @@ func TestCheckDeclaredCapacityRecordsWarning(t *testing.T) {
 func TestCheckDeclaredCapacityStaysSilent(t *testing.T) {
 	tests := []struct {
 		name     string
-		nodeCR   *infrav1alpha1.Node
+		nodeCR   *infrav2alpha1.Node
 		objects  []client.Object
 		warnings int
 	}{
@@ -290,7 +290,7 @@ func TestCheckDeclaredCapacityStaysSilent(t *testing.T) {
 		},
 		{
 			name: "the slot has never been provisioned",
-			nodeCR: func() *infrav1alpha1.Node {
+			nodeCR: func() *infrav2alpha1.Node {
 				s := slot(declaredCX23())
 				s.Spec.KubernetesNodeName = ""
 

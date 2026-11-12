@@ -28,7 +28,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
@@ -39,15 +39,15 @@ func lockScheme(t *testing.T) *runtime.Scheme {
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
-	require.NoError(t, infrav1alpha1.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	return scheme
 }
 
 // lockedSlot is a slot carrying a coordination lock written the way AcquireLock writes one, aged by
 // age, with the 5m timeout a scale-up takes.
-func lockedSlot(operation, owner string, age time.Duration) *infrav1alpha1.Node {
-	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+func lockedSlot(operation, owner string, age time.Duration) *infrav2alpha1.Node {
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	node.Annotations = map[string]string{
 		OperationLockAnnotation: operation,
 		LockOwnerAnnotation:     owner,
@@ -60,10 +60,10 @@ func lockedSlot(operation, owner string, age time.Duration) *infrav1alpha1.Node 
 
 // readSlot reads the slot back, so the assertions are about what is in the API and not about the
 // copy a test holds.
-func readSlot(t *testing.T, c client.Client) *infrav1alpha1.Node {
+func readSlot(t *testing.T, c client.Client) *infrav2alpha1.Node {
 	t.Helper()
 
-	node := &infrav1alpha1.Node{}
+	node := &infrav2alpha1.Node{}
 	require.NoError(t, c.Get(context.Background(),
 		types.NamespacedName{Name: "test-node", Namespace: config.NewNamespaceConfig().Get()}, node))
 
@@ -107,12 +107,12 @@ func TestRenewLockKeepsOurOwnLiveLock(t *testing.T) {
 func TestRenewLockTakesNothingOver(t *testing.T) {
 	tests := []struct {
 		name  string
-		slot  *infrav1alpha1.Node
+		slot  *infrav2alpha1.Node
 		owner string
 	}{
 		{
 			name:  "no lock at all",
-			slot:  CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp),
+			slot:  CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting),
 			owner: NodeControllerOwner,
 		},
 		{
@@ -149,7 +149,7 @@ func TestRenewLockTakesNothingOver(t *testing.T) {
 // helper: a lock written by an acquisition and a lock written by a re-stamp must age identically,
 // because three readers compute an expiry from the timestamp and the timeout.
 func TestAcquireLockAndRenewLockShareTheLockShape(t *testing.T) {
-	slot := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav1alpha1.PowerStateOn, infrav1alpha1.ProgressStartingUp)
+	slot := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
 	c := CreateFakeClient(lockScheme(t), slot)
 	coord := NewCoordinationManager(c, NodeControllerOwner)
 

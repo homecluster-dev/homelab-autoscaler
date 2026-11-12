@@ -32,7 +32,7 @@ Homelab Autoscaler adds dynamic scaling to physical homelab Kubernetes clusters.
 
 **Group CRD** - Defines autoscaling policies:
 ```yaml
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: worker-nodes
@@ -45,14 +45,13 @@ spec:
 
 **Node CRD** - Represents physical machines:
 ```yaml
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: worker-01
   labels:
     group: worker-nodes
 spec:
-  powerState: on
   kubernetesNodeName: worker-01
   startupPodSpec:
     image: homelab/power-manager:latest

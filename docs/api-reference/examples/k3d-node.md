@@ -6,7 +6,7 @@ This example demonstrates physical node configuration with simulated power opera
 # Example Node configuration for k3d testing environment
 # This demonstrates physical node configuration with simulated power operations
 
-apiVersion: infra.homecluster.dev/v1alpha1
+apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: k3d-homelab-autoscaler-agent-0
@@ -19,14 +19,10 @@ spec:
   # The Kubernetes node name this physical node represents
   kubernetesNodeName: k3d-homelab-autoscaler-agent-0
   
-  # Current power state (on/off)
-  powerState: "on"
-  
   # Pricing information for cost calculations
   pricing:
     hourlyRate: "1.5"  # Cost per hour when running
     podRate: "0.0"     # Additional cost per pod (optional)
-  
   # Job specification for starting up this node
   startupPodSpec:
     image: curlimages/curl:latest
@@ -40,7 +36,6 @@ spec:
     #   limits:
     #     cpu: 100m
     #     memory: 128Mi
-  
   # Job specification for shutting down this node
   shutdownPodSpec:
     image: curlimages/curl:latest

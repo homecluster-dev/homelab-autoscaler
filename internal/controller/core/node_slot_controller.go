@@ -28,27 +28,26 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	infrav1alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v1alpha1"
+	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 )
 
-// NodeSlotReconciler seeds the status of Node CRs (slots) that have no matching
-// Kubernetes node, i.e. slots that never had a machine behind them.
+// NodeSlotReconciler seeds the report of Node CRs (slots) that have never been observed: a freshly
+// committed pool has status.powerState "" and status.phase "", and `kubectl get
+// nodes.infra.homecluster.dev` on a pool that is idle by design reads as a pool of broken slots.
 //
-// KubernetesNodeReconciler is driven by corev1.Node objects, so a freshly committed
-// pool (all slots powerState: "off") never gets its status written and stays with
-// status.powerState: "" / status.progress: "". The gRPC cloud provider counts every
-// Node CR whose status.progress is not "shuttingdown"/"shutdown" as part of the
-// target size of the node group, so such a pool reports targetSize == number of slots,
-// the cluster-autoscaler sees "max size reached" and never asks for a scale up.
+// What changed under the NodeClaim model: the seeding is no longer load-bearing for the arithmetic.
+// In v1alpha1 the provider counted every slot whose status.progress was not one of
+// shuttingdown/shutdown/startingup, so an unseeded pool reported targetSize == number of slots,
+// cluster-autoscaler read "max size reached" and never asked for a scale up - the seeding existed to
+// make that arithmetic come out. v2alpha1 counts live claims, and "no live claim" needs no seeding,
+// no status and no observation (docs/design/nodeclaim.md §2). What is left here is the report: one
+// column that tells an operator the slot is free.
 //
-// This controller runs the same seeding for Node CRs that have no corev1.Node: a slot
-// that is desired to be off, and whose status was never observed, is reported as
-// off/shutdown so that it is excluded from the target size and can be picked up by
-// NodeGroupIncreaseSize.
-//
-// Slots whose status records a startup (status.lastStartupTime) are never seeded: the
-// state machine ran for them at least once, so the machine may well be running while its
-// Kubernetes node object is absent (for example after a failed status write).
+// KubernetesNodeReconciler is driven by corev1.Node objects, so a slot with no machine never gets a
+// pass from it. This controller runs on the slot object itself, and writes nothing a controller that
+// observes a machine owns: it refuses any slot with a live claim, a non-empty status, a machine
+// observed up, a node object, or a slot the state machine has already run for.
 type NodeSlotReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -58,12 +57,12 @@ type NodeSlotReconciler struct {
 // +kubebuilder:rbac:groups=infra.homecluster.dev,resources=nodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 
-// Reconcile seeds the status of a never-provisioned slot. It is idempotent and never
-// touches a slot that is on, transitioning (startingup/shuttingdown) or ready.
+// Reconcile seeds the report of a never-provisioned slot. It is idempotent and never touches a slot
+// with a claim, a machine, or a report someone else wrote.
 func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	nodeCR := &infrav1alpha1.Node{}
+	nodeCR := &infrav2alpha1.Node{}
 	if err := r.Get(ctx, req.NamespacedName, nodeCR); err != nil {
 		// Node CR not found - possibly deleted
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -73,13 +72,25 @@ func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	// A slot whose FSM has run at least once may have a real machine behind it: the
-	// Kubernetes node object can be missing because the machine was never created, because
-	// it was removed from the cluster, or because an earlier status write failed. Seeding
-	// off/shutdown in that case excludes a running machine from the target size, so leave
-	// the status to the controllers that observe the machine.
+	// A live claim means the slot is wanted: its report belongs to the controllers that read the
+	// claim, and seeding off here would report a slot that is being booted as free.
+	claims, err := claim.ListOfSlot(ctx, r.Client, nodeCR.Namespace, nodeCR.Name)
+	if err != nil {
+		logger.Error(err, "Failed to list the claims of the slot", "node", nodeCR.Name)
+
+		return ctrl.Result{}, err
+	}
+
+	if claim.LiveOfSlot(claims) != nil {
+		return ctrl.Result{}, nil
+	}
+
+	// A slot whose state machine has run at least once may have a real machine behind it: the
+	// Kubernetes node object can be missing because the machine was never created, because it was
+	// removed from the cluster, or because an earlier status write failed. Seeding off in that case
+	// reports a running machine as free, so leave the status to the controllers that observe it.
 	if nodeCR.Status.LastStartupTime != nil {
-		logger.Info("Skipping status seed, the state machine has already run for this slot; "+
+		logger.Info("Skipping the status seed, the state machine has already run for this slot; "+
 			"the machine may still be running while its Kubernetes node object is absent, so its "+
 			"state must be verified out of band",
 			"node", nodeCR.Name,
@@ -95,17 +106,19 @@ func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if err := r.Get(ctx, client.ObjectKey{Name: name}, k8sNode); err == nil {
 			logger.V(1).Info("Kubernetes node exists, leaving status to the node controller",
 				"node", nodeCR.Name, "kubernetesNode", name)
+
 			return ctrl.Result{}, nil
 		} else if !apierrors.IsNotFound(err) {
 			logger.Error(err, "Failed to get Kubernetes node", "node", nodeCR.Name, "kubernetesNode", name)
+
 			return ctrl.Result{}, err
 		}
 	}
 
 	// Create a copy for the status update to avoid conflicts with spec updates
 	nodeCRCopy := nodeCR.DeepCopy()
-	nodeCRCopy.Status.PowerState = infrav1alpha1.PowerStateOff
-	nodeCRCopy.Status.Progress = infrav1alpha1.ProgressShutdown
+	nodeCRCopy.Status.PowerState = infrav2alpha1.PowerStateOff
+	nodeCRCopy.Status.Phase = infrav2alpha1.NodePhaseOff
 
 	// Use status subresource to avoid conflicts with spec updates
 	if err := r.Status().Update(ctx, nodeCRCopy); err != nil {
@@ -115,52 +128,58 @@ func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Seeded status of never-provisioned slot",
+	logger.Info("Seeded the report of a never-provisioned slot",
 		"node", nodeCR.Name,
-		"powerstate", nodeCRCopy.Status.PowerState,
-		"progress", nodeCRCopy.Status.Progress)
+		"powerstate", string(nodeCRCopy.Status.PowerState),
+		"phase", string(nodeCRCopy.Status.Phase))
 
 	return ctrl.Result{}, nil
 }
 
-// needsStatusSeed reports whether the slot's status must be seeded as off/shutdown.
-// It returns false for slots that are on, for transitional progress values
-// (startingup/shuttingdown), for ready slots, and for slots that are already seeded.
-func needsStatusSeed(node *infrav1alpha1.Node) bool {
-	// Only slots that are desired to be off are capacity that is not in use.
-	if node.Spec.DesiredPowerState != infrav1alpha1.PowerStateOff {
+// needsStatusSeed reports whether the slot's report must be seeded as off. It returns false for a
+// slot that carries a report already, a slot with a claim digest (an episode ran on it), and a slot
+// whose machine is observed up.
+func needsStatusSeed(node *infrav2alpha1.Node) bool {
+	if node.Status.PowerState == infrav2alpha1.PowerStateOn {
+		// A real observation. Never overwrite it.
 		return false
 	}
 
-	// A real status (the machine is on) is never overwritten.
-	if node.Status.PowerState == infrav1alpha1.PowerStateOn {
+	if node.Status.LastClaim != nil {
+		// The slot has a claim history; its report is written by the observation and the claim
+		// paths, which read the history.
 		return false
 	}
 
-	switch node.Status.Progress {
-	case infrav1alpha1.ProgressStartingUp, infrav1alpha1.ProgressShuttingDown, infrav1alpha1.ProgressReady:
-		// Transition in flight, or the node is serving: leave it alone.
+	switch node.Status.Phase {
+	case infrav2alpha1.NodePhaseOff:
+		// Already seeded: complete an empty power state, and nothing else.
+		return node.Status.PowerState != infrav2alpha1.PowerStateOff
+	case infrav2alpha1.NodePhasePending, infrav2alpha1.NodePhaseBooting,
+		infrav2alpha1.NodePhaseReady, infrav2alpha1.NodePhaseDraining:
+		// Someone who reads the claim, or observes the machine, owns this report.
 		return false
-	case infrav1alpha1.ProgressShutdown:
-		// Already excluded from the target size, only complete an empty power state.
-		return node.Status.PowerState != infrav1alpha1.PowerStateOff
 	default:
-		// Empty progress: the slot was never observed by the node controllers, so it is
-		// counted as part of the target size of the node group.
+		// Empty: a slot of a freshly committed pool, idle by design.
 		return true
 	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
 //
-// What has to be seeded is decided by the spec (spec.desiredPowerState), so the watch uses
-// GenerationChangedPredicate: it lets create events and spec changes through, and ignores
-// updates that only touch fields written by the other reconcilers. A status write bumps the
-// resourceVersion, never the generation, so status-only updates from
-// KubernetesNodeReconciler and the FSM do not re-trigger this reconciler.
+// What has to be seeded is decided by the spec, so the watch uses GenerationChangedPredicate: it
+// lets create events and spec changes through, and ignores updates that only touch fields written by
+// the other reconcilers. In v2alpha1 the spec of a slot carries no runtime intent at all
+// (spec.desiredPowerState is gone with the claim model, docs/design/nodeclaim.md §2), so "the spec
+// changed" is the only question this predicate answers, and it is the right one: a status write bumps
+// the resourceVersion, never the generation, so status-only updates from KubernetesNodeReconciler and
+// the FSM do not re-trigger this reconciler.
 func (r *NodeSlotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&infrav1alpha1.Node{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&infrav2alpha1.Node{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		// A claim is owned by its slot, so the claims of a slot are watched through the slot: a claim
+		// that appears, moves, and is collected never enqueues this reconciler, which owns a report and
+		// not a machine.
 		Named("core-node-slot").
 		Complete(r)
 }
