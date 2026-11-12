@@ -1493,8 +1493,17 @@ spec:
 			Eventually(func() string {
 				return kubeNodeAnnotations(zonedSlot)[nodelabels.AppliedLabelsAnnotation]
 			}, labelGate, checkInterval).Should(
-				ContainSubstring("topology.kubernetes.io/zone"),
-				"the node records the keys the slot wrote, which is what makes the removal below possible")
+				Equal(fmt.Sprintf("%s,%s", rackKey, "topology.kubernetes.io/zone")),
+				"the node records every key the slot wrote, sorted and comma-joined: that record is the "+
+					"ownership claim the removal below is built on, so it is read in full here, not as a "+
+					"substring that a partial record would satisfy: %s",
+				describeNodeMetadata(zonedSlot))
+
+			Eventually(func() string {
+				return kubeNodeAnnotations(zonedSlot)[nodelabels.AppliedAnnotationsAnnotation]
+			}, labelGate, checkInterval).Should(
+				Equal(serialKey),
+				"the annotations have their own record, for the same reason: %s", describeNodeMetadata(zonedSlot))
 
 			By("Recording the write on the slot")
 			// The read is the suite's own (`kubectl get events`, the core Event the API server
@@ -1532,6 +1541,11 @@ spec:
 				map[string]string{"topology.kubernetes.io/zone": zoneA},
 				nil)).To(Succeed())
 
+			// The same clock as the drift above. A key the declaration drops comes off the node on the
+			// slot's next pass, and a settled slot has no pass of its own: the spec write enqueues one,
+			// and the suite asks for it as well, so the gate measures the rule and not the queue.
+			requestSlotPass(zonedSlot)
+
 			By("Watching the key come off the node")
 			// Both removals are asserted over a read that reports its own failure: "the key is not
 			// there" is only a fact about a node object that was read, and a nil map from a failed
@@ -1541,13 +1555,14 @@ spec:
 			}, labelGate, checkInterval).ShouldNot(
 				ContainElement(rackKey),
 				"taking a label out of Git takes it off the machine: that is the only way the declaration "+
-					"stays true of a box that runs for months")
+					"stays true of a box that runs for months. The removal is keyed by the record on the "+
+					"node, so the record is shown beside it: %s", describeNodeMetadata(zonedSlot))
 
 			Eventually(func() ([]string, error) {
 				return nodeAnnotationKeys(zonedSlot)
 			}, labelGate, checkInterval).ShouldNot(
 				ContainElement(serialKey),
-				"the same rule for annotations")
+				"the same rule for annotations: %s", describeNodeMetadata(zonedSlot))
 
 			By("Claiming a key Kubernetes owns, from a slot that may not")
 			// The webhook refuses this declaration in a cluster that runs webhooks; this environment

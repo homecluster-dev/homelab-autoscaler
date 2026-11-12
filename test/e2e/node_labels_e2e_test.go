@@ -27,6 +27,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/test/utils"
 )
 
@@ -135,6 +136,53 @@ func slotEventsFor(slot string) (string, error) {
 	}
 
 	return strings.Join(lines, "\n"), nil
+}
+
+// describeNodeMetadata renders what the writer based its decision on, for the gates that assert the
+// record and the removals built on it: the declaration the slot carries, and the three records on the
+// node object - the keys a slot applied, the keys it annotated, and the keys it refused. A removal is
+// keyed by the record, so a gate that asserts a key came off has to show the record when it fails.
+func describeNodeMetadata(nodeName string) string {
+	lines := []string{"node " + nodeName}
+
+	labels := kubeNodeLabels(nodeName)
+	if labels == nil {
+		lines = append(lines, "  node object unreadable")
+	} else {
+		lines = append(lines, "  node label keys: "+strings.Join(sortedKeysOf(labels), ","))
+		lines = append(lines, "  record "+nodelabels.AppliedLabelsAnnotation+
+			"="+labels[nodelabels.AppliedLabelsAnnotation])
+	}
+
+	annotations := kubeNodeAnnotations(nodeName)
+	if annotations != nil {
+		lines = append(lines, "  record "+nodelabels.AppliedAnnotationsAnnotation+
+			"="+annotations[nodelabels.AppliedAnnotationsAnnotation])
+		lines = append(lines, "  record "+nodelabels.SkippedKeysAnnotation+
+			"="+annotations[nodelabels.SkippedKeysAnnotation])
+	}
+
+	out, err := utils.Run(kubectl("get", "nodes.infra.homecluster.dev", nodeName, "-n", namespace,
+		"-o", `jsonpath={.spec.nodeLabels} {.spec.nodeAnnotations}`))
+	if err != nil {
+		lines = append(lines, "  slot declaration unreadable: "+err.Error())
+	} else {
+		lines = append(lines, "  slot declares: "+strings.TrimSpace(out))
+	}
+
+	return "\n" + strings.Join(lines, "\n")
+}
+
+// sortedKeysOf renders a map's keys in order, for a message that has to be comparable between runs.
+func sortedKeysOf(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	return keys
 }
 
 // nodeLabelKeys reads the *keys* of a slot's Kubernetes node, and reports the failure of the read
