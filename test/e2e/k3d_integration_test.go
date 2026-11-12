@@ -91,6 +91,11 @@ const (
 	// minutes late by construction, and a shutdown Job has to run before the machine is even asked to
 	// stop.
 	machineStateTimeout = 4 * time.Minute
+	// machineDownTimeout is the window of an observation that an unclaimed machine is down. The pass
+	// that powers a settled slot's machine off rides that slot's resync - a stable slot has no event left
+	// to ask for a pass - and the VM control server that stops the container answers one request at a
+	// time, so the shutdown of a machine the suite does not drive is minutes, not one reconcile.
+	machineDownTimeout = 6 * time.Minute
 
 	// The window of the "a served claim stays ready past its boot deadline" spec is measured from the
 	// claim's own deadline, and bounded: minDeadlineWatch is the shortest honest observation, and
@@ -206,7 +211,10 @@ var _ = BeforeSuite(func() {
 // nothing to scale down. The lifecycle helpers claimSlot and releaseSlot are the harness playing its
 // half of the model, and they are the only writes this suite makes to a claim.
 // =============================================================================
-var _ = Describe("K3d Integration", Serial, func() {
+// The three specs share a cluster, a group and a machine, and each one starts from the shape the one
+// before it left: Ordered is the container that says so, and it is serial by construction. An
+// AfterAll - legal only in an Ordered container - is where the harness stops wanting its machines.
+var _ = Describe("K3d Integration", Ordered, func() {
 	// The harness stops wanting its machines when the run is over: the claims it wrote for the k3d
 	// containers are deleted, and the model powers the machines down. This is housekeeping, not a gate -
 	// what a release does is asserted by the spec that reads the slot, not here.
@@ -227,10 +235,9 @@ var _ = Describe("K3d Integration", Serial, func() {
 	// 3. Set up VM control server service for node power management
 	// 4. Apply Node CRs (v2alpha1) that define our agent slots
 	// 5. Apply Group CR with aggressive scale-down settings for testing
-	// 6. Verify the slots start free: no live NodeClaim names them, and the machines nobody claimed
-	//    are observed coming down
-	// 7. Claim the slot of the machine the scale-down spec runs on, and follow the claim to ready:
-	//    the harness is the machine, so a simulated machine in service is a claimed slot
+	// 6. Verify the slots start free: no live NodeClaim names them
+	// 7. Take the scale-down spec's machine down (the harness owns the container), then claim its slot:
+	//    the operator boots the machine the claim asks for, and the claim is followed to ready
 	// =============================================================================
 	Context("Setup & Environment Validation", func() {
 		It("should verify prerequisites and prepare environment", func() {
@@ -314,30 +321,16 @@ var _ = Describe("K3d Integration", Serial, func() {
 			}, 30*time.Second, checkInterval).Should(Equal(agentNode0),
 				"The slot's identity is its name and its kubernetesNodeName: the provider looks a slot up by name")
 
-			// Apply Group CR with aggressive scale-down settings for testing
-			// scaleDownUnneededTime: 30s - CA will consider node unneeded after 30s
-			// scaleDownUtilizationThreshold: 0.1 - Node with <10% utilization is unneeded
-			// maxNodeProvisionTime: 2m - the floor of a claim's deadline. The operator's budget of one
-			// attempt (claim.AttemptBudget) is longer, so the claims of this run carry the operator's
-			// budget: the floor never enforces a deadline shorter than the number cluster-autoscaler
-			// is itself told (NodeGroupGetOptions -> MaxNodeProvisionDuration).
-			By("Applying Group CR with aggressive scale-down settings")
-			groupYAML := `
-apiVersion: infra.homecluster.dev/v2alpha1
-kind: Group
-metadata:
-  name: group1
-  namespace: homelab-autoscaler-system
-spec:
-  ignoreDaemonSetsUtilization: true
-  maxNodeProvisionTime: 2m
-  scaleDownGpuUtilizationThreshold: "30"
-  scaleDownUnneededTime: 30s
-  scaleDownUnreadyTime: 30s
-  scaleDownUtilizationThreshold: "0.1"
-  zeroOrMaxNodeScaling: false
-`
-			applyGroupCR(groupYAML)
+			// Apply the Group CR: the pool's numbers. maxNodeProvisionTime: 2m is the floor of a claim's
+			// deadline - the operator's budget of one attempt (claim.AttemptBudget) is longer, so the claims
+			// of this run carry the operator's budget, and the floor never enforces a deadline shorter than
+			// the number cluster-autoscaler is itself told (NodeGroupGetOptions -> MaxNodeProvisionDuration).
+			// The scale-down window is wide, deliberately: the machine the harness boots for the scale-down
+			// spec has to still be in service when that spec starts, and the autoscaler, reading this pool's
+			// numbers, is the one that would take it away. The scale-down spec tightens the window; this one
+			// only asks for a machine that stays.
+			By("Applying Group CR with a scale-down window the setup's machine survives")
+			applyGroupCR(groupYAML("15m"))
 
 			By("Verifying the Group CR is served at v2alpha1")
 			Eventually(func() string {
@@ -370,31 +363,24 @@ spec:
 			}, 30*time.Second, checkInterval).Should(Equal(0),
 				"A slot nobody asked for has no live claim: that is the free shape IncreaseSize claims")
 
-			By("Verifying the machines nobody claimed are coming down")
-			// The k3d agents booted with the cluster, so their machines are observed up while no claim
-			// names them. A machine is wanted exactly when a live claim names its slot, so these two are
-			// unwanted capacity: the shutdown path owns them, and the slot's report is draining on the way
-			// down and off once the machine is down. The pair is one shape - a machine the pool does not
-			// want - a Job and a reconcile apart, so the suite reads the pair and then the off end of it.
-			for _, slot := range []string{agentNode0, agentNode1} {
-				Eventually(func() bool {
-					return slotIsUnwanted(slot)
-				}, machineStateTimeout, checkInterval).Should(BeTrue(),
-					"A slot no claim names reports off, or draining while its machine comes down")
-			}
+			By("Putting the scale-down spec's machine in the shape a claim boots")
+			// The harness is the machine: the k3d container is the suite's to power. The scale-down spec
+			// needs a machine that is up and in service, and the law boots the machine a claim asks for on
+			// a slot whose machine is observed off - a claim written on a slot whose machine is already up is
+			// the shape nothing boots (the machine runs, the claim is not stamped ready, and no startup Job
+			// is owed). So the suite takes its own machine down, the shape every pool machine starts in, and
+			// watches the slot read as idle.
+			//
+			// The other slot is left to the operator on purpose: it is the idle pool of a homelab, a machine
+			// up that nothing wants. What the law does with it - cordon, shutdown Job, power off - is the
+			// same shutdown path the scale-down spec reads a minute later, and it is read there, once the run
+			// has given the observation, the Job and the kubelet's silence time to land.
+			stopMachine(agentNode0)
 
-			// The off end is the shape the scale-down spec starts from, and the shape the harness's claim
-			// boots a machine out of: a live claim on a slot whose machine is observed off is a request
-			// the input law answers by booting it. Claiming a slot whose machine is already observed up
-			// is the shape nothing boots - the machine is up and the claim has not been stamped ready, so
-			// the slot reports the boot window and no startup Job is owed - so the suite waits for the
-			// machines to be down before it asks for one.
-			Eventually(func() []infrav2alpha1.NodePhase {
-				return []infrav2alpha1.NodePhase{slotPhase(agentNode0), slotPhase(agentNode1)}
-			}, machineStateTimeout, checkInterval).Should(Equal([]infrav2alpha1.NodePhase{
-				infrav2alpha1.NodePhaseOff,
-				infrav2alpha1.NodePhaseOff,
-			}), "A machine the pool does not want ends off: the pool reads as idle, and every slot is free")
+			Eventually(func() infrav2alpha1.NodePhase {
+				return slotPhase(agentNode0)
+			}, machineStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseOff),
+				"A free slot whose machine is observed off is off: the shape a claim boots a machine out of")
 
 			By("Claiming the slot of the machine the scale-down spec runs on")
 			// The harness is the machine: the pool's machines are k3d containers it starts and stops, and
@@ -418,7 +404,12 @@ spec:
 				"the machine of a claimed slot is booted by the provider's startup Job, so the VM control server saw /start for it")
 
 			// The claim's ready phase is the sentence "the machine it asked for can take the pool's
-			// work", and the slot's report follows it: ready, with the machine observed on.
+			// work", and the slot's report is the same fact recomputed from (the live claim, the observed
+			// power, the usability of the node). A pass recomputes it, and a slot that has settled into
+			// service has no event left to ask for one, so the suite asks - and then asserts the value the
+			// formula derives, which is the assertion, not the write.
+			requestSlotPass(agentNode0)
+
 			Eventually(func() infrav2alpha1.NodePhase {
 				return slotPhase(agentNode0)
 			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseReady),
@@ -441,17 +432,18 @@ spec:
 	//
 	// Flow:
 	// 1. The machine is in service because a live NodeClaim names its slot (the setup's claim): the node
-	//    is Ready, the slot reports ready, and the group has an empty node to consider.
-	// 2. CA decides: it writes "Scale-down: removing empty node <name>" as it taints the node and starts
+	//    is Ready, the slot reports ready, and the pool's scale-down window has left it alone.
+	// 2. The pool's window is tightened: an empty node unneeded for 30s is a scale-down candidate.
+	// 3. CA decides: it writes "Scale-down: removing empty node <name>" as it taints the node and starts
 	//    the deletion, then calls the provider's NodeGroupDeleteNodes.
-	// 3. The provider cancels the machine: the live claim of the slot is recorded with the request
+	// 4. The provider cancels the machine: the live claim of the slot is recorded with the request
 	//    (call: DeleteNodes, nodes: the names) and deleted. A booting or ready claim keeps its
 	//    finalizer until the machine is observed off; a slot with no live claim has nothing to cancel,
 	//    and the input law powers its machine off on the slot's next pass.
-	// 4. The slot's shutdown transition runs: cordon, shutdown Job, power off.
-	// 5. The shutdown Job curls the VM control server's /stop endpoint, and the VM control server stops
+	// 5. The slot's shutdown transition runs: cordon, shutdown Job, power off.
+	// 6. The shutdown Job curls the VM control server's /stop endpoint, and the VM control server stops
 	//    the k3d node.
-	// 6. The machine is observed off: the slot's report is off, the marked claim ends completed and is
+	// 7. The machine is observed off: the slot's report is off, the marked claim ends completed and is
 	//    released, and the slot's digest keeps the episode.
 	//
 	// Key validations:
@@ -465,9 +457,19 @@ spec:
 	// - VM control server received /stop for this machine, and the k3d node actually stopped
 	// - the claim stops being live, and the slot's digest of the episode records an ended claim
 	// - Kubernetes node became NotReady
+	// - the pool's other machine, which no claim ever named, is powered off by the input law alone
 	// =============================================================================
 	Context("Scale-Down Workflow", func() {
 		It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
+			// The machine is in service: the setup's claim booted it, the readiness gate stamped the claim
+			// ready, and the pool's scale-down window is wide enough that cluster-autoscaler has left it
+			// alone. What this spec exercises is the autoscaler deciding that an idle machine is not needed,
+			// so the pool's window is tightened first: an empty node, unneeded for 30s, under the utilization
+			// threshold. The decision is the autoscaler's, on the pool's numbers - the suite asks, it does
+			// not act.
+			By("Tightening the pool's scale-down window")
+			applyGroupCR(groupYAML("30s"))
+
 			// The minute the suite starts watching from. Every lifecycle Job asserted below is one this
 			// decision created: the setup's shutdown of the same slot left a completed shutdown Job
 			// behind, and a Job of a past episode is not the evidence that this scale-down ran.
@@ -685,6 +687,23 @@ spec:
 				return status == "False" || status == "Unknown" || status == ""
 			}, machineStateTimeout, checkInterval).Should(BeTrue(),
 				"Kubernetes node should be NotReady or Unknown")
+
+			By("Verifying the machine nobody ever claimed came down by the law alone")
+			// agent-1's slot has never had a claim: its machine booted with the cluster, so it is unwanted
+			// capacity, and no DeleteNodes named it, no call and no owner attached. The input law owns it -
+			// cordon, shutdown Job, power off - which is the same shutdown path this spec has just followed
+			// with a request, an owner and a reason on it. It is read at the end of the run, because the pass
+			// that powers a settled slot's machine down rides that slot's resync: the clock of a stable slot,
+			// not of a reconcile.
+			Eventually(func() bool {
+				return slotIsUnwanted(agentNode1)
+			}, machineDownTimeout, checkInterval).Should(BeTrue(),
+				"A slot no claim names reports off, or draining while its machine comes down")
+
+			Eventually(func() infrav2alpha1.NodePhase {
+				return slotPhase(agentNode1)
+			}, machineDownTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseOff),
+				"A machine the pool never wanted ends off: the pool reads as idle, and every slot is free")
 
 			// Store node name for Test 3 (Scale-Up Workflow)
 			shutdownNodeName = agentNode0
@@ -1061,6 +1080,10 @@ spec:
 				"An attempt is counted by the claim that bought the machine, and ends with it")
 
 			By("Verifying the slot's report is ready, and the machine is observed on")
+			// The report of the slot is recomputed by a pass over it, and a serving slot has no event left
+			// to ask for one: the suite asks, and the assertion is the value the formula derives.
+			requestSlotPass(shutdownNodeName)
+
 			Eventually(func() infrav2alpha1.NodePhase {
 				return slotPhase(shutdownNodeName)
 			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseReady),
@@ -1157,7 +1180,7 @@ spec:
 			// pod must not land on. The operator's budget for one attempt is longer than 5m, so the claim
 			// deadlines of this run are unchanged (claim.DeadlineAt takes the larger of the two).
 			By("Updating Group CR to prevent immediate scale-down during pod startup")
-			groupYAML := `
+			relaxedGroup := `
 apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
@@ -1172,7 +1195,7 @@ spec:
   scaleDownUtilizationThreshold: "0.05"
   zeroOrMaxNodeScaling: false
 `
-			applyGroupCR(groupYAML)
+			applyGroupCR(relaxedGroup)
 
 			By("Verifying the scale-up of the claim is still standing")
 			Consistently(func() infrav2alpha1.NodePhase {
@@ -1370,6 +1393,17 @@ func newHarnessClaim(slot *infrav2alpha1.Node, requestedBy string) *infrav2alpha
 	}
 }
 
+// stopMachine is the harness powering off one of its own machines. The pool's machines are k3d
+// containers and the suite is the thing that starts and stops them, so an out-of-band power-off is the
+// harness's own doing: it is the common shape in a homelab (the machine is off, the pool is idle, and
+// nothing in the cluster put it there), and it is the shape a claim boots a machine out of.
+func stopMachine(slotName string) {
+	GinkgoHelper()
+
+	out, err := utils.Run(exec.Command("k3d", "node", "stop", slotName))
+	Expect(err).NotTo(HaveOccurred(), "the harness must be able to stop its own machine %s: %s", slotName, out)
+}
+
 // releaseSlot is the harness stopping wanting one of its machines: it deletes the live claim of the
 // slot. A pending claim goes outright, and the input law powers the machine down; a booting or ready
 // claim is deleted through its finalizer, so the shutdown path runs to the end and the object is
@@ -1399,6 +1433,28 @@ func releaseSlot(slotName string) {
 	if err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "releaseSlot(%s): deleting claim %s: %s\n", slotName, live.Name, out)
 	}
+}
+
+// groupYAML is the Group CR of the pool with a given scale-down window. The suite changes only that
+// window between its specs - a machine the harness boots has to survive the autoscaler while the setup
+// watches it, and the scale-down spec tightens the window to make the autoscaler decide - and the rest
+// of the pool's numbers are the same: the utilization threshold that makes an idle homelab machine
+// underutilized, the provision floor of a claim's deadline, and no zero-or-max scaling.
+func groupYAML(scaleDownUnneededTime string) string {
+	return fmt.Sprintf(`apiVersion: infra.homecluster.dev/v2alpha1
+kind: Group
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  ignoreDaemonSetsUtilization: true
+  maxNodeProvisionTime: 2m
+  scaleDownGpuUtilizationThreshold: "30"
+  scaleDownUnneededTime: %s
+  scaleDownUnreadyTime: 30s
+  scaleDownUtilizationThreshold: "0.1"
+  zeroOrMaxNodeScaling: false
+`, groupName, namespace, scaleDownUnneededTime)
 }
 
 // applyGroupCR writes a Group CR and applies it. The suite changes the pool's numbers mid-run - the
@@ -1586,6 +1642,23 @@ func stampClaimDeadline(name string, at time.Time) error {
 		"--type", "merge", "-p", stamp))
 
 	return err
+}
+
+// requestSlotPass asks the operator for a fresh pass over a slot. The slot's report is a computation,
+// written by the observation path and by the transition path, and a slot that has settled - serving,
+// with its claim stamped ready - has neither a transition running nor a change to its inputs left to
+// trigger one. The write is an annotation: metadata on the slot, no field of a spec (the model stores no
+// intent there), and nothing in the operator reads it. What the suite asserts is the value the formula
+// derives from the inputs, which the pass recomputes; the annotation is the clock, not the answer.
+func requestSlotPass(slotName string) {
+	GinkgoHelper()
+
+	stamp := fmt.Sprintf(`{"metadata":{"annotations":{"e2e.homecluster.dev/pass-requested-at":%q}}}`,
+		time.Now().UTC().Format(time.RFC3339))
+
+	_, err := utils.Run(kubectl("patch", "nodes.infra.homecluster.dev", slotName, "-n", namespace,
+		"--type", "merge", "-p", stamp))
+	Expect(err).NotTo(HaveOccurred(), "the suite can ask for a pass over slot %s", slotName)
 }
 
 // nodeSchedulable reports whether the Kubernetes node of a slot is still schedulable: a cordon is
