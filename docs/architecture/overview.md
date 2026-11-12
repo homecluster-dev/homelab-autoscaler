@@ -25,9 +25,11 @@ machine, and `Node.status` is what the cluster observes about it.
 
 **Group CRD** (`infra.homecluster.dev/v2alpha1`) - autoscaling policy for a pool:
 - scaling thresholds and timing (`minSize`, `maxNodeProvisionTime`, scale-down windows)
-- node selection
+- **no node selection, and no `maxSize`**: a pool is the set of `Node` CRs labelled
+  `group: <name>`, and the labels a machine carries are declared on the slot
+  (`spec.nodeLabels`). The pool's ceiling is its slot count
 - the readiness taints a machine must be free of before it counts as capacity
-- health status
+- the pool's report: `slots`, `on`, `off`, `health`, and the last scale
 
 **Node CRD** (`infra.homecluster.dev/v2alpha1`) - a slot: the configuration of one machine, and
 nothing about what anyone wants it to do next:
@@ -47,8 +49,14 @@ nothing about what anyone wants it to do next:
 ### Controllers
 
 **Group Controller** (`internal/controller/infra/group_controller.go`)
-- Manages Group CRDs and autoscaling policies
-- Updates group health status
+- Reads the policy object, publishes it to the provider, and keeps the `Loaded` condition
+- Counts the pool in one pass over its slots and writes the report `kubectl get groups` prints:
+  `slots`, `on`, `off`, and `health` derived from the slots' reports (`offline` when no slot has
+  ever reported, `healthy` once one has)
+- Materializes the last scale (`lastScaleAt` / `lastScaleAction`) off each slot's `status.lastClaim`
+  digest, so the pool's history outlives the Events and the claim's TTL
+- Decides nothing: no reconciler reads these counts, and the provider's arithmetic counts live
+  claims and slots directly
 
 **Slot reconciler** (`internal/controller/infra/node_controller.go`, `lifecycle.go`, `claims.go`)
 - Reads the live claim of the slot, the observed power and the node's usability, and fires the one
@@ -206,7 +214,11 @@ and monitoring node events. The claim controller's field index is `spec.slotRef.
 - Enabled on port 50051 by default, configurable via command-line flags
 
 ### Health Checks
-- Default: every 10 seconds, configurable via the CronJob schedule
+- The manager's own liveness and readiness probes, on `:8081` (`/healthz`, `/readyz`), defined in
+  the chart (`controllerManager.container.livenessProbe` / `.readinessProbe`). There is no scheduled
+  health job: nothing runs on a CronJob
+- A pool's health is a field on the objects, not a probe result: `kubectl get groups` answers it from
+  the slots' reports, and a slot's health is on the slot
 
 ## Security
 

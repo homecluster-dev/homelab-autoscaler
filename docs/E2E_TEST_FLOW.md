@@ -76,15 +76,18 @@ slot nobody claims is a machine the pool does not want. `claimSlot` and `release
 
 ## Test Execution Flow
 
-### Phase 1: Cleanup (Lines 114-115 in Makefile)
+### Phase 1: Cleanup (the head of the `test-e2e` target)
 ```bash
 lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
-lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+lsof -i :9052 | awk '{print $2}' | tail -n 1 | xargs kill -9 || echo "ok"
+lsof -ti :50052 | xargs kill -9 2>/dev/null || true
 ```
-- Kills any lingering processes from previous test runs on ports 8080/8081
-- Ensures clean state before starting
+- Frees the ports the run owns: **8081** the manager's health probes bind, **9052** the VM control
+  server, **50052** the local gRPC server
+- Ensures clean state before starting; `make run-e2e` only frees 50052, because it is the target you
+  re-run against a cluster you already have
 
-### Phase 2: Environment Setup (Line 118)
+### Phase 2: Environment Setup (`./development/install-dev.sh`)
 ```bash
 ./development/install-dev.sh
 ```
@@ -96,25 +99,28 @@ This script performs:
 5. **Helm Installation**: Installs cluster autoscaler with development values
 6. **Service Forwarder**: Applies local service forwarder for gRPC communication
 
-### Phase 3: Start VM Control Server (Lines 120-121)
+### Phase 3: Start VM Control Server
 ```bash
-cd examples/k3d && python3 vm_control_server.py &
+cd examples/k3d && nohup python3 vm_control_server.py > /tmp/vm-control.log 2>&1 &
 ```
-- Starts HTTP server on port 9052
+- Starts the HTTP server on port **9052**
 - Listens for start/stop commands for k3d nodes
-- Stores PID in `/tmp/vm-control.pid` for cleanup
+- Stores the PID in `/tmp/vm-control.pid` for cleanup
 
-### Phase 4: Start Local Controller (Lines 123-127)
+### Phase 4: Start Local Controller
 ```bash
-KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-address :50052 &
+KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false nohup go run cmd/main.go --grpc-server-address :50052 > /tmp/homelab-autoscaler.log 2>&1 &
 ```
-- Launches homelab-autoscaler controller locally
-- Binds gRPC server to port 50052
-- Uses local kubeconfig to communicate with k3d cluster
-- Stores PID in `/tmp/local-server.pid` for cleanup
-- Webhooks disabled for local testing
+- Launches the homelab-autoscaler controller locally
+- Binds the gRPC server to port **50052**: the local service forwarder maps the in-cluster
+  `homelab-autoscaler-grpc-local:50051` to it, which is the endpoint cluster-autoscaler dials
+- Uses the local kubeconfig to talk to the k3d cluster
+- Stores the PID in `/tmp/local-server.pid` for cleanup
+- Webhooks disabled for local testing: a manager outside the cluster cannot serve the chart's
+  `ValidatingWebhookConfiguration`, so the admission rules are not enforced in this environment and
+  the `internal/webhook/infra/v2alpha1` suite covers them
 
-### Phase 5: Run E2E Tests (Line 130)
+### Phase 5: Run E2E Tests
 ```bash
 KUBECONFIG=./kubeconfig go test -timeout 25m -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 ```
@@ -363,7 +369,7 @@ container. `-ginkgo.dry-run` is the local check for that class of mistake.
 
 ---
 
-### Phase 6: Cleanup (Lines 132-155)
+### Phase 6: Cleanup (the `cleanup-e2e` target, run by `test-e2e` at the end)
 
 **Stop Local Controller:**
 ```bash
@@ -397,9 +403,9 @@ manifest applied in `default`.
 **Final Port Cleanup:**
 ```bash
 lsof -i :8081 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
-lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
+lsof -i :9052 | awk '{print $2}' | tail -n 1 | xargs kill -9 || echo "ok"
 ```
-- Ensures no lingering processes
+- Frees the probe port and the VM control server's port
 
 ## Key Integration Points
 
@@ -556,7 +562,8 @@ const (
 | Test 1: Setup | 3-5m | The unclaimed machines come down, then the harness's claim boots one and follows it to `ready` |
 | Test 2: Scale-Down | 3-6m | The autoscaler's decision window, the drain, the shutdown Job, the machine observed off |
 | Test 3: Scale-Up | 15-20m | The boot to `ready`, then the observation that outlives the claim's 12m10s budget |
-| **Total** | **~25 minutes** | The long spec is the deadline observation, which cannot be shortened: the budget is a sum of the operator's constants |
+| Test 4: Slot Labels | 2-4m | No boot and no machine clock: the spec's own gates are 60 s per reconcile and 2 min for the bind |
+| **Total** | **~25 minutes** | The long spec is the deadline observation, which cannot be shortened: the budget is a sum of the operator's constants. The CI run of the suite measured 604 s |
 
 ## Test Tags
 
@@ -581,7 +588,8 @@ const (
 - `examples/k3d/delete-cluster.sh`: Cluster deletion script
 
 ### Test Implementation
-- `test/e2e/k3d_integration_test.go`: Main test file with 3 sequential tests
+- `test/e2e/k3d_integration_test.go`: the suite - one `Describe("K3d Integration", Ordered)` with the
+  four `Context`s listed in [Test Structure](#test-structure)
 - `test/utils/utils.go`: Helper functions for node management, VM control, job verification
 
 ### Test Fixtures

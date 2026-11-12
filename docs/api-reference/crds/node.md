@@ -54,8 +54,8 @@ overwrite a declaration. A machine is wanted exactly when a live
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `hourlyRate` | `float64` | Yes | Cost per hour when running |
-| `podRate` | `float64` | Yes | Cost per pod scheduled on the node |
+| `hourlyRate` | `string` | Yes | Cost per hour when running, as a decimal string (`"0.05"`). The CRD has no number type for it: `0.05` unquoted is refused at apply |
+| `podRate` | `string` | Yes | Cost per pod scheduled on the node, as a decimal string (`"0.001"`) |
 
 ### NodeStatus
 
@@ -334,12 +334,24 @@ apiVersion: infra.homecluster.dev/v2alpha1
 kind: Node
 metadata:
   name: storage-01
+  namespace: homelab-autoscaler-system
   labels:
     group: storage-nodes
 spec:
   kubernetesNodeName: storage-01
+  pricing:
+    hourlyRate: "0.05"
+    podRate: "0.001"
   nodeLabels:
     topology.kubernetes.io/zone: fsn1
+  startupPodSpec:
+    image: gemtest/ipmitool:latest
+    command: ["ipmitool"]
+    args: ["-I", "lanplus", "-H", "storage-01-ipmi", "power", "on"]
+  shutdownPodSpec:
+    image: gemtest/ipmitool:latest
+    command: ["ipmitool"]
+    args: ["-I", "lanplus", "-H", "storage-01-ipmi", "power", "soft"]
 ---
 # the pod: it asks for that zone, and only a pool whose template carries it is a candidate
 apiVersion: v1
@@ -560,8 +572,8 @@ spec:
       secretName: ssh-keys
     serviceAccount: power-manager
   pricing:
-    hourlyRate: 0.05
-    podRate: 0.001
+    hourlyRate: "0.05"      # strings: 0.05 unquoted is refused at apply
+    podRate: "0.001"
   nodeCapacity:
     cpu: 1950m
     memory: 3.2Gi
@@ -576,7 +588,7 @@ spec:
     effect: NoSchedule
 status:
   health: healthy
-  powerState: on          # observed
+  powerState: "on"          # observed; quoted, because bare `on` is a YAML boolean
   phase: ready            # derived from (live claim, observed power, node usability)
   lastClaim:              # the digest of the request that owns this machine
     name: worker-01-7f4b9c
@@ -714,6 +726,10 @@ spec:
   request:
     call: IncreaseSize      # the closest label for a hand-made request
     group: worker-nodes
+  # Stamp the budget: the provider computes these two when it creates a claim, and nothing
+  # fills them in for a hand-made one. A claim with no spec.deadlineAt never expires.
+  requestedAt: "2026-03-04T09:38:15Z"
+  deadlineAt: "2026-03-04T09:50:25Z"   # requestedAt + the 12m10s of one attempt
 ```
 
 ```bash

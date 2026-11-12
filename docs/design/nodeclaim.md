@@ -84,7 +84,7 @@ race with Git, and no scalar that has to mean three things.
 | --- | --- | --- | --- | --- |
 | `Node` (slot) | Git | the operator's observation reconcilers | as long as the machine is committed to the pool | what a slot **is**: lifecycle pod specs, `kubernetesNodeName`, taints, capacity, pricing. Config only — in v2 its spec has no runtime intent in it |
 | `NodeClaim` | the autoscaler (the gRPC handlers create it) | the claim controller | one scale-up attempt: minutes, then collected by TTL | one request for one machine: what was asked, by which call, with what deadline, and how it ended |
-| `Node.status` | — | the operator's observation reconcilers | with the slot | `powerState`, `progress` (derived and reported, never read to decide), and a digest of the last claim (`lastClaim`) |
+| `Node.status` | — | the operator's observation reconcilers | with the slot | `powerState` (observed), `phase` (derived and reported, never read to decide: the field that replaces `progress`, §11), and a digest of the last claim (`lastClaim`) |
 
 One live claim per slot, and that is the whole model:
 
@@ -442,13 +442,14 @@ deadline, becomes `failed`, stops being counted, force-shuts the machine, and th
 
 ## 6. What `status.progress` Becomes
 
-`status.progress` stays on `Node`, and its meaning changes: it is a **derived, reported phase**,
-written by the observation reconciler, and **never read to decide anything**.
+The field is **removed** (§11 records the settlement), and the derived, reported phase it stood in for
+is `Node.status.phase`: written by the observation path and the transition path from the same
+formula, and **never read to decide anything**. The table is the vocabulary the removal landed on.
 
-| Reported phase | Derived from | Today's value |
+| Reported phase | Derived from | The `progress` value it replaces |
 | --- | --- | --- |
 | `off` | no live claim, no observed machine | `shutdown` |
-| `boot pending` | a live claim in `pending`, no lifecycle Job yet | *(new — today the shape is `{desired: on, progress: shutdown}` and is indistinguishable from a free slot)* |
+| `pending` | a live claim in `pending`, no lifecycle Job yet | *(new — under the old field the shape was `{desired: on, progress: shutdown}` and was indistinguishable from a free slot)* |
 | `booting` | a live claim in `booting` | `startingup` |
 | `ready` | a live claim in `ready`, node observed Ready and gate-clear | `ready` |
 | `draining` | a claim marked for scale-down, node cordoned, machine still observed up | `shuttingdown` |
@@ -520,7 +521,7 @@ Removing the lock is listed in §10 as the first follow-up once claims are prove
 
 **The readiness gate stays, and becomes the gate for `phase: ready`.** Nothing about
 `Group.spec.nodeReadinessTaints` (defaulted to Cilium's
-`node.cilium.io/agent-not-ready:NoExecute`, `api/infra/v1alpha1/group_types.go`) changes:
+`node.cilium.io/agent-not-ready:NoExecute`, `api/infra/v2alpha1/group_types.go`) changes:
 `fsm.setNodeSchedulableWithRetry` waits for the node to be Ready **and** free of every declared
 taint, with the two budgets separate — 90s for the node object to register
 (`fsm.DefaultUncordonTimeout`), 4m for the gate from the moment the object appears
@@ -577,8 +578,8 @@ which is how the churn came back.
 
 Direct cut. No deprecation, no compatibility shim, no conversion webhook.
 
-- **Chart `0.2.0`** (`dist/chart/Chart.yaml`, today `0.1.22`). A minor bump is the release the
-  breaking API lands in.
+- **Chart `0.2.0`** (`dist/chart/Chart.yaml`; it was `0.1.22` when this design was written, and `0.2.3`
+  is the chart that carries it today). A minor bump is the release the breaking API lands in.
 - **Served and storage version: `infra.homecluster.dev/v2alpha1`.** `v1alpha1` is removed from the
   served set and as a storage version in the same release, for `nodes`, `groups`, and the new
   `nodeclaims`.
@@ -595,6 +596,8 @@ first. Nothing in the order is optional: each step's risk is the previous step's
 0. **Quiesce.** Scale cluster-autoscaler to 0, and record what is in flight:
 
    ```bash
+   # Against the running v1alpha1 objects: `spec.powerState` and `status.progress` are the 0.1.22
+   # fields. After step 1 they are gone from the schema, and the same read answers <none>.
    kubectl get nodes.infra.homecluster.dev -o custom-columns=\
    SLOT:.metadata.name,CLAIM:.spec.powerState,OBSERVED:.status.powerState,PROGRESS:.status.progress
    ```
@@ -685,10 +688,12 @@ be persisted at all, and the answer is the same precedent the design cites: keep
 reads in a crisis. §6 makes it derived and read by nobody, and a
 value that is computed from `(live claim, observation)` can be computed on read instead of written
 on every observation — no status write, no stale report, no watchdog grace to protect it. It
-cannot be a computed field, so the choices are: keep persisting it (cheap for the writer, and
-`kubectl get nodes.infra.homecluster.dev` keeps its `Progress` column), or drop the field and
+cannot be a computed field, so the choices were: keep persisting it (cheap for the writer, and
+`kubectl get nodes.infra.homecluster.dev` keeps a column for it), or drop the field and
 report the phase in the claim only (`kubectl get nodeclaim` becomes the one command). The
-precedent in this repo is the `NodeReadinessTaints` condition: a record of what a slot is gated
+implementation took the middle road §11 records: the field is dropped, and the derived report is
+persisted as `status.phase`, so `kubectl get nodes.infra.homecluster.dev` keeps its `Phase` column.
+The precedent in this repo is the `NodeReadinessTaints` condition: a record of what a slot is gated
 on, kept because an operator reads it in a crisis.
 
 **Removing the coordination lock.** The first follow-up (§7). The work is the two guarantees a
@@ -856,11 +861,10 @@ open. Everything else in this document is the model as it runs.
 ## Related Documentation
 
 - [Architecture Overview](../architecture/overview.md) — the components this design changes
-- [State Management](../architecture/state.md) — the FSM, the authority order for
-  `status.progress`, and the rules §6 collapses
+- [State Management](../architecture/state.md) — the FSM, the authority order for the
+  report `status.phase` is, and the rules §6 collapses
 - [Node CRD](../api-reference/crds/node.md) — the v1alpha1 fields this design removes and keeps
 - [Group CRD](../api-reference/crds/group.md) — `maxNodeProvisionTime`, `minSize`,
   `nodeReadinessTaints`
 - [Known Issues](../troubleshooting/known-issues.md) — the symptoms the 0.1.19–0.1.22 fixes were
-  patches on
-- [Implementation Status](../development/IMPLEMENTATION-STATUS.md) — what is built today
+  patches on, and what the model bounds instead

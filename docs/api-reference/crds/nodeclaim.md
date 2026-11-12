@@ -184,9 +184,14 @@ status:
   - type: MachineCommitted
     status: "True"
     reason: booting
+    message: "startup Job worker-01-startup-1772185095 exists: the boot is committed"
+    lastTransitionTime: "2026-03-04T09:39:02Z"
 ```
 
-A manual scale-up, with the identity of whoever asked:
+A manual scale-up, with the identity of whoever asked, and the budget stamped by hand: the provider
+computes `spec.requestedAt` and `spec.deadlineAt` when it creates a claim, and nothing fills them in
+for one you write. A claim with no `spec.deadlineAt` never expires, so an attempt that never starts
+holds its slot open with nothing left to time it out.
 
 ```yaml
 apiVersion: infra.homecluster.dev/v2alpha1
@@ -204,6 +209,8 @@ spec:
   request:
     call: IncreaseSize
     group: worker-nodes
+  requestedAt: "2026-03-04T09:38:15Z"   # now, RFC3339
+  deadlineAt: "2026-03-04T09:50:25Z"    # requestedAt + 12m10s, the budget of one attempt
 ```
 
 ## Usage
