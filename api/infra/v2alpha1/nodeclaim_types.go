@@ -110,13 +110,13 @@ const (
 	// True for an attempt that ended from booting or ready, because a machine was committed and is
 	// the thing the input law powers off; False for an attempt that ended from pending, because
 	// nothing was ever bought. It is a record for an operator, never an instruction to a
-	// reconciler (claim.Recorder.stampTerminalConditions, docs/architecture/state.md).
+	// reconciler (claim.Recorder.stampTerminalConditions, docs/development/state.md).
 	ClaimConditionMachineCommitted = "MachineCommitted"
 	// ClaimConditionMachineObservedOff is True while the machine of a claim that reached ready is
 	// observed off. Its lastTransitionTime is the instant the loss was first recorded, and it is what
 	// the MachineGone bound is measured from: the observation has to outlast a whole boot window
 	// before the model calls a machine gone, because a reboot shows the same shape and is not one
-	// (docs/design/nodeclaim.md §4). Cleared when the machine comes back.
+	// (docs/development/nodeclaim.md §4). Cleared when the machine comes back.
 	ClaimConditionMachineObservedOff = "MachineObservedOff"
 )
 
@@ -150,9 +150,14 @@ type NodeClaimSpec struct {
 	// +kubebuilder:validation:Required
 	Request ClaimRequest `json:"request"`
 
-	// DeadlineAt is the budget for this attempt: the operator's budget
-	// (job monitor poll + registration wait + readiness gate + margin), floored by the group's
-	// spec.maxNodeProvisionTime. Overdue means failed, and failed means force shutdown.
+	// DeadlineAt is the budget for this attempt, measured from spec.requestedAt, and it is the sum of
+	// every deadline one attempt can consume (claim.AttemptBudget): startup Job timeout 5m + job monitor
+	// poll 30s + registration wait 90s + readiness gate 4m + uncordon retry ceiling 10s + 1m margin =
+	// 12m10s. The startup Job's own timeout is in the sum because the clock starts at requestedAt,
+	// before the Job exists. The group's spec.maxNodeProvisionTime is a floor, never a ceiling below the
+	// operator's number. Overdue means failed, and failed means force shutdown. The move to ready clears
+	// the field - the second write of the move, behind the status one (claim.Recorder.clearBootDeadline)
+	// - so the deadline bounds the boot, not the machine's life.
 	// +optional
 	DeadlineAt *metav1.Time `json:"deadlineAt,omitempty"`
 
@@ -204,15 +209,19 @@ type NodeClaimStatus struct {
 	// No status default: the status subresource strips `status` from a create, so a default here is
 	// only stamped by the first status write and buys nothing in the window the model cares about. A
 	// claim with no phase is read as pending by phase.IsLive / phase.IsPending, which is the single
-	// place the reading lives (docs/design/nodeclaim.md §3).
+	// place the reading lives (docs/development/nodeclaim.md §3).
 	// +kubebuilder:validation:Enum=pending;booting;ready;failed;completed
 	// +optional
 	Phase NodeClaimPhase `json:"phase,omitempty"`
 
-	// Attempt is 1..N for this slot: the number of machines the slot has been asked to buy in a
-	// row. It is seeded from Node.status.lastClaim.attempt at creation, incremented by the
-	// pending -> booting write (the attempt is a machine bought, not a reconcile pass), and bounded
-	// per slot by the consecutive streak the digest records.
+	// Attempt is 1..N for this slot: the number of the machine this claim asks it to buy. The claim
+	// controller stamps it once, on its first pass over the claim, from Node.status.lastClaim.attempt
+	// (claim.SeedAttempt: the next number while the slot keeps failing, 1 again after an episode that
+	// ended ready or completed), and only while the field is still 0. Nothing writes it after that -
+	// not the pending -> booting edge, not a reconcile pass - so one claim is one attempt. The
+	// provider leaves it unset at creation for the same reason: the seeding reads the slot's digest,
+	// and a claim built from a stale cache must not bake in a number the controller cannot correct.
+	// claim.MaxConsecutiveAttempts bounds the consecutive streak the slot's digest records.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Attempt int32 `json:"attempt,omitempty"`
@@ -231,7 +240,7 @@ type NodeClaimStatus struct {
 	// The streak ends with the claim, and it resets: when the machine is observed off the claim ends
 	// completed, and when a reset grace passes with the machine still up the count goes back to 0 and
 	// the shutdown fires again, so a pool whose shutdown script has been fixed is picked up by the next
-	// pass (docs/design/nodeclaim.md §4, docs/architecture/state.md).
+	// pass (docs/development/nodeclaim.md §4, docs/development/state.md).
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	ShutdownAttempts int32 `json:"shutdownAttempts,omitempty"`
@@ -266,7 +275,7 @@ type NodeClaimStatus struct {
 
 // NodeClaim is one request for one machine: the scale-up intent of the autoscaler, with an
 // identity, an attribution, a deadline and an end. It is the object the v1alpha1 scalar
-// spec.powerState could not be. See docs/design/nodeclaim.md.
+// spec.powerState could not be. See docs/development/nodeclaim.md.
 type NodeClaim struct {
 	metav1.TypeMeta `json:",inline"`
 

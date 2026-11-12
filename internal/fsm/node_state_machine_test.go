@@ -49,10 +49,10 @@ import (
 
 // inputLawCases is the phase state table of the NodeClaim model, as a test: every row is
 // (live claim, observed power, node usability, Jobs in flight) in, and the derived report and the
-// derived state machine state out. It is the table the PR and docs/architecture/state.md carry, and
+// derived state machine state out. It is the table the PR and docs/development/state.md carry, and
 // the same rows are driven end to end in internal/controller/infra's input-law test.
 //
-// The four laws of docs/design/nodeclaim.md §6 are rows 1, 2, 3 and 4 (boot / ready / shut down /
+// The four laws of docs/development/nodeclaim.md §6 are rows 1, 2, 3 and 4 (boot / ready / shut down /
 // force shut down); the rest are the shapes between them.
 func TestFSMInputLaw(t *testing.T) {
 	scheme := runtime.NewScheme()

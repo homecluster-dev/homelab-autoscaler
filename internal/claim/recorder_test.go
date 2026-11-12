@@ -37,7 +37,7 @@ import (
 )
 
 // claimPhasesInOrder is the phase set of the claim, in the order the design's table lists it
-// (docs/design/nodeclaim.md §3): the three live phases, then the two terminal ones.
+// (docs/development/nodeclaim.md §3): the three live phases, then the two terminal ones.
 var claimPhasesInOrder = []infrav2alpha1.NodeClaimPhase{
 	infrav2alpha1.NodeClaimPending,
 	infrav2alpha1.NodeClaimBooting,
@@ -46,7 +46,7 @@ var claimPhasesInOrder = []infrav2alpha1.NodeClaimPhase{
 	infrav2alpha1.NodeClaimCompleted,
 }
 
-// theImplementedPhaseTable is claim.LegalMoves as docs/architecture/state.md states it ("Claim
+// theImplementedPhaseTable is claim.LegalMoves as docs/development/state.md states it ("Claim
 // phases, and who writes each move"): the design's §3 sketch, plus the two edges the implementation
 // settled in §11 - a pending claim may be stamped ready when the machine it asked for is up before
 // the boot stamp lands (a manual claim on a running slot), and a booting claim ends completed on
@@ -172,7 +172,7 @@ func TestCanMoveIsTheWholeMatrix(t *testing.T) {
 	})
 }
 
-// theDesignPhaseTable is the phase table of docs/design/nodeclaim.md §3 as written: the sketch the
+// theDesignPhaseTable is the phase table of docs/development/nodeclaim.md §3 as written: the sketch the
 // design states, with the "Legal next phases" column verbatim.
 var theDesignPhaseTable = map[infrav2alpha1.NodeClaimPhase][]infrav2alpha1.NodeClaimPhase{
 	infrav2alpha1.NodeClaimPending: {
@@ -227,7 +227,7 @@ func TestTheDesignPhaseTableIsTheLowBoundOfTheRunningOne(t *testing.T) {
 			from: infrav2alpha1.NodeClaimBooting,
 			to:   infrav2alpha1.NodeClaimCompleted,
 			why: "the finalizer path of a scale-down that named a booting claim ends it completed once the machine is observed off: " +
-				"a boot is reversed, never interrupted (docs/design/nodeclaim.md §11)",
+				"a boot is reversed, never interrupted (docs/development/nodeclaim.md §11)",
 		},
 	}
 

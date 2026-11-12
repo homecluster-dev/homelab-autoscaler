@@ -46,7 +46,7 @@ are the slot reconciler's: published on the claim that carries the count, with t
 | --- | --- | --- | --- |
 | `ClaimCreated` | Normal | the claim exists — the first write of a fresh claim, for every creator: the provider, a hand-applied claim, a replay | `requestedBy`, the call and its `delta` / `nodes`, the group, the attempt number, the deadline and the budget |
 | `ClaimBooting` | Normal | `pending → booting` | the startup Job of the attempt (or the label selector that finds it), and that the boot is committed and no longer cancelable |
-| `ClaimReady` | Normal | `booting → ready` | the Kubernetes node that passed the readiness gate, and the time from `spec.requestedAt`; the same write cleared `spec.deadlineAt` |
+| `ClaimReady` | Normal | `booting → ready` | the Kubernetes node that passed the readiness gate, and the time from `spec.requestedAt`; the move clears `spec.deadlineAt` on a **second** write behind the status one (`claim.Recorder.Move`, then `clearBootDeadline`) |
 | `ClaimFailed` | Warning | any move to `failed` | `status.reason` **and the number behind it**: the deadline that passed, the Job that died, the attempts spent, the next attempt's number |
 | `ClaimCancelled` | Normal | a live claim a caller cancelled reached its end (`CancelledByDecreaseTargetSize`, `NodeDeleted`, `DeletedByHand`) | which call asked, its delta / nodes, whether a machine had been bought, and how long the attempt lasted |
 | `ClaimCompleted` | Normal | a move to `completed` with no cancel behind it | that the machine is observed off, the duration, and the shutdown Job that powered it off when one is readable |

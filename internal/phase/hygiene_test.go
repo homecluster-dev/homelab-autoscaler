@@ -33,7 +33,7 @@ import (
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 )
 
-// The law this file asserts, in the words of docs/architecture/state.md: the observability the
+// The law this file asserts, in the words of docs/development/state.md: the observability the
 // cluster-view work adds - the ring of recent transitions, the activation counts, the transition's
 // own timestamp and the phase it came from - is a **derived, materialized report**, and the state
 // machine must never read it.

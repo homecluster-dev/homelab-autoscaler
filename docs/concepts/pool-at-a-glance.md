@@ -121,8 +121,8 @@ kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node
 
 ## Durations
 
-There is no duration column, and none will be added: a printer column selects a value from the object,
-it does not subtract one, and the API server prints what the object holds. What the object holds is the
+There is no duration column: a printer column selects a value from the object, it does not subtract
+one, and the API server prints what the object holds. What the object holds is the
 instant (`SINCE`); the duration is arithmetic you do at read time, and `status.phase` tells you which
 side of the power you are measuring. The command, its exact output and the fixture it is checked
 against are in the runbook:

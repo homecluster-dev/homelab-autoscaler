@@ -46,7 +46,7 @@ func claim(phase infrav2alpha1.NodeClaimPhase, marked bool) *infrav2alpha1.NodeC
 	return nodeClaim
 }
 
-// TestDeriveIsThePhaseStateTable is the table of docs/architecture/state.md, asserted on the one
+// TestDeriveIsThePhaseStateTable is the table of docs/development/state.md, asserted on the one
 // function that computes the report. Every row is (live claim, observed power, node usability) in,
 // a reported phase out; no row reads a record.
 func TestDeriveIsThePhaseStateTable(t *testing.T) {

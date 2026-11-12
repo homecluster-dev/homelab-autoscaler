@@ -109,7 +109,7 @@ func (s *HomeClusterProviderServer) groupClaims(ctx context.Context, groupName s
 
 // targetSizeOf is the count of live claims: the target size of a group, and the number
 // cluster-autoscaler sizes the group from. No progress value, and no spec field of a slot, appears
-// in the arithmetic (docs/design/nodeclaim.md §5).
+// in the arithmetic (docs/development/nodeclaim.md §5).
 //
 // The v1alpha1 rule this replaces counted a slot when spec.desiredPowerState was on **or** its
 // status.progress was not one of shuttingdown / shutdown / startingup, and the "on" half of it
@@ -690,7 +690,7 @@ func claimsOfSlot(claims []infrav2alpha1.NodeClaim, slotName string) []infrav2al
 // spec.requestedBy: the autoscaler) and deleting them, and reports the size the request actually
 // produced.
 //
-// pending is the only cancelable phase (docs/design/nodeclaim.md §3): nothing is in flight, the object
+// pending is the only cancelable phase (docs/development/nodeclaim.md §3): nothing is in flight, the object
 // goes, and its unit comes off the target size on that write. A booting claim is committed and is
 // never a cancel target - the startup Job, the coordination lock, the cordon, the node object and the
 // machine are all in flight, and a cancel leaves the Job in a state nothing owns, which is the residue
@@ -846,7 +846,7 @@ func countPhase(claims []infrav2alpha1.NodeClaim, to infrav2alpha1.NodeClaimPhas
 // creating, and a slot no claim names and with no machine behind it is not reported at all.
 //
 // The word "wanted" is what moved: v1alpha1 read it off spec.desiredPowerState, v2alpha1 reads it off
-// the live claim of the slot (docs/design/nodeclaim.md §5). The states keep their names, and the
+// the live claim of the slot (docs/development/nodeclaim.md §5). The states keep their names, and the
 // boundary the autoscaler depends on - every corev1.Node maps to exactly one instance, and an instance
 // exists exactly when a machine exists or is on its way - is the same boundary.
 func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.NodeGroupNodesRequest) (*pb.NodeGroupNodesResponse, error) {

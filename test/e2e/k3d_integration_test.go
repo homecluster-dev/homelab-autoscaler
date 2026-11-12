@@ -203,7 +203,7 @@ var _ = BeforeSuite(func() {
 // 2. Scale-Down Workflow - Verify nodes can be powered off when not needed
 // 3. Scale-Up Workflow - Verify nodes can be powered on when needed
 //
-// The model the suite drives is the claim model of docs/design/nodeclaim.md: a slot (Node CR) is
+// The model the suite drives is the claim model of docs/development/nodeclaim.md: a slot (Node CR) is
 // configuration only, a NodeClaim is one request for one machine, and Node.status is the report of
 // what the cluster observes. Desired power is derived, never stored, so nothing here reads or writes
 // a spec field of a slot: a scale-up is a claim the provider creates, a scale-down is the end of one,

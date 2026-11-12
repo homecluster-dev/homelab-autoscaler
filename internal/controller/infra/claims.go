@@ -87,7 +87,7 @@ func (w *transitionClaimWriter) RecordShutdownAttempt(ctx context.Context, nodeC
 
 // StampDigest copies a claim's summary onto the slot's status.lastClaim, so that
 // `kubectl describe node.infra.homecluster.dev <slot>` answers "who asked, when, how many attempts,
-// why did it end" after the claim has been collected (docs/design/nodeclaim.md §8).
+// why did it end" after the claim has been collected (docs/development/nodeclaim.md §8).
 //
 // It writes only when the record differs, so a resync of a slot whose last claim has not moved
 // writes nothing. It never stamps a summary of a claim that is not the newest of its slot: the digest
@@ -170,7 +170,7 @@ func newestClaimOfSlot(ctx context.Context, c client.Client, namespace, slotName
 // The count is status.shutdownAttempts, a counter of its own, and never status.attempt: status.attempt
 // is the number of machines this slot has been asked to buy, it is the seed of the next claim's
 // attempt, and a shutdown that will not land must not spend the boot budget of the episode that is
-// draining (docs/design/nodeclaim.md §4).
+// draining (docs/development/nodeclaim.md §4).
 //
 // It returns whether the count moved, and whether the move was a reset: a streak that is spent with
 // its grace past starts from 1 again, so a pool whose shutdown script has been fixed is picked up by

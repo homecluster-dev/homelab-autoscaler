@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package phase is the single place the state of a slot is computed.
 //
-// The law the whole NodeClaim model rests on (docs/design/nodeclaim.md §2, §6):
+// The law the whole NodeClaim model rests on (docs/development/nodeclaim.md §2, §6):
 //
 //	machine is wanted  ⇔  a live NodeClaim exists for the slot
 //
@@ -141,7 +141,7 @@ func IsPending(phase infrav2alpha1.NodeClaimPhase) bool {
 // InBootWindow reports whether a claim is in the phase range `spec.deadlineAt` bounds: the machine
 // is being bought, and has not been bought. A claim that reached `ready` owns a machine, and the
 // boot budget says nothing about it, so the deadline, and the attempt bound that rides on it, stop
-// applying there (docs/design/nodeclaim.md §4).
+// applying there (docs/development/nodeclaim.md §4).
 func InBootWindow(phase infrav2alpha1.NodeClaimPhase) bool {
 	return IsPending(phase) || phase == infrav2alpha1.NodeClaimBooting
 }
@@ -161,7 +161,7 @@ func (in Input) MarkedForScaleDown() bool {
 }
 
 // Derive computes the value of Node.status.phase from the input. It is a report, and the phase
-// state table in the PR / docs/architecture/state.md is its specification:
+// state table in the PR / docs/development/state.md is its specification:
 //
 //	live claim          observed   usable   phase      meaning
 //	none                off        -        off        a free slot

@@ -373,10 +373,13 @@ kubectl patch nodeclaim <claim> -n homelab-autoscaler-system --subresource=statu
 
 Attempts are a property of the request, not of the slot:
 
-- `status.attempt` is `1..N` for a slot, seeded from `Node.status.lastClaim.attempt + 1` when a
-  claim is created.
-- It is incremented by the `pending → booting` write, the same write that creates the startup Job
-  (§3), so it counts machines bought, not reconcile passes.
+- `status.attempt` is `1..N` for a slot, stamped once on the claim's first pass by
+  `claim.Recorder.Seed` — and only while the field is still 0 — from `Node.status.lastClaim.attempt + 1`
+  (`claim.SeedAttempt`, which returns 1 when the last episode ended `ready` or `completed`). The
+  provider leaves it unset at creation, so the number is the controller's, read off the live slot.
+- Nothing writes it again. The `pending → booting` write does not touch it and a reconcile pass does
+  not: one claim is one attempt, and the number the claim was born with is the number of the machine
+  it buys.
 - A bound on attempts is a bound on consecutive claims; there is no counter on the slot to
   accumulate, and no reset heuristic, because the object that carries the count dies with the
   episode. The bound is enforced on a claim in the boot window: a claim that has its machine

@@ -201,7 +201,7 @@ func OfSlotNamed(claims []infrav2alpha1.NodeClaim, slot *infrav2alpha1.Node) []i
 // long is left of the reset grace. The bound is the same claim.MaxConsecutiveAttempts the boot
 // attempts are bounded by, and it is read off the record of the last claim, which the claim
 // controller keeps in step with the attempts it spent: the v1alpha1 ShutdownAttempts condition on the
-// long-lived slot, and its two reset sites, are gone (docs/design/nodeclaim.md §4).
+// long-lived slot, and its two reset sites, are gone (docs/development/nodeclaim.md §4).
 //
 // This is the case with no claim left to carry the count: the machine was left up by an episode that
 // has already been collected. The digest is the record, so the streak and its clock are read from it,

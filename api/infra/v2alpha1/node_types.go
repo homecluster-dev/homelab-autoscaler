@@ -82,7 +82,7 @@ func (p PowerState) MarshalYAML() (interface{}, error) {
 // observation path and by the lifecycle transition path, both of which compute it from those three
 // inputs with the one function phase.Derive, and it is never read to decide an action: the state
 // machine's input is the live claim and the observation, not this record. See
-// docs/design/nodeclaim.md §6 and docs/architecture/state.md.
+// docs/development/nodeclaim.md §6 and docs/development/state.md.
 type NodePhase string
 
 const (
@@ -105,7 +105,7 @@ const (
 // In v1alpha1 this struct carried spec.powerState, a scalar that served as the scale-up request,
 // the lock, the target-size arithmetic and the history at once. It is gone in v2alpha1, and there is
 // no field in the spec for any of that: desired power is derived, never stored, and a slot is
-// wanted exactly when a live NodeClaim names it (docs/design/nodeclaim.md §2). Git is
+// wanted exactly when a live NodeClaim names it (docs/development/nodeclaim.md §2). Git is
 // the only writer of this spec, so an apply can never contradict a scale-up, and a scale-up can
 // never overwrite a declaration.
 type NodeSpec struct {
@@ -189,11 +189,14 @@ type NodeSpec struct {
 	// node that already matches is not patched) and one Normal event with reason
 	// `NodeLabelsApplied` is recorded on the Node CR when a write happens.
 	//
-	// cluster-autoscaler sees them twice over. The group's node template is built from one
-	// representative slot and carries that slot's declared labels, and a slot at zero whose pool
-	// has no node object at all gets a placeholder carrying them, so the estimator can place a
-	// zoned pod on a machine that does not exist yet. Existing machines are read from their
-	// corev1.Node, which is the object the controller stamps.
+	// cluster-autoscaler sees them twice over. What reaches the group's node template is the group's
+	// consensus, not one slot's declaration: a key counts only when every slot of the group declares
+	// it with the same value, and a key the slots disagree on is left out of the template and reported
+	// in the provider's log (nodelabels.Consensus, groupTemplateConsensus). A slot at zero whose pool
+	// has no node object at all gets a placeholder carrying that same consensus set, so the estimator
+	// can place a zoned pod on a machine that does not exist yet, and places it only where every slot
+	// of the pool will carry the label. Existing machines are read from their corev1.Node, which is
+	// the object the controller stamps.
 	//
 	// Keys a Kubernetes component, the autoscaler, a GitOps tool, or this operator owns are refused
 	// at admission, with the reason in the message: `infra.homecluster.dev/*` and
@@ -220,7 +223,7 @@ type NodeSpec struct {
 	// buys whichever slot of the group is free. So a declared key reaches the template only when every
 	// slot of the group declares it with the same value: a key they disagree on is left out, and
 	// reported in the provider's log, because a template carrying a label some slots will not have buys
-	// a machine the pod cannot use. Group slots you need to tell apart into different groups.
+	// a machine the pod cannot use. Put the slots you need to tell apart into different groups.
 	// +optional
 	// +kubebuilder:validation:MaxProperties=64
 	NodeLabels map[string]string `json:"nodeLabels,omitempty"`
@@ -500,7 +503,7 @@ type NodeTransition struct {
 }
 
 // LastClaimSummary is the digest of the last NodeClaim of a slot. Its field set is the design's
-// (docs/design/nodeclaim.md §8): the story of the episode that ended, without a second command.
+// (docs/development/nodeclaim.md §8): the story of the episode that ended, without a second command.
 type LastClaimSummary struct {
 	// Name is the name of the claim, so an operator can find it while it still exists.
 	// +optional
@@ -528,7 +531,7 @@ type LastClaimSummary struct {
 
 	// LastShutdownAttemptAt is when the last of those attempts was counted. The streak reset's grace is
 	// measured from it, so a slot whose pool script has been fixed is not sentenced by the attempts of
-	// the episodes that ended (docs/design/nodeclaim.md §4).
+	// the episodes that ended (docs/development/nodeclaim.md §4).
 	// +optional
 	LastShutdownAttemptAt *metav1.Time `json:"lastShutdownAttemptAt,omitempty"`
 

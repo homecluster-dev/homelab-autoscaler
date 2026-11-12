@@ -258,7 +258,7 @@ func (r *NodeReconciler) newestLifecycleJob(ctx context.Context, node *infrav2al
 }
 
 // handleStateTransitionsWithFSM fires the lifecycle transition the input law asks for. The law, in
-// the order it is applied (docs/design/nodeclaim.md §6):
+// the order it is applied (docs/development/nodeclaim.md §6):
 //
 //  1. a live claim with the machine off boots it;
 //  2. a live claim, the machine on, and the node usable is ready: nothing to fire;
@@ -272,7 +272,7 @@ func (r *NodeReconciler) newestLifecycleJob(ctx context.Context, node *infrav2al
 //
 // The transitions run on the state machine, which takes the coordination lock in its before_ hook,
 // so a scale-up and a scale-down of one slot cannot both take the slot apart (see
-// internal/fsm/coordination.go, and docs/design/nodeclaim.md §7 on why the lock stays one more
+// internal/fsm/coordination.go, and docs/development/nodeclaim.md §7 on why the lock stays one more
 // release as a belt over the claim).
 func (r *NodeReconciler) handleStateTransitionsWithFSM(
 	ctx context.Context,
@@ -447,7 +447,7 @@ func (r *NodeReconciler) requeueAtWindowExpiry(result ctrl.Result, node *infrav2
 // (claim.MaxConsecutiveAttempts) counted on the scale-down claim of the slot - status.shutdownAttempts,
 // a counter of its own, not the boot attempts of the episode - and stamped onto the slot's digest, so
 // it survives the claim's collection. It replaces the v1alpha1 ShutdownAttempts condition on the
-// long-lived slot, with its two reset sites (docs/design/nodeclaim.md §4).
+// long-lived slot, with its two reset sites (docs/development/nodeclaim.md §4).
 //
 // The streak is counted where a shutdown is fired: the state machine's ShutdownNode, on the path that
 // created the shutdown Job (fsm.recordShutdownAttempt -> BumpScaleDownAttempt). A pass that only
