@@ -36,6 +36,13 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # golangci-lint v1 shipped goconst with analyze-tests: false; v2 dropped that
+      # setting and now reads test files too, so every repeated literal in a table
+      # driven test became a finding. The literals in those tests are the fixture and
+      # naming them adds indirection, not clarity. goconst stays on for production code.
+      - linters:
+          - goconst
+        path: _test\.go
     paths:
       - third_party$
       - builtin$

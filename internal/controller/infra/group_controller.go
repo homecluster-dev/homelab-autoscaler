@@ -124,7 +124,7 @@ func (r *GroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"off", group.Status.Off,
 		"lastScale", group.Status.LastScaleAction)
 
-	return ctrl.Result{Requeue: false}, nil
+	return ctrl.Result{}, nil
 }
 
 // recordPoolShape materializes the shape of a pool from its slots, in one pass over the list the

@@ -101,12 +101,12 @@ func (m *MockClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 
 	// Use reflection to copy the stored object to the target object
 	objValue := reflect.ValueOf(obj)
-	if objValue.Kind() == reflect.Ptr {
+	if objValue.Kind() == reflect.Pointer {
 		objValue = objValue.Elem()
 	}
 
 	storedValue := reflect.ValueOf(storedCopy)
-	if storedValue.Kind() == reflect.Ptr {
+	if storedValue.Kind() == reflect.Pointer {
 		storedValue = storedValue.Elem()
 	}
 
@@ -126,7 +126,7 @@ func (m *MockClient) List(ctx context.Context, list client.ObjectList, opts ...c
 
 	// Get the item type from the list
 	listValue := reflect.ValueOf(list)
-	if listValue.Kind() == reflect.Ptr {
+	if listValue.Kind() == reflect.Pointer {
 		listValue = listValue.Elem()
 	}
 
@@ -141,7 +141,7 @@ func (m *MockClient) List(ctx context.Context, list client.ObjectList, opts ...c
 	// Filter objects by type and namespace
 	for key, obj := range m.objects {
 		objType := reflect.TypeOf(obj)
-		if objType.Kind() == reflect.Ptr {
+		if objType.Kind() == reflect.Pointer {
 			objType = objType.Elem()
 		}
 
@@ -178,7 +178,7 @@ func (m *MockClient) List(ctx context.Context, list client.ObjectList, opts ...c
 	itemsSlice := reflect.MakeSlice(itemsField.Type(), len(matchingObjects), len(matchingObjects))
 	for i, obj := range matchingObjects {
 		objValue := reflect.ValueOf(obj)
-		if objValue.Kind() == reflect.Ptr {
+		if objValue.Kind() == reflect.Pointer {
 			objValue = objValue.Elem()
 		}
 		itemsSlice.Index(i).Set(objValue)
@@ -318,14 +318,14 @@ func (m *MockClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ..
 	}
 
 	objType := reflect.TypeOf(obj)
-	if objType.Kind() == reflect.Ptr {
+	if objType.Kind() == reflect.Pointer {
 		objType = objType.Elem()
 	}
 
 	keysToDelete := make([]string, 0, len(m.objects))
 	for key, stored := range m.objects {
 		storedType := reflect.TypeOf(stored)
-		if storedType.Kind() == reflect.Ptr {
+		if storedType.Kind() == reflect.Pointer {
 			storedType = storedType.Elem()
 		}
 
@@ -399,7 +399,7 @@ func (m *MockClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
 	}
 
 	// Simple heuristic: core/v1 Nodes are cluster-scoped, everything else is namespaced
-	if gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == "Node" {
+	if gvk.Group == "" && gvk.Version == "v1" && gvk.Kind == kindNode {
 		return false, nil
 	}
 	return true, nil

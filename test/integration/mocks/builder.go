@@ -32,6 +32,14 @@ import (
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
 )
 
+// The TypeMeta strings the fixtures write. Named because goconst (golangci-lint v2.15)
+// reads helper files, not only _test.go, and because the client's scope heuristic in
+// client.go compares the Kind it resolves against the same word.
+const (
+	apiVersionInfraV2Alpha1 = "infra.homecluster.dev/v2alpha1"
+	kindNode                = "Node"
+)
+
 // MockClientBuilder provides a fluent interface for building mock clients with predefined data
 type MockClientBuilder struct {
 	client *MockClient
@@ -50,7 +58,7 @@ func NewMockClientBuilder(scheme *runtime.Scheme) *MockClientBuilder {
 func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockClientBuilder {
 	group := &infrav2alpha1.Group{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: "infra.homecluster.dev/v2alpha1",
+			APIVersion: apiVersionInfraV2Alpha1,
 			Kind:       "Group",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -86,8 +94,8 @@ func (b *MockClientBuilder) WithGroup(name string, opts ...GroupOption) *MockCli
 func (b *MockClientBuilder) WithNode(name string, opts ...NodeOption) *MockClientBuilder {
 	node := &infrav2alpha1.Node{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: "infra.homecluster.dev/v2alpha1",
-			Kind:       "Node",
+			APIVersion: apiVersionInfraV2Alpha1,
+			Kind:       kindNode,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -133,7 +141,7 @@ func (b *MockClientBuilder) WithKubernetesNode(name string, opts ...KubernetesNo
 	node := &corev1.Node{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
-			Kind:       "Node",
+			Kind:       kindNode,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -211,7 +219,7 @@ type ClaimOption func(*infrav2alpha1.NodeClaim)
 func (b *MockClientBuilder) WithNodeClaim(name, slotName string, opts ...ClaimOption) *MockClientBuilder {
 	nodeClaim := &infrav2alpha1.NodeClaim{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: "infra.homecluster.dev/v2alpha1",
+			APIVersion: apiVersionInfraV2Alpha1,
 			Kind:       "NodeClaim",
 		},
 		ObjectMeta: metav1.ObjectMeta{
