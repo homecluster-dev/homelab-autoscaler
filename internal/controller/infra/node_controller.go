@@ -36,6 +36,7 @@ import (
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/capacity"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
 
@@ -154,6 +155,13 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		// Don't fail reconciliation, just log and continue
 	}
 
+	// Stamp the labels and annotations the slot declares (spec.nodeLabels, spec.nodeAnnotations)
+	// onto the Kubernetes node, and take back the ones its declaration dropped
+	if err := r.applyNodeLabelsToKubernetesNode(ctx, node); err != nil {
+		logger.Error(err, "Failed to apply declared node labels", "node", node.Name)
+		// Don't fail reconciliation, just log and continue
+	}
+
 	// Compare the machine that registered with the shape the slot declares (spec.nodeCapacity),
 	// and warn when they disagree
 	if err := r.checkDeclaredNodeCapacity(ctx, node); err != nil {
@@ -268,6 +276,14 @@ func (r *NodeReconciler) handleNodeDeletion(ctx context.Context, node *infrav2al
 func (r *NodeReconciler) addLabelToKubernetesNodeWithPatch(ctx context.Context, nodeName, labelKey, labelValue string) error {
 	logger := log.FromContext(ctx)
 
+	// This helper writes the operator's own two labels on the node object
+	// (infra.homecluster.dev/group and infra.homecluster.dev/node), the keys of this namespace that
+	// belong to the operator and to nothing else. The labels a *slot* declares (spec.nodeLabels) go
+	// through nodelabels.ApplyToKubernetesNode, which merges, re-asserts drift, removes the keys a
+	// declaration dropped, and refuses the namespaces Kubernetes owns. Do not add slot-declared keys
+	// here: this writer stamps one key unconditionally and keeps no record, so it cannot tell a key
+	// it owns from a key it does not.
+
 	// Get the Kubernetes node
 	kubernetesNode := &corev1.Node{}
 	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, kubernetesNode); err != nil {
@@ -353,6 +369,31 @@ func (r *NodeReconciler) setProviderIDForKubernetesNode(ctx context.Context, nod
 // them.
 func (r *NodeReconciler) applyNodeTaintsToKubernetesNode(ctx context.Context, node *infrav2alpha1.Node) error {
 	return taints.ApplyToKubernetesNode(ctx, r.Client, node, r.EventRecorder)
+}
+
+// applyNodeLabelsToKubernetesNode stamps the labels and annotations a Node CR declares
+// (spec.nodeLabels, spec.nodeAnnotations) onto the corev1.Node of that slot. It is a thin wrapper
+// over nodelabels.ApplyToKubernetesNode, the single implementation of that write, which the FSM's
+// pre-uncordon hook calls too, so the two writers cannot drift apart.
+//
+// Semantics, in short (nodelabels.Reconcile and nodelabels.ApplyToKubernetesNode hold the rules):
+//   - a declared key lands on the node with the declared value;
+//   - drift is put back: a value changed by hand, a label a rebooted kubelet stopped stamping, a
+//     node object recreated by a re-registration, all of it is re-asserted on the next pass, which
+//     is the same promise spec.nodeTaints makes about taints;
+//   - a key the declaration drops is removed from the node, because the controller records the keys
+//     it wrote on the node object (infra.homecluster.dev/applied-node-labels,
+//     /applied-node-annotations) and owns exactly those;
+//   - a key the slot never declared is never touched, so a label the kubelet, a cloud integration
+//     or another tool owns is never fought over; a key in a reserved namespace is refused at
+//     admission, and skipped with a Warning event if it reached the spec anyway;
+//   - the write is idempotent (nothing is patched when nothing differs) and one Normal Event with
+//     reason NodeLabelsApplied is recorded per write that happened.
+//
+// spec.taintsToRemove and spec.nodeTaints are unrelated to this field: they shape the taints of
+// the node and of the autoscaler's template. Do not conflate them.
+func (r *NodeReconciler) applyNodeLabelsToKubernetesNode(ctx context.Context, node *infrav2alpha1.Node) error {
+	return nodelabels.ApplyToKubernetesNode(ctx, r.Client, node, r.EventRecorder)
 }
 
 // checkDeclaredNodeCapacity compares the Kubernetes node of a Ready slot with the capacity that

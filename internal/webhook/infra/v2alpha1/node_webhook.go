@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 )
 
 // nolint:unused
@@ -60,6 +61,10 @@ type NodeCustomValidator struct {
 func (v *NodeCustomValidator) ValidateCreate(ctx context.Context, node *infrav2alpha1.Node) (admission.Warnings, error) {
 	nodelog.Info("Validation for Node upon creation", "name", node.GetName())
 
+	if err := validateSlotMetadata(node); err != nil {
+		return nil, err
+	}
+
 	if err := v.validateGroupLabel(ctx, node); err != nil {
 		return nil, err
 	}
@@ -70,6 +75,10 @@ func (v *NodeCustomValidator) ValidateCreate(ctx context.Context, node *infrav2a
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type Node.
 func (v *NodeCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *infrav2alpha1.Node) (admission.Warnings, error) {
 	nodelog.Info("Validation for Node upon update", "name", newObj.GetName())
+
+	if err := validateSlotMetadata(newObj); err != nil {
+		return nil, err
+	}
 
 	if err := v.validateGroupLabel(ctx, newObj); err != nil {
 		return nil, err
@@ -121,6 +130,41 @@ func (v *NodeCustomValidator) kubernetesNodeWarnings(ctx context.Context, node *
 	nodelog.V(1).Info("Validated kubernetes node exists", "nodeName", node.Spec.KubernetesNodeName)
 
 	return nil
+}
+
+// validateSlotMetadata validates what the slot declares for its node object: spec.nodeLabels and
+// spec.nodeAnnotations.
+//
+// The rules live in internal/nodelabels, the package that also writes them, so admission and the
+// apply cannot disagree about which keys exist and which are refused. Every problem is reported at
+// once, on one field path each, because the manifest an operator applies is a file with twenty
+// labels in it and a refusal that names one of them is a two-second fix while a refusal that names
+// none is a bisect.
+//
+// This is the only place the shape of the declaration is checked. The CRD bounds the count
+// (maxProperties: 64 on both fields); the syntax of a key, the syntax of a value, and the reserved
+// namespaces are here, because a CRD pattern cannot express a qualified name with its exceptions,
+// and because the message an operator needs is "node.kubernetes.io/role is written by the kubelet",
+// not a regex.
+//
+// Why it matters that this fails at admission: a slot whose label key the API server will not take
+// is a slot whose label never lands on the node, which is a pod that never schedules, on a pool
+// that never grows, discovered by reading a scheduler event five minutes later. Refusing the slot
+// at `kubectl apply` puts the failure next to the edit that caused it.
+func validateSlotMetadata(node *infrav2alpha1.Node) error {
+	spec := field.NewPath("spec")
+
+	errs := nodelabels.ValidateLabels(node.Spec.NodeLabels, spec.Child("nodeLabels"))
+	errs = append(errs, nodelabels.ValidateAnnotations(node.Spec.NodeAnnotations, spec.Child("nodeAnnotations"))...)
+
+	if len(errs) == 0 {
+		return nil
+	}
+
+	nodelog.Info("Refusing a slot with node labels or annotations it may not declare",
+		"name", node.GetName(), "errors", len(errs))
+
+	return apierrors.NewInvalid(infrav2alpha1.GroupVersion.WithKind("Node").GroupKind(), node.GetName(), errs)
 }
 
 // validateGroupLabel checks if the "group" label exists and references a valid Group CRD

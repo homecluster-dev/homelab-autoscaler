@@ -1923,7 +1923,12 @@ func TestSetNodeSchedulableDoesNotWaitForACiliumItDoesNotHave(t *testing.T) {
 	require.NoError(t, nm.setNodeSchedulableWithRetry("test-node-k8s"))
 
 	assert.Less(t, time.Since(start), time.Second, "no Cilium, no waiting")
-	assert.Equal(t, 2, recorder.gets, "one read for the gate, one for the uncordon, no retry")
+	// Three reads, and no retry. The gate reads the node, the label apply reads it (a slot that
+	// declares nothing still has to be reconciled: the record of the keys the slot wrote, which is
+	// what removes a dropped key, lives on the node object, so it has to be read), and the uncordon
+	// reads it before it writes. spec.nodeTaints is empty on this fixture, so the taint apply
+	// returns before its own read - the reason the count was 2 before the labels field arrived.
+	assert.Equal(t, 3, recorder.gets, "one read for the gate, one for the declared labels, one for the uncordon, no retry")
 	require.Len(t, recorder.writes, 1)
 	assert.Contains(t, recorder.writes[0], "node.kubernetes.io/role", "the taints of the slot are kept by the uncordon")
 }

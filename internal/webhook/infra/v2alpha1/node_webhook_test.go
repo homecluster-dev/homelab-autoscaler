@@ -19,6 +19,7 @@ package v2alpha1
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +68,17 @@ func nodeUnderTest(labels map[string]string) *infrav2alpha1.Node {
 
 func groupLabels() map[string]string {
 	return map[string]string{"group": testGroup}
+}
+
+// entries builds a map of n distinct, valid keys, for the rows that assert the bound on how many
+// labels, and how many annotations, one slot may declare.
+func entries(n int) map[string]string {
+	out := make(map[string]string, n)
+	for i := range n {
+		out[fmt.Sprintf("pool.homecluster.dev/k%d", i)] = "v"
+	}
+
+	return out
 }
 
 var _ = Describe("Node Webhook", func() {
@@ -212,6 +224,149 @@ var _ = Describe("Node Webhook", func() {
 			Expect(warnings[0]).To(ContainSubstring(
 				"kubernetes node \"" + testNodeName + "\" has not joined the cluster yet"))
 		})
+	})
+
+	// The table of what a slot may declare about its node object.
+	//
+	// Every refusal is asserted to name the offending key, because the manifest an operator applies
+	// carries many keys and the only useful admission message is the one that points at the entry.
+	// The reserved rows are one per prefix on purpose: each prefix has its own owner and its own
+	// reason, and a rule that refuses the whole list is only trustworthy if each entry is shown to
+	// be in it.
+	Context("When a slot declares nodeLabels and nodeAnnotations", func() {
+		DescribeTable("the declaration is admitted, or refused naming the key",
+			func(labels, annotations map[string]string, wantDenied string) {
+				obj.Spec.NodeLabels = labels
+				obj.Spec.NodeAnnotations = annotations
+
+				// The create path is a Git apply of a new slot, the update path is a Git apply over
+				// an existing one: both carry the same declaration, so both must answer the same.
+				_, createErr := validator.ValidateCreate(context.Background(), obj)
+				_, updateErr := validator.ValidateUpdate(context.Background(), oldObj, obj)
+
+				if wantDenied == "" {
+					Expect(createErr).NotTo(HaveOccurred())
+					Expect(updateErr).NotTo(HaveOccurred())
+
+					return
+				}
+
+				for _, err := range []error{createErr, updateErr} {
+					Expect(err).To(HaveOccurred(), "the declaration must be refused at admission")
+					Expect(err.Error()).To(ContainSubstring(wantDenied))
+				}
+			},
+
+			// The motivating case, and the shape of a working declaration: the zone CA matches a
+			// zoned pod against, a region, a rack in the operator's own namespace, and a plain key.
+			Entry("admits the labels that make a zoned pod schedulable",
+				map[string]string{
+					"topology.kubernetes.io/zone":   "fsn1",
+					"topology.kubernetes.io/region": "eu-central-1",
+					"pool.homecluster.dev/rack":     "rack-3",
+					"dedicated":                     "remote",
+				}, nil, ""),
+
+			Entry("admits annotations in any namespace Kubernetes does not own",
+				nil,
+				map[string]string{
+					"power.homecluster.dev/serial": "SN-0001",
+					// node.kubernetes.io/ and topology.kubernetes.io/ are reserved for *labels*,
+					// where a Kubernetes component stamps and rotates them. As annotations they
+					// have no owner writing them, so a note there is the operator's: the row pins
+					// that judgement down.
+					"node.kubernetes.io/maintenance": "true",
+					"topology.kubernetes.io/note":    "rack 3, top of frame",
+				}, ""),
+
+			Entry("admits a slot that declares nothing, which is every slot written before this field",
+				nil, nil, ""),
+
+			Entry("admits an empty label value, which is a valid label value",
+				map[string]string{"pool.homecluster.dev/ssd": ""}, nil, ""),
+
+			Entry("refuses a label key that is not a qualified name",
+				map[string]string{"Bad Key": "value"}, nil, "spec.nodeLabels[Bad Key]"),
+
+			Entry("refuses a label key with an empty prefix",
+				map[string]string{"/bare": "value"}, nil, "spec.nodeLabels[/bare]"),
+
+			Entry("refuses a label key with two slashes",
+				map[string]string{"pool.homecluster.dev/a/b": "value"}, nil, "spec.nodeLabels[pool.homecluster.dev/a/b]"),
+
+			Entry("refuses a label value that is not a valid label value",
+				map[string]string{"rack": "not a value!"}, nil, "a valid label must be an empty string"),
+
+			Entry("refuses a label value longer than 63 characters",
+				map[string]string{"rack": strings.Repeat("x", 64)}, nil, "must be no more than 63 bytes"),
+
+			// One row per reserved prefix, with the owner in the message.
+			Entry("refuses the operator's own namespace",
+				map[string]string{"infra.homecluster.dev/group": "worker"}, nil,
+				"spec.nodeLabels[infra.homecluster.dev/group]"),
+
+			Entry("refuses the kubelet and node lifecycle namespace",
+				map[string]string{"node.kubernetes.io/role": "agent"}, nil,
+				"spec.nodeLabels[node.kubernetes.io/role]"),
+
+			Entry("refuses the kubernetes.io namespace",
+				map[string]string{"kubernetes.io/hostname": "worker-01"}, nil,
+				"spec.nodeLabels[kubernetes.io/hostname]"),
+
+			Entry("refuses the node role namespace",
+				map[string]string{"node-role.kubernetes.io/control-plane": ""}, nil,
+				"spec.nodeLabels[node-role.kubernetes.io/control-plane]"),
+
+			Entry("refuses the rest of the topology namespace",
+				map[string]string{"topology.kubernetes.io/zone-labels": "fsn1"}, nil,
+				"spec.nodeLabels[topology.kubernetes.io/zone-labels]"),
+
+			// The exceptions, asserted as entries of their own: the refusal above must not swallow
+			// the two keys the whole feature is about.
+			Entry("allows topology.kubernetes.io/zone, the key a zone nodeSelector matches",
+				map[string]string{"topology.kubernetes.io/zone": "fsn1"}, nil, ""),
+
+			Entry("allows topology.kubernetes.io/region",
+				map[string]string{"topology.kubernetes.io/region": "eu-central-1"}, nil, ""),
+
+			Entry("says who owns a reserved key, not just that it is refused",
+				map[string]string{"kubernetes.io/arch": "amd64"}, nil, "reserved key, not writable from a slot"),
+
+			Entry("refuses the operator's annotation namespace, records included",
+				nil, map[string]string{"infra.homecluster.dev/applied-node-labels": "rack"},
+				"spec.nodeAnnotations[infra.homecluster.dev/applied-node-labels]"),
+
+			Entry("refuses Argo CD's annotations",
+				nil, map[string]string{"argocd.argoproj.io/sync-wave": "1"},
+				"spec.nodeAnnotations[argocd.argoproj.io/sync-wave]"),
+
+			Entry("refuses kubectl's annotations",
+				nil, map[string]string{"kubectl.kubernetes.io/last-applied-configuration": "{}"},
+				"spec.nodeAnnotations[kubectl.kubernetes.io/last-applied-configuration]"),
+
+			Entry("refuses an annotation key that is not a qualified name",
+				nil, map[string]string{"not a key": "value"}, "spec.nodeAnnotations[not a key]"),
+
+			// A label key is case-sensitive and its prefix must be a lowercase subdomain, so a
+			// capitalised namespace is refused as a malformed key before the reserved list is
+			// consulted. Annotation keys are the other way round: compared in lower case.
+			Entry("refuses a label key whose prefix is not a lowercase subdomain",
+				map[string]string{"Kubernetes.io/hostname": "worker"}, nil,
+				"spec.nodeLabels[Kubernetes.io/hostname]"),
+
+			// The bounds. A CRD expresses maxProperties for the count; the size of the annotation
+			// map is the API server's own limit on the node object, and a Node CR that exceeds it is
+			// a slot whose labels never land.
+			Entry("refuses more labels than a slot may declare",
+				entries(65), nil, "spec.nodeLabels: Too many: 65: must have at most 64 items"),
+
+			Entry("refuses more annotations than a slot may declare",
+				nil, entries(65), "spec.nodeAnnotations: Too many: 65: must have at most 64 items"),
+
+			Entry("refuses an annotation map larger than the node object may carry",
+				nil, map[string]string{"pool.homecluster.dev/notes": strings.Repeat("x", 256*1024+1)},
+				"larger than limit"),
+		)
 	})
 })
 
@@ -369,5 +524,86 @@ var _ = Describe("Node Webhook through the API server", Ordered, func() {
 		err := advClient.Create(ctx, node)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("group"))
+	})
+
+	// The reserved-key rules, on the admission path an operator actually takes: a deployed webhook,
+	// a real API server, a client that reads the message `kubectl apply` prints. The table above
+	// asserts the validator's decisions; this asserts that a refusal reaches the operator, naming
+	// the key, and that the key a zoned pool needs is not caught by the same rule.
+	It("denies a slot whose nodeLabels declare a key Kubernetes owns", func() {
+		rec.drain()
+
+		node := &infrav2alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "envtest-slot-reserved-labels",
+				Namespace: envtestNamespace,
+				Labels:    map[string]string{"group": envtestGroup},
+			},
+			Spec: infrav2alpha1.NodeSpec{
+				KubernetesNodeName: "envtest-slot-reserved-labels",
+				Pricing:            infrav2alpha1.PricingSpec{HourlyRate: "0", PodRate: "0"},
+				NodeLabels: map[string]string{
+					"kubernetes.io/hostname":  "spoofed",
+					"node.kubernetes.io/role": "agent",
+				},
+				NodeAnnotations: map[string]string{"argocd.argoproj.io/sync-wave": "1"},
+			},
+		}
+
+		err := advClient.Create(ctx, node)
+		Expect(err).To(HaveOccurred(), "a slot that declares a reserved key is refused at apply time")
+
+		// Every refused key is reported, in one message: a manifest with twenty labels names the
+		// offender, it does not hide one behind another.
+		for _, key := range []string{
+			"spec.nodeLabels[kubernetes.io/hostname]",
+			"spec.nodeLabels[node.kubernetes.io/role]",
+			"spec.nodeAnnotations[argocd.argoproj.io/sync-wave]",
+		} {
+			Expect(err.Error()).To(ContainSubstring(key))
+		}
+
+		Expect(err.Error()).To(ContainSubstring("reserved key, not writable from a slot"))
+		Expect(err.Error()).To(ContainSubstring("topology.kubernetes.io/zone"),
+			"the refusal says what to declare instead, not only what is forbidden")
+	})
+
+	It("admits a slot that declares a zone, the key the whole feature is about", func() {
+		rec.drain()
+
+		node := &infrav2alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "envtest-slot-zoned",
+				Namespace: envtestNamespace,
+				Labels:    map[string]string{"group": envtestGroup},
+			},
+			Spec: infrav2alpha1.NodeSpec{
+				KubernetesNodeName: "envtest-slot-zoned",
+				Pricing:            infrav2alpha1.PricingSpec{HourlyRate: "0", PodRate: "0"},
+				NodeLabels: map[string]string{
+					"topology.kubernetes.io/zone":   "fsn1",
+					"topology.kubernetes.io/region": "eu-central-1",
+					"pool.homecluster.dev/rack":     "rack-3",
+				},
+				NodeAnnotations: map[string]string{"pool.homecluster.dev/serial": "SN-0001"},
+			},
+		}
+
+		// The validator reads the Group through the manager's cache, which has to observe it first.
+		Eventually(func() error {
+			err := advClient.Create(ctx, node)
+			if apierrors.IsAlreadyExists(err) {
+				return nil
+			}
+
+			return err
+		}).WithTimeout(30*time.Second).WithPolling(500*time.Millisecond).Should(Succeed(),
+			"a zoned slot is the configuration the scheduler and cluster-autoscaler need: admission must take it")
+
+		stored := &infrav2alpha1.Node{}
+		Expect(advClient.Get(ctx, client.ObjectKey{Name: node.Name, Namespace: envtestNamespace}, stored)).To(Succeed())
+		Expect(stored.Spec.NodeLabels).To(HaveKeyWithValue("topology.kubernetes.io/zone", "fsn1"),
+			"the CRD schema carries the field, so the declaration survives the API server")
+		Expect(stored.Spec.NodeAnnotations).To(HaveKeyWithValue("pool.homecluster.dev/serial", "SN-0001"))
 	})
 })

@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zoned-hello-world
+  namespace: default
+  labels:
+    app: zoned-hello-world
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zoned-hello-world
+  template:
+    metadata:
+      labels:
+        app: zoned-hello-world
+    spec:
+      # The pod asks for a machine in one zone. Only a slot whose spec.nodeLabels declare that zone
+      # can take it: the scheduler matches the label on the node object, and cluster-autoscaler
+      # matches it on the group's node template.
+      nodeSelector:
+        topology.kubernetes.io/zone: fsn1
+        infra.homecluster.dev/group: group1
+      tolerations:
+      - key: node.kubernetes.io/role
+        operator: Equal
+        value: agent
+        effect: NoSchedule
+      containers:
+      - name: hello-world
+        image: busybox:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            echo "hello world from the zoned slot"
+            sleep 30
+          done
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+      restartPolicy: Always

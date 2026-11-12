@@ -37,6 +37,7 @@ import (
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
@@ -891,6 +892,14 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 		// provisioning boundary (an empty providerID, i.e. no cloud-controller-manager, would
 		// otherwise report the bare node name and then the providerID). Keep the providerID of
 		// the Kubernetes node when it is set, it is the authoritative identity.
+		//
+		// An Instance carries an id and a status, and nothing else: the proto has no labels, no
+		// annotations, no capacity. What cluster-autoscaler knows about a machine that already
+		// registered it reads off that machine's corev1.Node, which the cluster registry lists, so
+		// the labels a slot declares have to be on the node object to be visible to the autoscaler
+		// for an existing node - that is nodelabels.ApplyToKubernetesNode's job, on join and on every
+		// drift. The template is the other half: the shape of a machine that does not exist yet, and
+		// the only place a scale-up can be matched against a label.
 		instanceID := kubernetesNode.Spec.ProviderID
 		if instanceID == "" {
 			instanceID = fmt.Sprintf("homelab://%s", node.Name)
@@ -958,7 +967,35 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	templateNode.UID = ""
 	templateNode.ResourceVersion = ""
 
-	// Remove node-specific labels that shouldn't be in template
+	// Put the labels and annotations the slot declares into the template, after the copy and before
+	// the marshal, so the rule is the same for the node copied from a live slot and for the
+	// synthesized placeholder (the same shape as applyTemplateCapacity below, for the same reason).
+	//
+	// This is the half of the feature cluster-autoscaler reads. The estimator matches a pending pod's
+	// nodeSelector and node affinity against the labels of this template, so a pod that asks for
+	// `topology.kubernetes.io/zone: fsn1` is placed on a group whose template carries that label and
+	// on no other: with every slot reporting the same template the answer to "which slot?" is "any
+	// slot", and a zoned pod is never placed on this pool at all, so no machine is ever bought for
+	// it. Declaring the zone on the slots that have one is what makes the scale-up possible.
+	//
+	// The declaration goes on top of the copy, and only the declared keys: what the representative
+	// node carries beyond them is the machine's own shape, which the template keeps. Reserved
+	// namespaces (nodelabels.ReservedLabelKey) are skipped, so a declaration that predates the
+	// webhook's rule cannot stamp a key the kubelet owns - kubernetes.io/hostname in particular -
+	// onto the template.
+	//
+	// One template per group, built from one representative slot: a group whose slots declare
+	// different labels is simulated from whichever slot the provider picked (a Ready node, else any
+	// slot). That is the contract of NodeGroupTemplateNodeInfo, not a limitation of this code, and
+	// the consequence is that a pod selecting a label only some slots carry may be answered with a
+	// slot that does not have it. Slots you need the scheduler to tell apart belong in different
+	// groups.
+	templateNode.Labels = nodelabels.Overlay(templateNode.Labels, representativeNodeCR.Spec.NodeLabels)
+	templateNode.Annotations = nodelabels.Overlay(templateNode.Annotations, representativeNodeCR.Spec.NodeAnnotations)
+
+	// Remove node-specific labels that shouldn't be in template. After the overlay, so a
+	// declaration cannot put the representative's hostname back: the key is refused at admission
+	// (kubernetes.io/ is reserved) and this is the write that proves it.
 	delete(templateNode.Labels, "kubernetes.io/hostname")
 
 	// Set Ready conditions (remove NotReady status)
@@ -1248,21 +1285,28 @@ func overlayDeclaredCapacity(list *corev1.ResourceList, declared corev1.Resource
 
 // placeholderTemplateNode builds the object the template is derived from when no slot of the
 // group has a corev1.Node: a fully powered off pool. It carries everything that can be read from
-// the Node CR, the group label, the taints the slot declares, and the capacity the slot declares,
-// on top of the defaults applyTemplateCapacity fills in. No machine size is invented: cpu, memory,
-// ephemeral-storage of a machine that has never registered cannot be read, so an undeclared
-// placeholder says "I do not know the size of this machine" by carrying none of them, and the pool
-// that declared spec.nodeCapacity is answering the question from Git. The pod ceiling is the one
-// number that is not a fact about the hardware, and it is defaulted so the scheduler can place a
-// pod on the template at all. The call here is what makes the placeholder a complete object on its
-// own.
+// the Node CR, the group label, the labels and annotations the slot declares, the taints the slot
+// declares, and the capacity the slot declares, on top of the defaults applyTemplateCapacity fills
+// in. No machine size is invented: cpu, memory, ephemeral-storage of a machine that has never
+// registered cannot be read, so an undeclared placeholder says "I do not know the size of this
+// machine" by carrying none of them, and the pool that declared spec.nodeCapacity is answering the
+// question from Git. The pod ceiling is the one number that is not a fact about the hardware, and it
+// is defaulted so the scheduler can place a pod on the template at all. The call here is what makes
+// the placeholder a complete object on its own.
+//
+// The declared labels are the reason a pool at zero can be chosen at all: the estimator matches a
+// pod's nodeSelector against this object, and the case that matters, a slot in a specific zone, is
+// answered from Git, because a pool whose every machine is off has no node object to read the zone
+// off. The caller overlays the declaration on the template it builds, so the placeholder and the
+// live-copy path state the same rule.
 func placeholderTemplateNode(slot *infrav2alpha1.Node) *corev1.Node {
 	placeholder := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: slot.Name,
-			Labels: map[string]string{
+			Labels: nodelabels.Overlay(map[string]string{
 				"infra.homecluster.dev/group": slot.Labels["group"],
-			},
+			}, slot.Spec.NodeLabels),
+			Annotations: nodelabels.Overlay(nil, slot.Spec.NodeAnnotations),
 		},
 		Spec: corev1.NodeSpec{
 			Taints: taints.Overlay(nil, slot.Spec.NodeTaints),

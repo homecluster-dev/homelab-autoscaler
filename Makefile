@@ -133,7 +133,7 @@ test-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests with fu
 	sleep 5
 	
 	@echo "Running e2e tests..."
-	KUBECONFIG=$(CURDIR)/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
+	KUBECONFIG=$(CURDIR)/kubeconfig go test -timeout 25m -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 
 .PHONY: run-e2e
 run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without cleanup
@@ -156,7 +156,7 @@ run-e2e: helm-sync-crds generate fmt vet ## Run the k3d-based e2e tests without 
 	sleep 5
 	
 	@echo "Running e2e tests..."
-	KUBECONFIG=$(CURDIR)/kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
+	KUBECONFIG=$(CURDIR)/kubeconfig go test -timeout 25m -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 	
 	@echo "E2E tests completed! Environment is still running for inspection."
 	@echo "To clean up manually:"
@@ -177,6 +177,8 @@ cleanup-e2e: ## Clean up all e2e test resources (servers, cluster, etc.)
 	@kubectl delete -f ./examples/k3d/nodes1.yaml --ignore-not-found || true
 	@echo "Cleaning up test deployment..."
 	@kubectl delete -f examples/k3d/hello-world-deployment.yaml --ignore-not-found || true
+	@echo "Cleaning up the zoned deployment of the labels spec..."
+	@kubectl delete -f examples/k3d/zoned-deployment.yaml --ignore-not-found || true
 	@echo "Cleaning up Group CR..."
 	@kubectl delete group group1 -n homelab-autoscaler-system --ignore-not-found || true
 	@echo "Cleaning up local server..."

@@ -433,6 +433,77 @@ Message: node worker-1 carries the cluster-autoscaler marker ToBeDeletedByCluste
 2. Check group scaling thresholds
 3. Ensure gRPC server is responding to Cluster Autoscaler
 
+### A Pod Needs A Slot With A Specific Label
+
+A pod with `nodeSelector: {topology.kubernetes.io/zone: fsn1}` (or a label affinity, or a
+topology spread over a label) that stays `Pending` on a pool that is powered off is a labels
+question, and it has three answers: the label is on the machine, the label is on the pool's
+template, or the pool cannot be the one that answers.
+
+```bash
+kubectl describe pod <pod> | sed -n '/Events:/,$p'
+# 0/5 nodes are available: 1 node(s) didn't match Pod's node affinity/selector. preemption: ...
+```
+
+**1. Is the label on the node?**
+
+```bash
+kubectl get node <node> -o jsonpath='{.metadata.labels}' | tr ',' '\n' | grep -i zone
+kubectl get node <node> -o jsonpath='{.metadata.annotations.infra\.homecluster\.dev/applied-node-labels}'
+```
+
+The record annotation lists the keys the slot wrote. A label that is on the node and not in that
+list was put there by something else - the kubelet, a cloud integration, a hand `kubectl label` -
+and the operator will not maintain it.
+
+**2. Is the label declared on the slot?**
+
+```bash
+kubectl get nodes.infra.homecluster.dev <slot> -n <ns> -o jsonpath='{.spec.nodeLabels}' ; echo
+kubectl describe node.infra.homecluster.dev <slot> -n <ns>
+#  Normal  NodeLabelsApplied  ApplyNodeLabels  node <node>: labels: +topology.kubernetes.io/zone ...
+```
+
+No declaration, no label: the apply-on-join path writes the keys `spec.nodeLabels` declares, and
+nothing else. No event, and the declaration present, means the node object the write targets does
+not exist (the machine never registered, or `spec.kubernetesNodeName` names the wrong node) - the
+apply is skipped until it does, and re-asserted every reconcile after that.
+
+If the slot was refused at `kubectl apply`, the message names the key. `kubernetes.io/hostname`,
+`node.kubernetes.io/*`, `node-role.kubernetes.io/*`, `infra.homecluster.dev/*` and
+`topology.kubernetes.io/*` other than `zone` and `region` are keys their owner writes and re-writes;
+declare a key in your own namespace (`pool.example.com/rack`), or the zone of a box no cloud
+controller knows.
+
+**3. Is the pool the one the autoscaler can answer with?**
+
+A pending pod is matched against each pool's **node template**, not against live machines, and a
+pool at zero has no machine to read: the template is built from one representative slot, and the
+declaration of that slot is what the estimator sees.
+
+```bash
+# the slots of the pool, and what each declares
+kubectl get nodes.infra.homecluster.dev -n <ns> -l group=<group> \
+  -o custom-columns=NAME:.metadata.name,ZONE:.spec.nodeLabels.topology\.kubernetes\.io/zone
+```
+
+- No slot of the group declares the label: no scale-up is planned for this group, and the autoscaler
+  is right. Declare it on the slots.
+- The slots declare **different** values: the group answers with one template, from the slot the
+  provider picked, so a pod selecting the other value is simulated onto a machine that will not have
+  it. Move the slots you need told apart into different groups - that is the configuration the
+  single-template contract asks for.
+- The label is on the template and the scale-up runs, and the pod still lands elsewhere: check the
+  taints. A node that is a selector match and rejects the pod on a taint is reported by
+  `kubectl describe pod` as the same "didn't match" line, and the taint is the pool's
+  `spec.nodeTaints` (see [Node Taints](../api-reference/crds/node.md#node-taints)).
+
+**4. A label that keeps coming back after you removed it, and vice versa**
+
+The declaration is the intent. A value you change on the node with `kubectl label --overwrite` is
+put back on the next reconcile, and a key you delete from the slot's `spec.nodeLabels` is removed
+from the node on the next reconcile. Fix Git, not the node, and the node follows.
+
 ### Resource State Mismatch
 1. Run manual sync: Annotate resource with `homelab-autoscaler.dev/force-reconcile`
 2. Check Core controller logs for sync issues

@@ -34,6 +34,7 @@ import (
 	"github.com/looplab/fsm"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
@@ -1022,6 +1023,18 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		// does not stop the uncordon, the next reconcile re-applies it.
 		if err := taints.ApplyToKubernetesNode(ctx, nm.client, nm.node, nm.eventRecorder); err != nil {
 			logger.Info("Failed to apply declared taints before uncordon", "error", err.Error(), "elapsed", time.Since(start).String())
+		}
+
+		// Stamp the labels and annotations the slot declares (spec.nodeLabels,
+		// spec.nodeAnnotations) in the same hook, for the same two reasons. A node that becomes
+		// schedulable before its zone label exists is a node a pod with
+		// `nodeSelector: {topology.kubernetes.io/zone: ...}` is bound to and then evicted from, and
+		// cluster-autoscaler bound it there because the group's template carries the label the slot
+		// declares: the simulation and the machine have to agree on the label the selector matches,
+		// and the machine only agrees once this write lands. Called on every retry, and idempotent
+		// (no write when the node already carries the declaration).
+		if err := nodelabels.ApplyToKubernetesNode(ctx, nm.client, nm.node, nm.eventRecorder); err != nil {
+			logger.Info("Failed to apply declared node labels before uncordon", "error", err.Error(), "elapsed", time.Since(start).String())
 		}
 
 		// The gate: Ready, and free of every readiness taint the Group declares. Both are required
