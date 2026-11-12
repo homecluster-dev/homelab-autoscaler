@@ -529,6 +529,13 @@ var _ = Describe("K3d Integration", Ordered, func() {
 				"the provider must answer the scale-down of %s by cancelling the claim that wanted it",
 				agentNode0)
 
+			// scaleDownClaim is the claim the scale-down named, captured while it is live: the
+			// shutdown Job of this episode is the attempt of that claim, and by the time the Job has
+			// run the claim has ended and been collected, so the name cannot be read afterwards.
+			// Empty means the scale-down cancelled a pending claim, which has no finalizer and is
+			// gone outright: that shutdown has no claim, and the slot owns it alone.
+			var scaleDownClaim string
+
 			By("Verifying the claim of the machine is marked, with the request on it")
 			// A machine is wanted exactly when a live claim names its slot, so this is where a scale-down
 			// is readable: the provider records the request on the live claim (call: DeleteNodes, nodes:
@@ -561,6 +568,8 @@ var _ = Describe("K3d Integration", Ordered, func() {
 						live.Name, live.Spec.Request.Nodes, agentNode0)
 				}
 
+				scaleDownClaim = live.Name
+
 				return claimCancelled
 			}, deleteNodesRPCTimeout, checkInterval).Should(Equal(claimCancelled),
 				"A scale-down is a request on an object: the claim of the slot carries the call that ended it,\n"+
@@ -589,23 +598,36 @@ var _ = Describe("K3d Integration", Ordered, func() {
 				"the shutdown transition of the scale-down creates a shutdown Job for %s",
 				agentNode0)
 
-			By("Verifying the shutdown job carries the spec the slot declares")
+			By("Verifying the shutdown job carries the spec the slot declares, and the claim that asked for it")
 			// One read of the typed object, and one sentence: the controller's ServiceAccount, the two
 			// volumes the slot's shutdownPodSpec declares - the ConfigMap its script sources and the Secret
 			// it authenticates with, each named as the slot names them - and a TTL so a pool that scales
-			// twice a day does not accumulate Jobs.
+			// twice a day does not accumulate Jobs. Then the ownership: the Job is the attempt of the claim
+			// the scale-down named, so that claim is its controller owner - the Job hangs under the claim
+			// in Argo CD's tree, and the shutdown of a cancelled claim is owned by the request that runs it
+			// from the moment it starts to the moment the machine is observed off - with the slot kept as
+			// the secondary owner the slot's tree reads.
 			Eventually(func() string {
 				job, err := readJob(shutdownJob)
 				if err != nil {
 					return err.Error()
 				}
 
-				return lifecycleJobSpecProblem(job, "controller-manager", []lifecycleVolume{
+				specProblem := lifecycleJobSpecProblem(job, "controller-manager", []lifecycleVolume{
 					{name: "config", configMap: "shutdown-config"},
 					{name: "auth", secret: "auth-secrets"},
 				})
+				if specProblem != "" {
+					return specProblem
+				}
+
+				// The claim the request named, read where it is readable: the shutdown Job is the
+				// attempt of that claim, and the claim ends - and is collected - once the machine is
+				// observed off, which is exactly what the ownership is there to record.
+				return lifecycleJobClaimOwnerProblem(job, scaleDownClaim, agentNode0)
 			}, 60*time.Second, checkInterval).Should(BeEmpty(),
-				"the shutdown Job of the scale-down is the Job the slot's shutdownPodSpec declares")
+				"the shutdown Job of the scale-down is the Job the slot's shutdownPodSpec declares,\n"+
+					"owned by the claim whose attempt it is")
 
 			By("Verifying VM control server receives /stop request")
 			// The request log is read over a window: a /stop for this machine in the last bootRequestWindow.
@@ -2083,6 +2105,83 @@ func lifecycleJobSpecProblem(job *batchv1.Job, serviceAccount string, want []lif
 
 	if job.Spec.TTLSecondsAfterFinished == nil {
 		return fmt.Sprintf("job %s has no ttlSecondsAfterFinished: a pool that scales twice a day accumulates Jobs", job.Name)
+	}
+
+	return ""
+}
+
+// lifecycleJobClaimOwnerProblem is the ownership a lifecycle Job of a scale-down must carry, read
+// off the typed object. claimName is the claim the request named; "" is the shape where the
+// scale-down cancelled a pending claim, which has no finalizer and is gone outright, leaving the
+// slot the only owner - as it is for every shutdown of a machine the pool stopped wanting.
+//
+// With a claim: the NodeClaim is the controller owner, so the Job hangs under the claim in Argo
+// CD's tree and the attempt is attributable by label (`kubectl get jobs -l
+// infra.homecluster.dev/nodeclaim=<claim>`); the slot stays a secondary, non-controller owner, so
+// the Job is still readable under the slot and keeps that provenance after the claim is collected.
+// The claim cannot go away mid-shutdown, because its finalizer comes off only once the machine is
+// observed off. "" means the Job is owned as the model says; anything else is the sentence an
+// operator reads.
+func lifecycleJobClaimOwnerProblem(job *batchv1.Job, claimName, slotName string) string {
+	if job == nil {
+		return "the Job is not readable"
+	}
+
+	var controllerRef, slotRef, claimRef *metav1.OwnerReference
+
+	for i := range job.OwnerReferences {
+		ref := &job.OwnerReferences[i]
+
+		switch {
+		case ref.Controller != nil && *ref.Controller:
+			controllerRef = ref
+		case ref.Kind == "Node":
+			slotRef = ref
+		case ref.Kind == "NodeClaim":
+			claimRef = ref
+		}
+	}
+
+	owner := "nothing"
+	if controllerRef != nil {
+		owner = controllerRef.Kind + "/" + controllerRef.Name
+	}
+
+	if claimName == "" {
+		// No claim to own the attempt: the slot is the controller owner, and no claim
+		// provenance is stamped on a Job nothing asked for.
+		if controllerRef == nil || controllerRef.Kind != "Node" || controllerRef.Name != slotName {
+			return fmt.Sprintf("job %s of a scale-down with no claim is controller-owned by %s, not by slot %s",
+				job.Name, owner, slotName)
+		}
+
+		if claimRef != nil {
+			return fmt.Sprintf("job %s names NodeClaim %s, which this scale-down cancelled outright", job.Name, claimRef.Name)
+		}
+
+		if got, found := job.Labels[fsm.LabelNodeClaim]; found {
+			return fmt.Sprintf("job %s carries %s=%q with no claim behind the attempt", job.Name, fsm.LabelNodeClaim, got)
+		}
+
+		return ""
+	}
+
+	if controllerRef == nil {
+		return fmt.Sprintf("job %s has no controller ownerReference: nothing owns the attempt it runs", job.Name)
+	}
+
+	if controllerRef.Kind != "NodeClaim" || controllerRef.Name != claimName {
+		return fmt.Sprintf("job %s is the child of %s, not of the NodeClaim %s whose attempt it is",
+			job.Name, owner, claimName)
+	}
+
+	if slotRef == nil {
+		return fmt.Sprintf("job %s is not owned by slot %s: the slot's tree in Argo CD loses the Job", job.Name, slotName)
+	}
+
+	if got := job.Labels[fsm.LabelNodeClaim]; got != claimName {
+		return fmt.Sprintf("job %s carries %s=%q, not the claim %s it is the attempt of",
+			job.Name, fsm.LabelNodeClaim, got, claimName)
 	}
 
 	return ""

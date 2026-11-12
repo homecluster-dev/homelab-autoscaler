@@ -367,10 +367,14 @@ kubectl describe nodes.infra.homecluster.dev <slot> -n homelab-autoscaler-system
 
 Both lifecycle Jobs are created by the transition that takes the lock, carry the slot's name and
 the lifecycle phase as labels, and are cleaned up by `spec.ttlSecondsAfterFinished` of the
-`MinimalPodSpec` the slot declares.
+`MinimalPodSpec` the slot declares. A Job is owned by the claim that asked for it — the controller
+ownerReference is the `NodeClaim`, with the slot kept as a secondary, non-controller owner so the
+Job is also readable under the slot — and a shutdown with no claim (law 3) is owned by the slot
+alone.
 
 ```bash
 kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<slot>
+kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/nodeclaim=<claim>
 kubectl get jobs -n homelab-autoscaler-system -l type=startup
 ```
 

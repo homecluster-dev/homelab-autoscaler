@@ -27,6 +27,8 @@ import (
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -1422,17 +1424,40 @@ func TestNodeStateMachine_VolumesAndServiceAccount(t *testing.T) {
 	})
 }
 
+// ownerRefOfKind is the ownerReference of the given Kind, and nil when the object has
+// none. A lifecycle Job has two owners once a claim exists, so the assertions read the
+// ref they are talking about by kind instead of by position.
+func ownerRefOfKind(refs []metav1.OwnerReference, kind string) *metav1.OwnerReference {
+	for i := range refs {
+		if refs[i].Kind == kind {
+			return &refs[i]
+		}
+	}
+
+	return nil
+}
+
+// isControllerRef is the reading Kubernetes itself uses for the controller owner: a ref
+// with no Controller field is a plain, non-controller owner.
+func isControllerRef(ref *metav1.OwnerReference) bool {
+	return ref.Controller != nil && *ref.Controller
+}
+
 // TestNodeStateMachine_LifecycleJobProvenance asserts that the startup/shutdown Jobs the
 // controller creates carry the label + annotation set that makes them attributable to the
-// Node CR that caused them, that the pod template labels stay in sync with the Job's own
-// labels, and that the controller ownerReference to the Node CR is still what ties the
-// Job to the Node (Argo CD reads that ownerReference; no Argo tracking label is added).
+// Node CR that caused them and - when the transition has one - to the NodeClaim whose
+// attempt they are, that the pod template labels stay in sync with the Job's own labels,
+// and that the ownerReferences tie the Job to both objects: the claim is the controller
+// owner of its attempt and the Node stays a secondary owner, and with no claim at all the
+// Node stays exactly the controller owner it was (Argo CD reads those ownerReferences; no
+// Argo tracking label is added).
 func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
 	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
 
 	const nodeUID = types.UID("11111111-2222-3333-4444-555555555555")
+	const claimUID = types.UID("66666666-7777-8888-9999-000000000000")
 
 	tests := []struct {
 		name     string
@@ -1440,6 +1465,9 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 		power    infrav2alpha1.PowerState
 		progress infrav2alpha1.NodePhase
 		action   func(*NodeStateMachine) error
+		// claim is the live claim of the transition, and nil is the shape of a shutdown of a
+		// machine the pool stopped wanting: no claim, nothing asking, law 3.
+		claim *infrav2alpha1.NodeClaim
 	}{
 		{
 			name:     "startup job",
@@ -1455,6 +1483,20 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 			progress: infrav2alpha1.NodePhaseReady,
 			action:   func(f *NodeStateMachine) error { return f.ShutdownNode() },
 		},
+		{
+			name:   "startup job of a live claim",
+			phase:  PhaseStartup,
+			power:  infrav2alpha1.PowerStateOff,
+			action: func(f *NodeStateMachine) error { return f.StartNode() },
+			claim:  TestClaim("test-node", "test-node-claim-a", infrav2alpha1.NodeClaimPending, false),
+		},
+		{
+			name:   "shutdown job of a claim a scale-down marked",
+			phase:  PhaseShutdown,
+			power:  infrav2alpha1.PowerStateOn,
+			action: func(f *NodeStateMachine) error { return f.ShutdownNode() },
+			claim:  TestClaim("test-node", "test-node-claim-b", infrav2alpha1.NodeClaimReady, true),
+		},
 	}
 
 	for _, tt := range tests {
@@ -1464,7 +1506,13 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 			mockCoord := NewMockCoordinationManager()
 			fakeClient := CreateFakeClient(scheme, node)
 
-			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord)
+			opts := []Option{}
+			if tt.claim != nil {
+				tt.claim.UID = claimUID
+				opts = append(opts, WithClaim(tt.claim, nil))
+			}
+
+			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, opts...)
 			fsm.uncordonTimeout = 100 * time.Millisecond      // Short timeout for tests
 			fsm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -1492,15 +1540,25 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 				"infra.homecluster.dev/node":  "test-node",
 				"infra.homecluster.dev/phase": tt.phase,
 			}
-			assert.Equal(t, expectedLabels, job.Labels, "job labels")
-			assert.Equal(t, expectedLabels, job.Spec.Template.Labels,
-				"pod template labels must stay in sync with the job labels")
-
 			expectedAnnotations := map[string]string{
 				"infra.homecluster.dev/node-uid":   string(nodeUID),
 				"infra.homecluster.dev/node-group": "test-group",
 				"infra.homecluster.dev/created-by": "homelab-autoscaler",
 			}
+
+			if tt.claim != nil {
+				// The attempt is the claim's, so the Job of an attempt names it, and
+				// `kubectl get jobs -l infra.homecluster.dev/nodeclaim=<claim>` answers "which
+				// attempt did this?". With no claim - the shutdown of a machine the pool stopped
+				// wanting - both keys stay absent, and the selector answers exactly the Jobs that
+				// have an attempt behind them.
+				expectedLabels["infra.homecluster.dev/nodeclaim"] = tt.claim.Name
+				expectedAnnotations["infra.homecluster.dev/nodeclaim-uid"] = string(claimUID)
+			}
+
+			assert.Equal(t, expectedLabels, job.Labels, "job labels")
+			assert.Equal(t, expectedLabels, job.Spec.Template.Labels,
+				"pod template labels must stay in sync with the job labels")
 			assert.Equal(t, expectedAnnotations, job.Annotations, "job annotations")
 
 			// The Jobs are controller-owned, not Argo-managed children: an Argo tracking
@@ -1508,18 +1566,133 @@ func TestNodeStateMachine_LifecycleJobProvenance(t *testing.T) {
 			assert.NotContains(t, job.Labels, "argocd.argoproj.io/instance")
 			assert.NotContains(t, job.Spec.Template.Labels, "argocd.argoproj.io/instance")
 
-			// The controller ownerReference to the Node CR is what Argo CD's resource
-			// tree uses to show the Job under the Node.
+			// The ownerReferences are the provenance Argo CD's resource tree reads. With a live
+			// claim the Job hangs under the claim that asked for it - the controller owner - and
+			// under the slot as a secondary owner; with no claim, under the slot alone, as before.
 			refs := job.GetOwnerReferences()
-			require.Len(t, refs, 1, "job must have exactly one owner reference")
-			assert.Equal(t, infrav2alpha1.GroupVersion.String(), refs[0].APIVersion)
-			assert.Equal(t, "Node", refs[0].Kind)
-			assert.Equal(t, "test-node", refs[0].Name)
-			assert.Equal(t, nodeUID, refs[0].UID)
-			require.NotNil(t, refs[0].Controller)
-			assert.True(t, *refs[0].Controller, "owner reference must be the controller ref")
+
+			nodeRef := ownerRefOfKind(refs, "Node")
+			require.NotNil(t, nodeRef, "the Job stays attributable to the slot")
+			assert.Equal(t, infrav2alpha1.GroupVersion.String(), nodeRef.APIVersion)
+			assert.Equal(t, "test-node", nodeRef.Name)
+			assert.Equal(t, nodeUID, nodeRef.UID)
+
+			claimRef := ownerRefOfKind(refs, "NodeClaim")
+
+			if tt.claim == nil {
+				require.Len(t, refs, 1, "no claim means the slot is the only owner")
+				assert.Nil(t, claimRef, "no claim means no claim ownerReference")
+				assert.True(t, isControllerRef(nodeRef), "with no claim the slot is the controller owner")
+
+				return
+			}
+
+			require.NotNil(t, claimRef, "the Job of an attempt is owned by the claim that asked for it")
+			assert.Equal(t, infrav2alpha1.GroupVersion.String(), claimRef.APIVersion)
+			assert.Equal(t, tt.claim.Name, claimRef.Name)
+			assert.Equal(t, claimUID, claimRef.UID)
+			assert.True(t, isControllerRef(claimRef), "the claim is the controller owner of its Job")
+			require.NotNil(t, claimRef.BlockOwnerDeletion)
+			assert.True(t, *claimRef.BlockOwnerDeletion,
+				"a committed boot is not removed ahead of the shutdown Job that reverses it")
+			assert.False(t, isControllerRef(nodeRef), "the slot is a secondary, non-controller owner")
 		})
 	}
+}
+
+// TestNodeStateMachine_LifecycleJobSelectors asserts that every selector that reads the lifecycle
+// Jobs of a slot keeps finding them now that the Job is claim-owned and carries the claim label:
+// cleanupPendingJobs (node label + type filter), the slot reconciler's view (slot label + phase
+// label), the group view the provider's label keys give (`group` + `type`), and the claim selector
+// that answers "which attempt did this?". A label that stopped matching would strand a pending Job
+// in the slot, and the recovery that re-fires a finished Job reads the same labels.
+func TestNodeStateMachine_LifecycleJobSelectors(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
+
+	tests := []struct {
+		name   string
+		power  infrav2alpha1.PowerState
+		phase  string
+		action func(*NodeStateMachine) error
+		claim  *infrav2alpha1.NodeClaim
+	}{{
+		name:   "startup Job of a live claim",
+		power:  infrav2alpha1.PowerStateOff,
+		phase:  PhaseStartup,
+		action: func(f *NodeStateMachine) error { return f.StartNode() },
+		claim:  TestClaim("test-node", "test-node-claim-sel", infrav2alpha1.NodeClaimPending, false),
+	}, {
+		name:   "shutdown Job with no claim",
+		power:  infrav2alpha1.PowerStateOn,
+		phase:  PhaseShutdown,
+		action: func(f *NodeStateMachine) error { return f.ShutdownNode() },
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), tt.power, "")
+			mockCoord := NewMockCoordinationManager()
+			fakeClient := CreateFakeClient(scheme, node)
+
+			opts := []Option{}
+			if tt.claim != nil {
+				opts = append(opts, WithClaim(tt.claim, nil))
+			}
+
+			fsm := NewNodeStateMachine(node, fakeClient, scheme, mockCoord, opts...)
+			fsm.uncordonTimeout = 100 * time.Millisecond
+			fsm.readinessGateTimeout = 100 * time.Millisecond
+
+			require.NoError(t, tt.action(fsm))
+
+			// The reconciler's view: the slot label, filtered by the phase label
+			// (lifecycleJobsInFlight, newestLifecycleJob).
+			found := listJobsWithLabels(t, fakeClient, node.Namespace, map[string]string{LabelNodeCR: node.Name})
+			require.Len(t, found, 1, "the slot selector must find the Job it created")
+			assert.Equal(t, tt.phase, found[0].Labels[LabelPhase], "the phase label the reconciler filters on")
+
+			// The provider's grouping key, and the type filter.
+			grouped := listJobsWithLabels(t, fakeClient, node.Namespace, map[string]string{
+				LabelGroup: node.Labels[LabelGroup], LabelType: tt.phase,
+			})
+			require.Len(t, grouped, 1, "the group + type selector must find the Job")
+
+			// The attempt's view: the claim the Job belongs to. A Job the pool owes no claim to -
+			// the shutdown of a machine nobody wants - is not selectable by claim at all.
+			if tt.claim == nil {
+				claimJobs := listJobsWithLabels(t, fakeClient, node.Namespace, map[string]string{LabelNodeClaim: "any"})
+				require.Len(t, claimJobs, 0, "a Job with no claim carries no claim label")
+			} else {
+				claimJobs := listJobsWithLabels(t, fakeClient, node.Namespace, map[string]string{LabelNodeClaim: tt.claim.Name})
+				require.Len(t, claimJobs, 1, "the claim selector answers which attempt made this Job")
+				assert.Equal(t, tt.claim.Name, claimJobs[0].Labels[LabelNodeClaim])
+			}
+
+			// cleanupPendingJobs selects on the legacy node label and filters on the type
+			// label: it must still find the pending Job, claim-owned or not, and delete it.
+			require.NoError(t, fsm.cleanupPendingJobs(node.Spec.KubernetesNodeName))
+
+			remaining := listJobsWithLabels(t, fakeClient, node.Namespace, map[string]string{LabelNodeLegacy: node.Spec.KubernetesNodeName})
+			assert.Empty(t, remaining, "cleanupPendingJobs found the Job through its selectors and deleted it")
+		})
+	}
+}
+
+// listJobsWithLabels lists the Jobs of a namespace through a label selector, the way the callers
+// that read the lifecycle Jobs do.
+func listJobsWithLabels(t *testing.T, c client.Client, namespace string, set map[string]string) []batchv1.Job {
+	t.Helper()
+
+	jobs := &batchv1.JobList{}
+	err := c.List(context.TODO(), jobs, &client.ListOptions{
+		Namespace:     namespace,
+		LabelSelector: labels.SelectorFromSet(labels.Set(set)),
+	})
+	require.NoError(t, err)
+
+	return jobs.Items
 }
 
 // TestNodeStateMachine_PriorityClassName asserts that spec.startupPodSpec.priorityClassName /
