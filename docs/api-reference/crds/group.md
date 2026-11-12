@@ -23,6 +23,49 @@ The Group Custom Resource Definition (CRD) defines autoscaling policies for coll
 | `minSize` | `int32` | No | Floor cluster-autoscaler must not scale the group below. Defaults to `0` |
 | `nodeReadinessTaints` | `[]corev1.Taint` | No | Taints a machine of this group must be free of before the controller calls the slot ready and uncordons it, on top of the node reporting `Ready`. Defaults to Cilium's `node.cilium.io/agent-not-ready` (`NoExecute`); an empty list gates on `Ready` alone |
 
+### GroupStatus
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `health` | `string` | `healthy`, `offline`, `unknown` |
+| `conditions` | `[]metav1.Condition` | The `Loaded` condition the group controller stamps on every pass |
+| `slots` | `int32` | The `Node` CRs labelled `group: <name>`: the machines the pool can have, i.e. its max size, the same number the provider reports to cluster-autoscaler as `MaxSize` |
+| `on` | `int32` | The slots reporting a machine the pool is paying for: `booting`, `ready`, `draining` |
+| `off` | `int32` | The rest: `off`, `pending`, and a slot that has never reported. `slots == on + off` always |
+| `lastScaleAt` | `*metav1.Time` | When the pool last grew or shrank |
+| `lastScaleAction` | `string` | That scale in one line, naming the slot and the request: `up remote-worker-2`, `down remote-worker-4`, `ca:DeleteNodes remote-worker-3` |
+
+The group controller writes all of it, in one pass over the slots of the pool, and the pool
+reconciles when a slot changes (`Owns(&Node{})`, via the controller reference the slot's reconciler
+stamps). The counts are a sum over the slots' `status.phase`; they are a display sum, and no
+decision reads them - the provider's arithmetic counts live claims and slots directly
+([NodeClaim design](../../design/nodeclaim.md)).
+
+`lastScaleAt` / `lastScaleAction` are **materialized, not read on demand**, and that is the point.
+The same story is a Kubernetes Event on a slot, Events are garbage-collected in about an hour, and
+the question - "did this pool thrash last night?" - is asked the next morning. The per-slot record
+that outlives a claim's TTL collection is `Node.status.lastClaim` (the digest the claim controller
+stamps), so the newest of those over the pool is copied onto the pool: a scale is legible on the
+Group a day later, with no Event to have kept and nothing to correlate. The timestamp is the
+request's own instant (`lastClaim.requestedAt`), because the question is when the pool moved, not
+when its episode closed.
+
+### The Columns of `kubectl get groups`
+
+```
+NAME             SLOTS   ON   OFF   LASTSCALE   HEALTH   AGE
+remote-workers   5       2    3     24m                  41d
+```
+
+`NAME` and `AGE` are the built-in columns of a Kubernetes table; the five that come between them are
+this CRD's. A pool that used to answer "it exists" now answers "four slots, two machines up, the
+last thing it did was take one back 24 minutes ago". The columns are asserted on the generated CRD
+and on the chart's copy by `internal/controller/infra/crd_columns_test.go`, and their values are
+asserted against a live API server in `internal/controller/infra/group_columns_envtest_test.go`.
+
+The read-time companion, for one slot's history and for durations, is the runbook's
+[Read the Pool at a Glance](../../troubleshooting/common-issues.md#read-the-pool-at-a-glance).
+
 ## Readiness Gate
 
 `nodeReadinessTaints` is the list the gate for a claim's **`ready`** phase waits for: the
@@ -116,6 +159,10 @@ kubectl describe group worker-nodes -n homelab-autoscaler-system
 # Watch group status changes
 kubectl get groups -n homelab-autoscaler-system -w
 ```
+
+`kubectl get groups` answers the shape of the pool (slots, up, down, last scale); `kubectl describe
+group` adds the sentence of the last scale (`lastScaleAction: ca:DeleteNodes remote-worker-3`) and
+the `Loaded` condition.
 
 ## Scaling Behavior
 

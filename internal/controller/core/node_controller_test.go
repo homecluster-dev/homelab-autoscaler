@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	"github.com/stretchr/testify/assert"
@@ -480,11 +481,27 @@ func TestApplyObservation(t *testing.T) {
 
 			in := phase.Input{Claim: tc.claim, ObservedPower: tc.observed, NodeUsable: tc.usable}
 
-			changed := applyObservation(node, tc.observed, in)
+			at := time.Date(2025, 11, 12, 9, 0, 0, 0, time.UTC)
+			changed := applyObservation(node, tc.observed, in, at)
 
 			assert.Equal(t, tc.wantChange, changed)
 			assert.Equal(t, tc.wantPower, node.Status.PowerState)
 			assert.Equal(t, tc.wantPhase, node.Status.Phase)
+
+			// The history is written with the report by the one writer of it (phase.Record): a pass
+			// that moved the phase dates it and records the row, a pass that moved nothing does not.
+			if tc.wantPhase != tc.from {
+				require.NotNil(t, node.Status.LastTransitionTime, "a phase change dates itself")
+				assert.True(t, node.Status.LastTransitionTime.Time.Equal(at))
+				assert.Equal(t, tc.from, node.Status.PreviousPhase)
+				require.Len(t, node.Status.RecentTransitions, 1)
+				assert.Equal(t, tc.wantPhase, node.Status.RecentTransitions[0].To)
+				assert.NotEmpty(t, node.Status.RecentTransitions[0].Reason, "the row names the inputs")
+			} else {
+				assert.Nil(t, node.Status.LastTransitionTime, "a resync does not date a change that did not happen")
+				assert.Empty(t, node.Status.RecentTransitions)
+				assert.Zero(t, node.Status.ActivationsLast24H)
+			}
 		})
 	}
 }

@@ -120,11 +120,58 @@ type GroupStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// Slots is the number of Node CRs labelled `group: <this group>`: the max size of the pool,
+	// the number of machines it can have. The group controller counts them on its pass; the count
+	// is the same list the provider's max-size arithmetic reads, and it decides nothing here. The
+	// three counts carry no `omitempty`: an empty column in `kubectl get groups` is not the
+	// sentence "this pool has zero machines up", and a pool at zero is the normal state of a pool
+	// that is doing its job.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Slots int32 `json:"slots"`
+
+	// On is how many slots of the pool report a machine that is up: `booting`, `ready` and
+	// `draining`, the phases phase.Derive only reaches when the machine is observed on. It is what
+	// the pool is paying for right now, counted from the slots' reports.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	On int32 `json:"on"`
+
+	// Off is the rest of the pool: `off`, `pending`, and a slot that has never reported. Slots ==
+	// On + Off always, so "4 of 6 up" is one read of one object.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Off int32 `json:"off"`
+
+	// LastScaleAt is when the pool last grew or shrank, and LastScaleAction names the slot it
+	// moved and the request that moved it. They are **materialized**, and that is the point: the
+	// same story is a Kubernetes Event, Events are garbage-collected in about an hour, and
+	// "did this pool thrash last night?" is asked the next morning. The group controller
+	// materializes it off the `status.lastClaim` digest of the slots, which outlives the claim's
+	// TTL collection, so the answer is on the pool a day later with nothing to correlate.
+	// +optional
+	LastScaleAt *metav1.Time `json:"lastScaleAt,omitempty"`
+
+	// LastScaleAction is the sentence of that last scale: `up <slot>`, `down <slot>`,
+	// `ca:DeleteNodes <slot>`. Written by the group controller from the same digest, and read by
+	// nothing that decides.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	LastScaleAction string `json:"lastScaleAction,omitempty"`
 }
 
+// The columns of `kubectl get groups`: the shape of a pool at a glance. NAME is the built-in
+// column of a Kubernetes table, not a printcolumn; AGE is built in too, and the pool's shape is
+// what replaces it as the first thing an operator reads.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:storageversion
+// +kubebuilder:printcolumn:name="Slots",type=integer,JSONPath=".status.slots",description="Node CRs committed to this pool (its max size)"
+// +kubebuilder:printcolumn:name="On",type=integer,JSONPath=".status.on",priority=0,description="Slots of this pool reporting a machine that is up (booting, ready, draining)"
+// +kubebuilder:printcolumn:name="Off",type=integer,JSONPath=".status.off",priority=0,description="Slots of this pool with no machine up"
+// +kubebuilder:printcolumn:name="LastScale",type=date,JSONPath=".status.lastScaleAt",priority=0,description="When the pool last grew or shrank"
+// +kubebuilder:printcolumn:name="Health",type=string,JSONPath=".status.health",priority=0,description="healthy / offline / unknown"
 
 // Group is the Schema for the groups API
 type Group struct {

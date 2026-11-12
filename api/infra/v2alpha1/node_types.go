@@ -390,6 +390,78 @@ type NodeStatus struct {
 	// LastShutdownTime is the last time the node was successfully shut down.
 	// +optional
 	LastShutdownTime *metav1.Time `json:"lastShutdownTime,omitempty"`
+
+	// LastTransitionTime is the instant status.phase last changed value. It is the "since" an
+	// operator reads ("this slot has been booting for 12 minutes"), and it is written with the
+	// phase, by the one writer of the report (phase.Record), so a pass that records nothing
+	// leaves it alone: it dates the change, not the resync.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+
+	// PreviousPhase is the phase the slot reported before status.phase, empty when the slot has
+	// reported exactly one phase. It is the other half of the sentence a phase cannot say on its
+	// own: "off -> booting" is a machine coming up, "ready -> booting" is a machine the pool lost.
+	// +kubebuilder:validation:Enum="";off;pending;booting;ready;draining
+	// +optional
+	PreviousPhase NodePhase `json:"previousPhase,omitempty"`
+
+	// ActivationsTotal is the monotonic count of the slot's boots: every pass that recorded the
+	// report entering `booting` counted one. It is the slot's lifetime counter ("how many times has
+	// this machine been woken up"), and it never resets, so it is comparable to the machine, not
+	// to the clock. It carries no `omitempty`: a zero is a number an operator reads ("this slot has
+	// never been booted"), and a field omitted at zero renders an empty column, which is a different
+	// and worse sentence.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ActivationsTotal int32 `json:"activationsTotal"`
+
+	// ActivationsLast24H is how many of those boots are inside the last 24 hours. It is a
+	// materialized count of status.recentTransitions, not a third record of the same fact: the
+	// ring is the ledger and this is its sum, recomputed on every write of the report, and pruned
+	// and recomputed on the pass that watches the oldest entry expire (see
+	// phase.NextTransitionExpiry). Churn - the pool that boots a machine for one pod and powers it
+	// off ten minutes later - is visible here and nowhere else in the API.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ActivationsLast24H int32 `json:"activationsLast24H"`
+
+	// RecentTransitions is the bounded, time-boxed ring of the slot's phase changes: the last
+	// TransitionRingCap of them, pruned to TransitionWindow. It is the shape of the pool over a
+	// day (`off -> booting -> ready -> draining -> off` at 03:00, and again at 09:00), readable
+	// with no second command, and it is what activationsLast24H is counted from.
+	//
+	// It is observability and nothing else: no reconciler, hook, provider call or state machine
+	// reads it, and it is bounded on purpose - a day of a slot is 32 rows, not a growing list in
+	// etcd.
+	// +optional
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=atomic
+	RecentTransitions []NodeTransition `json:"recentTransitions,omitempty"`
+}
+
+// NodeTransition is one recorded change of Node.status.phase: the moment, the phase it came from,
+// the phase it went to, and one line saying why. `from` is empty for the first phase a slot ever
+// reported, which is a seeding, not a transition of a machine.
+type NodeTransition struct {
+	// At is the instant the report changed value.
+	// +optional
+	At *metav1.Time `json:"at,omitempty"`
+
+	// From is the phase the slot reported before this one.
+	// +kubebuilder:validation:Enum="";off;pending;booting;ready;draining
+	// +optional
+	From NodePhase `json:"from,omitempty"`
+
+	// To is the phase the slot reports since.
+	// +kubebuilder:validation:Enum=off;pending;booting;ready;draining
+	To NodePhase `json:"to"`
+
+	// Reason is the one line that says what the report was derived from: the live claim of the
+	// slot, the power the provider observed, the usability of the node object (see
+	// phase.Reason). It names the inputs, it does not narrate a transition.
+	// +optional
+	// +kubebuilder:validation:MaxLength=320
+	Reason string `json:"reason,omitempty"`
 }
 
 // LastClaimSummary is the digest of the last NodeClaim of a slot. Its field set is the design's
@@ -452,11 +524,23 @@ type LastClaimSummary struct {
 	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
 }
 
+// The columns of `kubectl get nodes.infra.homecluster.dev`: the shape of a slot at a glance,
+// without a second command. NAME is the built-in column of every Kubernetes table, not a
+// printcolumn. The two that were there first (Powerstate, Phase) keep their names and casing.
+//
+// A duration column is not possible: a printer column is a JSONPath read off the object, so it can
+// select a value and cannot subtract one. "up for 3h" is therefore a read-time command over
+// status.phase + status.lastTransitionTime, documented in the runbook
+// (docs/troubleshooting/common-issues.md, "Read the pool at a glance").
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:storageversion
 // +kubebuilder:printcolumn:name="Powerstate",type=string,JSONPath=".status.powerState",description="Current power state"
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=".status.phase",description="Derived phase of the slot (live claim + observed power + node usability)"
+// +kubebuilder:printcolumn:name="Group",type=string,JSONPath=".metadata.labels.group",description="The pool this slot belongs to"
+// +kubebuilder:printcolumn:name="Zone",type=string,JSONPath=".spec.nodeLabels['topology\\.kubernetes\\.io/zone']",description="The zone the slot declares (spec.nodeLabels), empty for a pool that does not zone its slots"
+// +kubebuilder:printcolumn:name="Since",type=date,JSONPath=".status.lastTransitionTime",description="When status.phase last changed value"
+// +kubebuilder:printcolumn:name="On24h",type=integer,JSONPath=".status.activationsLast24H",priority=0,description="Boots of this machine inside the last 24h"
 
 // Node is the Schema for the nodes API
 type Node struct {

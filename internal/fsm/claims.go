@@ -72,7 +72,20 @@ func (nm *NodeStateMachine) reportPhase() {
 			return err
 		}
 
-		if !stampDerivedPhase(fresh, derived) {
+		// The staleness guard, applied to the object this attempt read. The check above compares the
+		// machine with its own inputs; this one compares the inputs with the slot, and it is the one
+		// that matters for the *history*: a slot that already reports the phase these inputs derive
+		// (the observation path wrote it, a pass of a machine that replaced this one wrote it) has its
+		// change recorded, and appending the same change again would push the oldest real row out of
+		// the ring and count a boot twice. A slot that reports something else is a slot this machine
+		// no longer describes, and the writer of that report is the pass that owns the inputs.
+		if fresh.Status.Phase == derived {
+			nm.node = fresh
+
+			return nil
+		}
+
+		if !stampDerivedPhase(fresh, derived, time.Now(), phase.Reason(nm.input, derived)) {
 			// The slot already reports what the inputs say: nothing to write.
 			nm.node = fresh
 
@@ -91,17 +104,26 @@ func (nm *NodeStateMachine) reportPhase() {
 	}
 }
 
-// stampDerivedPhase writes the derived phase onto a fresh copy of the slot and keeps the two
-// timestamps an operator reads ("when did this machine last boot / go off") in step with it. It
-// returns true when the object changed, so a pass whose report already matches writes nothing.
-func stampDerivedPhase(node *infrav2alpha1.Node, derived infrav2alpha1.NodePhase) bool {
-	if node.Status.Phase == derived {
-		return false
+// stampDerivedPhase writes the derived phase onto a fresh copy of the slot, together with the
+// record of the change (phase.Record: lastTransitionTime, previousPhase, the ring, the activation
+// counts), and keeps the two timestamps an operator reads ("when did this machine last boot / go
+// off") in step with it. It returns true when the object changed, so a pass whose report already
+// matches writes nothing.
+//
+// The history is not written here: phase.Record is its only writer, and the observation path calls
+// it with the same derived value, so a slot's history is the same list of changes whichever path
+// got there first - and the caller's guard ("the slot already reports what my inputs derive") is
+// what keeps the two from each appending the same change.
+func stampDerivedPhase(node *infrav2alpha1.Node, derived infrav2alpha1.NodePhase, at time.Time, reason string) bool {
+	moved := node.Status.Phase != derived
+
+	changed := phase.Record(node, derived, at, reason)
+
+	if !moved {
+		return changed
 	}
 
-	node.Status.Phase = derived
-
-	now := metav1.NewTime(time.Now())
+	now := metav1.NewTime(at)
 
 	switch derived {
 	case infrav2alpha1.NodePhaseBooting:

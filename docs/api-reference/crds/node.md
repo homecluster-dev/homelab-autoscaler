@@ -68,6 +68,68 @@ overwrite a declaration. A machine is wanted exactly when a live
 | `health` | `string` | Health status: `healthy`, `offline`, `unknown` |
 | `lastStartupTime` | `*metav1.Time` | Last successful startup time |
 | `lastShutdownTime` | `*metav1.Time` | Last successful shutdown time |
+| `lastTransitionTime` | `*metav1.Time` | The instant `status.phase` last changed value. Written with the phase, by the one writer of it (`phase.Record`), so a resync that records nothing does not move it. The `SINCE` column |
+| `previousPhase` | `NodePhase` | The phase the slot reported before this one, empty for the first report. "`off -> booting`" is a machine coming up, "`ready -> booting`" is a machine the pool lost, and the phase alone cannot tell them apart |
+| `activationsTotal` | `int32` | Monotonic count of the slot's boots: every pass that recorded the report **entering** `booting` counted one. Never resets, so it is a fact about the machine, not about the clock |
+| `activationsLast24H` | `int32` | How many of those boots are inside the last 24 hours: a materialized count of `recentTransitions`, recomputed on every write of the report and on the pass that watches the oldest row leave the window. The `ON24H` column, the churn number |
+| `recentTransitions` | `[]NodeTransition` | The ring of the slot's phase changes: at most 32, pruned to the last 24 hours, newest last. Each row is `{at, from, to, reason}`, the `reason` naming the inputs the report was derived from (live claim, observed power, node usability) |
+
+#### NodeTransition
+
+```go
+type NodeTransition struct {
+    At     *metav1.Time // when the report changed value
+    From   NodePhase    // the phase it came from (empty for the first report)
+    To     NodePhase    // the phase it went to
+    Reason string       // the inputs it was derived from, e.g. "claim c1 ready, observed on, node usable"
+}
+```
+
+The ring is bounded twice over, on purpose: 32 rows and 24 hours, whichever bites first. A day of a
+churning slot is a list an operator can read and etcd can hold. It is written by the passes that
+write the phase - the observation path, the lifecycle transition path, the seed of a
+never-provisioned slot - and by nothing else: `phase.Record` is the single writer of every field
+above, so a slot's history is the same list of changes whichever path got there first. Nothing in
+the operator reads them, and
+[the state doc](../../architecture/state.md#the-observability-fields) says why that is asserted by
+a test and not by a promise.
+
+### The Columns of `kubectl get`
+
+```bash
+kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system
+```
+
+```
+NAME              POWERSTATE   PHASE     GROUP           ZONE   SINCE    ON24H
+remote-worker-1   on           ready     remote-workers  fsn1   3h13m    3
+remote-worker-2   on           booting   remote-workers  fsn1   4m       1
+remote-worker-3   off          off       remote-workers  hel1   18h      2
+remote-worker-4   on           draining  remote-workers         30m      0
+```
+
+| Column | Source |
+| --- | --- |
+| `NAME` | the built-in column of every Kubernetes table, not a printcolumn |
+| `POWERSTATE` | `.status.powerState` |
+| `PHASE` | `.status.phase` |
+| `Group` | `.metadata.labels.group` |
+| `Zone` | `.spec.nodeLabels['topology\.kubernetes\.io/zone']` - the key contains dots, so the JSONPath escapes them |
+| `Since` | `.status.lastTransitionTime`, type `date` |
+| `On24h` | `.status.activationsLast24H`, visible by default (`priority: 0`) |
+
+The names and casing of `Powerstate` and `Phase` are the ones shipped before this work and are
+frozen by `internal/controller/infra/crd_columns_test.go`, which asserts the columns of the
+generated CRD **and** of the Helm chart's copy: a printer column is a string nothing compiles, and
+the failure mode of a typo is a silent column in front of an operator.
+
+**There is no duration column, and there cannot be one.** A printer column is a JSONPath evaluated
+on the object: it selects a value, it does not subtract one, and "up for 3h" is the difference
+between `status.lastTransitionTime` and the time you ask the question. The API server prints what
+the object holds, so the object holds the instant and the duration is computed at read time. The
+exact command, and its output, are in the runbook: [Read the Pool at a
+Glance](../../troubleshooting/common-issues.md#read-the-pool-at-a-glance) - and that snippet is run
+by a test (`test/integration/duration_snippet_test.go`), so the doc cannot rot.
 
 #### PowerState
 

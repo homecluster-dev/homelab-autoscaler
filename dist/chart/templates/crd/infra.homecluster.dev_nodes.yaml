@@ -34,6 +34,23 @@ spec:
       jsonPath: .status.phase
       name: Phase
       type: string
+    - description: The pool this slot belongs to
+      jsonPath: .metadata.labels.group
+      name: Group
+      type: string
+    - description: The zone the slot declares (spec.nodeLabels), empty for a pool
+        that does not zone its slots
+      jsonPath: .spec.nodeLabels['topology\.kubernetes\.io/zone']
+      name: Zone
+      type: string
+    - description: When status.phase last changed value
+      jsonPath: .status.lastTransitionTime
+      name: Since
+      type: date
+    - description: Boots of this machine inside the last 24h
+      jsonPath: .status.activationsLast24H
+      name: On24h
+      type: integer
     name: v2alpha1
     schema:
       openAPIV3Schema:
@@ -429,6 +446,28 @@ spec:
           status:
             description: status defines the observed state of Node
             properties:
+              activationsLast24H:
+                description: |-
+                  ActivationsLast24H is how many of those boots are inside the last 24 hours. It is a
+                  materialized count of status.recentTransitions, not a third record of the same fact: the
+                  ring is the ledger and this is its sum, recomputed on every write of the report, and pruned
+                  and recomputed on the pass that watches the oldest entry expire (see
+                  phase.NextTransitionExpiry). Churn - the pool that boots a machine for one pod and powers it
+                  off ten minutes later - is visible here and nowhere else in the API.
+                format: int32
+                minimum: 0
+                type: integer
+              activationsTotal:
+                description: |-
+                  ActivationsTotal is the monotonic count of the slot's boots: every pass that recorded the
+                  report entering `booting` counted one. It is the slot's lifetime counter ("how many times has
+                  this machine been woken up"), and it never resets, so it is comparable to the machine, not
+                  to the clock. It carries no `omitempty`: a zero is a number an operator reads ("this slot has
+                  never been booted"), and a field omitted at zero renders an empty column, which is a different
+                  and worse sentence.
+                format: int32
+                minimum: 0
+                type: integer
               conditions:
                 description: |-
                   conditions represent the current state of the Node resource.
@@ -587,6 +626,14 @@ spec:
                   started up.
                 format: date-time
                 type: string
+              lastTransitionTime:
+                description: |-
+                  LastTransitionTime is the instant status.phase last changed value. It is the "since" an
+                  operator reads ("this slot has been booting for 12 minutes"), and it is written with the
+                  phase, by the one writer of the report (phase.Record), so a pass that records nothing
+                  leaves it alone: it dates the change, not the resync.
+                format: date-time
+                type: string
               phase:
                 description: |-
                   Phase is the derived report of the slot: see NodePhase. Written from
@@ -609,6 +656,72 @@ spec:
                 - "on"
                 - "off"
                 type: string
+              previousPhase:
+                description: |-
+                  PreviousPhase is the phase the slot reported before status.phase, empty when the slot has
+                  reported exactly one phase. It is the other half of the sentence a phase cannot say on its
+                  own: "off -> booting" is a machine coming up, "ready -> booting" is a machine the pool lost.
+                enum:
+                - ""
+                - "off"
+                - pending
+                - booting
+                - ready
+                - draining
+                type: string
+              recentTransitions:
+                description: |-
+                  RecentTransitions is the bounded, time-boxed ring of the slot's phase changes: the last
+                  TransitionRingCap of them, pruned to TransitionWindow. It is the shape of the pool over a
+                  day (`off -> booting -> ready -> draining -> off` at 03:00, and again at 09:00), readable
+                  with no second command, and it is what activationsLast24H is counted from.
+
+                  It is observability and nothing else: no reconciler, hook, provider call or state machine
+                  reads it, and it is bounded on purpose - a day of a slot is 32 rows, not a growing list in
+                  etcd.
+                items:
+                  description: |-
+                    NodeTransition is one recorded change of Node.status.phase: the moment, the phase it came from,
+                    the phase it went to, and one line saying why. `from` is empty for the first phase a slot ever
+                    reported, which is a seeding, not a transition of a machine.
+                  properties:
+                    at:
+                      description: At is the instant the report changed value.
+                      format: date-time
+                      type: string
+                    from:
+                      description: From is the phase the slot reported before this
+                        one.
+                      enum:
+                      - ""
+                      - "off"
+                      - pending
+                      - booting
+                      - ready
+                      - draining
+                      type: string
+                    reason:
+                      description: |-
+                        Reason is the one line that says what the report was derived from: the live claim of the
+                        slot, the power the provider observed, the usability of the node object (see
+                        phase.Reason). It names the inputs, it does not narrate a transition.
+                      maxLength: 320
+                      type: string
+                    to:
+                      description: To is the phase the slot reports since.
+                      enum:
+                      - "off"
+                      - pending
+                      - booting
+                      - ready
+                      - draining
+                      type: string
+                  required:
+                  - to
+                  type: object
+                maxItems: 32
+                type: array
+                x-kubernetes-list-type: atomic
             type: object
         required:
         - spec

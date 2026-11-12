@@ -109,7 +109,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Only update when the recorded status disagrees with what is observed. A status
 	// write on every reconcile would keep this controller hot, so the fast path covers
 	// "power state and derived phase unchanged, and no new autoscaler marker".
-	if !applyObservation(nodeCR.DeepCopy(), nodeStatus, input) && !markerChanged {
+	if !applyObservation(nodeCR.DeepCopy(), nodeStatus, input, observedAt) && !markerChanged {
 		logger.V(1).Info("Node status unchanged, skipping update", "node", node.Name, "status", nodeStatus)
 		return ctrl.Result{}, nil
 	}
@@ -128,7 +128,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return err
 		}
 
-		powerChanged := applyObservation(fresh, nodeStatus, input)
+		powerChanged := applyObservation(fresh, nodeStatus, input, observedAt)
 
 		decision, markerChanged := autoscaler.ApplyMarker(fresh, node, observedAt)
 		if !powerChanged && !markerChanged {
@@ -200,7 +200,14 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 //
 // It returns true when the object changed, so the caller skips the status write when there is
 // nothing to do.
-func applyObservation(node *infrav2alpha1.Node, powerState infrav2alpha1.PowerState, in phase.Input) bool {
+//
+// The report's own observability (lastTransitionTime, previousPhase, the ring of recent
+// transitions, the activation counts) is written by the single writer of it, phase.Record, which
+// the transition path calls with the same value: one formula for the phase, one writer for its
+// history, so the two writers of the report cannot leave a slot whose history disagrees with the
+// phase it reports. `at` is the instant this pass read the node object, the same clock the marker
+// record quotes.
+func applyObservation(node *infrav2alpha1.Node, powerState infrav2alpha1.PowerState, in phase.Input, at time.Time) bool {
 	changed := false
 
 	if node.Status.PowerState != powerState {
@@ -211,8 +218,7 @@ func applyObservation(node *infrav2alpha1.Node, powerState infrav2alpha1.PowerSt
 	in.ObservedPower = powerState
 
 	derived := phase.Derive(in)
-	if node.Status.Phase != derived {
-		node.Status.Phase = derived
+	if phase.Record(node, derived, at, phase.Reason(in, derived)) {
 		changed = true
 	}
 

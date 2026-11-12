@@ -20,7 +20,7 @@ Two writers, with disjoint jobs. Nothing else decides anything.
 | Question | Who answers | Where | What it may write |
 | --- | --- | --- | --- |
 | Is a machine wanted on this slot, and how did the request end? | the **claim** | the claim controller (`internal/controller/infra/nodeclaim_controller.go`) and the lifecycle transitions, both through `internal/claim/recorder.go` | `NodeClaim.status` (phase, reason, attempt, conditions, finishedAt) |
-| What is the cluster observing about that machine? | the **observation** | `internal/controller/core/node_controller.go` (and the transition path, through `phase.Derive`) | `Node.status.powerState`, `Node.status.phase`, the autoscaler marker conditions |
+| What is the cluster observing about that machine? | the **observation** | `internal/controller/core/node_controller.go` (and the transition path, through `phase.Derive`) | `Node.status.powerState`, `Node.status.phase`, the report's own history (`lastTransitionTime`, `previousPhase`, the ring and the activation counts, all through `phase.Record`), the autoscaler marker conditions |
 | What lifecycle operation runs on the slot next? | the **input law**, derived, never stored | `internal/phase/phase.go` + `internal/controller/infra/lifecycle.go` | lifecycle Jobs, cordons, the coordination lock, the claim moves listed above |
 
 The claim decides. The observation reports. A report is never an input: `Node.status.phase`,
@@ -29,6 +29,26 @@ reads them to choose an action. That is the whole answer to the class of bug the
 and the 0.1.22 observed-power precedence rule existed to patch — a field that was both the state
 machine's own state and the world's report, written by four controllers. There is one such field
 left (`status.phase`), it has one formula, and it decides nothing.
+
+## The observability fields
+
+`Node.status` carries five fields that exist to be read and are inputs to nothing:
+`lastTransitionTime`, `previousPhase`, `recentTransitions` (the bounded ring: 32 rows, 24 hours),
+`activationsTotal` and `activationsLast24H`. `Group.status` carries the same kind of thing one level
+up: `slots`, `on`, `off`, `lastScaleAt`, `lastScaleAction`. They are **derived and materialized**:
+derived, because each is a function of facts the model already computes - the phase,
+the live claim, the observation - and materialized, because the answer has to be on the object when
+an operator asks, hours after the Events that recorded it were garbage-collected and after the claim
+that caused it was collected by its TTL. `activationsLast24H` is the pure case of the pattern: a
+window over a list, counted where it is written. A slot's phase and its history have one writer,
+`phase.Record`, called by the passes that already own a phase write (the observation, the transition,
+the seed of a never-provisioned slot) and by the pass the window's expiry schedules. Nothing reads
+them to decide: the state machine's input stays the triple, `Derive`'s inputs are the triple, and
+`internal/phase/hygiene_test.go` asserts on the source that no code outside the writer touches the
+ring, the counts, `previousPhase` or `lastTransitionTime`. That is the law this repository keeps
+paying for - a field that is both the machine's state and the world's report is how a slot gets
+stranded - and the new fields are the shape of that bug in its most tempting form, a history you can
+consult "just to know what happened last".
 
 ## The input law
 

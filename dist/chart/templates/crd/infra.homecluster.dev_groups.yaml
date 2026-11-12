@@ -25,7 +25,29 @@ spec:
     singular: group
   scope: Namespaced
   versions:
-  - name: v2alpha1
+  - additionalPrinterColumns:
+    - description: Node CRs committed to this pool (its max size)
+      jsonPath: .status.slots
+      name: Slots
+      type: integer
+    - description: Slots of this pool reporting a machine that is up (booting, ready,
+        draining)
+      jsonPath: .status.on
+      name: "On"
+      type: integer
+    - description: Slots of this pool with no machine up
+      jsonPath: .status.off
+      name: "Off"
+      type: integer
+    - description: When the pool last grew or shrank
+      jsonPath: .status.lastScaleAt
+      name: LastScale
+      type: date
+    - description: healthy / offline / unknown
+      jsonPath: .status.health
+      name: Health
+      type: string
+    name: v2alpha1
     schema:
       openAPIV3Schema:
         description: Group is the Schema for the groups API
@@ -234,6 +256,49 @@ spec:
                 - offline
                 - unknown
                 type: string
+              lastScaleAction:
+                description: |-
+                  LastScaleAction is the sentence of that last scale: `up <slot>`, `down <slot>`,
+                  `ca:DeleteNodes <slot>`. Written by the group controller from the same digest, and read by
+                  nothing that decides.
+                maxLength: 256
+                type: string
+              lastScaleAt:
+                description: |-
+                  LastScaleAt is when the pool last grew or shrank, and LastScaleAction names the slot it
+                  moved and the request that moved it. They are **materialized**, and that is the point: the
+                  same story is a Kubernetes Event, Events are garbage-collected in about an hour, and
+                  "did this pool thrash last night?" is asked the next morning. The group controller
+                  materializes it off the `status.lastClaim` digest of the slots, which outlives the claim's
+                  TTL collection, so the answer is on the pool a day later with nothing to correlate.
+                format: date-time
+                type: string
+              "off":
+                description: |-
+                  Off is the rest of the pool: `off`, `pending`, and a slot that has never reported. Slots ==
+                  On + Off always, so "4 of 6 up" is one read of one object.
+                format: int32
+                minimum: 0
+                type: integer
+              "on":
+                description: |-
+                  On is how many slots of the pool report a machine that is up: `booting`, `ready` and
+                  `draining`, the phases phase.Derive only reaches when the machine is observed on. It is what
+                  the pool is paying for right now, counted from the slots' reports.
+                format: int32
+                minimum: 0
+                type: integer
+              slots:
+                description: |-
+                  Slots is the number of Node CRs labelled `group: <this group>`: the max size of the pool,
+                  the number of machines it can have. The group controller counts them on its pass; the count
+                  is the same list the provider's max-size arithmetic reads, and it decides nothing here. The
+                  three counts carry no `omitempty`: an empty column in `kubectl get groups` is not the
+                  sentence "this pool has zero machines up", and a pool at zero is the normal state of a pool
+                  that is doing its job.
+                format: int32
+                minimum: 0
+                type: integer
             type: object
         required:
         - spec
