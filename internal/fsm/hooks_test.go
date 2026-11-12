@@ -198,11 +198,14 @@ func TestAfterJobCompleted(t *testing.T) {
 		updatedNode := &infrav2alpha1.Node{}
 		err := fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updatedNode)
 		assert.NoError(t, err)
-		// The gate passed, so the claim moved booting -> ready. The slot's report is the derived
-		// value, and the observation this pass was built from says the machine is off: the report
-		// flips to ready when the node object is observed Ready (internal/controller/core), and
-		// nothing here reads the report to decide anything.
-		assert.Equal(t, infrav2alpha1.NodePhaseBooting, updatedNode.Status.Phase)
+		// The gate passed, so the claim moved booting -> ready, and the gate's own read of the node is
+		// an input of the report (recordGateAnswer): the node it just uncordoned reports Ready, so the
+		// machine is observed on and usable, and the derived report is ready. This is the shape of a real
+		// boot - the machine that fired the startup Job watched it off, and the machine that answers for
+		// its completion is the goroutine of that same pass - and the report has to land here: the other
+		// writer, the observation path, runs on corev1.Node events, and a kubelet that has settled into
+		// Ready writes no more of them.
+		assert.Equal(t, infrav2alpha1.NodePhaseReady, updatedNode.Status.Phase)
 
 		updatedClaim := &infrav2alpha1.NodeClaim{}
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(startingClaim), updatedClaim))
@@ -792,7 +795,12 @@ func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *
 	fakeClient := CreateFakeClient(scheme, node, kubeNode)
 
 	mockCoord := NewMockCoordinationManager()
-	nm := MachineForState(node, fakeClient, scheme, mockCoord)
+	// The gate the test's name names: the bootstrap taint is the key the pool's Group declares, so
+	// the loop waits for Cilium to remove it, and runs out of its budget. Without the key declared the
+	// gate is the Ready condition alone, and this node is Ready - the fixture would answer for a gate
+	// that passed.
+	nm := MachineForState(node, fakeClient, scheme, mockCoord,
+		WithReadinessTaintKeys([]string{TaintCiliumAgentNotReady}))
 	nm.uncordonTimeout = 100 * time.Millisecond
 	nm.readinessGateTimeout = 100 * time.Millisecond // the gate has its own deadline
 
@@ -812,11 +820,10 @@ func TestAfterJobCompletedCompletesTheTransitionWhenTheReadinessGateTimesOut(t *
 
 	updated := &infrav2alpha1.Node{}
 	require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(node), updated))
-	assert.Equal(t, infrav2alpha1.NodePhaseBooting, updated.Status.Phase,
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, updated.Status.Phase,
 		"the transition completes: a slot is never left transitional by a readiness gate that timed out. "+
-			"The report is the derived value: the gate's answer moved the claim to failed, and this "+
-			"slot's machine is observed off, so the slot is on its way out (a failed claim with the "+
-			"machine off is booted again by the next claim, attempt N+1)")
+			"The gate's answer moved the claim to failed, and a terminal claim with the machine observed up "+
+			"is the force-shutdown row of the table, so the slot reports draining and law 3 powers the machine off")
 
 	updatedKubeNode := &corev1.Node{}
 	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "test-node-k8s"}, updatedKubeNode))

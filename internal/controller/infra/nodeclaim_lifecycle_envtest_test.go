@@ -237,6 +237,72 @@ var _ = Describe("NodeClaim lifecycle", func() {
 		Expect(jobsOfSlot(name)).To(HaveLen(1), "the startup Job in flight is the only lifecycle Job")
 	})
 
+	// "a boot that started from an off observation lands its report ready"
+	//
+	// This is the shape the k3d e2e drives and the shape every real boot is: the pass that fires
+	// StartNode reads the machine observed off, and the Job monitor that reports the boot completed is
+	// the goroutine of *that* pass, so the input of the machine that answers for the boot is the
+	// snapshot of the boot's start - off, with no usable node. The machine came up while the Job ran:
+	// the kubelet joined, the observation path recorded the power, and the readiness gate has just read
+	// the node object it is answering for. The report the same pass writes is derived from that
+	// evidence, not from the snapshot the boot started in.
+	//
+	// The spec above fixes the observation at `on` before the gate runs, which is the shape a fixture
+	// can seed and a boot cannot reach. Here nothing re-reads the slot for the monitor: a settled
+	// kubelet writes no further corev1.Node event (its heartbeats go to its Lease), so the observation
+	// path - the other writer of the report - never runs again, and a report the gate refuses to write
+	// stays `booting` for the life of the machine.
+	It("lands a boot that started from an off observation on a ready report", func() {
+		name := slotName("boot-from-off")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseOff)
+		nodeClaim := newClaim(slot, infrav2alpha1.NodeClaimPending, nil)
+
+		// Law 1 boots it: the startup Job, the pending -> booting commit, and the report of the pass.
+		reconcileSlot(readSlotObject(name))
+
+		Expect(readClaimObject(nodeClaim.Name).Status.Phase).To(Equal(infrav2alpha1.NodeClaimBooting))
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseBooting))
+
+		job := newestJobOf(jobsOfSlot(name, fsm.PhaseStartup))
+
+		// The state machine of the pass that started the boot, built from the inputs that pass read:
+		// the machine observed off, and no node object, the kubelet of a powered-off machine not having
+		// joined yet. The Job monitor of the boot is the goroutine of this machine.
+		reconciler := &NodeReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+
+		bootingSlot := readSlotObject(name)
+
+		live, err := reconciler.liveClaimOf(ctx, bootingSlot)
+		Expect(err).NotTo(HaveOccurred())
+		requireLiveClaim(live)
+
+		monitor := startupGateMachine(reconciler, bootingSlot, live)
+		Expect(monitor.GetCurrentState()).To(Equal(fsm.StateStartingUp),
+			"the boot in flight is the state its completion is reachable from")
+
+		// The machine comes up, and the observation follows it.
+		k8sNode(name, true)
+		reconcileObservation(name + "-k8s")
+
+		Expect(readSlotObject(name).Status.PowerState).To(Equal(infrav2alpha1.PowerStateOn),
+			"the kubelet is beating, so the machine is observed on")
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseBooting),
+			"the claim has not been stamped ready, and an unstamped claim on a machine that is up is booting")
+
+		// The startup Job finishes, and the monitor of the pass that started it reports the completion.
+		completeJob(job)
+
+		Expect(monitor.JobCompleted(job)).To(Succeed())
+
+		ready := readClaimObject(nodeClaim.Name)
+		Expect(ready.Status.Phase).To(Equal(infrav2alpha1.NodeClaimReady),
+			"the readiness gate answered for the claim: the node is Ready, gate-clear and uncordoned")
+
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseReady),
+			"the gate's own read of the node is an input, so the report of the same evidence is ready: a slot\n"+
+				"that reports booting here has no writer left to fix it, the node object is quiet")
+	})
+
 	// "spec.deadlineAt in the past on a booting claim -> failed, and the machine is force-shut down"
 	It("fails an overdue booting claim and powers its machine off", func() {
 		name := slotName("deadline")

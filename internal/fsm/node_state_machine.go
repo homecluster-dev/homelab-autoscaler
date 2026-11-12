@@ -707,13 +707,16 @@ func (nm *NodeStateMachine) setNodeUnschedulable(nodeName string) error {
 	return nil
 }
 
-// setNodeSchedulableInternal performs the actual uncordon operation without retry
-func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
+// setNodeSchedulableInternal performs the actual uncordon operation without retry, and returns the
+// node object as the machine left it: the gate's answer is recorded from that object (see
+// recordGateAnswer), so what the report of the same pass derives from is the state the uncordon
+// wrote, not a read of it from before.
+func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) (*corev1.Node, error) {
 	logger := log.Log.WithName("fsm").WithValues("node", nm.node.Name, "kubernetesNode", nodeName, "action", "uncordon")
 
 	if nodeName == "" {
 		logger.V(1).Info("No Kubernetes node name specified, skipping uncordon operation")
-		return nil
+		return nil, nil
 	}
 
 	ctx := context.TODO()
@@ -722,7 +725,7 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 	kubeNode := &corev1.Node{}
 	if err := nm.client.Get(ctx, client.ObjectKey{Name: nodeName}, kubeNode); err != nil {
 		logger.Info("Kubernetes node not found, skipping uncordon operation", "error", err.Error())
-		return nil // Don't fail the operation if the node doesn't exist
+		return nil, nil // Don't fail the operation if the node doesn't exist
 	}
 
 	// Check if already schedulable and has no unschedulable taint
@@ -738,7 +741,7 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 
 	if !needsUpdate && !needsTaintRemoval {
 		logger.V(1).Info("Kubernetes node is already schedulable")
-		return nil
+		return kubeNode, nil
 	}
 
 	// Set node as schedulable
@@ -754,17 +757,19 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) error {
 				newTaints = append(newTaints, taint)
 			}
 		}
+
 		kubeNode.Spec.Taints = newTaints
 		logger.Info("Removed unschedulable taint", "taintKey", "node.kubernetes.io/unschedulable")
 	}
 
 	if err := nm.client.Update(ctx, kubeNode); err != nil {
 		logger.Error(err, "Failed to uncordon Kubernetes node")
-		return err
+		return nil, err
 	}
 
 	logger.Info("Successfully uncordoned Kubernetes node")
-	return nil
+
+	return kubeNode, nil
 }
 
 // TaintCiliumAgentNotReady is Cilium's bootstrap taint: its agent adds it to a node that has just
@@ -975,8 +980,12 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		}
 
 		// Try to uncordon using internal method (no retry)
-		err := nm.setNodeSchedulableInternal(nodeName)
+		uncordoned, err := nm.setNodeSchedulableInternal(nodeName)
 		if err == nil {
+			// The gate has answered, and its answer is an input of the report: record it before the
+			// caller moves the claim to ready and writes the slot's phase (see recordGateAnswer).
+			nm.recordGateAnswer(uncordoned)
+
 			logger.Info("Successfully uncordoned Kubernetes node",
 				"elapsed", time.Since(start).String(),
 				"gate", "satisfied")
@@ -1016,7 +1025,7 @@ func (nm *NodeStateMachine) abandonReadinessGate(logger logr.Logger, nodeName, w
 	nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonReadinessGateTimeout, ActionUncordon,
 		readinessGateNote(nm.node.Name, nodeName, gate, waitingOn, budget))
 
-	if err := nm.setNodeSchedulableInternal(nodeName); err != nil {
+	if _, err := nm.setNodeSchedulableInternal(nodeName); err != nil {
 		logger.Error(err, "Best-effort uncordon after the readiness timeout failed, leaving the node cordoned",
 			"elapsed", elapsed.String())
 	}

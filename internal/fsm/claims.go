@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/looplab/fsm"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -160,6 +161,49 @@ func (nm *NodeStateMachine) setInputPhase(to infrav2alpha1.NodeClaimPhase) {
 
 	if to == infrav2alpha1.NodeClaimBooting {
 		nm.input.StartupJobInFlight = true
+	}
+}
+
+// recordGateAnswer is the readiness gate writing its own evidence into the machine's input, so the
+// report the transition derives next describes the machine the gate is standing in front of.
+//
+// The machine that answers for a boot is the goroutine of the pass that fired it (`monitorJobCompletion`),
+// and the input of that machine is the triple the pass read: for a real boot, the machine observed
+// **off**, with no node object. The gate then spends its time turning that into a machine that is up
+// and usable - registration, Ready, free of the pool's readiness taints, uncordoned - and the claim
+// move it writes is recorded into the input (`setInputPhase`). The other two inputs of the triple are
+// the evidence the gate read for itself, and are recorded here: the node object the uncordon just left
+// behind, asked with the one predicate the report uses (`phase.Unusable`), and its Ready condition,
+// which is the definition `status.powerState` is written from.
+//
+// Without this, the `booting -> ready` report is derived from the boot's starting snapshot, the
+// staleness guard of `reportPhase` refuses the write - correctly, that machine's inputs describe a
+// machine that is not up - and nothing writes the ready report afterwards. The other writer of the
+// report is the observation path, and it runs on `corev1.Node` events: a kubelet that has settled into
+// Ready is quiet (its heartbeats go to its Lease, and its status posts every five minutes), so a slot
+// whose machine booted while the pass that started it watched it off reports `booting` for the life of
+// the machine, and the autoscaler reads the pool as having no usable capacity.
+//
+// A node object that cannot be handed over (no name on the slot, a Get the API refused, the gate
+// abandoned on its timeout) records nothing: the input keeps the observation it was built from, and
+// the report is the observation reconciler's to write when the node object next moves. A gate that
+// timed out moves the claim to `failed` anyway, so that shape has an owner: the input law shuts the
+// machine down, and law 3 writes the report of the shutdown it fires.
+func (nm *NodeStateMachine) recordGateAnswer(kubeNode *corev1.Node) {
+	if kubeNode == nil {
+		return
+	}
+
+	nm.input.NodeUsable = phase.Unusable(kubeNode, nm.readinessTaintKeys) == ""
+
+	for _, cond := range kubeNode.Status.Conditions {
+		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+			// The gate's own definition of the machine being up, the same one the observation path
+			// writes status.powerState from (core.KubernetesNodeReconciler.getNodeStatus).
+			nm.input.ObservedPower = infrav2alpha1.PowerStateOn
+
+			break
+		}
 	}
 }
 

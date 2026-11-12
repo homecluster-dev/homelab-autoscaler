@@ -18,6 +18,7 @@ package phase
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -167,6 +168,96 @@ func TestUnusableIsTheReadinessGate(t *testing.T) {
 	cordoned := ready()
 	cordoned.Spec.Unschedulable = true
 	assert.Contains(t, Unusable(cordoned, keys), "cordoned")
+}
+
+// TestServingSlotIsTheServingShape is the diagnosis of the k3d e2e failure written as a table: the
+// state the setup spec puts its machine in - a live claim stamped ready, the machine observed on, a
+// corev1.Node whose kubelet is beating, Ready, uncordoned and carrying only the pool's own role taint
+// - derives `ready`, and nothing else in the shape moves the answer.
+//
+// The rows are the suspects the failure had to be read against. Each is the serving triple with one
+// field added that a controller *could* have read (the digest of a past episode, a condition on the
+// claim, a boot deadline that has run out, an in-flight startup Job of the boot that landed) and the
+// answer stays `ready`: the report has exactly three inputs, and a slot whose report says `booting`
+// in this shape is a writer that handed in a stale triple, not a formula that disagrees (§6, and the
+// table in TestDeriveIsThePhaseStateTable).
+func TestServingSlotIsTheServingShape(t *testing.T) {
+	now := metav1.Now()
+
+	// servingNode is a machine a kubelet is running: Ready with a current heartbeat, uncordoned, and
+	// carrying the pool's role taint, which is not one of the readiness keys the Group declares.
+	servingNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "k3d-homelab-autoscaler-agent-0"},
+		Spec: corev1.NodeSpec{
+			Taints: []corev1.Taint{{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}},
+		},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:               corev1.NodeReady,
+			Status:             corev1.ConditionTrue,
+			LastHeartbeatTime:  now,
+			LastTransitionTime: now,
+		}}},
+	}
+
+	// The triple of the spec, with the readiness question asked the way the controllers ask it.
+	serving := Input{
+		Claim:         claim(infrav2alpha1.NodeClaimReady, false),
+		ObservedPower: infrav2alpha1.PowerStateOn,
+		NodeUsable:    Unusable(servingNode, nil) == "",
+	}
+
+	assert.True(t, serving.NodeUsable, "the role taint of the pool is not a readiness taint, and a Ready, uncordoned node is usable")
+	assert.Equal(t, infrav2alpha1.NodePhaseReady, Derive(serving), "a live ready claim, a machine observed on and a usable node is ready")
+	assert.Equal(t, StateReady, State(serving), "and the state machine starts in ready, where ShutdownNode is reachable and StartNode is not")
+
+	// The suspects, each added to the same triple.
+	t.Run("a boot deadline in the past says nothing about a machine that is serving", func(t *testing.T) {
+		overdue := serving
+		overdue.Claim = claim(infrav2alpha1.NodeClaimReady, false)
+		stamped := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+		overdue.Claim.Spec.DeadlineAt = &stamped
+
+		assert.Equal(t, infrav2alpha1.NodePhaseReady, Derive(overdue))
+		assert.False(t, InBootWindow(overdue.Claim.Status.Phase), "the deadline bounded the boot, and the boot is over")
+	})
+
+	t.Run("the record of an episode is not an input", func(t *testing.T) {
+		withDigest := serving
+		withDigest.Claim = claim(infrav2alpha1.NodeClaimReady, false)
+		withDigest.Claim.Status.Conditions = []metav1.Condition{{
+			Type:               infrav2alpha1.ClaimConditionMachineObservedOff,
+			Status:             metav1.ConditionTrue,
+			Reason:             infrav2alpha1.ClaimReasonMachineGone,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-time.Hour)),
+		}}
+
+		assert.Equal(t, infrav2alpha1.NodePhaseReady, Derive(withDigest),
+			"a condition is the record of an observation, and the observation is the input")
+	})
+
+	t.Run("the startup Job of the boot that landed is not a boot in flight", func(t *testing.T) {
+		// The report of a serving slot with its consumed startup Job still counted would be booting, so
+		// the answer is not the presence of a Job on the slot: it is a Job of this operation, in flight.
+		jobFinished := serving
+
+		assert.Equal(t, infrav2alpha1.NodePhaseReady, Derive(jobFinished))
+	})
+
+	// The one suspect that does move the answer, kept honest: a claim a scale-down has named is not a
+	// serving slot, and a machine nobody observed on is not a machine that is up.
+	assert.Equal(t, infrav2alpha1.NodePhaseDraining, Derive(Input{
+		Claim:         claim(infrav2alpha1.NodeClaimReady, true),
+		ObservedPower: serving.ObservedPower,
+		NodeUsable:    serving.NodeUsable,
+	}))
+
+	for _, observed := range []infrav2alpha1.PowerState{infrav2alpha1.PowerStateOff, ""} {
+		assert.Equal(t, infrav2alpha1.NodePhaseBooting, Derive(Input{
+			Claim:         claim(infrav2alpha1.NodeClaimReady, false),
+			ObservedPower: observed,
+			NodeUsable:    true,
+		}), "a ready claim whose machine is not observed on is a machine being bought again, not a serving one")
+	}
 }
 
 // TestIsLiveIsTheWantsMachineReading is the law's predicate, asserted on the phase set: the three
