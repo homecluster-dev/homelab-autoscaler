@@ -66,15 +66,16 @@ const (
 //     those;
 //   - a key the slot never declared is never touched. The kubelet's labels, a cloud
 //     integration's, another tool's, are not this field's business;
-//   - a declared key in a reserved namespace is skipped, and the skip is surfaced with a Warning
-//     event, not swallowed;
+//   - a declared key in a reserved namespace is skipped, the refusal is recorded on the node object
+//     (SkippedKeysAnnotation) and surfaced with a Warning event when the set of refused keys
+//     changes - not on every resync of a declaration that is not going to change;
 //   - the write is one JSON merge patch carrying only the keys that differ, so an
 //     unchanged resync sends nothing, and a patch that names only its own keys cannot clobber a
 //     concurrent write of a key it did not touch.
 //
-// One Normal Event with reason ReasonApplied is recorded per write that happened, naming the keys
-// in each direction, and one Info log line says the same. A write that changed nothing records
-// nothing.
+// One Normal Event with reason ReasonApplied is recorded per write of the slot's own keys, naming
+// the keys in each direction, and one Info log line says the same. A write that only moves the
+// controller's bookkeeping, and a pass that changes nothing, record nothing.
 //
 // A missing node object is not a failure: the machine has not registered yet, and the labels land
 // when it does. recorder may be nil, which records nothing (the unit tests do that).
@@ -101,15 +102,30 @@ func ApplyToKubernetesNode(ctx context.Context, c client.Client, slot *infrav2al
 	declaredLabels, skippedLabels := dropReserved(slot.Spec.NodeLabels, ReservedLabelKey)
 	declaredAnnotations, skippedAnnotations := dropReserved(slot.Spec.NodeAnnotations, ReservedAnnotationKey)
 
-	if len(skippedLabels)+len(skippedAnnotations) > 0 && recorder != nil {
-		note := skippedKeysNote(slot.Name, skippedLabels, skippedAnnotations)
+	// The refusal is recorded on the node object, in the operator's own namespace, and the Warning
+	// event fires when that record *changes*: the reconciler runs this on every pass of every slot,
+	// and an event per resync for a declaration that is not going to change is noise that buries the
+	// one event worth reading. A slot that keeps declaring the same key it may not write is warned
+	// about once, and the record on the node says it is still being refused every time anyone looks.
+	skipped := skippedKeysRecord(skippedLabels, skippedAnnotations)
+	previousSkipped := kubernetesNode.Annotations[SkippedKeysAnnotation]
 
-		// V(1) plus an Event, the same two channels as the taints package: this runs on every
-		// reconcile, and the Event is where an operator looks.
-		logger.V(1).Info("Ignoring declared keys with namespaces their owner controls",
-			"kubernetesNode", slot.Spec.KubernetesNodeName, "note", note)
+	if skipped != previousSkipped {
+		if skipped != "" && recorder != nil {
+			note := skippedKeysNote(slot.Name, skippedLabels, skippedAnnotations)
 
-		recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonSkippedReservedKey, ActionApplyNodeLabels, "%s", note)
+			// V(1) plus an Event, the same two channels as the taints package: the event is where an
+			// operator looks, the log line is the one that says when it fired.
+			logger.V(1).Info("Ignoring declared keys with namespaces their owner controls",
+				"kubernetesNode", slot.Spec.KubernetesNodeName, "note", note)
+
+			recorder.Eventf(slot, nil, corev1.EventTypeWarning, ReasonSkippedReservedKey, ActionApplyNodeLabels, "%s", note)
+		} else if previousSkipped != "" {
+			// The set went empty: the operator took the refused key out of the declaration, and the
+			// record comes off the node with it. Nothing to warn about, worth one log line.
+			logger.Info("Declared keys that were being refused are no longer declared",
+				"kubernetesNode", slot.Spec.KubernetesNodeName, "were", previousSkipped)
+		}
 	}
 
 	ownedLabels := DecodeOwnerRecord(kubernetesNode.Annotations[AppliedLabelsAnnotation])
@@ -123,7 +139,8 @@ func ApplyToKubernetesNode(ctx context.Context, c client.Client, slot *infrav2al
 	recordAnnotations := EncodeOwnerRecord(DeclaredKeys(declaredAnnotations))
 
 	recordChange := recordDiff(kubernetesNode.Annotations, AppliedLabelsAnnotation, recordLabels) +
-		recordDiff(kubernetesNode.Annotations, AppliedAnnotationsAnnotation, recordAnnotations)
+		recordDiff(kubernetesNode.Annotations, AppliedAnnotationsAnnotation, recordAnnotations) +
+		recordDiff(kubernetesNode.Annotations, SkippedKeysAnnotation, skipped)
 
 	if labelChange.Empty() && annotationChange.Empty() && recordChange == 0 {
 		// The node is what the slot declares. Write nothing, record nothing: this is the state of
@@ -132,7 +149,7 @@ func ApplyToKubernetesNode(ctx context.Context, c client.Client, slot *infrav2al
 	}
 
 	patch, err := buildPatch(labels, labelChange, annotations, annotationChange,
-		kubernetesNode.Annotations, recordLabels, recordAnnotations)
+		kubernetesNode.Annotations, recordLabels, recordAnnotations, skipped)
 	if err != nil {
 		return fmt.Errorf("build node labels patch: %w", err)
 	}
@@ -142,9 +159,19 @@ func ApplyToKubernetesNode(ctx context.Context, c client.Client, slot *infrav2al
 	}
 
 	note := ChangeNote(labelChange, annotationChange)
+	if note == "" {
+		// Only the bookkeeping moved - a record appearing, a refused-key set changing. The write
+		// happened, and the record on the node is its audit trail; an Event that announced "nothing
+		// of yours changed" next to the Warning that explains the refusal is a second voice saying
+		// the same thing.
+		logger.V(1).Info("Updated the node object's records of a slot's declared keys",
+			"kubernetesNode", slot.Spec.KubernetesNodeName)
 
-	// Info, not V(1): this line fires only when a write happened, so it is the audit trail of
-	// "when did the controller stamp this machine", not per-resync noise.
+		return nil
+	}
+
+	// Info, not V(1): this line fires only when a write of the operator's keys happened, so it is
+	// the audit trail of "when did the controller stamp this machine", not per-resync noise.
 	logger.Info("Successfully patched Kubernetes node with declared labels",
 		"kubernetesNode", slot.Spec.KubernetesNodeName,
 		"labels", len(declaredLabels),
@@ -220,7 +247,7 @@ func buildPatch(
 	labels map[string]string, labelChange Change,
 	annotations map[string]string, annotationChange Change,
 	existingAnnotations map[string]string,
-	recordLabels, recordAnnotations string,
+	recordLabels, recordAnnotations, skippedKeys string,
 ) ([]byte, error) {
 	patch := nodePatch{Metadata: metadataPatch{
 		Labels:      map[string]*string{},
@@ -248,7 +275,8 @@ func buildPatch(
 	for _, record := range []struct {
 		key  string
 		want string
-	}{{AppliedLabelsAnnotation, recordLabels}, {AppliedAnnotationsAnnotation, recordAnnotations}} {
+	}{{AppliedLabelsAnnotation, recordLabels}, {AppliedAnnotationsAnnotation, recordAnnotations},
+		{SkippedKeysAnnotation, skippedKeys}} {
 		if existingAnnotations[record.key] == record.want {
 			continue
 		}
@@ -294,10 +322,22 @@ func (c Change) addedAndUpdated() map[string]struct{} {
 // skippedKeysNote renders the Warning event: which slot, which keys, and why they were dropped.
 func skippedKeysNote(nodeName string, labels, annotations []string) string {
 	return fmt.Sprintf("spec.nodeLabels / spec.nodeAnnotations of node %s declare keys in namespaces "+
-		"their owner controls, they are not applied: %s. Kubernetes, a CNI, Argo CD, kubectl or this "+
-		"operator adds and removes them; declare a key you own, or topology.kubernetes.io/zone and "+
-		"topology.kubernetes.io/region.",
+		"their owner controls, they are not applied: %s. Kubernetes, a CNI, Argo CD, kubectl, "+
+		"cluster-autoscaler or this operator adds and removes them; declare a key you own, or "+
+		"topology.kubernetes.io/zone and topology.kubernetes.io/region.",
 		nodeName, joinKeys(labels, annotations))
+}
+
+// skippedKeysRecord renders the node object's record of the refused keys: sorted, comma-separated,
+// and empty for a slot that declares nothing that is refused. Stable, so the comparison above
+// fires on a real change and not on map iteration order.
+func skippedKeysRecord(labels, annotations []string) string {
+	all := append(append([]string(nil), labels...), annotations...)
+	if len(all) == 0 {
+		return ""
+	}
+
+	return EncodeOwnerRecord(all)
 }
 
 func joinKeys(labels, annotations []string) string {

@@ -17,9 +17,11 @@ limitations under the License.
 package nodelabels
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestReconcile(t *testing.T) {
@@ -174,7 +176,8 @@ func TestReconcileDoesNotAliasItsInputs(t *testing.T) {
 
 func TestOverlay(t *testing.T) {
 	// The template's rule: declared keys win, everything else is kept, nothing is removed, and a
-	// reserved key is never written, whatever the spec of an old object claims.
+	// key of the namespace the *labels* belong to is never written, whatever the spec of an old
+	// object claims.
 	current := map[string]string{
 		"kubernetes.io/hostname":      "worker-01",
 		"topology.kubernetes.io/zone": "hel1",
@@ -188,6 +191,10 @@ func TestOverlay(t *testing.T) {
 		"kubernetes.io/hostname":      "spoofed",
 		"node.kubernetes.io/role":     "spoofed",
 		"infra.homecluster.dev/group": "spoofed",
+		"homelab-autoscaler.dev/role": "spoofed",
+		// refused as an annotation (Argo CD owns it there), and a label a nodeSelector can match:
+		// the label overlay must keep it, or the pod selecting it is never placed
+		"argocd.argoproj.io/team": "platform",
 	}
 
 	assert.Equal(t, map[string]string{
@@ -196,24 +203,108 @@ func TestOverlay(t *testing.T) {
 		"infra.homecluster.dev/group": "workers",
 		"node.kubernetes.io/role":     "agent",
 		"pool.homecluster.dev/tier":   "storage",
-	}, Overlay(current, declared))
+		"argocd.argoproj.io/team":     "platform",
+	}, OverlayLabels(current, declared),
+		"the label overlay filters the label-reserved namespaces and nothing else: dropping "+
+			"argocd.argoproj.io/team is the silent failure this feature exists to remove, because the "+
+			"template the estimator judges the pod against would not carry the label the selector asks for")
 
-	assert.Equal(t, current, Overlay(current, nil), "a slot that declares nothing leaves the template as copied")
-	assert.Nil(t, Overlay(nil, nil))
+	assert.Equal(t, current, OverlayLabels(current, nil), "a slot that declares nothing leaves the template as copied")
+	assert.Nil(t, OverlayLabels(nil, nil))
+
+	// The same key in the other direction: refused as an annotation, where Argo CD owns it.
+	assert.NotContains(t, OverlayAnnotations(nil, map[string]string{"argocd.argoproj.io/team": "platform"}),
+		"argocd.argoproj.io/team", "the annotation overlay uses the annotation list")
 }
 
 func TestOverlayAnnotationsSkipsReservedKeys(t *testing.T) {
-	overlaid := Overlay(map[string]string{"pool.homecluster.dev/note": "keep"}, map[string]string{
-		"argocd.argoproj.io/sync-wave":                     "1",
-		"kubectl.kubernetes.io/last-applied-configuration": "{}",
-		"infra.homecluster.dev/applied-node-labels":        "rack",
-		"pool.homecluster.dev/power":                       "ipmi",
+	overlaid := OverlayAnnotations(map[string]string{"pool.homecluster.dev/note": "keep"}, map[string]string{
+		"argocd.argoproj.io/sync-wave":                         "1",
+		"kubectl.kubernetes.io/last-applied-configuration":     "{}",
+		"infra.homecluster.dev/applied-node-labels":            "rack",
+		"homelab-autoscaler.dev/operation-lock":                "scale-up",
+		"cluster-autoscaler.kubernetes.io/scale-down-disabled": "true",
+		"pool.homecluster.dev/power":                           "ipmi",
+		// the namespaces reserved for labels only are open for annotations
+		"kubernetes.io/maintenance-window": "sat 03:00",
 	})
 
 	assert.Equal(t, map[string]string{
-		"pool.homecluster.dev/note":  "keep",
-		"pool.homecluster.dev/power": "ipmi",
+		"pool.homecluster.dev/note":        "keep",
+		"pool.homecluster.dev/power":       "ipmi",
+		"kubernetes.io/maintenance-window": "sat 03:00",
 	}, overlaid)
+}
+
+func TestConsensus(t *testing.T) {
+	// The fail-closed rule of a group's template: a key is answered for the group only when every
+	// slot of the group declares it, with the same value. Anything less is a promise the scale-up
+	// cannot keep, because IncreaseSize buys whichever slot is free.
+	slots := []SlotDeclaration{
+		{Name: "slot-a", Declared: map[string]string{
+			TopologyZoneLabel:                "fsn1",
+			"pool.homecluster.dev/rack":      "3",
+			"pool.homecluster.dev/tier":      "storage",
+			"pool.homecluster.dev/contested": "nvme",
+		}},
+		{Name: "slot-b", Declared: map[string]string{
+			TopologyZoneLabel:                "fsn1",
+			"pool.homecluster.dev/rack":      "3",
+			"pool.homecluster.dev/contested": "sata",
+			"pool.homecluster.dev/power":     "ipmi",
+		}},
+		{Name: "slot-c", Declared: map[string]string{
+			TopologyZoneLabel:                "fsn1",
+			"pool.homecluster.dev/rack":      "3",
+			"pool.homecluster.dev/contested": "nvme",
+		}},
+	}
+
+	agreed, conflicts := Consensus(slots)
+
+	assert.Equal(t, map[string]string{TopologyZoneLabel: "fsn1", "pool.homecluster.dev/rack": "3"}, agreed,
+		"a key every slot declares with the same value is the group's shape")
+
+	require.Len(t, conflicts, 3, "one key with two values, and two keys some slots do not declare at all")
+
+	notes := make([]string, 0, len(conflicts))
+	for _, conflict := range conflicts {
+		notes = append(notes, conflict.Note())
+	}
+
+	joined := strings.Join(notes, "\n")
+
+	assert.Contains(t, joined, "pool.homecluster.dev/contested")
+	assert.Contains(t, joined, `"nvme" on slot-a, slot-c`, "the note names the value and the slots that declare it")
+	assert.Contains(t, joined, `"sata" on slot-b`)
+	assert.Contains(t, joined, `pool.homecluster.dev/tier: "storage" on slot-a; not declared at all on slot-b, slot-c`,
+		"a key some slots never declare is not the group's shape either: the machine IncreaseSize buys "+
+			"may be one of them, and the pod would stay Pending on a machine that was paid for")
+	assert.Contains(t, joined, `pool.homecluster.dev/power: "ipmi" on slot-b; not declared at all on slot-c`)
+
+	// A group of one slot is exact, which is every pool of one machine, and a pool whose slots
+	// declare the same keys is exact, which is every pool the docs describe.
+	single, conflicts := Consensus([]SlotDeclaration{{Name: "slot-a", Declared: map[string]string{TopologyZoneLabel: "fsn1"}}})
+	assert.Equal(t, map[string]string{TopologyZoneLabel: "fsn1"}, single)
+	assert.Empty(t, conflicts)
+
+	// A slot that declares nothing declares no opinion, so nothing is guaranteed for the group.
+	zero, conflicts := Consensus([]SlotDeclaration{
+		{Name: "slot-a", Declared: map[string]string{TopologyZoneLabel: "fsn1"}},
+		{Name: "slot-b"},
+	})
+	assert.Empty(t, zero, "one slot of the pool has no zone, so the pool cannot promise one")
+	require.Len(t, conflicts, 1)
+	assert.Equal(t, []string{"slot-b"}, conflicts[0].Silent)
+
+	// Nothing declared anywhere, and no slots at all: the answer is "no promises, no conflicts".
+	empty, conflicts := Consensus(nil)
+	assert.Nil(t, empty)
+	assert.Empty(t, conflicts)
+
+	empty, conflicts = Consensus([]SlotDeclaration{{Name: "slot-a"}, {Name: "slot-b"}})
+	assert.Empty(t, empty)
+	assert.Empty(t, conflicts, "a pool that declares nothing is exactly what it is")
 }
 
 func TestChangeNote(t *testing.T) {

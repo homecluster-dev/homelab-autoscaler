@@ -31,6 +31,22 @@ import "strings"
 // the kubelet and the controllers write continuously and rotates (kubernetes.io/hostname,
 // /os, /arch, the version keys).
 
+// The domain of this project, and the domain of its API group. Both are reserved, for labels and
+// for annotations, because both are where this operator writes its own bookkeeping:
+// `infra.homecluster.dev/*` is the API group's domain (the labels the operator stamps on a node
+// object, the records of the keys it applied), and `homelab-autoscaler.dev/*` is the project's
+// domain (the coordination locks the state machine takes on a slot, and the force-reconcile marker
+// an operator sets). Neither is a namespace a slot's declaration has anything to add to.
+const (
+	operatorDomainPrefix = "infra.homecluster.dev/"
+	projectDomainPrefix  = "homelab-autoscaler.dev/"
+
+	// autoscalerPrefix is cluster-autoscaler's own namespace: it reads its per-machine controls off
+	// the node object (cluster-autoscaler.kubernetes.io/scale-down-disabled), and stamps nothing
+	// there for a slot to declare.
+	autoscalerPrefix = "cluster-autoscaler.kubernetes.io/"
+)
+
 // reservedLabelPrefixes is the label-key namespaces spec.nodeLabels refuses to write, each with
 // the reason an operator reads in the admission message. `exceptions` lists the keys inside a
 // prefix that are allowed anyway.
@@ -47,9 +63,20 @@ import "strings"
 // /failures-domain, /region of a machine the cloud controller already knows) stays with its owner.
 var reservedLabelPrefixes = []reservedPrefix{
 	{
-		prefix: "infra.homecluster.dev/",
+		prefix: operatorDomainPrefix,
 		reason: "the homelab-autoscaler operator owns this namespace: it stamps infra.homecluster.dev/group " +
-			"and /node on the node object, and records the keys it applies there",
+			"and /node on the node object, and records the keys it applies and the keys it refused there",
+	},
+	{
+		prefix: projectDomainPrefix,
+		reason: "this project's own domain: the coordination locks a lifecycle operation takes on a slot " +
+			"(homelab-autoscaler.dev/operation-lock, /lock-owner, /lock-timestamp, /lock-timeout) live under it",
+	},
+	{
+		prefix: autoscalerPrefix,
+		reason: "cluster-autoscaler owns this namespace: it reads its per-machine controls off the node " +
+			"object (cluster-autoscaler.kubernetes.io/scale-down-disabled), so a slot declaring a key here is " +
+			"a slot rewriting the autoscaler's settings on its own machine",
 	},
 	{
 		prefix: "node.kubernetes.io/",
@@ -79,23 +106,43 @@ var reservedLabelPrefixes = []reservedPrefix{
 // reservedAnnotationPrefixes is the annotation-key namespaces spec.nodeAnnotations refuses to
 // write. The prefixes, in plain words:
 //
-//   - infra.homecluster.dev/: the operator's own namespace. It carries the records this package
-//     writes (the list of keys a slot applied) and the coordination locks the FSM takes; a slot
-//     declaring one of them fights the write that tracks it.
+//   - infra.homecluster.dev/ and homelab-autoscaler.dev/: this operator's own domains. The first
+//     carries the records this package writes on the node object (the keys a slot applied, the keys
+//     it refused); the second carries the coordination locks a lifecycle operation takes on a slot
+//     (homelab-autoscaler.dev/operation-lock, on the Node CR, not on the node object). A slot
+//     declaring a key under either fights, or forges, the write that tracks it.
+//   - cluster-autoscaler.kubernetes.io/: cluster-autoscaler reads its per-machine controls off the
+//     node object, scale-down-disabled above all. A slot stamping it is a machine that removes
+//     itself from the pool's scale-down behind the pool's back - the pool has spec.minSize and the
+//     claim's lifecycle for that, and they are the parts the model can see.
 //   - argocd.argoproj.io/: Argo CD owns its tracking and hook annotations
 //     (argocd.argoproj.io/tracking-id, /sync-wave, /sync-options). A slot stamping them onto a
 //     node object is a slot rewriting the sync engine's metadata on an object it does not manage.
-//   - kubectl.kubernetes.io/: kubectl owns last-applied-configuration and the cordon/drain
-//     records it writes. A declaration here overwrites what the client of a live object needs.
+//   - kubectl.kubernetes.io/: kubectl owns the client-side records it writes on a live object,
+//     first of them kubectl.kubernetes.io/last-applied-configuration. It does *not* write
+//     annotations when it cordons or drains a node - a cordon is spec.unschedulable, a drain adds
+//     the node.kubernetes.io/exclude-from-external-load-balancers *label* - and those are covered
+//     by the label rules, not by this one.
 //
 // The node.kubernetes.io/ and kubernetes.io/ annotation namespaces are deliberately not listed:
 // they carry no annotation that a Kubernetes component adds and removes on a node object, so
 // there is no owner to defer to, and a note under them is the operator's own.
 var reservedAnnotationPrefixes = []reservedPrefix{
 	{
-		prefix: "infra.homecluster.dev/",
-		reason: "the homelab-autoscaler operator owns this namespace: the applied-keys records of the " +
-			"node object and the coordination locks live under it",
+		prefix: operatorDomainPrefix,
+		reason: "the homelab-autoscaler operator owns this namespace: the records of the keys a slot " +
+			"applied, and of the keys it refused, live on the node object under it",
+	},
+	{
+		prefix: projectDomainPrefix,
+		reason: "this project's own domain: the coordination locks a lifecycle operation takes on a slot " +
+			"(homelab-autoscaler.dev/operation-lock, /lock-owner, /lock-timestamp, /lock-timeout) live under it",
+	},
+	{
+		prefix: autoscalerPrefix,
+		reason: "cluster-autoscaler owns this namespace: it reads its per-machine controls off the node " +
+			"object (cluster-autoscaler.kubernetes.io/scale-down-disabled), and the pool's scale-down " +
+			"behaviour is the Group's configuration, not a slot's annotation",
 	},
 	{
 		prefix: "argocd.argoproj.io/",
@@ -103,8 +150,8 @@ var reservedAnnotationPrefixes = []reservedPrefix{
 	},
 	{
 		prefix: "kubectl.kubernetes.io/",
-		reason: "kubectl owns last-applied-configuration and the cordon/drain records it writes on a " +
-			"live object",
+		reason: "kubectl owns the client-side records it writes on a live object, " +
+			"kubectl.kubernetes.io/last-applied-configuration above all",
 	},
 }
 
@@ -146,6 +193,12 @@ const (
 const (
 	AppliedLabelsAnnotation      = "infra.homecluster.dev/applied-node-labels"
 	AppliedAnnotationsAnnotation = "infra.homecluster.dev/applied-node-annotations"
+
+	// SkippedKeysAnnotation records the declared keys this writer refused, on the node object, so
+	// the answer to "the slot declares it, why is it not on the node" is readable where the label
+	// is missing. It is also what keeps the Warning event honest: the event fires when this string
+	// changes, not on every resync of a slot that keeps declaring the same key it may not write.
+	SkippedKeysAnnotation = "infra.homecluster.dev/skipped-node-keys"
 )
 
 // ReservedLabelKey reports whether a label key is in a namespace this operator must not write,

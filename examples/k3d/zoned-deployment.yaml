@@ -17,7 +17,9 @@ spec:
     spec:
       # The pod asks for a machine in one zone. Only a slot whose spec.nodeLabels declare that zone
       # can take it: the scheduler matches the label on the node object, and cluster-autoscaler
-      # matches it on the group's node template.
+      # matches it on the group's node template - a template that carries a declared label only when
+      # every slot of the group declares it with the same value, because the scale-up the template
+      # authorises buys whichever slot of the group is free.
       nodeSelector:
         topology.kubernetes.io/zone: fsn1
         infra.homecluster.dev/group: group1

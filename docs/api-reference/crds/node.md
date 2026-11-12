@@ -22,11 +22,11 @@ overwrite a declaration. A machine is wanted exactly when a live
 |-------|------|----------|-------------|
 | `startupPodSpec` | `MinimalPodSpec` | Yes | Pod specification for startup operations |
 | `shutdownPodSpec` | `MinimalPodSpec` | Yes | Pod specification for shutdown operations |
-| `kubernetesNodeName` | `string` | Yes | Name of the corresponding Kubernetes node |
+| `kubernetesNodeName` | `string` | Yes | Name of the corresponding Kubernetes node. One slot per machine: admission refuses a second slot that claims a node another slot already claims, and names the holder |
 | `pricing` | `PricingSpec` | Yes | Cost information for the node |
 | `nodeCapacity` | `corev1.ResourceList` | No | The shape of the machine this slot boots, as the kubelet reports it. Applied to the node template resource by resource, which is what lets a pool at `minSize: 0` scale back up; `pods` is defaulted for you |
-| `nodeLabels` | `map[string]string` | No | Labels this machine must carry on its `corev1.Node`: applied on join, re-asserted on drift, removed when the declaration drops the key, and carried into the node template so cluster-autoscaler can match a `nodeSelector` against this pool |
-| `nodeAnnotations` | `map[string]string` | No | The same, for annotations. Applied, re-asserted and removed by the same rules; annotations play no part in scheduling |
+| `nodeLabels` | `map[string]string` | No | Labels this machine must carry on its `corev1.Node`: applied on join - in the gate, before the node is uncordoned - re-asserted on drift, removed when the declaration drops the key, and carried into the node template so cluster-autoscaler can match a `nodeSelector` against this pool. A declared key reaches the template only when every slot of the group declares it with the same value |
+| `nodeAnnotations` | `map[string]string` | No | The same, for annotations. Applied, re-asserted and removed by the same rules; annotations play no part in scheduling, and the group rule above decides what the template carries |
 | `nodeTaints` | `[]corev1.Taint` | No | Taints this machine must carry, applied to the Kubernetes node and included in the node template |
 | `taintsToRemove` | `[]corev1.Taint` | No | Taints stripped from the node template so the autoscaler ignores them |
 
@@ -192,7 +192,11 @@ The controller writes them onto the `corev1.Node`, and keeps the node at the dec
 
 - The labels land when the node object exists. On a scale-up they are stamped in the same hook that
   uncordons the node, so a node is never schedulable for a pod whose selector it does not yet
-  satisfy.
+  satisfy. That is a gate, not a best effort: for a slot that declares labels or annotations, a write
+  that fails keeps the machine cordoned, records a `DeclaredNodeLabelsUnwritten` Warning on the slot,
+  and is retried inside the readiness gate's deadline. The deadline still wins - at that point the
+  node is uncordoned (`ReadinessGateTimeout`, naming what it was waiting on) and the slot reconciler
+  keeps retrying, because a cordoned machine is one cluster-autoscaler's scale-down never removes.
 - Drift is put back. Change the value with `kubectl label --overwrite`, delete a key, reboot a
   machine whose kubelet stamps its own set, let a re-registration recreate the node object: the next
   reconcile re-asserts the declaration.
@@ -218,11 +222,17 @@ CRD pattern cannot: that every key is a valid label key, every label value a val
 annotations fit the 256 kB the API server allows on the node object, and no key is in a namespace
 someone else owns. A slot that fails any of it is refused at `kubectl apply`, naming the key.
 
+Two rules are checked only at admission, and the writer repeats them for a slot object that predates
+them (created while the webhook was down, a cluster restored from an older etcd): a key in a reserved
+namespace is skipped with a Warning, and a slot may not claim the Kubernetes node of another slot.
+
 Keys the controller refuses to write, with the reason in the admission message:
 
 | Label keys | Owner, and why the refusal |
 | --- | --- |
-| `infra.homecluster.dev/*` | this operator: it stamps `group` and `node` on the node object, and keeps the applied-keys records there |
+| `infra.homecluster.dev/*` | this operator's API domain: it stamps `group` and `node` on the node object, and keeps its records there (the keys a slot applied, the keys it refused) |
+| `homelab-autoscaler.dev/*` | this project's domain: the coordination locks a lifecycle operation takes on a slot (`homelab-autoscaler.dev/operation-lock`, on the **Node CR**) live under it |
+| `cluster-autoscaler.kubernetes.io/*` | cluster-autoscaler: it reads its per-machine controls off the node object (`cluster-autoscaler.kubernetes.io/scale-down-disabled`) |
 | `node.kubernetes.io/*` | the kubelet and the node lifecycle controller: `role`, `os`, `arch`, `instance-type`, `exclude-home`, `drain-status` |
 | `kubernetes.io/*` | the kubelet and the cloud integrations: `hostname`, `os`, `arch`, the version keys |
 | `node-role.kubernetes.io/*` | the tooling that joins a machine: kubeadm, k3s, RKE2 |
@@ -230,12 +240,19 @@ Keys the controller refuses to write, with the reason in the admission message:
 
 | Annotation keys | Owner, and why the refusal |
 | --- | --- |
-| `infra.homecluster.dev/*` | this operator: the applied-keys records and the coordination locks |
+| `infra.homecluster.dev/*` | this operator's API domain: the applied-keys and refused-keys records of the node object |
+| `homelab-autoscaler.dev/*` | this project's domain: the coordination locks of a lifecycle operation, and the operator's own markers |
+| `cluster-autoscaler.kubernetes.io/*` | cluster-autoscaler's per-machine controls, read off the node object. A slot that stamps `scale-down-disabled` removes its own machine from the pool's scale-down behind the pool's back; `spec.minSize` of the Group and the claim's lifecycle are the parts the model can see |
 | `argocd.argoproj.io/*` | Argo CD's tracking and sync annotations (`tracking-id`, `sync-wave`, `sync-options`) |
-| `kubectl.kubernetes.io/*` | kubectl's own records on a live object (`last-applied-configuration`, the cordon/drain entries) |
+| `kubectl.kubernetes.io/*` | kubectl's client-side records on a live object, first of them `last-applied-configuration`. (A cordon is `spec.unschedulable` and a drain adds a `node.kubernetes.io/*` *label*, so those are the label rules' business, not this one.) |
 
-The `node.kubernetes.io/` and `kubernetes.io/` namespaces are reserved for **labels** only. Nothing
-stamps an annotation there on its own, so a note under them is yours, and admission says so.
+The two lists are not the same list, and that is deliberate. `node.kubernetes.io/`, `kubernetes.io/`
+and `node-role.kubernetes.io/` are reserved for **labels** only: nothing stamps an annotation there
+on its own, so a note under them is yours. `argocd.argoproj.io/` is reserved for **annotations**
+only, for the same reason in reverse: Argo CD owns its annotations, and a *label* under that domain
+(`argocd.argoproj.io/team: platform`) is a label like any other, and the label a `nodeSelector`
+matches. The template path applies each list to the kind it writes, and
+[the runbook entry](../../troubleshooting/common-issues.md) names the symptom when it does not.
 
 `topology.kubernetes.io/zone` and `topology.kubernetes.io/region` are the exception because a
 homelab has no cloud node controller to ask where a box is: the slot's declaration in Git is the
@@ -272,7 +289,11 @@ spec:
 What happens, in order:
 
 1. The slot's declaration lands on the `corev1.Node` when the machine joins, and is kept there
-   against drift.
+   against drift. On a scale-up the write happens **before** the node is uncordoned, and a machine
+   whose labels could not be written stays cordoned until they land: the readiness gate refuses it,
+   with a `DeclaredNodeLabelsUnwritten` Warning on the slot. The gate's deadline still wins - at that
+   point the machine is uncordoned and the slot reconciler keeps retrying the write, because a
+   cordoned machine is one cluster-autoscaler's scale-down never removes.
 2. The provider puts the same labels into the group's node template, the object cluster-autoscaler
    simulates a placement on. A pool whose every slot is off gets a placeholder carrying the
    declaration, so the label is available before any machine has ever registered.
@@ -283,15 +304,40 @@ Before the field, every slot of a pool reported the same template, so a pod sele
 template carried was placed on no pool: the scale-up never happened, and the pod stayed Pending with
 a message about a node affinity it never matched.
 
-**A group answers with one template.** `NodeGroupTemplateNodeInfo` is called per *group*, and one
-call returns one node, so the provider builds the template from the representative slot it already
-picks - a slot whose node object exists, a Ready one preferred, and any slot of a fully powered off
-pool. Slots of the same group that declare **different** labels are therefore simulated from one of
-them, and a pod selecting a label only some slots carry can be answered with a machine that does not
-have it. The consequence is configuration advice, not a bug to work around: put the slots you need
-the scheduler to tell apart in different groups, and let every slot of a group declare the same
-labels. A group whose slots declare the same labels, and a pool that declares nothing, are both
-exact.
+**A group answers with one template, and the template promises only what the group guarantees.**
+`NodeGroupTemplateNodeInfo` is called per *group*, and one call returns one node, while the scale-up
+it authorises is `IncreaseSize`, which buys whichever slot the provider has free (sorted by name).
+So the template carries a declared key only when **every slot of the group declares it with the same
+value**. Anything else is a promise the group cannot keep, and it is left out:
+
+| the group's slots | the template |
+| --- | --- |
+| all declare `zone: fsn1` | carries `zone: fsn1` |
+| one declares `zone: fsn1`, another `zone: hel1` | carries no `zone` at all |
+| one declares `zone: fsn1`, another declares nothing | carries no `zone` at all |
+| one slot, declaring `zone: fsn1` | carries `zone: fsn1` (one slot *is* the group) |
+| nobody declares anything | carries nothing declared, exactly as before the field |
+
+The omitted key is reported, per group, when it appears and when it changes (not on every scan):
+
+```
+INFO grpc-server NodeGroupTemplateNodeInfo: the slots of a group disagree on their declared node
+metadata, the keys named are left out of the group's template ... {"nodeGroup": "storage-nodes",
+"disagreements": "labels [topology.kubernetes.io/zone: \"fsn1\" on storage-01; \"hel1\" on storage-02]"}
+```
+
+A pod selecting a label the group disagrees on is then **not** placed on that group at all: the
+estimator matches the selector against a template that does not carry it, plans nothing, and buys no
+machine. That is the fail-closed direction. The alternative - simulating the representative slot's
+label - spends the money and leaves the pod `Pending`: the boot runs, the machine registers without
+the label, the estimator's plan does not fit, and the pool is one Ready machine larger with the work
+still unscheduled. The fix is configuration: declare the key with the same value on every slot of the
+group, or put the slots the scheduler must tell apart in **different groups**. A group whose slots
+declare the same labels, a group of one slot, and a pool that declares nothing are all exact.
+
+The disagreement is not an error and does not fail the call: the group stays exact and useful for
+every pod that does not select the disputed key, and a call that returns an error makes
+cluster-autoscaler skip the group for *every* pod.
 
 **For machines that already exist the node object is the source.** `NodeGroupNodes` reports an
 instance as an id and a status, and the proto carries no labels, no annotations and no capacity, so
@@ -388,18 +434,25 @@ The provider reports one machine shape per group, built from a slot of that grou
 
 1. A slot whose Kubernetes node object exists, a Ready one preferred. That node object is the
    only source of `status.allocatable`, `spec.taints` and the labels a pod needs to schedule, so
-   the autoscaler simulates a real machine. The slot's declared `nodeLabels` and `nodeAnnotations`
-   are overlaid on the copy, declaration last, so the group answers with the label the pool is
-   configured to carry and not with the value one live node happens to have.
+   the autoscaler simulates a real machine. The `nodeLabels` and `nodeAnnotations` the group's slots
+   declare are overlaid on the copy, declaration last, so the group answers with the label the pool
+   is configured to carry and not with the value one live node happens to have. Only the keys every
+   slot of the group declares with the same value are overlaid (see
+   [Scheduling with labels](#scheduling-with-labels)), and `kubernetes.io/hostname` is stripped
+   after the overlay, so no declaration can put the representative's hostname into the template.
 2. If no slot has a node object (the whole pool is powered off), the provider synthesizes a
-   placeholder from the Node CR. It carries the group label, the declared `nodeLabels` and
-   `nodeAnnotations`, the declared `nodeTaints` and the declared `nodeCapacity`, on top of the
-   default pod ceiling. No machine size is invented: a pool that declared `nodeCapacity` is
-   answering the question from Git, and a pool that declared nothing gets a template with no cpu,
-   no memory and no disk, because the size of a machine that never registered can't be read.
+   placeholder from the Node CR. It carries the group label, the declared `nodeTaints` and the
+   declared `nodeCapacity`, on top of the default pod ceiling, and the caller overlays the declared
+   labels and annotations on it exactly as it does on a copy of a live node - one overlay, for both
+   paths, so the two cannot state the rule differently. No machine size is invented: a pool that
+   declared `nodeCapacity` is answering the question from Git, and a pool that declared nothing gets
+   a template with no cpu, no memory and no disk, because the size of a machine that never registered
+   can't be read.
 
-One template per group, from one slot: a group whose slots declare different labels is simulated
-from the slot that was picked. Slots the scheduler must tell apart belong in different groups (see
+One template per group. A key the slots of a group disagree on - two values, or a value some slots
+never declare - is left out of the template, so the estimator never simulates a label the group
+cannot guarantee, and the disagreement is reported in the provider's log. Slots the scheduler must
+tell apart belong in different groups (see
 [Scheduling with labels](#scheduling-with-labels)).
 
 Because the template is copied from a live node, the autoscaler's own taints are filtered out of

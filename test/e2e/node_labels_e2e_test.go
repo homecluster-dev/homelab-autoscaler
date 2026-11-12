@@ -21,6 +21,8 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -88,43 +90,89 @@ func kubeNodeAnnotations(nodeName string) map[string]string {
 	return node.Annotations
 }
 
-// slotEventsFor renders the reasons of the events.k8s.io Events published on a slot, the way
-// `kubectl describe` does, so a failing gate shows what the controller recorded about the write.
+// slotEventsFor renders the Events published on one slot, the way this suite reads every cluster
+// fact: `kubectl get events`, one list, and the selection done on the decoded object.
 //
-// The list is unfiltered and the selection is done on the decoded object: the field selectors of
-// the events registry are a detail this suite has no business depending on, and the target of an
-// Event is the `regarding` reference of the new events API, which is exactly what the recorder
-// stamps for a CRD object.
-func slotEventsFor(slot string) string {
-	out, err := utils.Run(kubectl("get", "events.k8s.io", "-n", namespace, "-o", "json"))
+// The list is the namespace's, filtered on `involvedObject.kind == Node` and its name in Go, for
+// the two reasons the claim reader states (claimEventReasons): the operator publishes
+// events.k8s.io objects and the core/v1 Event that `kubectl get events` shows is the API server's
+// projection of one, and the field selectors of the events registry are the API server's business,
+// not something a suite should depend on. Reading `kubectl get events.k8s.io` is *not* the same
+// read: kubectl parses that argument as a resource named `events` in version `k8s.io`, not as the
+// `events.k8s.io` API group, and the new API's `regarding` reference is not a field of the core
+// Event, so a decoder written against it sees nothing. The read returns its error: a helper that
+// answers the zero value on a failed read turns a broken read into an assertion that can never
+// pass, and the first CI run of this spec is the evidence.
+//
+// The rendered line is `reason message`, which is what `kubectl describe` prints for an Event, so a
+// failing gate shows what the controller recorded about the write.
+func slotEventsFor(slot string) (string, error) {
+	out, err := utils.Run(kubectl("get", "events", "-n", namespace, "-o", "json"))
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("list the events in %s: %w", namespace, err)
 	}
 
-	var listed struct {
-		Items []struct {
-			Reason    string `json:"reason"`
-			Regarding struct {
-				Kind string `json:"kind"`
-				Name string `json:"name"`
-			} `json:"regarding"`
-			Note string `json:"note"`
-		} `json:"items"`
+	list := &corev1.EventList{}
+	if err := json.Unmarshal([]byte(out), list); err != nil {
+		return "", fmt.Errorf("decode the event list of slot %s: %w", slot, err)
 	}
 
-	if err := json.Unmarshal([]byte(out), &listed); err != nil {
-		return ""
-	}
+	lines := make([]string, 0, len(list.Items))
 
-	reasons := make([]string, 0, len(listed.Items))
-
-	for _, event := range listed.Items {
-		if event.Regarding.Name != slot {
+	for _, nodeEvent := range list.Items {
+		// Kind "Node" and the slot's name is the slot's own record: every Event the operator
+		// publishes about a slot is filed against it, and the reasons asserted here
+		// (NodeLabelsApplied, SkippedReservedNodeLabelKey) are the operator's, not the kubelet's. The
+		// Kubernetes node of the k3d pool shares its name with its slot, so the machine's own Events
+		// can ride along in this text; they carry other reasons, and a gate that reads a reason never
+		// mistakes them. Filtering on a field selector would depend on the events registry, which the
+		// suite's claim reader already declines to do.
+		if nodeEvent.InvolvedObject.Kind != "Node" || nodeEvent.InvolvedObject.Name != slot {
 			continue
 		}
 
-		reasons = append(reasons, event.Reason+" "+event.Note)
+		lines = append(lines, nodeEvent.Reason+" "+nodeEvent.Message)
 	}
 
-	return strings.Join(reasons, "\n")
+	return strings.Join(lines, "\n"), nil
+}
+
+// nodeLabelKeys reads the *keys* of a slot's Kubernetes node, and reports the failure of the read
+// instead of answering with a nil map. It exists for the removal assertions: "the label is gone" is
+// only a fact about a node object that was read, and a helper that returns a nil map on failure lets
+// an unparseable, deleted or unreadable node object satisfy "it is not there".
+func nodeLabelKeys(nodeName string) ([]string, error) {
+	return nodeMetadataKeys(nodeName, "labels")
+}
+
+// nodeAnnotationKeys is nodeLabelKeys for the annotations of the same object, the record of the keys
+// a slot wrote included.
+func nodeAnnotationKeys(nodeName string) ([]string, error) {
+	return nodeMetadataKeys(nodeName, "annotations")
+}
+
+func nodeMetadataKeys(nodeName, field string) ([]string, error) {
+	out, err := utils.Run(kubectl("get", "node", nodeName, "-o", "json"))
+	if err != nil {
+		return nil, fmt.Errorf("read the %s of Kubernetes node %s: %w", field, nodeName, err)
+	}
+
+	node := &corev1.Node{}
+	if err := json.Unmarshal([]byte(out), node); err != nil {
+		return nil, fmt.Errorf("decode Kubernetes node %s: %w", nodeName, err)
+	}
+
+	metadata := node.Labels
+	if field == "annotations" {
+		metadata = node.Annotations
+	}
+
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	return keys, nil
 }

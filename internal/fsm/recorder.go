@@ -49,6 +49,15 @@ const (
 	// gate closes is a machine paid for and unusable - and because the FSM has already done the only
 	// safe thing it can (uncordon, complete the transition) and will not try again.
 	ReasonReadinessGateTimeout = "ReadinessGateTimeout"
+
+	// ReasonDeclaredLabelsUnwritten is recorded when the scale-up gate refuses a node because the
+	// labels and annotations its slot declares (spec.nodeLabels, spec.nodeAnnotations) could not be
+	// written to it. The write is what makes the machine agree with the template cluster-autoscaler
+	// placed a pod on, so the machine stays cordoned while the gate retries, and the operator is told
+	// that far: a node held cordoned by a write that keeps failing looks, from the outside, like a
+	// controller that stopped working. Recorded once per gate, not per retry; the gate's own deadline
+	// records the outcome (ReasonReadinessGateTimeout), and that path uncordons.
+	ReasonDeclaredLabelsUnwritten = "DeclaredNodeLabelsUnwritten"
 )
 
 // Actions recorded on the Node CR. The new events API keeps `reason` (what happened,

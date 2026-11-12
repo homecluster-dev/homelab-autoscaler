@@ -324,6 +324,67 @@ func TestApplySkipsReservedKeys(t *testing.T) {
 	}
 }
 
+func TestApplyWarnsAboutASkippedKeyOnce(t *testing.T) {
+	// The same declaration, reconciled. The refusal is a fact about the slot's configuration, and it
+	// does not change between passes, so the Warning fires once: the slot reconciler runs this on
+	// every pass and on a five-minute resync, and an event per pass is the noise that hides the one
+	// event that reports a real change. The record on the node object is the durable half - it says
+	// the key is still being refused, on every `kubectl get node -o jsonpath`.
+	env := newApplyEnv(
+		map[string]string{TopologyZoneLabel: "fsn1", "kubernetes.io/hostname": "spoofed"},
+		map[string]string{"argocd.argoproj.io/sync-wave": "1"},
+		nil,
+	)
+	env.run(t)
+	env.run(t)
+	env.run(t)
+
+	assert.Equal(t, 1, countReason(env.recorder, ReasonSkippedReservedKey),
+		"three passes, one refusal, one Warning")
+	assert.Equal(t, 1, countReason(env.recorder, ReasonApplied), "the write of the allowed key is reported once")
+
+	node := env.applied(t)
+	assert.Equal(t, "argocd.argoproj.io/sync-wave,kubernetes.io/hostname",
+		node.Annotations[SkippedKeysAnnotation],
+		"the refusal is recorded where the label is missing, and the record is the memory that keeps the event quiet")
+
+	// A new refused key is a change of the set, and the operator is told again.
+	env.slot.Spec.NodeLabels["node.kubernetes.io/role"] = "spoofed"
+	env.run(t)
+
+	assert.Equal(t, 2, countReason(env.recorder, ReasonSkippedReservedKey))
+	assert.Contains(t, env.applied(t).Annotations[SkippedKeysAnnotation], "node.kubernetes.io/role")
+
+	// The operator takes the refused keys out of Git. The record comes off the node, and nothing is
+	// warned about: the change is the all-clear, not an alarm.
+	env.slot.Spec.NodeLabels = map[string]string{TopologyZoneLabel: "fsn1"}
+	env.slot.Spec.NodeAnnotations = nil
+	env.run(t)
+
+	assert.Equal(t, 2, countReason(env.recorder, ReasonSkippedReservedKey), "the all-clear is not a Warning")
+
+	_, refused := env.applied(t).Annotations[SkippedKeysAnnotation]
+	assert.False(t, refused, "a slot that refuses nothing carries no refusal record")
+
+	// Steady state after the cleanup: nothing to write, nothing to say.
+	patches := env.patchCalls
+	env.run(t)
+	assert.Equal(t, patches, env.patchCalls, "a settled slot's pass writes nothing")
+}
+
+// countReason counts the recorded events of one reason.
+func countReason(recorder *capturingRecorder, reason string) int {
+	count := 0
+
+	for _, call := range recorder.calls {
+		if call.reason == reason {
+			count++
+		}
+	}
+
+	return count
+}
+
 func TestApplyToleratesANodeThatHasNotJoined(t *testing.T) {
 	// The machine has not registered, which is the normal state of a slot of an idle pool and of a
 	// boot in flight. The labels land when the node object appears.

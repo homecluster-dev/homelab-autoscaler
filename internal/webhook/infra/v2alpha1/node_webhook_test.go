@@ -43,6 +43,11 @@ const (
 	testNamespace = "homelab-autoscaler-system"
 	testGroup     = "remote-workers"
 	testNodeName  = "omni-remote-2"
+
+	// joinedKubernetesNode is the corev1.Node of a slot whose machine is up: the fake cluster has
+	// that node object, and it is the name the tests that exercise
+	// spec.kubernetesNodeName - the join, and the claim of one node by two slots - point a slot at.
+	joinedKubernetesNode = "omni-remote-1"
 )
 
 // nodeUnderTest returns a Node CR: a slot, declared by Git. In v2alpha1 its spec carries no
@@ -81,6 +86,20 @@ func entries(n int) map[string]string {
 	return out
 }
 
+// requireDenialOfSharedNode asserts that a slot which claims another slot's Kubernetes node was
+// refused, and that the refusal is actionable: the field, the machine, and the slot that holds it.
+func requireDenialOfSharedNode(err error, holder string) {
+	Expect(err).To(HaveOccurred(),
+		"two slots naming one node object is refused: they rewrite each other's record of applied keys "+
+			"and patch the node against each other on every pass")
+
+	message := err.Error()
+	Expect(message).To(ContainSubstring("spec.kubernetesNodeName"), "the refusal names the field to edit")
+	Expect(message).To(ContainSubstring(testNodeName), "and the slot that was refused")
+	Expect(message).To(ContainSubstring(holder), "and the slot that already holds the node")
+	Expect(message).To(ContainSubstring(joinedKubernetesNode), "and the machine they both claim")
+}
+
 var _ = Describe("Node Webhook", func() {
 	var (
 		obj          *infrav2alpha1.Node
@@ -102,7 +121,7 @@ var _ = Describe("Node Webhook", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: testGroup, Namespace: testNamespace},
 		}
 		runningNode := &corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: "omni-remote-1"},
+			ObjectMeta: metav1.ObjectMeta{Name: joinedKubernetesNode},
 		}
 		k8sClient = fake.NewClientBuilder().
 			WithScheme(testScheme).
@@ -185,7 +204,7 @@ var _ = Describe("Node Webhook", func() {
 		})
 
 		It("Should admit a slot whose Kubernetes node exists, without warnings", func() {
-			obj.Spec.KubernetesNodeName = "omni-remote-1"
+			obj.Spec.KubernetesNodeName = joinedKubernetesNode
 
 			warnings, err := validator.ValidateCreate(context.Background(), obj)
 			Expect(err).NotTo(HaveOccurred())
@@ -223,6 +242,115 @@ var _ = Describe("Node Webhook", func() {
 			Expect(warnings).To(HaveLen(1))
 			Expect(warnings[0]).To(ContainSubstring(
 				"kubernetes node \"" + testNodeName + "\" has not joined the cluster yet"))
+		})
+	})
+
+	// Two slots naming one machine. spec.kubernetesNodeName is the identity the operator writes
+	// node metadata against, and the record of the keys a slot applied lives on the node object: a
+	// second slot claiming the same node rewrites that record every pass, and the two of them remove
+	// each other's labels forever. The rule is admission's, because by the time the second apply
+	// lands the fight is already running.
+	Context("When a slot claims the Kubernetes node of another slot", func() {
+		// slotOn builds a slot in the test namespace, pointed at one Kubernetes node.
+		slotOn := func(name, kubernetesNodeName string) *infrav2alpha1.Node {
+			slot := nodeUnderTest(groupLabels())
+			slot.Name = name
+			slot.Spec.KubernetesNodeName = kubernetesNodeName
+
+			return slot
+		}
+
+		// validatorWith returns the validator over a cluster that already holds the given slots.
+		validatorWith := func(slots ...*infrav2alpha1.Node) NodeCustomValidator {
+			objects := []client.Object{clusterGroup}
+			for i := range slots {
+				objects = append(objects, slots[i])
+			}
+
+			return NodeCustomValidator{Client: fake.NewClientBuilder().
+				WithScheme(testScheme).WithObjects(objects...).Build()}
+		}
+
+		It("refuses the second slot, naming the slot that holds the node", func() {
+			v := validatorWith(slotOn("holder-slot", joinedKubernetesNode))
+
+			obj.Spec.KubernetesNodeName = joinedKubernetesNode
+
+			_, err := v.ValidateCreate(context.Background(), obj)
+			requireDenialOfSharedNode(err, "holder-slot")
+		})
+
+		It("refuses the same claim on the update path, which is a Git apply", func() {
+			v := validatorWith(slotOn("holder-slot", joinedKubernetesNode))
+
+			obj.Spec.KubernetesNodeName = joinedKubernetesNode
+			oldObj.Spec.KubernetesNodeName = testNodeName
+
+			_, err := v.ValidateUpdate(context.Background(), oldObj, obj)
+			requireDenialOfSharedNode(err, "holder-slot")
+		})
+
+		It("admits the slot that holds the node, re-applying its own declaration", func() {
+			// The apply of the holder itself: the cluster already contains a slot with the same
+			// kubernetesNodeName, and it is this slot. An apply that changes nothing about the claim
+			// must stay admissible, or the operator cannot touch the file.
+			self := slotOn(testNodeName, joinedKubernetesNode)
+			v := validatorWith(self)
+
+			obj.Spec.KubernetesNodeName = joinedKubernetesNode
+
+			_, err := v.ValidateCreate(context.Background(), obj)
+			Expect(err).NotTo(HaveOccurred(), "a slot re-applying its own claim is not a collision")
+
+			_, err = v.ValidateUpdate(context.Background(), self, obj)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("admits slots that claim no node at all", func() {
+			// A slot of an idle pool has no machine, and many of them share that emptiness. The empty
+			// value is not a claim, and refusing it would refuse every pool that has never booted.
+			v := validatorWith(slotOn("slot-idle-1", ""), slotOn("slot-idle-2", ""))
+
+			obj.Spec.KubernetesNodeName = ""
+
+			_, err := v.ValidateCreate(context.Background(), obj)
+			Expect(err).NotTo(HaveOccurred(), "an unprovisioned slot claims no node object")
+		})
+
+		It("admits, with a warning, a cluster whose slots cannot be listed", func() {
+			// The rule kubernetesNodeWarnings states, applied to the same read: a webhook that cannot
+			// read the cluster must not fail every apply of every pool.
+			listFailed := false
+
+			failingClient := fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(clusterGroup).
+				WithInterceptorFuncs(interceptor.Funcs{
+					List: func(callCtx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+						if _, ok := list.(*infrav2alpha1.NodeList); ok {
+							listFailed = true
+
+							return apierrors.NewInternalError(fmt.Errorf("injected list failure for slots"))
+						}
+
+						return c.List(callCtx, list, opts...)
+					},
+				}).
+				Build()
+
+			v := NodeCustomValidator{Client: failingClient}
+
+			obj.Spec.KubernetesNodeName = joinedKubernetesNode
+
+			warnings, err := v.ValidateCreate(context.Background(), obj)
+			Expect(listFailed).To(BeTrue(), "the slot list under test is the one that failed")
+			Expect(err).NotTo(HaveOccurred(), "a list failure must never deny admission")
+			Expect(warnings).To(ContainElement(ContainSubstring("could not check whether another slot already claims")),
+				"the check says it did not run, so a silent acceptance is not the outcome")
+
+			warnings, err = v.ValidateUpdate(context.Background(), oldObj, obj)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(warnings).To(ContainElement(ContainSubstring("could not check whether another slot already claims")))
 		})
 	})
 

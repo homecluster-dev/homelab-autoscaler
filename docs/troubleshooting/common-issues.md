@@ -470,39 +470,105 @@ not exist (the machine never registered, or `spec.kubernetesNodeName` names the 
 apply is skipped until it does, and re-asserted every reconcile after that.
 
 If the slot was refused at `kubectl apply`, the message names the key. `kubernetes.io/hostname`,
-`node.kubernetes.io/*`, `node-role.kubernetes.io/*`, `infra.homecluster.dev/*` and
-`topology.kubernetes.io/*` other than `zone` and `region` are keys their owner writes and re-writes;
-declare a key in your own namespace (`pool.example.com/rack`), or the zone of a box no cloud
-controller knows.
+`node.kubernetes.io/*`, `node-role.kubernetes.io/*`, `infra.homecluster.dev/*`,
+`homelab-autoscaler.dev/*`, `cluster-autoscaler.kubernetes.io/*` and `topology.kubernetes.io/*`
+other than `zone` and `region` are keys their owner writes and re-writes; declare a key in your own
+namespace (`pool.example.com/rack`), or the zone of a box no cloud controller knows.
+
+The writer refuses the same keys for a slot object that predates the webhook rule, and says so
+without swallowing it:
+
+```bash
+kubectl describe node.infra.homecluster.dev <slot> -n <ns>
+#  Warning  SkippedReservedNodeLabelKey  ApplyNodeLabels  ... declare keys in namespaces their owner controls, they are not applied: kubernetes.io/hostname
+kubectl get node <node> -o jsonpath='{.metadata.annotations.infra\.homecluster\.dev/skipped-node-keys}'
+```
+
+The Warning fires when the set of refused keys *changes*, and the node object's record says the key
+is still being refused on every pass after that. A label that is declared, warned about, and not on
+the node is this: take the key out of the declaration, and declare one you own.
 
 **3. Is the pool the one the autoscaler can answer with?**
 
 A pending pod is matched against each pool's **node template**, not against live machines, and a
-pool at zero has no machine to read: the template is built from one representative slot, and the
-declaration of that slot is what the estimator sees.
+pool at zero has no machine to read: the template is built from one representative slot, and what
+the group's slots agree on is what the estimator sees.
 
 ```bash
 # the slots of the pool, and what each declares
 kubectl get nodes.infra.homecluster.dev -n <ns> -l group=<group> \
   -o custom-columns=NAME:.metadata.name,ZONE:.spec.nodeLabels.topology\.kubernetes\.io/zone
+
+# the provider's own answer, when a group's slots disagree
+kubectl logs deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system \
+  | grep "the slots of a group disagree"
 ```
 
 - No slot of the group declares the label: no scale-up is planned for this group, and the autoscaler
   is right. Declare it on the slots.
-- The slots declare **different** values: the group answers with one template, from the slot the
-  provider picked, so a pod selecting the other value is simulated onto a machine that will not have
-  it. Move the slots you need told apart into different groups - that is the configuration the
-  single-template contract asks for.
+- The slots declare **different** values, or only some of them declare it: the key is **left out of
+  the template**, so a pod selecting it is not placed on this group at all. The group cannot guarantee
+  the label, because `NodeGroupTemplateNodeInfo` answers for a group with one node while the scale-up
+  it authorises buys whichever slot is free (sorted by name).
 - The label is on the template and the scale-up runs, and the pod still lands elsewhere: check the
   taints. A node that is a selector match and rejects the pod on a taint is reported by
   `kubectl describe pod` as the same "didn't match" line, and the taint is the pool's
   `spec.nodeTaints` (see [Node Taints](../api-reference/crds/node.md#node-taints)).
+
+**The direction the template is fail-closed in, and the money it saves.** Omitting a disputed key
+means the estimator plans nothing for that pod on that pool: the pod stays `Pending`, no machine is
+bought, and the pool keeps answering for every pod that does not select the disputed label. The
+alternative - answering the group with the representative slot's label - is the expensive failure:
+the estimator finds a fit, `NodeGroupIncreaseSize` boots a slot whose machine will never carry the
+label, the boot is paid for, the node registers Ready and unusable for that pod, and the pod is still
+`Pending` minutes later with the pool one machine up. A group whose slots differ is a configuration
+mistake, and the fix is configuration: **declare the key with the same value on every slot of the
+group, or put the slots the scheduler must tell apart in separate groups.** A group of one slot, and
+a group whose slots declare the same keys with the same values, are exact.
 
 **4. A label that keeps coming back after you removed it, and vice versa**
 
 The declaration is the intent. A value you change on the node with `kubectl label --overwrite` is
 put back on the next reconcile, and a key you delete from the slot's `spec.nodeLabels` is removed
 from the node on the next reconcile. Fix Git, not the node, and the node follows.
+
+Nothing in the operator watches the `corev1.Node` for a slot's sake: after a hand edit, the pass that
+puts the declaration back is the slot's next pass, which for a settled slot is the five-minute idle
+resync. Ask for it: patch any annotation on the Node CR (`kubectl annotate node.infra.homecluster.dev
+<slot> -n <ns> e2e.homecluster.dev/pass-requested-at=$(date -u +%FT%TZ) --overwrite`) and the write
+lands within seconds.
+
+**5. A key that left the spec and will not come off the node**
+
+Removal is keyed by the record the controller keeps on the node object
+(`infra.homecluster.dev/applied-node-labels`, `/applied-node-annotations`): the controller removes the
+keys it wrote, and never touches a key it did not. If you delete the record annotation by hand and
+then delete the key from `spec.nodeLabels`, the controller no longer knows it wrote that label, and it
+leaves it on the node - correctly, because from then on that label is one of "the keys the slot never
+declared", and the operator has no claim on it. Two ways out, and both are honest: remove the label
+yourself (`kubectl label node <node> <key>-`), or put the key back in the spec for one pass so the
+record is rewritten, then remove it from the spec again. Do not widen the record by hand to make a
+label removable: the record is the ownership claim, and a key listed in it is a key the controller
+will overwrite and delete.
+
+**6. A machine that comes up cordoned and stays cordoned, with a label warning**
+
+On a scale-up the labels are written **before** the node is uncordoned, and the write is part of the
+readiness gate: a slot that declares labels or annotations whose write to the node object fails keeps
+the machine cordoned, and records
+
+```
+Warning  DeclaredNodeLabelsUnwritten  Uncordon  Scale-up of node <slot>: the labels and annotations ... could not be written ...
+```
+
+while the gate retries. This is deliberate: the group's template carries the label the estimator
+placed the pod on, and a machine that becomes schedulable before it carries that label is a machine a
+zoned pod is bound to and then evicted from. The gate's deadline still wins - when it expires the
+machine is uncordoned (`ReadinessGateTimeout`, and the note repeats what it was waiting on), because
+a cordoned machine is one cluster-autoscaler's scale-down never removes. Read the error in the
+Warning: it is an API failure on the node object (the node was deleted mid-write, the manager cannot
+patch cluster-scoped objects, the API server was unreachable), and the slot reconciler keeps retrying
+the same write on every pass.
 
 ### Resource State Mismatch
 1. Run manual sync: Annotate resource with `homelab-autoscaler.dev/force-reconcile`

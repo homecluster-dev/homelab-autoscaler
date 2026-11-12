@@ -29,8 +29,14 @@ func TestReservedLabelKey(t *testing.T) {
 		// the operator's own namespace, including the records this package writes
 		AppliedLabelsAnnotation,
 		AppliedAnnotationsAnnotation,
+		SkippedKeysAnnotation,
 		"infra.homecluster.dev/group",
 		"infra.homecluster.dev/node",
+		// this project's own domain: the coordination locks of a lifecycle operation
+		"homelab-autoscaler.dev/operation-lock",
+		"homelab-autoscaler.dev/lock-owner",
+		// cluster-autoscaler's namespace: its per-machine controls
+		"cluster-autoscaler.kubernetes.io/scale-down-disabled",
 		// kubelet and node lifecycle controller
 		"node.kubernetes.io/role",
 		"node.kubernetes.io/not-ready",
@@ -63,7 +69,7 @@ func TestReservedLabelKey(t *testing.T) {
 		"pool.homecluster.dev/rack",
 		"dedicated",
 		"storage",
-		"k3d.io/role/agent",
+		"k3d.io/role",
 		"beta.kubernetes.io/os",
 	} {
 		isReserved, reason := ReservedLabelKey(key)
@@ -75,9 +81,15 @@ func TestReservedAnnotationKey(t *testing.T) {
 	reserved := []string{
 		AppliedLabelsAnnotation,
 		"infra.homecluster.dev/operation-lock",
+		"homelab-autoscaler.dev/operation-lock",
+		"homelab-autoscaler.dev/force-reconcile",
+		"cluster-autoscaler.kubernetes.io/scale-down-disabled",
 		"argocd.argoproj.io/tracking-id",
 		"argocd.argoproj.io/sync-wave",
 		"argocd.argoproj.io/sync-options",
+		// a label-only namespace stays open for annotations, and the key is listed here because
+		// the rule is about annotations, not about kubectl's cordon (a cordon is spec.unschedulable,
+		// and a drain adds a label): what is refused is kubectl's own client-side record.
 		"kubectl.kubernetes.io/last-applied-configuration",
 		"kubectl.kubernetes.io/cordon",
 	}
