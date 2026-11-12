@@ -36,3 +36,14 @@ jobs:
 
       - name: Run E2E tests
         run: make test-e2e
+
+      # The controller under test runs on the runner, outside the cluster, started by `make test-e2e`
+      # with nohup into /tmp/homelab-autoscaler.log. Nothing in the job shows it, and every gate in
+      # the suite asserts a decision that controller made, so a red run is only debuggable with its
+      # lines: what the slot reconciler read, what it wrote to the node object, what it refused.
+      - name: Show the local controller log
+        if: failure()
+        run: |
+          echo "::group::/tmp/homelab-autoscaler.log (last 3000 lines)"
+          tail -n 3000 /tmp/homelab-autoscaler.log || echo "no controller log at /tmp/homelab-autoscaler.log"
+          echo "::endgroup::"

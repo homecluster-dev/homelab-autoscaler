@@ -856,6 +856,10 @@ const TaintCiliumAgentNotReady = taints.CiliumAgentNotReady
 // (spec.nodeLabels, spec.nodeAnnotations). It is the guard of the gate's label write: a slot that
 // declares nothing has nothing that must land before its machine is schedulable, and holding the
 // gate open on a write that has no content would make every pool of the cluster wait on a no-op.
+//
+// The slot handed to it is the one read fresh in the hook, for the reason stated there: a snapshot
+// answers for the machine that was booted, and the write this guards is the one that decides which
+// keys of the node object the slot owns.
 func declaresNodeMetadata(slot *infrav2alpha1.Node) bool {
 	return len(slot.Spec.NodeLabels)+len(slot.Spec.NodeAnnotations) > 0
 }
@@ -1046,13 +1050,24 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		// and the machine only agrees once this write lands. Called on every retry, and idempotent
 		// (no write when the node already carries the declaration).
 		//
-		// The declaration written here is the FSM's snapshot of the slot (nm.node, the object the
-		// transition was built from, not a fresh read). A spec edit that lands while this gate runs -
-		// a Git apply that adds a rack label mid-boot - is applied by the slot reconciler's next pass,
-		// and the gate's job is to make *this* machine agree with the declaration it was booted for.
-		//
-		// A slot that declares keys, where the write fails, is a refusal of this gate: the same class
-		// as the Ready condition and the readiness taints, and for the same reason. Logging it and
+		// The declaration written here is read from the slot as the cluster has it now, not from the
+		// transition's snapshot: the apply removes the keys a declaration dropped, so a snapshot taken
+		// before a Git apply - one that declares nothing, or an older set - would remove the labels the
+		// pool declares today and delete the record that made them that slot's to manage. The next pass
+		// would write them back, and the two writers would trade the node object between them for as
+		// long as the machine lives. A slot the read cannot find is answered with the snapshot: this
+		// write stays best effort on that read, and the slot reconciler re-asserts the live declaration
+		// on its own pass.
+		labelSlot := &infrav2alpha1.Node{}
+		if err := nm.client.Get(ctx, client.ObjectKey{Namespace: nm.node.Namespace, Name: nm.node.Name}, labelSlot); err != nil {
+			logger.V(1).Info("Could not read the slot for its declared labels, writing the transition's snapshot",
+				"error", err.Error())
+
+			labelSlot = nm.node
+		}
+
+		// A slot that declares keys, whose write fails, is a refusal of this gate: the same class as
+		// the Ready condition and the readiness taints, and for the same reason. Logging it and
 		// uncordoning anyway is the promise the feature documents - the machine carries the labels the
 		// estimator placed the pod on - broken by an API failure the loop cannot see. So the loop waits
 		// on it, within the gate's deadline, keeping the operation lock alive, and the timeout path
@@ -1062,8 +1077,8 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		//
 		// A slot that declares nothing is not gated on this write: its label half has nothing to land,
 		// and the removal of keys an older declaration wrote is the reconciler's job on the next pass.
-		if declaresNodeMetadata(nm.node) {
-			if err := nodelabels.ApplyToKubernetesNode(ctx, nm.client, nm.node, nm.eventRecorder); err != nil {
+		if declaresNodeMetadata(labelSlot) {
+			if err := nodelabels.ApplyToKubernetesNode(ctx, nm.client, labelSlot, nm.eventRecorder); err != nil {
 				waitingOn = fmt.Sprintf("the labels and annotations the slot declares were not written: %v", err)
 
 				logger.Info("Declared node labels could not be written, holding the node cordoned",

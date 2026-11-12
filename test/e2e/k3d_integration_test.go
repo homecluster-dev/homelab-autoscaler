@@ -1541,22 +1541,36 @@ spec:
 				map[string]string{"topology.kubernetes.io/zone": zoneA},
 				nil)).To(Succeed())
 
-			// The same clock as the drift above. A key the declaration drops comes off the node on the
-			// slot's next pass, and a settled slot has no pass of its own: the spec write enqueues one,
-			// and the suite asks for it as well, so the gate measures the rule and not the queue.
-			requestSlotPass(zonedSlot)
+			// The suite's write is the input of the rule; the controller acts on the slot it can read.
+			// So the gate first waits for the slot to carry the declaration the suite applied - if a
+			// write of the same object from the operator, a Git apply or the harness wins that race,
+			// this is where it is named, with the slot's own lines beside it - and only then asserts
+			// what the writer does with it.
+			Eventually(func() string {
+				return slotDeclarationNote(zonedSlot)
+			}, labelGate, checkInterval).Should(
+				ContainSubstring(fmt.Sprintf(`{"topology.kubernetes.io/zone":"%s"}`, zoneA)),
+				"the slot carries the dropped declaration, so the pass below has one input to act on: %s",
+				controllerLogNote(zonedSlot))
+
+			// A key the declaration drops comes off the node on the slot's next pass, and a settled slot
+			// has no pass of its own. The suite asks for the pass on every poll, so the gate measures
+			// the rule and not the queue behind it.
 
 			By("Watching the key come off the node")
 			// Both removals are asserted over a read that reports its own failure: "the key is not
 			// there" is only a fact about a node object that was read, and a nil map from a failed
 			// read satisfies a Not(HaveKey) assertion.
 			Eventually(func() ([]string, error) {
+				requestSlotPass(zonedSlot)
+
 				return nodeLabelKeys(zonedSlot)
 			}, labelGate, checkInterval).ShouldNot(
 				ContainElement(rackKey),
 				"taking a label out of Git takes it off the machine: that is the only way the declaration "+
-					"stays true of a box that runs for months. The removal is keyed by the record on the "+
-					"node, so the record is shown beside it: %s", describeNodeMetadata(zonedSlot))
+					"stays true of a box that runs for months. The removal is keyed by the record of the "+
+					"keys the slot wrote, so the record, the declaration and the controller's own lines "+
+					"are shown beside it: %s", describeNodeMetadata(zonedSlot)+controllerLogNote(zonedSlot))
 
 			Eventually(func() ([]string, error) {
 				return nodeAnnotationKeys(zonedSlot)

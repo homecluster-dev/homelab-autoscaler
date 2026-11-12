@@ -22,6 +22,7 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -138,6 +139,43 @@ func slotEventsFor(slot string) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
+// controllerLogFile is where `make test-e2e` starts the local manager: the controller runs on this
+// host, with nohup redirecting its output here, exactly like the VM control server's request log the
+// suite already reads. It is the record of every decision the operator made, and the only way a
+// failing gate can say what the reconciler did to the object it asserts on.
+const controllerLogFile = "/tmp/homelab-autoscaler.log"
+
+// controllerLogNote renders the controller's recent lines about one slot, newest last. A gate that
+// asserts a consequence of a reconcile has to show the reconcile when it fails: the labels the writer
+// decided to apply, the record it read, the pass it skipped, all of it is in these lines.
+func controllerLogNote(slot string) string {
+	data, err := os.ReadFile(controllerLogFile)
+	if err != nil {
+		return "\n  controller log unreadable: " + err.Error()
+	}
+
+	var kept []string
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.Contains(line, slot) {
+			continue
+		}
+
+		kept = append(kept, "  "+line)
+	}
+
+	if len(kept) == 0 {
+		return "\n  no controller log line mentions " + slot
+	}
+
+	const tail = 40
+	if len(kept) > tail {
+		kept = kept[len(kept)-tail:]
+	}
+
+	return "\n  controller, newest last:\n" + strings.Join(kept, "\n")
+}
+
 // describeNodeMetadata renders what the writer based its decision on, for the gates that assert the
 // record and the removals built on it: the declaration the slot carries, and the three records on the
 // node object - the keys a slot applied, the keys it annotated, and the keys it refused. A removal is
@@ -150,16 +188,19 @@ func describeNodeMetadata(nodeName string) string {
 		lines = append(lines, "  node object unreadable")
 	} else {
 		lines = append(lines, "  node label keys: "+strings.Join(sortedKeysOf(labels), ","))
-		lines = append(lines, "  record "+nodelabels.AppliedLabelsAnnotation+
-			"="+labels[nodelabels.AppliedLabelsAnnotation])
 	}
 
+	// Every record of the writer is an annotation on the node object, and the labels it wrote are
+	// listed in one of them. Reading a record out of the *labels* map is the kind of mistake that
+	// turns a diagnostic into a lie, so all three are read from the annotations, once.
 	annotations := kubeNodeAnnotations(nodeName)
 	if annotations != nil {
-		lines = append(lines, "  record "+nodelabels.AppliedAnnotationsAnnotation+
-			"="+annotations[nodelabels.AppliedAnnotationsAnnotation])
-		lines = append(lines, "  record "+nodelabels.SkippedKeysAnnotation+
-			"="+annotations[nodelabels.SkippedKeysAnnotation])
+		lines = append(lines, "  node annotation keys: "+strings.Join(sortedKeysOf(annotations), ","))
+
+		for _, record := range []string{nodelabels.AppliedLabelsAnnotation,
+			nodelabels.AppliedAnnotationsAnnotation, nodelabels.SkippedKeysAnnotation} {
+			lines = append(lines, "  record "+record+"="+annotations[record])
+		}
 	}
 
 	out, err := utils.Run(kubectl("get", "nodes.infra.homecluster.dev", nodeName, "-n", namespace,
@@ -171,6 +212,17 @@ func describeNodeMetadata(nodeName string) string {
 	}
 
 	return "\n" + strings.Join(lines, "\n")
+}
+
+// slotDeclarationNote renders the slot's own declaration, the input of every write the suite asserts.
+func slotDeclarationNote(slot string) string {
+	out, err := utils.Run(kubectl("get", "nodes.infra.homecluster.dev", slot, "-n", namespace,
+		"-o", `jsonpath={.spec.nodeLabels} {.spec.nodeAnnotations}`))
+	if err != nil {
+		return "  slot declaration unreadable: " + err.Error()
+	}
+
+	return "  slot declares: " + strings.TrimSpace(out)
 }
 
 // sortedKeysOf renders a map's keys in order, for a message that has to be comparable between runs.
