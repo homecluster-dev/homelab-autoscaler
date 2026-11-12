@@ -1,42 +1,49 @@
 # K3D Group Example
 
-This example demonstrates a basic autoscaling group setup for development using k3d.
+The Group the k3d environment runs: short windows, so a laptop run reaches a scale-down in minutes.
 
 ```yaml
-# Example Group configuration for k3d testing environment
-# This demonstrates a basic autoscaling group setup for development
-
+# Example Group configuration for a k3d testing environment
 apiVersion: infra.homecluster.dev/v2alpha1
 kind: Group
 metadata:
   name: k3d-workers
   namespace: homelab-autoscaler-system
 spec:
-  
-  # Scale down when utilization is below 50%
-  scaleDownUtilizationThreshold: 0.5
-  
-  # Wait 2 minutes before scaling down unneeded nodes
+  # 0 lets the pool scale to nothing. Set 1 to keep one machine up: cluster-autoscaler
+  # will not take the pool below the floor, and no keepalive pod is needed.
+  minSize: 0
+  # Strings on a ratio field: "0.5" is 50% utilization. 0.5 unquoted is rejected by the
+  # API server, and "30" on this field is 3000% - a number the autoscaler compares
+  # against a utilization between 0 and 1.
+  scaleDownUtilizationThreshold: "0.5"
+  scaleDownGpuUtilizationThreshold: "0.3"
+  # Short windows for a test run; production numbers are in the Production Examples.
   scaleDownUnneededTime: "2m"
-  
-  # Wait 1 minute before scaling down unready nodes
   scaleDownUnreadyTime: "1m"
-  
-  # Maximum time to wait for a node to be provisioned
+  # The budget of one boot: the group's number is the floor of every claim's
+  # spec.deadlineAt here, and cluster-autoscaler's own termination deadline for the scale-up.
+  # A k3d container answers inside it; a real machine needs more.
   maxNodeProvisionTime: "2m"
-  
-  # Ignore DaemonSet pods when calculating utilization
-  ignoreDaemonSetsUtilization: true
-  
-  # Allow partial scaling (not just 0 or max)
   zeroOrMaxNodeScaling: false
-  
-  # GPU utilization threshold for scale down (if applicable)
-  scaleDownGpuUtilizationThreshold: "30"
+  ignoreDaemonSetsUtilization: true
 ```
 
-## Key Features
+## What The Fields Do Here
 
-- **Development-friendly settings**: Short timeouts for quick testing
-- **Moderate scaling thresholds**: 50% utilization threshold for responsive scaling
-- **Partial scaling enabled**: Allows gradual scaling rather than all-or-nothing
+- **No `maxSize`.** This pool's ceiling is the number of `Node` CRs labelled
+  `group: k3d-workers` — the k3d examples declare two, so `kubectl get groups` reads `SLOTS 2` and
+  the pool can never be asked for a third machine
+- **Every field except `minSize` and `nodeReadinessTaints` is required**, so a Group that declares
+  three of them is refused at apply with a list of what is missing
+- **`maxNodeProvisionTime: "2m"`** is the number a laptop run wants; the claim's own budget is
+  12m10s and the group's number only raises the floor, so on this pool a claim expires at 12m10s
+- **The readiness gate** is Cilium's bootstrap taint by default. A k3d cluster runs flannel, which
+  stamps no such taint, so the gate is satisfied by the `Ready` condition — the CRD default costs a
+  look at a key that never appears, not a stuck slot
+
+## Related Documentation
+
+- [Group CRD Reference](../crds/group.md)
+- [K3D Node Example](k3d-node.md)
+- [Quick Start](../../getting-started/quick-start.md)

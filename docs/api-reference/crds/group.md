@@ -254,17 +254,19 @@ is never called, so the group stays at zero and the floor that works is `minSize
 # Check group controller logs
 kubectl logs -n homelab-autoscaler-system deployment/homelab-autoscaler-controller-manager
 
-# List nodes in group
-kubectl get nodes -l group=worker-nodes
+# List the slots of the pool (the Node CRs are the pool's members)
+kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system -l group=worker-nodes
 
-# Check node CRDs
-kubectl get nodes.infra.homecluster.dev -l group=worker-nodes
+# The machines of the pool that have registered, as the kubelet reports them. The operator stamps
+# `infra.homecluster.dev/group` on the corev1.Node; the bare `group` label is the Node CR's.
+kubectl get nodes -l infra.homecluster.dev/group=worker-nodes
 
 # Check the requests of the group, and the budget they carry
 kubectl get nodeclaim -n homelab-autoscaler-system -l group=worker-nodes -o wide
 
-# Verify gRPC server status
-kubectl port-forward -n homelab-autoscaler-system service/homelab-autoscaler-grpc 50051:50051
+# Verify the gRPC service, and that its selector resolves to a ready pod
+kubectl get service,endpoints -n homelab-autoscaler-system -l control-plane=controller-manager
+kubectl port-forward -n homelab-autoscaler-system service/homelab-autoscaler-grpc-service 50051:50051
 ```
 
 ## Related Documentation

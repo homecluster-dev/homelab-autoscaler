@@ -117,17 +117,24 @@ When modifying Go struct definitions:
 ```
 ├── api/infra/v2alpha1/
 │   ├── group_types.go              # Go struct definitions
-│   └── node_types.go
+│   ├── node_types.go
+│   └── nodeclaim_types.go
 ├── config/crd/bases/               # Kubebuilder-generated CRDs
 │   ├── infra.homecluster.dev_groups.yaml
-│   └── infra.homecluster.dev_nodes.yaml
+│   ├── infra.homecluster.dev_nodes.yaml
+│   └── infra.homecluster.dev_nodeclaims.yaml
 ├── dist/chart/templates/crd/       # Helm-templated CRDs
 │   ├── infra.homecluster.dev_groups.yaml
-│   └── infra.homecluster.dev_nodes.yaml
+│   ├── infra.homecluster.dev_nodes.yaml
+│   └── infra.homecluster.dev_nodeclaims.yaml
 └── hack/
     ├── sync-helm-crds.sh          # CRD sync script
     └── validate-helm-crds.sh      # CRD validation script
 ```
+
+Three CRDs, in both directories. A release that installs `groups` and `nodes` without
+`nodeclaims` cannot serve a scale-up: the provider creates a `NodeClaim` per machine it is asked
+for, and the operator needs `nodeclaims/status` and `nodeclaims/finalizers` to run one to its end.
 
 ## Helm Chart Integration
 
@@ -210,9 +217,17 @@ If validation reports schema differences:
 - **Developer friendly**: No changes to development workflow
 - **Validation included**: Built-in consistency checking
 
-## Future Enhancements
+## Where This Is Asserted
 
-Potential improvements to consider:
+- `internal/controller/infra/crd_columns_test.go` asserts the printer columns of the generated CRD
+  **and** of the chart's copy, so a schema that synced without its columns fails a test
+- `./hack/validate-helm-crds.sh` compares the schema sections of source and target
+- `make pre-commit` runs `pre-commit-generate` (manifests, generate, helm-sync), validation and the
+  unit tests, and stages the generated files. `make install-pre-commit` installs the
+  [pre-commit](https://pre-commit.com) hooks that run it on every commit
+  (`.pre-commit-config.yaml`)
 
-- **Pre-commit hooks**: Ensure CRDs are synced before commits
-- **Schema versioning**: Track CRD schema changes over time
+## Remaining Improvements
+
+- **Schema versioning**: track CRD schema changes over time, so a diff of a release names the field
+  that moved

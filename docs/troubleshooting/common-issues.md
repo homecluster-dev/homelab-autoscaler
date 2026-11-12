@@ -2,7 +2,7 @@
 
 Quick reference for resolving frequently encountered problems with homelab-autoscaler.
 
-## 🔍 Quick Diagnostics
+## Quick Diagnostics
 
 ### Controller Not Starting
 ```bash
@@ -27,7 +27,7 @@ kubectl get svc -n homelab-autoscaler-system | grep grpc
 
 # Test gRPC connectivity
 kubectl run grpc-test --rm -it --image=nicolaka/netshoot -- \
-  grpc_cli call homelab-autoscaler-grpc:50051 NodeGroups ""
+  grpc_cli call homelab-autoscaler-grpc-service:50051 NodeGroups ""
 ```
 
 **Common Fixes:**
@@ -189,7 +189,7 @@ Both the command and its output above are asserted by a test
 (`test/integration/duration_snippet_test.go`), against the fixture in
 `test/integration/testdata/pool-shape/nodes.json`, so the snippet cannot rot.
 
-## 🛠️ Common Operations
+## Common Operations
 
 ### Manual Node Power Control
 
@@ -213,6 +213,10 @@ spec:
   request:
     call: IncreaseSize
     group: worker-nodes
+  # You stamp the budget. The provider computes it when it creates a claim; nothing fills it in for
+  # a hand-made one, and a claim with no deadlineAt never expires.
+  requestedAt: "2026-03-04T09:38:15Z"   # now, in RFC3339
+  deadlineAt: "2026-03-04T09:50:25Z"    # requestedAt + 12m10s
 YAML
 
 # Watch it: pending -> booting -> ready, inside spec.deadlineAt
@@ -252,7 +256,7 @@ kubectl get group <group-name> -n homelab-autoscaler-system -o jsonpath='{.statu
 kubectl get node.infra.homecluster.dev <node-name> -n homelab-autoscaler-system -o jsonpath='{.status.conditions}'
 ```
 
-## ⚡ Performance Issues
+## Performance Issues
 
 ### High Resource Usage
 ```bash
@@ -264,9 +268,13 @@ kubectl get --raw /metrics | grep apiserver_request_total
 ```
 
 **Tuning Options:**
-- Adjust reconciliation intervals in Helm values
-- Increase resource limits for controller
-- Reduce log verbosity if debug logging is enabled
+- Raise `controllerManager.container.resources` in your Helm values; the pass over a pool is one list
+  of slots, so the cost is memory and CPU of the manager, not a knob in the CRDs
+- Cut the log verbosity back from `--zap-log-level=debug`, which is what turns one reconcile into a
+  page
+- The resync of a settled slot is a constant (5 minutes, `idleResync` in
+  `internal/controller/infra/lifecycle.go`), not a value to tune: see
+  [Known Issues](known-issues.md) for what is and is not configurable
 
 ### Slow Scaling Operations
 ```bash
@@ -278,11 +286,16 @@ kubectl get jobs -n homelab-autoscaler-system -o wide
 ```
 
 **Optimizations:**
-- Tune job timeouts in Node CRD specifications
-- Optimize power operation scripts for faster execution
-- Consider higher resource limits for power operation jobs
+- The power script is the slow part of a boot: it powers the machine on and exits, and the machine's
+  own registration and the readiness gate are what the claim's 12m10s budget is made of
+- `spec.startupPodSpec.priorityClassName` keeps a power Job schedulable under resource pressure;
+  the Job's pod takes no resource requests you can set, and its `ttlSecondsAfterFinished` defaults
+  to 600s
+- A boot that is legitimately slow is a Group number: raise `spec.maxNodeProvisionTime`, which is
+  the floor of every claim's `spec.deadlineAt` and the deadline cluster-autoscaler gives the same
+  scale-up
 
-## 🐛 Debugging Specific Scenarios
+## Debugging Specific Scenarios
 
 ### Nodes Not Powering On/Off
 1. Check job status: `kubectl describe job <job-name>`
@@ -392,9 +405,11 @@ reconciler fires.
 ```bash
 kubectl patch nodeclaim claim-<node-name> -n homelab-autoscaler-system --subresource=status --type=merge \
   -p '{"status":{"shutdownAttempts":0,"lastShutdownAttemptAt":null}}'
-``` A healthy scale-down pays no second Job either: the guard reads the kubelet's
-heartbeat against the Job's `status.completionTime`, because a node object stays `Ready` for
-`node-monitor-grace-period` (~40s) after a real power-off.
+```
+
+A healthy scale-down pays no second Job either: the guard reads the kubelet's heartbeat against the
+Job's `status.completionTime`, because a node object stays `Ready` for `node-monitor-grace-period`
+(~40s) after a real power-off.
 
 ### A Claim Is Stuck Pending
 
@@ -416,7 +431,7 @@ kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system
 kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
 # 4. The slot reconciler's own words
 kubectl logs -n homelab-autoscaler-system deployment/homelab-autoscaler-controller-manager \
-  -l control-plane=controller-manager --tail=200 | grep <node-name>
+  --tail=200 | grep <node-name>
 ```
 
 The causes, in the order to check them:
@@ -508,7 +523,7 @@ The reason, and what to do with it:
 | `MachineGone` | the node object of a ready claim disappeared while the machine was observed off | the machine was deleted out of band; the slot becomes free and the next request claims it |
 
 A failed claim is kept for `spec.ttlSecondsAfterFinished` (default 3600s) after `status.finishedAt`,
-so `kubectl get nodeclaim -a` in the pool's namespace shows the episodes while they are readable. The
+so `kubectl get nodeclaim -n homelab-autoscaler-system` shows the episodes while they are readable. The
 Events of the attempt expire with the cluster's Event TTL (one hour by default), and the claim goes
 with its TTL: from there `status.conditions`, `status.reason` and `Node.status.lastClaim` are the
 record, which is why the conditions are stamped by the same write as the event and are the durable
@@ -726,32 +741,61 @@ patch cluster-scoped objects, the API server was unreachable), and the slot reco
 the same write on every pass.
 
 ### Resource State Mismatch
-1. Run manual sync: Annotate resource with `homelab-autoscaler.dev/force-reconcile`
-2. Check Core controller logs for sync issues
-3. Verify Kubernetes node exists and is healthy
 
-## 📋 Emergency Procedures
+The operator keeps no database and no cache of its own: the state is the `Group`, `Node` and
+`NodeClaim` objects in etcd, and what `kubectl get` prints is the bytes the reconcilers read. A
+report that looks stale is a slot that has not had a pass, and a settled slot is passed over on the
+five-minute idle resync. Ask for one now:
+
+```bash
+kubectl annotate node.infra.homecluster.dev <slot> -n homelab-autoscaler-system \
+  e2e.homecluster.dev/pass-requested-at=$(date -u +%FT%TZ) --overwrite
+kubectl get nodes.infra.homecluster.dev <slot> -n homelab-autoscaler-system -o wide
+```
+
+Then read the triple the report is derived from — the live claim, the observed power, the node — and
+the slot reconciler's own lines:
+
+```bash
+kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<slot>
+kubectl logs -n homelab-autoscaler-system deployment/homelab-autoscaler-controller-manager --tail=200 | grep <slot>
+kubectl get node <kubernetes-node-name> -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' ; echo
+```
+
+The annotation is the request; it is not a state reset. Nothing in the model reads
+`homelab-autoscaler.dev/force-reconcile`, and no such annotation is written by anything.
+
+## Emergency Procedures
 
 ### Complete System Reset
+
+Delete the requests first, then the slots that own them, then the pools: a claim is owned by its
+slot, so deleting the `Node` CRs takes their claims with them, and deleting the claims first is the
+order that powers the machines down through their finalizers instead of dropping the record of what
+was wanted.
+
 ```bash
-# Delete all custom resources (CAUTION: Destructive!)
-kubectl delete groups --all -n homelab-autoscaler-system
+# CAUTION: destructive. Every live claim is a machine the pool wants; deleting it shuts that machine
+# down through the claim's finalizer, and --all on the slots removes the pool's declaration.
+kubectl delete nodeclaims --all -n homelab-autoscaler-system
 kubectl delete nodes.infra.homecluster.dev --all -n homelab-autoscaler-system
+kubectl delete groups --all -n homelab-autoscaler-system
 
 # Restart controller
 kubectl rollout restart deployment/homelab-autoscaler-controller-manager -n homelab-autoscaler-system
 ```
 
-### Database Corruption Recovery
-```bash
-# Export current state for backup
-kubectl get groups -n homelab-autoscaler-system -o yaml > groups-backup.yaml
-kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system -o yaml > nodes-backup.yaml
+### Backup And Restore
 
-# Restore from backup
-kubectl apply -f groups-backup.yaml
-kubectl apply -f nodes-backup.yaml
+The objects are the state, so a read is a backup and an apply is the restore:
+
+```bash
+kubectl get groups,nodes.infra.homecluster.dev,nodeclaims -n homelab-autoscaler-system -o yaml > pool-backup.yaml
+kubectl apply -f pool-backup.yaml
 ```
+
+Restore the `Node` CRs before the claims: a claim is owned by its slot, and a claim applied without
+its slot is refused at admission.
 
 ---
 
