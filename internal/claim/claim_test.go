@@ -552,6 +552,9 @@ func TestDigestIsTheStoryThatOutlivesTheClaim(t *testing.T) {
 	requested := time.Date(2026, 3, 4, 9, 38, 15, 0, time.UTC)
 	deadline := time.Date(2026, 3, 4, 9, 45, 25, 0, time.UTC)
 	finished := time.Date(2026, 3, 4, 9, 45, 26, 0, time.UTC)
+	// The scale-down's own instant: three days after the request that created the machine it takes
+	// back, which is the point of keeping both.
+	scaledDown := requested.Add(3 * 24 * time.Hour)
 
 	overdue := &infrav2alpha1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: fixSlot + "-7f4b9c", Namespace: fixNamespace},
@@ -626,6 +629,44 @@ func TestDigestIsTheStoryThatOutlivesTheClaim(t *testing.T) {
 				Group:      fixGroup,
 				Reason:     infrav2alpha1.ClaimReasonNodeDeleted,
 				FinishedAt: ptrTime(finished),
+			},
+		},
+		{
+			// The pair of instants a scale-down leaves on a claim, and the reason the digest carries
+			// both. A DeleteNodes rewrites spec.request of a claim that can be days old and never
+			// touches spec.requestedAt, so the episode's request time is the age of the machine and
+			// the deletionTimestamp is the instant the pool shrank: a display that reads the first for
+			// a shrink dates "a machine taken back 24 minutes ago" by its boot, three days ago.
+			name:     "a scale-down that named a claim days after the request that made it",
+			wantSeed: 1,
+			claim: &infrav2alpha1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              fixSlot + "-9d8e7f",
+					DeletionTimestamp: ptrTime(scaledDown),
+				},
+				Spec: infrav2alpha1.NodeClaimSpec{
+					SlotRef:     corev1.ObjectReference{Name: fixSlot},
+					RequestedAt: metav1.NewTime(requested),
+					RequestedBy: RequestedByAutoscaler,
+					Request:     deleteNodes(fixK8sNode),
+				},
+				Status: infrav2alpha1.NodeClaimStatus{
+					Phase:      infrav2alpha1.NodeClaimCompleted,
+					Attempt:    1,
+					Reason:     infrav2alpha1.ClaimReasonNodeDeleted,
+					FinishedAt: ptrTime(finished),
+				},
+			},
+			want: &infrav2alpha1.LastClaimSummary{
+				Name:         fixSlot + "-9d8e7f",
+				Phase:        infrav2alpha1.NodeClaimCompleted,
+				Attempt:      1,
+				Call:         infrav2alpha1.ClaimCallDeleteNodes,
+				Group:        fixGroup,
+				Reason:       infrav2alpha1.ClaimReasonNodeDeleted,
+				RequestedAt:  ptrTime(requested),
+				ScaledDownAt: ptrTime(scaledDown),
+				FinishedAt:   ptrTime(finished),
 			},
 		},
 		{

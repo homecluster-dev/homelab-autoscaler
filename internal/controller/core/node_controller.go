@@ -33,6 +33,7 @@ import (
 	"github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/config"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
@@ -109,7 +110,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Only update when the recorded status disagrees with what is observed. A status
 	// write on every reconcile would keep this controller hot, so the fast path covers
 	// "power state and derived phase unchanged, and no new autoscaler marker".
-	if !applyObservation(nodeCR.DeepCopy(), nodeStatus, input) && !markerChanged {
+	if !applyObservation(nodeCR.DeepCopy(), nodeStatus, input, observedAt) && !markerChanged {
 		logger.V(1).Info("Node status unchanged, skipping update", "node", node.Name, "status", nodeStatus)
 		return ctrl.Result{}, nil
 	}
@@ -128,7 +129,7 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return err
 		}
 
-		powerChanged := applyObservation(fresh, nodeStatus, input)
+		powerChanged := applyObservation(fresh, nodeStatus, input, observedAt)
 
 		decision, markerChanged := autoscaler.ApplyMarker(fresh, node, observedAt)
 		if !powerChanged && !markerChanged {
@@ -200,7 +201,14 @@ func (r *KubernetesNodeReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 //
 // It returns true when the object changed, so the caller skips the status write when there is
 // nothing to do.
-func applyObservation(node *infrav2alpha1.Node, powerState infrav2alpha1.PowerState, in phase.Input) bool {
+//
+// The report's own observability (lastTransitionTime, previousPhase, the ring of recent
+// transitions, the activation counts) is written by the single writer of it, phase.Record, which
+// the transition path calls with the same value: one formula for the phase, one writer for its
+// history, so the two writers of the report cannot leave a slot whose history disagrees with the
+// phase it reports. `at` is the instant this pass read the node object, the same clock the marker
+// record quotes.
+func applyObservation(node *infrav2alpha1.Node, powerState infrav2alpha1.PowerState, in phase.Input, at time.Time) bool {
 	changed := false
 
 	if node.Status.PowerState != powerState {
@@ -211,8 +219,7 @@ func applyObservation(node *infrav2alpha1.Node, powerState infrav2alpha1.PowerSt
 	in.ObservedPower = powerState
 
 	derived := phase.Derive(in)
-	if node.Status.Phase != derived {
-		node.Status.Phase = derived
+	if phase.Record(node, derived, at, phase.Reason(in, derived)) {
 		changed = true
 	}
 
@@ -229,7 +236,19 @@ func nodeUsable(k8sNode *corev1.Node, nodeCR *infrav2alpha1.Node) bool {
 }
 
 // observationInput assembles the state machine's input for one observation of one slot: the live
-// claim the slot carries, the power the node object shows, and whether the node can take work.
+// claim the slot carries, the power the node object shows, whether the node can take work, and the
+// two lifecycle-Job facts that separate "claimed, nothing started" from "a startup is in flight".
+//
+// The Job fields are not decoration: phase.Derive reads them (a pending claim with a startup Job
+// running is `booting`, and without it `pending`), and the transition path fills them. An observation
+// that left them empty derived a **different phase for one machine** than the transition path derived
+// from the same world, and since the record of the report became one writer's job every such
+// disagreement appends a row to the slot's ring and can count a boot twice - the two paths trading
+// one slot's `pending` and `booting` back and forth, once per pass. So the fields are filled by the
+// one helper that answers the question, the same one the transition path calls
+// (fsm.JobsInFlightOfSlot, via the infra reconciler). The pair is pinned by
+// TestObservationInputAndLifecycleInputDeriveOnePhase, in this package and in
+// internal/controller/infra/node_controller_test.go.
 //
 // A claim list that fails is not fatal: a slot with no claim read is a slot reported from the
 // observation alone, which is the value of the report before any claim existed, and the next pass
@@ -243,10 +262,14 @@ func (r *KubernetesNodeReconciler) observationInput(ctx context.Context, nodeCR 
 		live = claim.LiveOfSlot(claims)
 	}
 
+	startup, shutdown := fsm.JobsInFlightOfSlot(ctx, r.Client, nodeCR.Namespace, nodeCR.Name)
+
 	return phase.Input{
-		Claim:         live,
-		ObservedPower: powerState,
-		NodeUsable:    nodeUsable(k8sNode, nodeCR),
+		Claim:               live,
+		ObservedPower:       powerState,
+		NodeUsable:          nodeUsable(k8sNode, nodeCR),
+		StartupJobInFlight:  startup,
+		ShutdownJobInFlight: shutdown,
 	}
 }
 

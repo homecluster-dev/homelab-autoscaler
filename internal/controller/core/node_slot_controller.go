@@ -18,6 +18,7 @@ package core
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,6 +31,7 @@ import (
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
 // NodeSlotReconciler seeds the report of Node CRs (slots) that have never been observed: a freshly
@@ -118,7 +120,11 @@ func (r *NodeSlotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Create a copy for the status update to avoid conflicts with spec updates
 	nodeCRCopy := nodeCR.DeepCopy()
 	nodeCRCopy.Status.PowerState = infrav2alpha1.PowerStateOff
-	nodeCRCopy.Status.Phase = infrav2alpha1.NodePhaseOff
+
+	// The first report of a slot that has never been observed, written through the one writer of
+	// the report's history so the seeded slot carries the same shape `kubectl get` reads as every
+	// other slot: a phase, the instant it was set, and one row saying it was never observed.
+	phase.Record(nodeCRCopy, infrav2alpha1.NodePhaseOff, time.Now(), "no live claim, never observed")
 
 	// Use status subresource to avoid conflicts with spec updates
 	if err := r.Status().Update(ctx, nodeCRCopy); err != nil {

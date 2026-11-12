@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -79,37 +80,12 @@ func (r *NodeReconciler) lifecycleInput(ctx context.Context, node *infrav2alpha1
 }
 
 // lifecycleJobsInFlight reports whether a startup Job and whether a shutdown Job of this slot is
-// running. The lifecycle Jobs carry the slot's name and the lifecycle phase as labels
-// (fsm.LabelNodeCR, fsm.LabelPhase), so this is one list, and the answer is a fact about objects
-// that exist, not about a string someone wrote on a slot.
+// running. It is one call to the one place that answers the question (fsm.JobsInFlightOfSlot): the
+// labels it reads are the lifecycle Job's own, and the observation path - the other writer of the
+// derived report - asks the same question through the same helper, so the two writers of one phase
+// cannot feed phase.Derive two inputs about one machine.
 func (r *NodeReconciler) lifecycleJobsInFlight(ctx context.Context, node *infrav2alpha1.Node) (bool, bool) {
-	jobList := &batchv1.JobList{}
-	selector := labels.SelectorFromSet(labels.Set{fsm.LabelNodeCR: node.Name})
-
-	if err := r.List(ctx, jobList, &client.ListOptions{Namespace: node.Namespace, LabelSelector: selector}); err != nil {
-		log.FromContext(ctx).V(1).Info("Failed to list the lifecycle Jobs of the slot",
-			"node", node.Name, "error", err.Error())
-
-		return false, false
-	}
-
-	var startup, shutdown bool
-
-	for i := range jobList.Items {
-		job := &jobList.Items[i]
-		if !job.DeletionTimestamp.IsZero() || job.Status.Succeeded > 0 || job.Status.Failed > 0 {
-			continue
-		}
-
-		switch job.Labels[fsm.LabelPhase] {
-		case fsm.PhaseStartup:
-			startup = true
-		case fsm.PhaseShutdown:
-			shutdown = true
-		}
-	}
-
-	return startup, shutdown
+	return fsm.JobsInFlightOfSlot(ctx, r.Client, node.Namespace, node.Name)
 }
 
 // recoverFinishedLifecycleJob re-fires the lifecycle event of a Job that finished with nobody
@@ -380,11 +356,73 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(
 
 	stateMachine.CheckStuckState()
 
+	// The 24 h window of the slot's ring moves on its own clock, so prune it on this pass and come
+	// back at the instant the next row leaves it: see refreshTransitionWindow.
+	r.refreshTransitionWindow(ctx, node)
+
 	if fsm.IsTransitionalState(state) {
-		return ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, nil
+		return r.requeueAtWindowExpiry(ctrl.Result{RequeueAfter: stateMachine.CalculateBackoff()}, node), nil
 	}
 
-	return ctrl.Result{RequeueAfter: idleResync}, nil
+	return r.requeueAtWindowExpiry(ctrl.Result{RequeueAfter: idleResync}, node), nil
+}
+
+// refreshTransitionWindow prunes the window of a slot's ring, and is the half of the 24 h honesty
+// that is not a requeue.
+//
+// status.activationsLast24H is a count of the last 24 hours, so it changes at an instant no object
+// event produces: the oldest row of the ring leaves the window. Nothing enqueues this reconciler
+// for that instant - a slot that is `off` has no node object, no claim and no lifecycle Job, and a
+// stable slot is otherwise looked at every idleResync - so a count recomputed only when a phase
+// changes is a count that goes stale for as long as the pool sleeps, which is exactly the horizon
+// of the question it answers ("how often does this machine boot in a day", asked the next morning).
+//
+// So the chosen mechanism is a requeue at the expiry instant (requeueAtWindowExpiry), and this pass
+// is the prune it schedules: phase.Record is called with the phase the slot *already* reports, which
+// records no transition and moves only the window and its count. The one writer of the record is
+// unchanged, and the phase of the pass is not re-derived here, so a stale machine can never write a
+// transition over a live one (the guard fsm.reportPhase keeps for the same reason).
+//
+// It is best-effort: a status write that fails costs the count for one resync, never the slot. And
+// it reads nothing: the fast path ("is there a window to move") lives inside the writer, which
+// reports no change, so no code outside internal/phase touches the ring - the law
+// internal/phase/hygiene_test.go asserts.
+func (r *NodeReconciler) refreshTransitionWindow(ctx context.Context, node *infrav2alpha1.Node) {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav2alpha1.Node{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
+			return err
+		}
+
+		if !phase.Record(fresh, fresh.Status.Phase, time.Now(), "") {
+			return nil
+		}
+
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+
+		// Keep the caller's copy in step, the way the readiness-taint stamp does, so the requeue
+		// this pass returns is computed from the window that is now recorded.
+		node.Status = fresh.Status
+
+		return nil
+	}); err != nil {
+		log.FromContext(ctx).V(1).Info("Failed to prune the transition window of the slot; the next pass recomputes it",
+			"node", node.Name, "error", err.Error())
+	}
+}
+
+// requeueAtWindowExpiry folds the expiry of the oldest row of the slot's ring into the requeue this
+// pass returns, so the pass that moves the 24 h window runs at the instant the window moves and not
+// one resync later. It is the same fold requeueAt does for a claim's boot deadline, and reuses it.
+func (r *NodeReconciler) requeueAtWindowExpiry(result ctrl.Result, node *infrav2alpha1.Node) ctrl.Result {
+	expiry, ok := phase.NextTransitionExpiry(node, time.Now())
+	if !ok {
+		return result
+	}
+
+	return requeueAt(result, expiry)
 }
 
 // scaleDownStreakRefusal reports that the model has stopped retrying the shutdown of a machine that

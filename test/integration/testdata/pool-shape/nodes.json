@@ -1,0 +1,216 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "infra.homecluster.dev/v2alpha1",
+      "kind": "Node",
+      "metadata": {
+        "name": "remote-worker-1",
+        "namespace": "homelab-autoscaler-system",
+        "labels": { "group": "remote-workers" },
+        "creationTimestamp": "2026-10-02T08:11:00Z"
+      },
+      "spec": {
+        "kubernetesNodeName": "remote-worker-1",
+        "nodeLabels": { "topology.kubernetes.io/zone": "fsn1" },
+        "pricing": { "hourlyRate": "0.05", "podRate": "0.001" },
+        "startupPodSpec": { "image": "examples/startup.sh" },
+        "shutdownPodSpec": { "image": "examples/shutdown.sh" }
+      },
+      "status": {
+        "powerState": "on",
+        "phase": "ready",
+        "previousPhase": "booting",
+        "lastTransitionTime": "2026-11-12T11:47:00Z",
+        "activationsTotal": 41,
+        "activationsLast24H": 3,
+        "lastStartupTime": "2026-11-12T11:41:00Z",
+        "recentTransitions": [
+          {
+            "at": "2026-11-12T11:41:00Z",
+            "from": "off",
+            "to": "booting",
+            "reason": "claim remote-worker-1-7f2a pending, observed off, startup job in flight"
+          },
+          {
+            "at": "2026-11-12T11:47:00Z",
+            "from": "booting",
+            "to": "ready",
+            "reason": "claim remote-worker-1-7f2a ready, observed on, node usable"
+          }
+        ],
+        "lastClaim": {
+          "name": "remote-worker-1-7f2a",
+          "phase": "ready",
+          "call": "IncreaseSize",
+          "group": "remote-workers",
+          "attempt": 1,
+          "requestedAt": "2026-11-12T11:40:00Z"
+        }
+      }
+    },
+    {
+      "apiVersion": "infra.homecluster.dev/v2alpha1",
+      "kind": "Node",
+      "metadata": {
+        "name": "remote-worker-2",
+        "namespace": "homelab-autoscaler-system",
+        "labels": { "group": "remote-workers" },
+        "creationTimestamp": "2026-10-02T08:11:00Z"
+      },
+      "spec": {
+        "kubernetesNodeName": "remote-worker-2",
+        "nodeLabels": { "topology.kubernetes.io/zone": "fsn1" },
+        "pricing": { "hourlyRate": "0.05", "podRate": "0.001" },
+        "startupPodSpec": { "image": "examples/startup.sh" },
+        "shutdownPodSpec": { "image": "examples/shutdown.sh" }
+      },
+      "status": {
+        "powerState": "off",
+        "phase": "booting",
+        "previousPhase": "off",
+        "lastTransitionTime": "2026-11-12T14:56:00Z",
+        "activationsTotal": 12,
+        "activationsLast24H": 1,
+        "lastStartupTime": "2026-11-12T14:56:00Z",
+        "recentTransitions": [
+          {
+            "at": "2026-11-12T14:56:00Z",
+            "from": "off",
+            "to": "booting",
+            "reason": "claim remote-worker-2-1c9d pending, observed off, startup job in flight"
+          }
+        ],
+        "lastClaim": {
+          "name": "remote-worker-2-1c9d",
+          "phase": "booting",
+          "call": "IncreaseSize",
+          "group": "remote-workers",
+          "attempt": 1,
+          "requestedAt": "2026-11-12T14:55:00Z"
+        }
+      }
+    },
+    {
+      "apiVersion": "infra.homecluster.dev/v2alpha1",
+      "kind": "Node",
+      "metadata": {
+        "name": "remote-worker-3",
+        "namespace": "homelab-autoscaler-system",
+        "labels": { "group": "remote-workers" },
+        "creationTimestamp": "2026-10-02T08:11:00Z"
+      },
+      "spec": {
+        "kubernetesNodeName": "remote-worker-3",
+        "nodeLabels": { "topology.kubernetes.io/zone": "hel1" },
+        "pricing": { "hourlyRate": "0.04", "podRate": "0.001" },
+        "startupPodSpec": { "image": "examples/startup.sh" },
+        "shutdownPodSpec": { "image": "examples/shutdown.sh" }
+      },
+      "status": {
+        "powerState": "off",
+        "phase": "off",
+        "previousPhase": "draining",
+        "lastTransitionTime": "2026-11-11T20:58:00Z",
+        "activationsTotal": 9,
+        "activationsLast24H": 2,
+        "lastShutdownTime": "2026-11-11T20:52:00Z",
+        "recentTransitions": [
+          {
+            "at": "2026-11-11T09:12:00Z",
+            "from": "off",
+            "to": "booting",
+            "reason": "claim remote-worker-3-4b7e pending, observed off, startup job in flight"
+          },
+          {
+            "at": "2026-11-11T09:19:00Z",
+            "from": "booting",
+            "to": "ready",
+            "reason": "claim remote-worker-3-4b7e ready, observed on, node usable"
+          },
+          {
+            "at": "2026-11-11T20:52:00Z",
+            "from": "ready",
+            "to": "draining",
+            "reason": "claim remote-worker-3-4b7e marked for scale-down, observed on"
+          },
+          {
+            "at": "2026-11-11T20:58:00Z",
+            "from": "draining",
+            "to": "off",
+            "reason": "claim remote-worker-3-4b7e marked for scale-down, observed off"
+          }
+        ],
+        "lastClaim": {
+          "name": "remote-worker-3-4b7e",
+          "phase": "completed",
+          "call": "DeleteNodes",
+          "group": "remote-workers",
+          "attempt": 1,
+          "reason": "NodeDeleted",
+          "requestedAt": "2026-11-11T20:51:00Z",
+          "finishedAt": "2026-11-11T20:58:00Z"
+        }
+      }
+    },
+    {
+      "apiVersion": "infra.homecluster.dev/v2alpha1",
+      "kind": "Node",
+      "metadata": {
+        "name": "remote-worker-4",
+        "namespace": "homelab-autoscaler-system",
+        "labels": { "group": "remote-workers" },
+        "creationTimestamp": "2026-10-02T08:11:00Z"
+      },
+      "spec": {
+        "kubernetesNodeName": "remote-worker-4",
+        "pricing": { "hourlyRate": "0.04", "podRate": "0.001" },
+        "startupPodSpec": { "image": "examples/startup.sh" },
+        "shutdownPodSpec": { "image": "examples/shutdown.sh" }
+      },
+      "status": {
+        "powerState": "on",
+        "phase": "draining",
+        "previousPhase": "ready",
+        "lastTransitionTime": "2026-11-12T14:30:00Z",
+        "activationsTotal": 4,
+        "activationsLast24H": 0,
+        "lastShutdownTime": "2026-11-12T14:30:00Z",
+        "recentTransitions": [
+          {
+            "at": "2026-11-12T14:30:00Z",
+            "from": "ready",
+            "to": "draining",
+            "reason": "claim remote-worker-4-88af marked for scale-down, observed on"
+          }
+        ],
+        "lastClaim": {
+          "name": "remote-worker-4-88af",
+          "phase": "ready",
+          "call": "DecreaseTargetSize",
+          "group": "remote-workers",
+          "attempt": 1,
+          "requestedAt": "2026-11-12T14:29:00Z"
+        }
+      }
+    },
+    {
+      "apiVersion": "infra.homecluster.dev/v2alpha1",
+      "kind": "Node",
+      "metadata": {
+        "name": "remote-worker-5",
+        "namespace": "homelab-autoscaler-system",
+        "labels": { "group": "remote-workers" },
+        "creationTimestamp": "2026-11-12T14:00:00Z"
+      },
+      "spec": {
+        "kubernetesNodeName": "remote-worker-5",
+        "pricing": { "hourlyRate": "0.04", "podRate": "0.001" },
+        "startupPodSpec": { "image": "examples/startup.sh" },
+        "shutdownPodSpec": { "image": "examples/shutdown.sh" }
+      },
+      "status": {}
+    }
+  ]
+}

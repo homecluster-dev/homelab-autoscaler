@@ -888,6 +888,61 @@ func TestNodeGroupDecreaseTargetSizeCancelsOnlyPendingClaims(t *testing.T) {
 		"the achievable resulting size is what the provider reports: the two cancelled units are off the number, the committed boot is not")
 }
 
+// TestNodeGroupDecreaseTargetSizeRecordsItsAttribution is the write the cancel loop owes and used to
+// skip: the request is recorded on the claim - the call, the delta, the requester - and only then is
+// the object deleted, exactly as NodeGroupDeleteNodes does it.
+//
+// The delete alone is a request nobody can see afterwards. The claim controller's finalizer ends the
+// episode from spec.request (reasonForDeletion maps the call to CancelledByDecreaseTargetSize), the
+// digest the slot keeps is built from the same field, and the pool's `down` column is rendered from
+// that digest - so a cancel that records nothing leaves the IncreaseSize attribution of the pending
+// claim as the story of the request, and the pool reports its own shrink as `up`, with the timestamp
+// of the boot it cancelled. Two consumers already read this field and nothing wrote it.
+//
+// The finalizer is what keeps the object readable after the delete: a pending claim with no finalizer
+// is simply gone, and the record this test asserts is the one the collector reads.
+func TestNodeGroupDecreaseTargetSizeRecordsItsAttribution(t *testing.T) {
+	cancelable := claimCR("slot-pending-1", infrav2alpha1.NodeClaimPending, func(c *infrav2alpha1.NodeClaim) {
+		c.Finalizers = append(c.Finalizers, claimFinalizer)
+		c.Spec.RequestedAt = metav1.NewTime(time.Now().Add(-3 * time.Hour))
+	})
+
+	// The slot of `pendingSlot`, with the claim of the same slot carrying the finalizer: a pending
+	// claim has none in the model, and the finalizer is here to keep the cancelled object readable.
+	server := newServer(t, nodeCR("slot-pending-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhasePending), cancelable)
+	ctx := context.Background()
+
+	_, err := server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
+	require.NoError(t, err)
+
+	live := &infrav2alpha1.NodeClaim{}
+	require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Namespace: testNamespace, Name: "claim-slot-pending-1"}, live),
+		"the finalizer keeps the object until the scale-down lands, which is the request's own record")
+
+	assert.False(t, live.DeletionTimestamp.IsZero(), "the claim is cancelled: the delete that follows the write is the request")
+	assert.Equal(t, infrav2alpha1.ClaimCallDecreaseTargetSize, live.Spec.Request.Call,
+		"the call is recorded before the delete, so the collector can name the request that ended the episode")
+	assert.Equal(t, int32(-1), live.Spec.Request.Delta, "and so is the delta, the signed size the request asked for")
+	assert.Equal(t, claim.RequestedByAutoscaler, live.Spec.RequestedBy)
+
+	// The digest the collector stamps is built from the same object, and carries both facts the pool
+	// renders: the verb, and the scale-down's own instant (never the request time of the boot).
+	digest := claim.Digest(live)
+	assert.Equal(t, infrav2alpha1.ClaimCallDecreaseTargetSize, digest.Call)
+	assert.NotNil(t, digest.ScaledDownAt, "the instant the scale-down named the claim, next to the episode's request time")
+	assert.True(t, digest.ScaledDownAt.After(digest.RequestedAt.Time), "the scale-down is the newer of the two instants")
+
+	// A claim the request already marked is left alone: the attribution is on the object, and a second
+	// write on a claim that is on its way out is not a cancellation.
+	before := live.DeepCopy()
+	_, err = server.NodeGroupDecreaseTargetSize(ctx, &pb.NodeGroupDecreaseTargetSizeRequest{Id: testGroup, Delta: -1})
+	require.NoError(t, err)
+
+	after := &infrav2alpha1.NodeClaim{}
+	require.NoError(t, server.Client.Get(ctx, client.ObjectKey{Namespace: testNamespace, Name: "claim-slot-pending-1"}, after))
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "the request is idempotent on a claim it already marked")
+}
+
 // TestNodeGroupDecreaseTargetSizeWithNothingToCancelIsRetryable is M6, the messaging half of the
 // cancelation contract. A group whose every live claim is past the pending phase cannot be
 // decreased by this entry point: a booting claim is committed and a ready machine runs work, so

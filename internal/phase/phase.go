@@ -29,6 +29,10 @@ limitations under the License.
 //   - Derive: the value of Node.status.phase, the derived *report*. It is written by the
 //     observation path and by the lifecycle transition path, and read to decide nothing. Both
 //     writers call Derive, so they cannot disagree about a value that has one formula.
+//   - Record: the history of that report - when it last changed value, what it changed from, the
+//     bounded ring of its changes, and the counts of the boots inside the last 24 h. Both writers
+//     call Record too, and nothing else writes those fields, so a slot's phase and its history
+//     cannot be told apart by which path got there first (see record.go).
 //   - State: the initial state of the node state machine. It is derived from the same triple,
 //     which is what replaces reading the FSM's own state out of status.progress
 //     (the v1alpha1 getCurrentState), the ambiguity that the 0.1.20 watchdog and the 0.1.22
@@ -248,6 +252,24 @@ func State(in Input) string {
 		return StateReady
 	default:
 		return StateShutdown
+	}
+}
+
+// IsUp reports whether a slot's phase means the pool is paying for a machine: `booting` (the boot
+// window: a machine being bought), `ready` (it takes the pool's work) and `draining` (up, unwanted,
+// cordoned and not yet off) are the three; `off`, `pending` and a slot that has never reported are
+// the rest.
+//
+// It is the summing rule of the pool's `On` count (Group.status.on), and a display rule only: no
+// decision in this repository branches on it. `booting` counts as up because it is the phase a slot
+// reports while its machine is being bought, and a boot that never lands is money spent - the count
+// is about what the pool is paying for, not about what a machine is doing this second.
+func IsUp(p infrav2alpha1.NodePhase) bool {
+	switch p {
+	case infrav2alpha1.NodePhaseBooting, infrav2alpha1.NodePhaseReady, infrav2alpha1.NodePhaseDraining:
+		return true
+	default:
+		return false
 	}
 }
 

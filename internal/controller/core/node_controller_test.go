@@ -21,10 +21,12 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -41,6 +43,7 @@ import (
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	autoscalerpkg "github.com/homecluster-dev/homelab-autoscaler/internal/autoscaler"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
@@ -480,11 +483,27 @@ func TestApplyObservation(t *testing.T) {
 
 			in := phase.Input{Claim: tc.claim, ObservedPower: tc.observed, NodeUsable: tc.usable}
 
-			changed := applyObservation(node, tc.observed, in)
+			at := time.Date(2025, 11, 12, 9, 0, 0, 0, time.UTC)
+			changed := applyObservation(node, tc.observed, in, at)
 
 			assert.Equal(t, tc.wantChange, changed)
 			assert.Equal(t, tc.wantPower, node.Status.PowerState)
 			assert.Equal(t, tc.wantPhase, node.Status.Phase)
+
+			// The history is written with the report by the one writer of it (phase.Record): a pass
+			// that moved the phase dates it and records the row, a pass that moved nothing does not.
+			if tc.wantPhase != tc.from {
+				require.NotNil(t, node.Status.LastTransitionTime, "a phase change dates itself")
+				assert.True(t, node.Status.LastTransitionTime.Time.Equal(at))
+				assert.Equal(t, tc.from, node.Status.PreviousPhase)
+				require.Len(t, node.Status.RecentTransitions, 1)
+				assert.Equal(t, tc.wantPhase, node.Status.RecentTransitions[0].To)
+				assert.NotEmpty(t, node.Status.RecentTransitions[0].Reason, "the row names the inputs")
+			} else {
+				assert.Nil(t, node.Status.LastTransitionTime, "a resync does not date a change that did not happen")
+				assert.Empty(t, node.Status.RecentTransitions)
+				assert.Zero(t, node.Status.ActivationsLast24H)
+			}
 		})
 	}
 }
@@ -504,6 +523,70 @@ var (
 	hardMarker    = corev1.Taint{Key: autoscalerpkg.TaintDeletionRequested, Effect: corev1.TaintEffectNoSchedule}
 	poolRoleTaint = corev1.Taint{Key: "node.kubernetes.io/role", Value: "agent", Effect: corev1.TaintEffectNoSchedule}
 )
+
+// lifecycleJobOf is a lifecycle Job of a slot that has not finished: the fact that separates "a boot
+// was asked for" from "a boot is running". The labels are the ones the controller stamps on the Jobs
+// it creates (fsm.LabelNodeCR is the slot, fsm.LabelPhase the direction), so the fixture is the shape
+// the production list reads.
+func lifecycleJobOf(slotName, jobPhase string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      slotName + "-" + jobPhase + "-inflight",
+			Namespace: slotNamespace,
+			Labels: map[string]string{
+				fsm.LabelNodeCR: slotName,
+				fsm.LabelPhase:  jobPhase,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{{Name: "lifecycle", Image: "envtest/lifecycle:latest"}},
+				},
+			},
+		},
+	}
+}
+
+// TestObservationInputAndLifecycleInputDeriveOnePhase is half 1 of a pair (the observation path's
+// half): the triple "a claim pending, the machine observed off, a startup Job in flight", assembled
+// by this path, derives `booting`. Its pair, TestLifecycleInputAndObservationInputDeriveOnePhase in
+// internal/controller/infra/node_controller_test.go, assembles the same world through the transition
+// path and asserts the same value.
+//
+// The pair is the point: these are the two writers of the derived report, a phase has one formula
+// (phase.Derive), and a formula with one value has one way to assemble its input. This path used to
+// leave the two lifecycle-Job fields empty - nothing in the observation reads a Job - so it derived
+// `pending` for a machine whose boot had already started while the transition path derived
+// `booting`, and since the record of the report became a writer's job that disagreement is not a
+// display hiccup: the two paths append two rows to one slot's ring and count one boot twice, once per
+// pass, all day. Both paths fill the fields from fsm.JobsInFlightOfSlot now, and these two tests are
+// the pin that they do.
+func TestObservationInputAndLifecycleInputDeriveOnePhase(t *testing.T) {
+	nodeCR := slot("worker-1", infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhasePending)
+	k8sNode := managedNode("worker-1", false)
+	nodeClaim := slotClaim("worker-1", infrav2alpha1.NodeClaimPending)
+
+	reconciler := newK8sNodeReconciler(t, nodeCR, k8sNode, nodeClaim, lifecycleJobOf("worker-1", fsm.PhaseStartup))
+
+	in := reconciler.observationInput(context.Background(), nodeCR, k8sNode, infrav2alpha1.PowerStateOff)
+
+	require.NotNil(t, in.Claim, "the live claim of the slot is the first input of the report")
+	assert.True(t, in.StartupJobInFlight, "the observation path fills the lifecycle-Job fields, through the one helper the transition path calls")
+	assert.False(t, in.ShutdownJobInFlight, "and answers the direction it did not find, not the one it did not ask")
+
+	assert.Equal(t, infrav2alpha1.NodePhaseBooting, phase.Derive(in),
+		"a pending claim, a machine observed off and a startup Job in flight is `booting` - the value of the same world, on both writers' paths")
+
+	// The shape the field is the difference of: take the Job away and the same triple is `pending`,
+	// the cancelable shape. Without the field filled in, this is the value the observation path
+	// produced for a machine that was already booting - and the value the transition path overrode,
+	// every pass, in the ring.
+	noJob := newK8sNodeReconciler(t, nodeCR, k8sNode, nodeClaim)
+
+	assert.Equal(t, infrav2alpha1.NodePhasePending, phase.Derive(noJob.observationInput(context.Background(), nodeCR, k8sNode, infrav2alpha1.PowerStateOff)))
+}
 
 // TestK8sNodeReconcilerRecordsTheAutoscalerMarkerOnce is the observability fix at the reconcile
 // level. Live, a node of a freshly started slot was cordoned about a minute after it joined and
