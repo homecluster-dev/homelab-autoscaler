@@ -117,12 +117,10 @@ const (
 	// findable.
 	logTailLines = 5000
 
-	// bootRequestWindow is the window the VM control server's request log is read over for one power
-	// transition. Each spec watches its own boot and its own shutdown, so the window covers the request
-	// rate of a transition the suite starts from the claim: a second, not a whole run. It is wide enough
-	// for a Job pod that starts slowly and narrow enough that the /stop of the setup's power-off, minutes
-	// earlier, is not the request the scale-down spec reads.
-	bootRequestWindow = 90 * time.Second
+	// The window each power transition is read over in the VM control server's request log is the
+	// timeline of the object that asked for it - the claim's spec.requestedAt, the minute the
+	// autoscaler's decision was read - and not a span counted backwards from the poll (see
+	// vmRequestProblem). There is no constant here to get that wrong.
 
 	// Claim timeouts - the NodeClaim is the object a scale-up is, so the phases of the model are
 	// what the suite waits on: a phase is a fact about one request, with a name, an attempt number
@@ -230,6 +228,92 @@ var _ = Describe("K3d Integration", Ordered, func() {
 		By("Releasing the machines the harness claimed")
 		releaseSlot(agentNode0)
 		releaseSlot(agentNode1)
+	})
+
+	// The pool the suite drives is also the pool the run before it left, and the cluster is not empty
+	// when the first spec starts: the agents registered when the cluster was created, their containers
+	// are up, and on a reused cluster (a developer's `make test-e2e`, a re-run of the job) the slots
+	// carry the claims, the lifecycle Jobs and the cordons of episodes that are over. Every spec in an
+	// Ordered container starts from the shape the one before it left, so the container says what that
+	// shape is before any of them is graded:
+	//
+	//   - nothing wants a machine: the claims of both slots are released. A claim with a finalizer runs
+	//     the shutdown of its machine to its end, and the harness's machines are k3d containers it
+	//     powers, so the release has an observation to finish on;
+	//   - the machine the setup's claim boots is down. That is the shape every pool machine starts in
+	//     and the shape a claim boots out of, and the suite powers it down here, on the harness's clock,
+	//     so that the first graded gate of a run is the operator's answer to a settled shape and not a
+	//     race with a shutdown the operator started a minute earlier (the chain of that race is a Job
+	//     pod scheduled, an image pulled, a container stopped and a kubelet's silence declared - every
+	//     one of them on a clock the suite does not own);
+	//   - the pool's other machine is deliberately left UP and unclaimed. It is the idle machine of a
+	//     homelab, and the scale-down spec reads it coming down by the input law alone - a proof that
+	//     needs a machine that is up when the run starts, and gets one.
+	//
+	// What the specs go on to prove is unchanged: a scale-up from a free, off, unclaimed slot; a
+	// scale-down the autoscaler decides and the provider cancels; a readiness gate that uncordons the
+	// machine it booted; the labels a slot declares landing on its node.
+	BeforeAll(func() {
+		By("Resetting the pool: no claim wants a machine, and the setup's machine is down")
+
+		// The harness stops wanting its machines, and does not wait for the answer: a booting or ready
+		// claim is deleted through its finalizer, and the finalizer is released when the machine is
+		// observed off, which is the next write and not this one.
+		releaseSlot(agentNode0)
+		releaseSlot(agentNode1)
+
+		// The machine the setup's claim boots goes down, first: `k3d node stop` answers 0 for a container
+		// that is already stopped, so this is the suite stating the shape it is about to gate on, not a
+		// bet on which of the two writers of power got there first.
+		stopMachine(agentNode0)
+
+		// A cordon outlives the machine it was written on: the node object of a k3d agent is not deleted
+		// when its container stops, and a cordoned machine is unusable to the readiness gate, to
+		// cluster-autoscaler and to the report of the slot that names it.
+		for _, machine := range []string{agentNode0, agentNode1} {
+			if out, err := utils.Run(kubectl("uncordon", machine)); err != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "reset: uncordon %s: %s\n", machine, out)
+			}
+		}
+
+		By("Verifying the pool is free: no live claim names a slot")
+		// The sentence the first spec's own gate asserts, read before any of it is graded, so a leftover
+		// request from an earlier run is the reset's problem to solve and not a spec's timeout to lose.
+		Eventually(func() string {
+			live, err := liveClaimsOfSlot(agentNode0)
+			if err != nil {
+				return "the claims of slot " + agentNode0 + " are unreadable: " + err.Error()
+			}
+
+			other, err := liveClaimsOfSlot(agentNode1)
+			if err != nil {
+				return "the claims of slot " + agentNode1 + " are unreadable: " + err.Error()
+			}
+
+			if len(live)+len(other) > 0 {
+				return fmt.Sprintf("the pool carries %d live claim(s) naming %s and %d naming %s: a claim with a finalizer ends when its machine is observed off",
+					len(live), agentNode0, len(other), agentNode1)
+			}
+
+			return ""
+		}, machineStateTimeout, checkInterval).Should(BeEmpty(),
+			"the run starts from a pool nothing has asked for: the free shape IncreaseSize claims a machine from")
+
+		By("Verifying the machine the setup's claim boots is down")
+		Eventually(func() string {
+			out, err := utils.Run(exec.Command("k3d", "node", "list", agentNode0))
+			if err != nil {
+				return "the state of the k3d node is unreadable: " + err.Error()
+			}
+
+			state := strings.ToLower(string(out))
+			if strings.Contains(state, "running") || strings.Contains(state, "up") {
+				return "the machine of the setup's claim is still up: " + strings.TrimSpace(state)
+			}
+
+			return ""
+		}, vmShutdownTimeout, checkInterval).Should(BeEmpty(),
+			"the suite is the provider of these machines, and the machine the first claim boots is powered down before the run is graded")
 	})
 
 	// =============================================================================
@@ -388,15 +472,20 @@ var _ = Describe("K3d Integration", Ordered, func() {
 			// is owed). So the suite takes its own machine down, the shape every pool machine starts in, and
 			// watches the slot read as idle.
 			//
+			// The machine has been down since the pool was reset, so this write is the suite stating the
+			// shape it is gating on, and the gate below is the operator's answer to it: the report of a free
+			// slot whose machine is observed off, asked of a fresh pass and read with the three objects it
+			// is derived from printed beside it when it disagrees.
+			//
 			// The other slot is left to the operator on purpose: it is the idle pool of a homelab, a machine
 			// up that nothing wants. What the law does with it - cordon, shutdown Job, power off - is the
 			// same shutdown path the scale-down spec reads a minute later, and it is read there, once the run
 			// has given the observation, the Job and the kubelet's silence time to land.
 			stopMachine(agentNode0)
 
-			Eventually(func() infrav2alpha1.NodePhase {
-				return slotPhase(agentNode0)
-			}, machineStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseOff),
+			Eventually(func() string {
+				return slotReportIs(agentNode0, infrav2alpha1.NodePhaseOff)
+			}, machineStateTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodePhaseOff)),
 				"A free slot whose machine is observed off is off: the shape a claim boots a machine out of")
 
 			By("Claiming the slot of the machine the scale-down spec runs on")
@@ -410,14 +499,17 @@ var _ = Describe("K3d Integration", Ordered, func() {
 			// The scale-down spec needs a machine the autoscaler can find Ready, empty and long enough in
 			// service to call unneeded. The other slot stays unclaimed on purpose: it is the idle pool of
 			// a homelab, readable as off, and the free slot the scale-up of the next spec asks for.
-			claimSlot(agentNode0, harnessRequestedBy)
+			setupClaim := claimSlot(agentNode0, harnessRequestedBy)
 
 			By("Verifying the claimed machine is in service")
 			// The VM control server was asked for the machine: the startup Job of the attempt is what
-			// powers a k3d container, so the request in its log is the boot, not the cluster creation.
-			Eventually(func() bool {
-				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/start", agentNode0, bootRequestWindow)
-			}, 30*time.Second, checkInterval).Should(BeTrue(),
+			// powers a k3d container, so the request in its log is the boot, not the cluster creation. The
+			// window is the claim's own: it opens at the instant the request was made, so a Job pod that was
+			// scheduled and pulled slowly is the boot this spec is watching and not a miss, and no request of
+			// an earlier episode of the same container can answer for it.
+			Eventually(func() string {
+				return vmRequestProblem("/start", agentNode0, claimRequestedAt(setupClaim))
+			}, 30*time.Second, checkInterval).Should(BeEmpty(),
 				"the machine of a claimed slot is booted by the provider's startup Job, so the VM control server saw /start for it")
 
 			// The claim's ready phase is the sentence "the machine it asked for can take the pool's
@@ -586,10 +678,12 @@ var _ = Describe("K3d Integration", Ordered, func() {
 			By("Verifying the slot reports the machine coming down")
 			// The machine is observed up and its claim is named for deletion: that row of the input table
 			// reports draining - cordoned, with the shutdown path owning the slot. The off end of the
-			// sequence is pinned below, after the Job has run and the machine is down.
-			Eventually(func() infrav2alpha1.NodePhase {
-				return slotPhase(agentNode0)
-			}, machineStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseDraining),
+			// sequence is pinned below, after the Job has run and the machine is down. The gate asks for a
+			// pass on every poll and prints the triple the report is derived from: the report is a
+			// computation, and the transition that owns this shape is the event that computes it.
+			Eventually(func() string {
+				return slotReportIs(agentNode0, infrav2alpha1.NodePhaseDraining)
+			}, machineStateTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodePhaseDraining)),
 				"The report of a slot whose machine is observed up while a scale-down names its claim is draining")
 
 			var shutdownJob string
@@ -638,12 +732,13 @@ var _ = Describe("K3d Integration", Ordered, func() {
 					"owned by the claim whose attempt it is")
 
 			By("Verifying VM control server receives /stop request")
-			// The request log is read over a window: a /stop for this machine in the last bootRequestWindow.
-			// The setup stopped this machine once already, and a gate that read the whole file is answered by
-			// that older request.
-			Eventually(func() bool {
-				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/stop", agentNode0, bootRequestWindow)
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
+			// The request log is read over the window this decision opened: the minute the suite started
+			// watching for the autoscaler's sentence. The setup stopped this machine, and the law stopped it
+			// again, and both requests are in the file; a gate that reads the file backwards from now is
+			// answered by a power-off this scale-down did not cause.
+			Eventually(func() string {
+				return vmRequestProblem("/stop", agentNode0, scaleDownStarted)
+			}, 60*time.Second, checkInterval).Should(BeEmpty(),
 				"VM control server should receive /stop request for %s", agentNode0)
 
 			By("Verifying shutdown job completes")
@@ -682,10 +777,15 @@ var _ = Describe("K3d Integration", Ordered, func() {
 			// The slot's report is derived from (the live claim, the observed power, the usability of the
 			// node). The machine is off and its claim has ended: nothing is wanted and nothing is running,
 			// which is the off row of the table, and the power the provider observes is off with it.
+			//
+			// The writer of that report is the observation path, and the event that wakes it is the node
+			// object declaring the kubelet silent - a clock the suite does not own, and on a loaded runner
+			// the slowest one in the chain. The gate asks for a pass over the slot as it polls, so what it
+			// waits for is the report the triple derives and not the last event that happened to compute it.
 			By("Verifying the slot's report becomes off")
-			Eventually(func() infrav2alpha1.NodePhase {
-				return slotPhase(agentNode0)
-			}, machineStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseOff),
+			Eventually(func() string {
+				return slotReportIs(agentNode0, infrav2alpha1.NodePhaseOff)
+			}, machineStateTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodePhaseOff)),
 				"The derived phase of a free slot with no machine is off")
 
 			By("Verifying the machine is observed off")
@@ -868,7 +968,15 @@ var _ = Describe("K3d Integration", Ordered, func() {
 			By("Verifying node is off from Test 2")
 			Expect(shutdownNodeName).ToNot(BeEmpty(),
 				"shutdownNodeName should be set by Test 2")
-			Expect(slotPhase(shutdownNodeName)).To(Equal(infrav2alpha1.NodePhaseOff),
+
+			// The shape the scale-up starts from, read as a gate and not as a fact the previous spec owes
+			// this one: the report of the slot, asked of a fresh pass, with the claim, the observation, the
+			// node object and the lifecycle Jobs printed when it is not the one awaited. The scale-down ends
+			// with the same gate; between the two sits an episode of a machine going down, whose report
+			// writer is the node object declaring the kubelet silent.
+			Eventually(func() string {
+				return slotReportIs(shutdownNodeName, infrav2alpha1.NodePhaseOff)
+			}, machineStateTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodePhaseOff)),
 				"The slot of the scale-up starts free: off, and no live claim names it")
 
 			// The shape IncreaseSize reads as "claimable": the scale-down of the last spec ended the claim
@@ -1084,9 +1192,9 @@ var _ = Describe("K3d Integration", Ordered, func() {
 				"A live claim moves from pending to booting when the startup Job of the attempt exists")
 
 			By("Verifying the slot reports booting")
-			Eventually(func() infrav2alpha1.NodePhase {
-				return slotPhase(shutdownNodeName)
-			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseBooting),
+			Eventually(func() string {
+				return slotReportIs(shutdownNodeName, infrav2alpha1.NodePhaseBooting)
+			}, nodeStateTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodePhaseBooting)),
 				"The report of a slot with a claim whose startup operation is in flight is booting")
 
 			var startupJob string
@@ -1119,11 +1227,18 @@ var _ = Describe("K3d Integration", Ordered, func() {
 				"the startup Job of the scale-up is the Job the slot's startupPodSpec declares")
 
 			By("Verifying VM control server receives /start request")
-			// The request log is read over the last 30s, so this is the /start of this boot: the setup's
-			// claim booted the same machine earlier, and its /start is in the log too.
-			Eventually(func() bool {
-				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/start", shutdownNodeName, bootRequestWindow)
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
+			// The window is the claim's own, opened at the instant the provider asked for the machine. The
+			// setup booted the same container and the scale-down took it down, and both requests are in the
+			// server's log; a window measured backwards from now is answered by the setup's boot, and
+			// misses this one when its Job pod was pulled and scheduled slowly.
+			Eventually(func() string {
+				scaleUpClaim, err := readClaimByName(scaleUpClaimName)
+				if err != nil {
+					return "the claim of the scale-up is unreadable: " + err.Error()
+				}
+
+				return vmRequestProblem("/start", shutdownNodeName, claimRequestedAt(scaleUpClaim))
+			}, 60*time.Second, checkInterval).Should(BeEmpty(),
 				"VM control server should receive /start request for %s", shutdownNodeName)
 
 			By("Verifying k3d node starts")
@@ -1684,19 +1799,33 @@ func claimSlot(slotName, requestedBy string) *infrav2alpha1.NodeClaim {
 	out, err := applyObject(newHarnessClaim(slot, requestedBy))
 	Expect(err).NotTo(HaveOccurred(), "Failed to apply the harness's NodeClaim for slot %s: %s", slotName, out)
 
-	// The phase, with the reason beside it: a claim that ends failed names why, and the suite says so.
+	// The claim is the object this call asked for, so the claim's own phase is the gate: pending ->
+	// booting is the write that created the startup Job, booting -> ready is the readiness gate
+	// answering for a machine that is up, joined and usable. A claim that is not where the call expected
+	// it prints the whole episode: the claim's reason, its conditions and the Events the recorder
+	// published on it, the lifecycle Jobs that power its machine and the state of their pods, the
+	// observation of the machine, and the node object as the kubelet writes it. That is the read an
+	// operator would do with `kubectl describe` and `kubectl get jobs`, in one screen, on the poll that
+	// gave up.
+	want := string(infrav2alpha1.NodeClaimReady) + "/"
+
 	Eventually(func() string {
 		fresh, err := newestClaimOfSlot(slotName)
 		if err != nil {
-			return "claims-unreadable"
+			return "claims-unreadable: " + err.Error()
 		}
 
 		if fresh == nil {
-			return "no-claim"
+			return "no-claim: no NodeClaim names slot " + slotName
 		}
 
-		return string(fresh.Status.Phase) + "/" + fresh.Status.Reason
-	}, claimReadyTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodeClaimReady)+"/"),
+		phase := string(fresh.Status.Phase) + "/" + fresh.Status.Reason
+		if phase == want {
+			return phase
+		}
+
+		return phase + "\n" + describeClaimEpisode(fresh, slotName)
+	}, claimReadyTimeout, checkInterval).Should(Equal(want),
 		"the claim the harness wrote for slot %s reaches ready: the machine is up, joined, and usable",
 		slotName)
 
@@ -1930,6 +2059,131 @@ func describeKubeNode(nodeName string) string {
 	}
 
 	return b.String()
+}
+
+// describeClaimEpisode renders the whole episode of one claim: the claim as its recorder left it, the
+// Events published on it, the lifecycle Jobs that power its machine and the state of the pods those
+// Jobs own, and the slot's own triple.
+//
+// A claim that is not where the caller expected it is a boot that stopped somewhere in a chain of
+// objects the suite does not own - a Job whose pod is being scheduled, an image being pulled, a
+// machine whose kubelet has not registered, a gate waiting on a taint - and the chain is readable off
+// those objects. This is the `kubectl describe` and `kubectl get jobs` an operator would run, printed
+// on the poll that gave up, so the run that fails in a minute of CI says where the boot stopped.
+func describeClaimEpisode(nodeClaim *infrav2alpha1.NodeClaim, slotName string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "claim %s: phase=%s reason=%s attempt=%d shutdownAttempts=%d marked=%v requestedBy=%s call=%s delta=%d group=%s requestedAt=%s deadlineAt=%s finishedAt=%s\n",
+		nodeClaim.Name, nodeClaim.Status.Phase, nodeClaim.Status.Reason, nodeClaim.Status.Attempt,
+		nodeClaim.Status.ShutdownAttempts, !nodeClaim.DeletionTimestamp.IsZero(),
+		nodeClaim.Spec.RequestedBy, nodeClaim.Spec.Request.Call, nodeClaim.Spec.Request.Delta,
+		nodeClaim.Spec.Request.Group, renderTime(&nodeClaim.Spec.RequestedAt),
+		renderTime(nodeClaim.Spec.DeadlineAt), renderTime(nodeClaim.Status.FinishedAt))
+
+	for _, cond := range nodeClaim.Status.Conditions {
+		fmt.Fprintf(&b, "  claim condition: %s=%s reason=%s message=%s\n", cond.Type, cond.Status, cond.Reason, cond.Message)
+	}
+
+	fmt.Fprintf(&b, "  claim events: %s\n", describeClaimEvents(nodeClaim.Name))
+
+	for _, jobPhase := range []string{fsm.PhaseStartup, fsm.PhaseShutdown} {
+		fmt.Fprintf(&b, "  %s job: %s\n", jobPhase, describeLifecycleJob(jobPhase, slotName))
+	}
+
+	b.WriteString(describeSlotState(slotName))
+
+	return b.String()
+}
+
+// describeClaimEvents renders the Events the recorder published on one claim, the way the suite reads
+// every cluster fact: one list, the selection done here (see claimEventReasons for why).
+func describeClaimEvents(claimName string) string {
+	out, err := utils.Run(kubectl("get", "events", "-n", namespace, "-o", "json"))
+	if err != nil {
+		return "unreadable: " + err.Error()
+	}
+
+	list := &corev1.EventList{}
+	if err := json.Unmarshal([]byte(out), list); err != nil {
+		return "unparseable: " + err.Error()
+	}
+
+	rendered := []string{}
+
+	for _, nodeEvent := range list.Items {
+		if nodeEvent.InvolvedObject.Kind != "NodeClaim" || nodeEvent.InvolvedObject.Name != claimName {
+			continue
+		}
+
+		rendered = append(rendered, fmt.Sprintf("%s %s x%d %s",
+			nodeEvent.LastTimestamp.Format(time.RFC3339), nodeEvent.Reason, nodeEvent.Count, nodeEvent.Message))
+	}
+
+	if len(rendered) == 0 {
+		return "none recorded on the claim"
+	}
+
+	return strings.Join(rendered, "; ")
+}
+
+// describeLifecycleJob renders the lifecycle Job of one phase of one slot, and the pods it owns. The
+// Job is the object that powers the claim's machine, and a boot that has not landed is sitting in one
+// of the states its pod can be in: not created, pending on a node, pulling its image, running, ended
+// with an exit code. The Job's own counters do not say which of those, and the suite's gates on a Job
+// (created, succeeded) are the two ends of it.
+func describeLifecycleJob(jobPhase, slotName string) string {
+	job := newestLifecycleJobOfSlot(jobPhase, slotName, time.Time{})
+	if job == "" {
+		return fmt.Sprintf("none of slot %s", slotName)
+	}
+
+	full, err := readJob(job)
+	if err != nil {
+		return fmt.Sprintf("%s: unreadable: %v", job, err)
+	}
+
+	lines := []string{fmt.Sprintf("%s created=%s active=%d succeeded=%d failed=%d",
+		job, full.CreationTimestamp.Format(time.RFC3339),
+		full.Status.Active, full.Status.Succeeded, full.Status.Failed)}
+
+	out, err := utils.Run(kubectl("get", "pods", "-n", namespace, "-l", "job-name="+job, "-o", "json"))
+	if err != nil {
+		return strings.Join(append(lines, "  pods: unreadable: "+err.Error()), "\n  ")
+	}
+
+	pods := &corev1.PodList{}
+	if err := json.Unmarshal([]byte(out), pods); err != nil {
+		return strings.Join(append(lines, "  pods: unparseable: "+err.Error()), "\n  ")
+	}
+
+	if len(pods.Items) == 0 {
+		lines = append(lines, "  pods: none yet (the Job has produced no pod for its script to run in)")
+	}
+
+	for _, pod := range pods.Items {
+		rendered := fmt.Sprintf("  pod %s: phase=%s node=%s", pod.Name, pod.Status.Phase, pod.Spec.NodeName)
+
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
+				rendered += fmt.Sprintf(" | not scheduled: %s %s", cond.Reason, cond.Message)
+			}
+		}
+
+		for _, state := range pod.Status.ContainerStatuses {
+			if state.State.Waiting != nil {
+				rendered += fmt.Sprintf(" | waiting: %s %s", state.State.Waiting.Reason, state.State.Waiting.Message)
+			}
+
+			if state.State.Terminated != nil {
+				rendered += fmt.Sprintf(" | terminated: %s exit=%d %s",
+					state.State.Terminated.Reason, state.State.Terminated.ExitCode, state.State.Terminated.Message)
+			}
+		}
+
+		lines = append(lines, rendered)
+	}
+
+	return strings.Join(lines, "\n  ")
 }
 
 // renderTime prints a claim's deadline for the dump, and says "none" for the field a ready claim has
@@ -2166,6 +2420,99 @@ func requestSlotPass(slotName string) {
 	_, err := utils.Run(kubectl("patch", "nodes.infra.homecluster.dev", slotName, "-n", namespace,
 		"--type", "merge", "-p", stamp))
 	Expect(err).NotTo(HaveOccurred(), "the suite can ask for a pass over slot %s", slotName)
+}
+
+// slotReportIs is the gate on a slot's report: the value the operator derives, asked of a fresh pass
+// on every poll, and printed with the objects it is a function of whenever it is not the one awaited.
+//
+// A gate that only reads the report is a gate that waits for an event, and the shapes this suite
+// gates on have, by definition, stopped producing the events that wake a pass: the node object of a
+// machine whose kubelet is dead has no kubelet left to move it, a kubelet that has settled into Ready
+// sends its heartbeats to its Lease, and a claim that has reached its end has no phase left to move.
+// The suite's clocks for those facts (nodeStateTimeout, machineStateTimeout) are minutes, and the
+// operator's own pass over a settled slot is its resync, which is five - so a gate that reads and
+// never asks is a gate that has to lose. Asking is the clock; the assertion is the value the formula
+// derives, and a report that disagrees prints the claim, the observation, the node object and the
+// lifecycle Jobs it was derived from.
+func slotReportIs(name string, want infrav2alpha1.NodePhase) string {
+	GinkgoHelper()
+
+	requestSlotPass(name)
+
+	return slotReportAs(name, want)
+}
+
+// vmRequestProblem is the read of the VM control server's request log for one power transition of one
+// machine, over a window the suite can point at, and "" when the request is in it.
+//
+// The server stamps every request it answers with its own clock, on the host the suite runs on:
+//
+//	[2026-11-12T18:56:26.337902] /start vm=k3d-homelab-autoscaler-agent-0
+//
+// so the window of a transition is the timeline of the object that asked for it: the claim's
+// spec.requestedAt for the boot the claim owes, the minute the autoscaler's decision was read for the
+// power-off it caused. A window measured backwards from the instant a gate happens to run answers
+// neither question. It is satisfied by an earlier episode of the same machine - the file is not
+// cleared between specs, and three of them boot and power off these same two containers - and it
+// misses a boot whose Job pod was scheduled and pulled slowly, which on a loaded runner is the normal
+// shape of a cold cluster and not the rare one.
+//
+// The answer is a sentence, not a boolean, so the gate that gives up prints the requests the server
+// did record for this machine.
+func vmRequestProblem(endpoint, machine string, since time.Time) string {
+	out, err := os.ReadFile(vmControlLogFile)
+	if err != nil {
+		return fmt.Sprintf("the VM control server's request log %s is not readable: %v", vmControlLogFile, err)
+	}
+
+	seen := []string{}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		stamp, request, found := strings.Cut(line, "]")
+		if !found {
+			continue
+		}
+
+		if !strings.Contains(request, "vm="+machine) {
+			continue
+		}
+
+		at, err := time.ParseInLocation("2006-01-02T15:04:05.999999",
+			strings.TrimPrefix(stamp, "["), time.Local)
+		if err != nil {
+			continue
+		}
+
+		seen = append(seen, fmt.Sprintf("%s%s (%s)", stamp, request, at.Format(time.RFC3339)))
+
+		if !at.Before(since) && strings.Contains(request, endpoint) {
+			return ""
+		}
+	}
+
+	return fmt.Sprintf("the VM control server recorded no %s for %s since %s.\nIts log carries for this machine:\n  %s",
+		endpoint, machine, since.Format(time.RFC3339), strings.Join(seen, "\n  "))
+}
+
+// bootMargin is the slack of the window a boot is read over: the claim's spec.requestedAt is stamped
+// by the suite to the second (metav1.Time), the VM control server stamps its requests to the
+// microsecond, and the two stamps are on one host. The margin absorbs the rounding; it is not a
+// timeout, and it is far shorter than the gap between two episodes of the same machine.
+const bootMargin = 10 * time.Second
+
+// claimRequestedAt is the instant a claim's machine was asked for, which is the instant the boot the
+// claim owes begins. A claim the suite did not write (the provider's, from a scale-up) carries the
+// provider's stamp; the read falls back to the object's creation when the field is empty.
+func claimRequestedAt(nodeClaim *infrav2alpha1.NodeClaim) time.Time {
+	if nodeClaim == nil {
+		return time.Now().Add(-bootMargin)
+	}
+
+	if !nodeClaim.Spec.RequestedAt.IsZero() {
+		return nodeClaim.Spec.RequestedAt.Time.Add(-bootMargin)
+	}
+
+	return nodeClaim.CreationTimestamp.Time.Add(-bootMargin)
 }
 
 // nodeSchedulable reports whether the Kubernetes node of a slot is still schedulable: a cordon is
