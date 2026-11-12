@@ -272,6 +272,24 @@ The gate's answer is the claim's move (`internal/fsm/hooks.go`):
   and **the claim moves to `failed` with that reason**. The machine is then force-shut-down by the
   input law, the slot becomes free, and the next claim on it is attempt N+1.
 
+The satisfied branch records its own read of the node into the machine's input
+(`fsm.recordGateAnswer`), and that is not a detail: the machine that answers for a boot is the Job
+monitor of the pass that **started** it, and the triple that pass read is the machine observed
+**off** with no node object - the shape every real boot starts in. The claim move is recorded into
+the input, and so must the other two inputs the gate spent its time establishing: the node object
+the uncordon left behind, asked with the one predicate the report uses (`phase.Unusable`), and its
+`Ready` condition, which is the definition `status.powerState` is written from.
+
+Deriving the report from the boot's snapshot instead is the bug this closes. The staleness guard of
+`reportPhase` refuses the write - correctly, that machine's inputs describe a machine that is not
+up - and the writer that would correct it is the observation reconciler, which runs on
+`corev1.Node` events, and a kubelet that has settled into `Ready` writes no more of them (its
+heartbeats go to its Lease, its status posts every five minutes). What is left is a live `ready`
+claim, a machine observed on, a `Ready` uncordoned node, and a slot reporting `booting` for the
+life of the machine - the autoscaler reading the pool as buying a machine it already has, and the
+pass that reads the true triple (`claimPhase=ready observed=on usable=true state=ready`) logging
+that it is in a stable state and writing nothing, which is what a stable state does.
+
 Under v1alpha1 a gate that timed out completed the transition and recorded the slot `ready`. Under
 the claim model a slot is not reported as capacity that can take the pool's work when the request
 that bought it failed to produce it.

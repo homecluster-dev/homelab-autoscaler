@@ -707,6 +707,16 @@ one detail settled by what the tests showed.
   taint on it" is enforced by the phase, not by a comment: the input law powers the machine off, the
   slot becomes free, and the next claim is attempt N+1. The node is still uncordoned on the way out,
   because a cordoned node is invisible to scale-down and is paid for forever.
+- **The gate's read of the node is an input of the report it writes.** §3 says the readiness gate
+  holds a claim at `booting` until the node is Ready and free of the pool's readiness taints, and §6
+  says `ready` is "a live claim in `ready`, node observed Ready and gate-clear". The transition that
+  answers for both runs in the Job monitor of the pass that started the boot, and that pass read the
+  machine **off**: so the gate records the node object it just uncordoned into the machine's input
+  (`fsm.recordGateAnswer`) next to the claim move, and the report of the same pass derives `ready`.
+  Without it the transition's own write is refused by the staleness guard, the observation reconciler
+  that would correct it never sees another event for a node that has settled into `Ready`, and the
+  slot reports `booting` for a machine that is serving - with a claim, an observation and a node
+  object that all say otherwise.
 - **A shutdown whose machine is observed up reports `draining`, and counts its attempts on the
   claim.** §6 lists `draining` as "a claim marked for scale-down, node cordoned, machine still
   observed up". The implementation covers the wider case, and states it in
