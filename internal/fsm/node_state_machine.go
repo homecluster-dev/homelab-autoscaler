@@ -430,14 +430,16 @@ func (nm *NodeStateMachine) lifecycleObjectMeta(name string, jobPhase string) me
 // lifecycleLabels returns the label set for a lifecycle Job of the given phase
 // (PhaseStartup or PhaseShutdown) and for its pod template.
 //
-// Provenance is carried by the labels below plus the controller ownerReference that
-// setOwnerReference() sets - that ownerReference is what makes Argo CD show the Job
-// under the Node CR in its resource tree. Do NOT add `argocd.argoproj.io/instance`
-// (or any other Argo tracking label) here: these Jobs are created by the controller,
-// they are not Argo-managed children, and a tracking label would make Argo claim them
-// and prune them for not existing in Git.
+// Provenance is carried by the labels below plus the ownerReferences that
+// setOwnerReference() sets: with a live claim the controller ownerReference points at
+// the NodeClaim - the Job is the attempt of that claim, and that is what makes Argo CD
+// show it under the claim - with the Node CR kept as a secondary owner so the Job is
+// also readable under the slot. Do NOT add `argocd.argoproj.io/instance` (or any other
+// Argo tracking label) here: these Jobs are created by the controller, they are not
+// Argo-managed children, and a tracking label would make Argo claim them and prune them
+// for not existing in Git.
 func (nm *NodeStateMachine) lifecycleLabels(jobPhase string) map[string]string {
-	return map[string]string{
+	jobLabels := map[string]string{
 		// Keys relied upon by cleanupPendingJobs, the gRPC server and the tests.
 		LabelApp:        LifecycleAppName,
 		LabelGroup:      nm.node.Labels[LabelGroup],
@@ -454,15 +456,32 @@ func (nm *NodeStateMachine) lifecycleLabels(jobPhase string) map[string]string {
 		LabelNodeCR: nm.node.Name,
 		LabelPhase:  jobPhase,
 	}
+
+	// The attempt is the claim's, so a Job of an attempt names it. No claim means the
+	// shutdown of a machine the pool stopped wanting (law 3): nothing asked for it, so
+	// the key is absent, and `kubectl get jobs -l infra.homecluster.dev/nodeclaim`
+	// selects exactly the Jobs that have an attempt behind them.
+	if nm.claim != nil {
+		jobLabels[LabelNodeClaim] = nm.claim.Name
+	}
+
+	return jobLabels
 }
 
-// lifecycleAnnotations returns the annotations recording which Node CR created the Job.
+// lifecycleAnnotations returns the annotations recording which Node CR, and which
+// NodeClaim, created the Job.
 func (nm *NodeStateMachine) lifecycleAnnotations() map[string]string {
-	return map[string]string{
+	annotations := map[string]string{
 		AnnotationNodeUID:   string(nm.node.UID),
 		AnnotationNodeGroup: nm.node.Labels[LabelGroup],
 		AnnotationCreatedBy: LifecycleAppName,
 	}
+
+	if nm.claim != nil {
+		annotations[AnnotationClaimUID] = string(nm.claim.UID)
+	}
+
+	return annotations
 }
 
 // createStartupJob creates a Kubernetes Job for node startup
@@ -657,17 +676,62 @@ func (nm *NodeStateMachine) createShutdownJob() (*batchv1.Job, error) {
 	return job, nil
 }
 
-// setOwnerReference sets the owner reference for a job
+// setOwnerReference stamps the ownership of a lifecycle Job.
+//
+// The Job is the attempt of a claim, so with a live claim the NodeClaim is the controller
+// owner: the Job hangs under the claim in Argo CD's tree, and the machine work a claim
+// asked for is readable on the claim.
+//
+// The Node CR stays a secondary, non-controller owner, and that is deliberate. The slot is
+// the object an operator reads for a machine (`kubectl get jobs -l
+// infra.homecluster.dev/node=<slot>`), and Kubernetes collects a dependent only once
+// *every* owner is gone: the secondary ref keeps the Job and its provenance on a slot that
+// outlives the claim the TTL has collected, and deleting the slot takes the claims and
+// their Jobs in one cascade.
+//
+// The cancelled claim is the ordering that matters. A claim a scale-down marked is a live
+// claim, so its shutdown Job is claim-owned from the moment ShutdownNode creates it, and it
+// cannot be collected mid-shutdown: the claim's finalizer comes off only once the machine
+// is observed off (NodeClaimReconciler.reconcileDeletion), which is the same window in
+// which the shutdown has to land. A pending claim has no Job to own - the `pending ->
+// booting` write is what creates the startup Job - and a pending Job a crash left behind on
+// a slot that is shutting down is cleanupPendingJobs' to delete.
+//
+// With no live claim - the force-shutdown of law 3, a machine the pool stopped wanting and
+// whose claim is already collected - the slot is the only object with an ownership to give,
+// and the Job is owned by the Node as controller, exactly as before this change.
 func (nm *NodeStateMachine) setOwnerReference(job *batchv1.Job) {
-	gvk := infrav2alpha1.GroupVersion.WithKind("Node")
+	nodeGVK := infrav2alpha1.GroupVersion.WithKind("Node")
+
+	nodeRef := metav1.OwnerReference{
+		APIVersion: nodeGVK.GroupVersion().String(),
+		Kind:       nodeGVK.Kind,
+		Name:       nm.node.Name,
+		UID:        nm.node.UID,
+	}
+
+	if nm.claim == nil {
+		nodeRef.Controller = &[]bool{true}[0]
+		job.SetOwnerReferences([]metav1.OwnerReference{nodeRef})
+
+		return
+	}
+
+	claimGVK := infrav2alpha1.GroupVersion.WithKind("NodeClaim")
+
 	job.SetOwnerReferences([]metav1.OwnerReference{
 		{
-			APIVersion: gvk.GroupVersion().String(),
-			Kind:       gvk.Kind,
-			Name:       nm.node.Name,
-			UID:        nm.node.UID,
-			Controller: &[]bool{true}[0],
+			APIVersion: claimGVK.GroupVersion().String(),
+			Kind:       claimGVK.Kind,
+			Name:       nm.claim.Name,
+			UID:        nm.claim.UID,
+			// The claim is the owner the attempt answers to, and the deletion of a
+			// committed boot is the shutdown this Job runs: the claim is not removed
+			// ahead of it.
+			Controller:         &[]bool{true}[0],
+			BlockOwnerDeletion: &[]bool{true}[0],
 		},
+		nodeRef,
 	})
 }
 

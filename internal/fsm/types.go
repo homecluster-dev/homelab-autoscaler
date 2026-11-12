@@ -70,8 +70,8 @@ const (
 // Label and annotation keys carried by every startup/shutdown Job the
 // controller creates, and by its pod template (labels only), so that
 // kubectl, Argo CD and anyone reading the cluster can tell which Node CR
-// a Job belongs to. See (NodeStateMachine).lifecycleLabels for the rules
-// about which keys may be added.
+// and which NodeClaim a Job belongs to. See (NodeStateMachine).lifecycleLabels
+// for the rules about which keys may be added.
 const (
 	// Legacy keys. cleanupPendingJobs() selects on LabelNodeLegacy and filters on
 	// LabelType, the gRPC server groups resources by LabelGroup, and tests assert on
@@ -92,11 +92,24 @@ const (
 	LabelNodeCR = "infra.homecluster.dev/node"
 	LabelPhase  = "infra.homecluster.dev/phase"
 
+	// LabelNodeClaim names the NodeClaim this Job is the attempt of. The slot is where the
+	// machine lives; the claim is who asked for it, so `kubectl get jobs -l
+	// infra.homecluster.dev/nodeclaim=<claim>` answers "which attempt did this?". It is
+	// stamped only when a live claim exists (the shutdown of a machine the pool stopped
+	// wanting has none - law 3). Like LabelNodeCR it is provenance for anyone reading the
+	// cluster and not an Argo tracking label - see (NodeStateMachine).lifecycleLabels.
+	LabelNodeClaim = "infra.homecluster.dev/nodeclaim"
+
 	// Annotations repeat the provenance so it stays legible in `kubectl describe`
 	// and survives a dropped ownerReference.
 	AnnotationNodeUID   = "infra.homecluster.dev/node-uid"
 	AnnotationNodeGroup = "infra.homecluster.dev/node-group"
 	AnnotationCreatedBy = "infra.homecluster.dev/created-by"
+
+	// AnnotationClaimUID pins the claim provenance to the object, so a Job whose claim has
+	// already been collected - the name is reused by nothing, but the record outlives it -
+	// still names the attempt that made it. Absent with no live claim, as LabelNodeClaim is.
+	AnnotationClaimUID = "infra.homecluster.dev/nodeclaim-uid"
 )
 
 // Label and annotation values used for the lifecycle Jobs.

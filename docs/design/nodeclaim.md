@@ -246,6 +246,13 @@ and no lock). Under this model:
   landed, and it never stamps a finalizer on a claim that is terminal, pending, or already being
   deleted.
 
+The shutdown Job that reverses a committed boot is a child of the claim that asked for it:
+`setOwnerReference` makes the `NodeClaim` the controller owner of the lifecycle Job, and keeps the
+`Node` as a secondary, non-controller owner so the Job is also readable under the slot in Argo CD's
+tree. The ordering is what makes the reversal safe: the claim's finalizer comes off only once the
+machine is observed off (`NodeClaimReconciler.reconcileDeletion`), so the claim cannot go away - and
+its shutdown Job cannot be garbage-collected - while the shutdown is still running.
+
 The `pending → booting` edge is also the attempt boundary: incrementing `status.attempt` is part
 of the same write that creates the startup Job, so an attempt is a machine bought and nothing
 else.
@@ -516,7 +523,10 @@ day writes claims forever. The cost is paid in three places, all of them explici
   `spec.ttlSecondsAfterFinished` on `MinimalPodSpec`). A claim that never lands is collected by its
   deadline plus the TTL, so nothing accumulates on a broken pool.
 - **OwnerRefs.** A claim is owned by its `Node`, so deleting a slot from Git takes its claims with
-  it, and deleting a pool cleans up after itself with no reconciler.
+  it, and deleting a pool cleans up after itself with no reconciler. The lifecycle Jobs of an attempt
+  are owned by the claim that asked for them, with the slot as a secondary owner: deleting the slot
+  takes the claims and their Jobs, and while the slot lives a Job keeps its provenance
+  (`infra.homecluster.dev/nodeclaim`, and the ownerReference behind it) after the claim is collected.
 - **A digest on the slot, so the story is still one command.** `Node.status.lastClaim` keeps
   `{slot, phase, attempt, request.call, request.group, reason, deadlineAt, finishedAt}`.
   `kubectl describe node.infra.homecluster.dev <slot>` answers "who asked, when, how many
