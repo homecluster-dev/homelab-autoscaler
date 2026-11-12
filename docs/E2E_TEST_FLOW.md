@@ -8,16 +8,22 @@ The `make test-e2e` target runs comprehensive end-to-end integration tests again
 
 The e2e tests consist of 3 sequential Ginkgo tests that verify the complete scale-down and scale-up workflows:
 
-1. **Setup & Environment Validation** - Verifies prerequisites and prepares the environment
-2. **Scale-Down Workflow** - Verifies CA detects unneeded nodes and triggers shutdown
+1. **Setup & Environment Validation** - Verifies prerequisites, prepares the environment, and claims
+   the machine the scale-down spec runs on
+2. **Scale-Down Workflow** - Verifies CA decides to remove a machine and the model powers it off
 3. **Scale-Up Workflow** - Verifies CA scales up when pods need scheduling
 
 All tests share state via Ginkgo's `BeforeSuite`/`AfterSuite` and global variables.
 
+The suite is the provider's counterpart: the pool's machines are k3d containers that only the VM control
+server powers, so a simulated machine that is in service has a live `NodeClaim` naming its slot, and a
+slot nobody claims is a machine the pool does not want. `claimSlot` and `releaseSlot` in
+`test/e2e/k3d_integration_test.go` are the harness playing that half of the model.
+
 ## Architecture Components
 
 ### 1. **VM Control Server** (`examples/k3d/vm_control_server.py`)
-- Simple HTTP server running on port 8080
+- Simple HTTP server running on port 9052
 - Exposes `/start?vm=VM_NAME` and `/stop?vm=VM_NAME` endpoints
 - Executes `k3d node start/stop` commands to power k3d nodes on/off
 - Simulates real VM provisioning/shutdown for k3d nodes
@@ -44,7 +50,7 @@ All tests share state via Ginkgo's `BeforeSuite`/`AfterSuite` and global variabl
 
 ### 5. **Service Forwarders** (created during test setup)
 - **homelab-autoscaler-grpc-local**: Routes cluster traffic on port 50052 to the local gRPC server
-- **host-internal**: Routes traffic on port 8080 to the VM control server running on the host
+- **host-internal**: Routes traffic on port 9052 to the VM control server running on the host
 
 ### 6. **Test Utilities** (`test/utils/utils.go`)
 - Node tainting utilities (`TaintNode`, `UntaintNode`, `VerifyNodeTaint`)
@@ -80,7 +86,7 @@ This script performs:
 ```bash
 cd examples/k3d && python3 vm_control_server.py &
 ```
-- Starts HTTP server on port 8080
+- Starts HTTP server on port 9052
 - Listens for start/stop commands for k3d nodes
 - Stores PID in `/tmp/vm-control.pid` for cleanup
 
@@ -112,8 +118,14 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
    - Ensures clean scale-down detection
 5. Verify gRPC service forwarder exists
 6. Verify VM control server is accessible
-7. Apply Node CRs from `examples/k3d/nodes1.yaml`
-8. Verify Node CRs are created
+7. Apply Node CRs from `examples/k3d/nodes1.yaml`, and the Group CR with the pool's scale-down numbers
+8. Verify the slots are free: no live `NodeClaim` names them, and the machines nobody claimed are
+   observed coming down (`draining`, then `off`) - a machine is wanted exactly when a live claim names
+   its slot
+9. **Claim** the slot of the machine the scale-down spec runs on: the harness writes a `NodeClaim`
+   (`request.call: IncreaseSize`, the group, a delta, `requestedBy: e2e`) and follows it to
+   `status.phase: ready`. The pool's machines are k3d containers the suite controls, so the suite is the
+   provider's counterpart: it asks for a machine the way the autoscaler does, and the operator boots it
 
 **Verification Points**:
 - k3d cluster is running
@@ -121,7 +133,10 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 - Agent nodes are tainted
 - gRPC service forwarder exists
 - VM control server is responding
-- Node CRs are created
+- Node CRs are created, and they declare configuration only
+- The slots are free, and the unclaimed machines report `draining`/`off`
+- The claimed slot reaches `ready`: the claim is stamped ready by the readiness gate, the VM control
+  server was asked for the machine, the slot reports `ready` and the machine is observed `on`
 
 ---
 
@@ -130,36 +145,40 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 **Purpose**: Verify Cluster Autoscaler detects unneeded nodes and triggers shutdown
 
 **Preconditions**:
-- Node CRs already applied (from Test 1)
-- Agent nodes tainted (no workloads can schedule)
+- The machine the spec runs on is in service because the setup's `NodeClaim` names its slot: the node is
+  Ready, the slot reports `ready`, and the pool has an empty node for the autoscaler to consider
+- Agent nodes are tainted, so no workload lands on them
 
 **Steps**:
-1. Apply Group CR with aggressive scale-down settings:
-   - `scaleDownUnneededTime: 30s`
-   - `scaleDownUtilizationThreshold: 0.1`
-   - `ignoreDaemonSetsUtilization: true`
-2. Wait for Cluster Autoscaler to detect unneeded nodes (~60s)
-   - Monitor CA logs for "unneeded" messages
-3. Verify gRPC `NodeGroupDeleteNodes` call was made
-   - Check CA logs for "DeleteNodes" call
-4. Verify the slot is not wanted: no live `NodeClaim` names it (`v2alpha1` has no `spec.powerState`)
-5. Verify shutdown job is created
-6. Verify shutdown job has correct ServiceAccount (`controller-manager`)
-7. Verify shutdown job has Secret volume (`auth-secrets`)
-8. Verify VM control server receives `/stop` HTTP request
-   - Requests logged to `/tmp/vm-control-requests.log`
-9. Verify k3d node is stopped
-10. Verify the slot's derived `status.phase` is `off` and `status.powerState` is `off`
-11. Verify Kubernetes node becomes NotReady
+1. Wait for Cluster Autoscaler to *decide*, reading the line its actuator writes as it taints the node
+   and starts the deletion: `Scale-down: removing empty node "<name>"` (or the drain line), naming this
+   machine. The word "unneeded" is not consulted: the autoscaler prints it as bookkeeping on every pass
+   (`--scale-down-unneeded-time` in its flag echo, `"<node> was unneeded for 3s"` from the candidate
+   tracker), so a gate built on it is true when nothing was decided
+2. Verify gRPC `NodeGroupDeleteNodes` reached the provider, and that the provider's log records the
+   cancellation of the claim of *this* machine
+3. Verify the claim is cancelled: the request is recorded on it (`call: DeleteNodes`, `nodes:` naming the
+   machine) and it carries the mark that runs the shutdown
+4. Verify the slot reports `draining`: the machine is observed up and a scale-down names its claim
+5. Verify the shutdown job of this machine, created after the decision, is the job the slot declares:
+   ServiceAccount `controller-manager`, the `auth-secrets` Secret volume, a
+   `ttlSecondsAfterFinished`, and a completion read off `job.status.succeeded`
+6. Verify VM control server receives `/stop` for this machine within a window, not somewhere in the
+   history of the run
+7. Verify k3d node is stopped
+8. Verify the slot's derived `status.phase` is `off` and `status.powerState` is `off`
+9. Verify the claim stops being live (its finalizer is released once the machine is observed off), and
+   the slot's digest of the episode records a terminal phase
+10. Verify Kubernetes node becomes NotReady
 
 **Verification Points**:
-- CA detects node as unneeded
-- gRPC DeleteNodes call is made
-- Shutdown job is created with correct ServiceAccount
-- Shutdown job has ConfigMap and Secret volumes
-- VM control server receives `/stop` request
-- k3d node stops
-- Slot reports `off`, and no live claim owns it
+- CA's decision is in its own log, naming this machine, and the RPC reached the provider
+- The claim that wanted the machine carries the DeleteNodes request and the mark
+- The slot's report is the machine coming down, and then off; the observed power is off
+- The shutdown job of this machine, from this decision, has the ServiceAccount, the Secret volume and
+  the TTL the slot declares, and it completed
+- VM control server receives `/stop` request; k3d node stops
+- Slot reports `off`, and no live claim owns it; the digest is a terminal phase
 - Kubernetes node becomes NotReady
 
 **Shared State**: Stores shutdown node name for Test 3
@@ -178,34 +197,36 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 1. Untaint the shutdown node to allow scheduling
 2. Verify node is untainted
 3. Apply hello-world deployment targeting the agent node
-4. Wait for CA to detect need for scale-up
-   - Check CA logs for "IncreaseSize" or "scale up"
+4. Wait for CA to *decide* to grow the pool, reading the line the orchestrator writes as it calls the
+   provider: `Scale-up: setting group group1 size to N`. "scale up" alone is printed on every idle pass
+   ("no need to scale up"), so it cannot gate on a decision
 5. Verify gRPC `NodeGroupIncreaseSize` call was made
 6. Verify the provider created a `NodeClaim` for the slot, carrying the request (call, delta, group,
     `requestedBy`), the deadline (the budget of one attempt, floored by the group's
     `maxNodeProvisionTime`), the seeded `status.attempt`, the TTL and the ownerReference
-7. Verify startup job is created
-8. Verify startup job has correct ServiceAccount (`controller-manager`)
-9. Verify startup job has ConfigMap volume (`startup-config`)
-10. Verify VM control server receives `/start` HTTP request
-11. Verify k3d node starts
-12. Verify startup job completes
-13. Verify the claim moves `pending` -> `booting` -> `ready`, and the slot reports `ready` with
+7. Verify the startup job of this attempt, on this slot, is the job the slot declares:
+   ServiceAccount `controller-manager`, the `startup-config` volume, a TTL, and `job.status.succeeded`
+8. Verify VM control server receives `/start` for this machine, and the k3d node starts
+9. Verify the claim moves `pending` -> `booting` -> `ready`, and the slot reports `ready` with
     `status.powerState: on`
-14. Verify Kubernetes node becomes Ready
-15. Verify deployment pod is scheduled and running
+10. Relax the pool's numbers (a long `scaleDownUnneededTime`, and a `maxNodeProvisionTime` that outlasts
+    a k3d boot) so the autoscaler keeps the machine it just bought in service while the spec observes it
+11. Watch the served claim across its own boot deadline: the claim's deadline is stamped into the past,
+    and the window is measured from the claim's natural deadline so the observation crosses it. The
+    claim stays `ready`, the slot stays `ready`, no shutdown Job appears, the node stays schedulable
+12. Verify the deployment pod is scheduled on the machine the claim bought
 
 **Verification Points**:
-- Pod scheduling triggers scale-up need
-- gRPC IncreaseSize call is made
-- Startup job is created with correct ServiceAccount
-- Startup job has ConfigMap volume
-- VM control server receives `/start` request
-- k3d node starts
-- Startup job completes successfully
+- Pod scheduling triggers the autoscaler's scale-up decision, naming the pool
+- gRPC IncreaseSize call is made, and the provider's claim is the record of the request
+- The startup job of this attempt has the ServiceAccount and the ConfigMap volume the slot declares,
+  carries a TTL, and completed
+- VM control server receives `/start` request; k3d node starts
 - The claim reaches `ready` and the slot reports `ready`
-- Kubernetes node Ready
-- Deployment pod scheduled and running
+- A ready claim that crosses its boot deadline keeps its machine (the window outlives the budget:
+  the operator's `claim.AttemptBudget`, 12m10s, and the group's number only raises it)
+- Kubernetes node Ready, uncordoned
+- Deployment pod scheduled and running on the claimed machine
 
 ---
 
@@ -265,13 +286,13 @@ lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
 ┌────────────┐    HTTP       ┌──────────────────┐    k3d CLI    ┌─────────────┐
 │ Startup    │──────────────►│ VM Control       │──────────────►│ k3d Node    │
 │ Pod        │  /start?vm=X  │ Server           │  k3d node     │ (powered on)│
-└────────────┘               │ (port 8080)      │    start X    └─────────────┘
+└────────────┘               │ (port 9052)      │    start X    └─────────────┘
                              └──────────────────┘
 
 ┌────────────┐    HTTP       ┌──────────────────┐    k3d CLI    ┌─────────────┐
 │ Shutdown   │──────────────►│ VM Control       │──────────────►│ k3d Node    │
 │ Pod        │   /stop?vm=X  │ Server           │   k3d node    │ (powered    │
-└────────────┘               │ (port 8080)      │    stop X     └─────────────┘
+└────────────┘               │ (port 9052)      │    stop X     └─────────────┘
                                                             (stopped)
 ```
 
@@ -282,22 +303,30 @@ lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
 2. **Agent nodes exist**: Both agent nodes are present
 3. **Node tainting**: Agent nodes tainted with `node.kubernetes.io/role=agent:NoSchedule`
 4. **gRPC forwarder exists**: Service forwarder for local controller is configured
-5. **VM control server responding**: HTTP server accessible on localhost:8080
-6. **Node CRs created**: Node custom resources (`v2alpha1`) applied successfully
+5. **VM control server responding**: HTTP server accessible on the forwarded port
+6. **Node CRs created**: Node custom resources (`v2alpha1`) applied successfully, declaring
+   configuration only
 7. **Slots are free**: no live `NodeClaim` names a slot, and an agent machine that is up with no claim
-   is reported `draining` - the law "a machine is wanted exactly when a live claim names the slot"
-   is what makes the idle pool of a homelab readable
+   is reported `draining`, then `off` - the law "a machine is wanted exactly when a live claim names the
+   slot" is what makes the idle pool of a homelab readable
+8. **The harness claims a machine**: a `NodeClaim` written by the suite (`requestedBy: e2e`,
+   `request.call: IncreaseSize`) boots its k3d machine through the operator and reaches `ready`; the
+   slot reports `ready`, the machine is observed `on`, and the VM control server saw `/start` for it
 
 ### Test 2: Scale-Down Workflow
-7. **CA detects unneeded nodes**: CA logs show "unneeded" detection
-8. **gRPC DeleteNodes call**: CA calls `NodeGroupDeleteNodes` via gRPC
-9. **Slot is not wanted**: no live `NodeClaim` names the slot - the sentence v1alpha1's
-   `spec.powerState: off` carried, now derived from the absence of a claim
-10. **Shutdown job created**: Kubernetes job with correct labels
-11. **Shutdown job ServiceAccount**: Uses `controller-manager` ServiceAccount
-12. **Shutdown job volumes**: Has `auth-secrets` Secret volume
-13. **VM control server receives /stop**: Request logged to `/tmp/vm-control-requests.log`
-14. **k3d node stops**: Node status is not "running" or "up"
+7. **CA decided, and said so**: the autoscaler's actuator line `Scale-down: removing empty node
+   "<machine>"` is in its log - not the word "unneeded", which it prints on every pass
+8. **gRPC DeleteNodes call**: CA calls `NodeGroupDeleteNodes`, and the provider logs cancelling the
+   claim of this machine
+9. **The claim is cancelled**: it carries `request.call: DeleteNodes` with the machine named, and the
+   mark that runs the shutdown; the slot with no live claim is asserted after the machine is off
+10. **Slot reports draining**: the machine is observed up while its claim is named for deletion
+11. **Shutdown job of this machine, from this decision**: scoped by the slot label and by the minute the
+    spec started watching
+12. **Shutdown job ServiceAccount / volume / TTL**: `controller-manager`, `auth-secrets`, and a
+    `ttlSecondsAfterFinished`, read off the typed Job
+13. **VM control server receives /stop**: request logged within a window, not somewhere in the history
+14. **k3d node stops**: node status is not "running"
 15. **Slot phase=off, observed off**: `Node.status.phase` is `off` and `status.powerState` is `off`,
     and the slot's digest of the last claim records a terminal phase
 16. **Kubernetes node NotReady**: Node condition is False or Unknown
@@ -305,21 +334,27 @@ lsof -i :8080 | awk '{print $$2}' | tail -n 1 | xargs kill -9 || echo "ok"
 ### Test 3: Scale-Up Workflow
 
 17. **Node untainted**: Taint removed, allowing scheduling
-18. **CA detects scale-up need**: CA logs show "IncreaseSize" or "scale up"
+18. **CA decided to grow the pool**: the orchestrator's line `Scale-up: setting group group1 size to N`
+    is in its log - not "scale up", which the idle pass prints
 19. **gRPC IncreaseSize call**: CA calls `NodeGroupIncreaseSize` via gRPC
 20. **NodeClaim created for the slot**: the scale-up is an object, with its attribution
     (`request.call: IncreaseSize`, `request.group`, `request.delta`, `spec.requestedBy`), its
     deadline, its seeded `status.attempt`, its TTL and its ownerReference on the slot
-21. **Startup job created**: Kubernetes job with correct labels
-22. **Startup job ServiceAccount**: Uses `controller-manager` ServiceAccount
-23. **Startup job volumes**: Has `startup-config` ConfigMap volume
-24. **VM control server receives /start**: Request logged to `/tmp/vm-control-requests.log`
-25. **k3d node starts**: Node status is "running" or "up"
-26. **Startup job completes**: Job reaches succeeded state
-27. **Claim phase=ready, slot phase=ready**: the claim asserts the machine it asked for can take the
+21. **Startup job of this attempt, on this slot**: scoped by the slot label and by the minute the spec
+    started watching
+22. **Startup job ServiceAccount / volume / TTL**: `controller-manager` and `startup-config`, read off
+    the typed Job
+23. **VM control server receives /start**: within a window, so the boot of the setup's machine is not
+    the request this spec reads
+24. **k3d node starts**: node status is "running"
+25. **Startup job completes**: `job.status.succeeded` is at least 1
+26. **Claim phase=ready, slot phase=ready**: the claim asserts the machine it asked for can take the
     pool's work, the slot reports `ready`, `status.powerState` is `on`, and the slot keeps the digest
-28. **Kubernetes node Ready**: Node condition is True
-29. **Deployment pod running**: hello-world pod scheduled and running
+27. **A ready claim past its boot deadline keeps its machine**: the observation is measured from the
+    claim's own deadline (the operator's budget is 12m10s, and the group's `maxNodeProvisionTime` is a
+    floor that only raises it), and the claim, the slot, the node and the pod are left alone
+28. **Kubernetes node Ready**: Node condition is True, and uncordoned
+29. **Deployment pod running**: hello-world pod scheduled on the machine the claim bought
 
 ## Environment Variables
 
@@ -336,7 +371,7 @@ const (
     grpcServerPort   = "50052"
     kubeconfigPath   = "./kubeconfig"
     namespace        = "homelab-autoscaler-system"
-    vmControlPort    = 8080
+    vmControlPort    = 9052
     vmControlHost    = "localhost"
     vmControlLogFile = "/tmp/vm-control-requests.log"
 
@@ -348,16 +383,32 @@ const (
     agentTaint = "node.kubernetes.io/role=agent:NoSchedule"
 
     // Timeouts
-    caDetectionTimeout   = 60 * time.Second
+    // Gates the autoscaler is asked to pass: a decision, then the call it leads to
+    caDecisionTimeout     = 5 * time.Minute  // CA's loop + the unneeded window + the drain
+    deleteNodesRPCTimeout = 2 * time.Minute  // the taint delay, then the call
+
+    // The machine's own clock: a container stops, the kubelet goes silent, the node lifecycle
+    // controller declares it NotReady after its monitor grace period
     vmShutdownTimeout    = 60 * time.Second
     vmStartupTimeout     = 60 * time.Second
     jobCompletionTimeout = 120 * time.Second
-    podScheduleTimeout   = 60 * time.Second
+    podScheduleTimeout   = 200 * time.Second
     nodeStateTimeout     = 120 * time.Second
+    machineStateTimeout  = 4 * time.Minute
+
+    // The claim's phases: created, committed, ready, collected
+    claimCreatedTimeout   = 60 * time.Second
+    claimPhaseTimeout     = 90 * time.Second
+    claimReadyTimeout     = 5 * time.Minute
+    claimCollectedTimeout = 3 * time.Minute
+
+    // The window of the deadline spec, and the VM control request window
+    minDeadlineWatch  = 3 * time.Minute
+    maxDeadlineWatch  = 14 * time.Minute
+    bootRequestWindow = 90 * time.Second
 
     // Check intervals
-    checkInterval     = 5 * time.Second
-    fastCheckInterval = 1 * time.Second
+    checkInterval = 5 * time.Second
 )
 ```
 
@@ -365,10 +416,10 @@ const (
 
 | Test | Duration | Notes |
 |------|----------|-------|
-| Test 1: Setup | 30s | Quick validation |
-| Test 2: Scale-Down | 2.5m | CA detection (60s) + shutdown (60s) + verification |
-| Test 3: Scale-Up | 2.5m | Scale-up (60s) + startup (60s) + verification |
-| **Total** | **~6 minutes** | With overhead, ~8 minutes |
+| Test 1: Setup | 3-5m | The unclaimed machines come down, then the harness's claim boots one and follows it to `ready` |
+| Test 2: Scale-Down | 3-6m | The autoscaler's decision window, the drain, the shutdown Job, the machine observed off |
+| Test 3: Scale-Up | 15-20m | The boot to `ready`, then the observation that outlives the claim's 12m10s budget |
+| **Total** | **~25 minutes** | The long spec is the deadline observation, which cannot be shortened: the budget is a sum of the operator's constants |
 
 ## Test Tags
 

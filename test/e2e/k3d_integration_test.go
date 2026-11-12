@@ -30,7 +30,10 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
@@ -59,13 +62,61 @@ const (
 	// Taints - prevents workloads from being scheduled on agent nodes
 	agentTaint = "node.kubernetes.io/role=agent:NoSchedule"
 
+	// harnessRequestedBy is the attribution the harness stamps on a claim it writes for one of its own
+	// simulated machines. The harness owns the machines (they are k3d containers it starts and stops),
+	// so it is the caller for them, and the model says so on the object: a machine is up exactly when a
+	// live NodeClaim names its slot, and the claim that says so names who asked.
+	harnessRequestedBy = "e2e"
+
 	// Timeouts - various timeouts for different operations
-	caDetectionTimeout   = 60 * time.Second  // Time for CA to detect need for scale
 	vmShutdownTimeout    = 60 * time.Second  // Time for VM to power off
 	vmStartupTimeout     = 60 * time.Second  // Time for VM to power on
 	jobCompletionTimeout = 120 * time.Second // Time for startup/shutdown job to complete
 	podScheduleTimeout   = 200 * time.Second // Time for pod to be scheduled after node is ready
 	nodeStateTimeout     = 120 * time.Second // Time for the slot's report to follow an observation
+
+	// The two gates cluster-autoscaler is asked to pass are decisions of a process outside this suite,
+	// so their clocks are the autoscaler's, not a reconcile's.
+
+	// caDecisionTimeout is how long the autoscaler may take to decide: its loop period, the group's
+	// scaleDownUnneededTime window measured from the moment the machine became Ready and the
+	// autoscaler finished registering it, and - for a scale-up - the simulation of the pending pod.
+	caDecisionTimeout = 5 * time.Minute
+	// deleteNodesRPCTimeout is how long the autoscaler may take, once it has logged the decision, to
+	// have the call reach the provider: the taint delay (--node-delete-delay-after-taint) and the drain.
+	deleteNodesRPCTimeout = 2 * time.Minute
+	// machineStateTimeout is how long an observation of a machine - a k3d container coming up or down,
+	// and the kubelet's heartbeat following it - may take to reach the slot's report. The node lifecycle
+	// controller declares a silent kubelet only after its monitor grace period, so an off-report is
+	// minutes late by construction, and a shutdown Job has to run before the machine is even asked to
+	// stop.
+	machineStateTimeout = 4 * time.Minute
+
+	// The window of the "a served claim stays ready past its boot deadline" spec is measured from the
+	// claim's own deadline, and bounded: minDeadlineWatch is the shortest honest observation, and
+	// maxDeadlineWatch keeps one spec from eating the suite. The floor is not decoration: a claim's
+	// budget is the operator's claim.AttemptBudget (12m10s) and the group's spec.maxNodeProvisionTime
+	// is a floor that only ever raises it (claim.DeadlineAt), so no pool number shortens a deadline
+	// below one boot window, and a window shorter than that says nothing about a machine that outlives
+	// its boot budget.
+	minDeadlineWatch = 3 * time.Minute
+	maxDeadlineWatch = 14 * time.Minute
+	// deadlineWatchMargin is how long past the claim's deadline the observation keeps going: the passes
+	// that would act on an overdue claim are a reconcile apart from the deadline itself.
+	deadlineWatchMargin = 2 * time.Minute
+
+	// logTailLines is how much of a log the gates read. cluster-autoscaler writes its loop bookkeeping
+	// every pass, so a tail of 1000 lines is a couple of minutes of history: a decision made before the
+	// suite started watching has to be visible, and a decision that made the suite's gate has to be
+	// findable.
+	logTailLines = 5000
+
+	// bootRequestWindow is the window the VM control server's request log is read over for one power
+	// transition. Each spec watches its own boot and its own shutdown, so the window covers the request
+	// rate of a transition the suite starts from the claim: a second, not a whole run. It is wide enough
+	// for a Job pod that starts slowly and narrow enough that the /stop of the setup's power-off, minutes
+	// earlier, is not the request the scale-down spec reads.
+	bootRequestWindow = 90 * time.Second
 
 	// Claim timeouts - the NodeClaim is the object a scale-up is, so the phases of the model are
 	// what the suite waits on: a phase is a fact about one request, with a name, an attempt number
@@ -85,19 +136,23 @@ const (
 	// is the request that reverses a committed boot, and it is released once the machine is
 	// observed off. The TTL of a terminal claim is much longer (the suite never waits for it);
 	// what the suite asserts is that the claim stops being live, which is the sentence "the
-	// machine is no longer wanted".
-	claimCollectedTimeout = 2 * time.Minute
+	// machine is no longer wanted". It is measured from the machine being observed off, so it is
+	// pinned to machineStateTimeout, not to the autoscaler's clocks.
+	claimCollectedTimeout = 3 * time.Minute
 
 	// Check intervals - how often to poll for state changes
-	checkInterval     = 5 * time.Second
-	fastCheckInterval = 1 * time.Second
+	checkInterval = 5 * time.Second
 )
+
+// claimCancelled is the answer of the read that asks "has the scale-down named this machine": it is
+// returned by a slot whose claim carries the DeleteNodes request and the mark, and by a slot that has
+// no live claim left to cancel, because both are the shape the request asked for.
+const claimCancelled = "cancelled"
 
 // Shared state between tests
 // These variables persist across test contexts and are used to track state
 var (
-	vmControlServerPID int    // PID of the VM control server process
-	shutdownNodeName   string // Name of the node that was shut down (for scale-up test)
+	shutdownNodeName string // Name of the node that was shut down (for scale-up test)
 
 	// scaleUpClaimName is the NodeClaim the provider created for the scale-up of Test 3. The claim
 	// is the request, so the suite names it and follows it across its phases, and its digest on the
@@ -142,8 +197,24 @@ var _ = BeforeSuite(func() {
 // what the cluster observes. Desired power is derived, never stored, so nothing here reads or writes
 // a spec field of a slot: a scale-up is a claim the provider creates, a scale-down is the end of one,
 // and every wait in the suite is on a phase - of the claim, of the slot's report, of the machine.
+//
+// The harness is the machine. The pool's machines are k3d containers the suite starts and stops
+// through the VM control server, so the suite is the provider's other half: a simulated machine that
+// is up has a live NodeClaim naming its slot, and a slot nobody claims is a machine the pool does not
+// want, which the operator powers off. A suite that left its machines unclaimed would be exercising
+// cluster-autoscaler on a group of machines that are already going down, and the autoscaler has
+// nothing to scale down. The lifecycle helpers claimSlot and releaseSlot are the harness playing its
+// half of the model, and they are the only writes this suite makes to a claim.
 // =============================================================================
 var _ = Describe("K3d Integration", Serial, func() {
+	// The harness stops wanting its machines when the run is over: the claims it wrote for the k3d
+	// containers are deleted, and the model powers the machines down. This is housekeeping, not a gate -
+	// what a release does is asserted by the spec that reads the slot, not here.
+	DeferCleanup(func() {
+		By("Releasing the machines the harness claimed")
+		releaseSlot(agentNode0)
+		releaseSlot(agentNode1)
+	})
 
 	// =============================================================================
 	// TEST 1: Setup & Environment Validation
@@ -156,7 +227,10 @@ var _ = Describe("K3d Integration", Serial, func() {
 	// 3. Set up VM control server service for node power management
 	// 4. Apply Node CRs (v2alpha1) that define our agent slots
 	// 5. Apply Group CR with aggressive scale-down settings for testing
-	// 6. Verify the slots start free: no live NodeClaim names them
+	// 6. Verify the slots start free: no live NodeClaim names them, and the machines nobody claimed
+	//    are observed coming down
+	// 7. Claim the slot of the machine the scale-down spec runs on, and follow the claim to ready:
+	//    the harness is the machine, so a simulated machine in service is a claimed slot
 	// =============================================================================
 	Context("Setup & Environment Validation", func() {
 		It("should verify prerequisites and prepare environment", func() {
@@ -212,8 +286,9 @@ var _ = Describe("K3d Integration", Serial, func() {
 
 			// Node CRs define our agent slots with startup/shutdown pod specs.
 			// These pods will curl the VM control server to power nodes on/off.
-			// The v2alpha1 spec carries no runtime intent: there is no spec.powerState in it, so
-			// applying this file can never contradict a scale-up, and selfHeal has nothing to revert.
+			// A slot is configuration: its identity, its machine, the Jobs that power it on and off, and
+			// no field of it carries a scale-up, so applying this file cannot contradict a claim and there
+			// is nothing for selfHeal to revert.
 			By("Applying Node CRs")
 			cmd = exec.Command("kubectl", "apply", "-f", "./examples/k3d/nodes1.yaml")
 			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
@@ -262,18 +337,7 @@ spec:
   scaleDownUtilizationThreshold: "0.1"
   zeroOrMaxNodeScaling: false
 `
-			tmpFile, err := os.CreateTemp("", "group-*.yaml")
-			Expect(err).NotTo(HaveOccurred())
-			defer os.Remove(tmpFile.Name())
-
-			_, err = tmpFile.WriteString(groupYAML)
-			Expect(err).NotTo(HaveOccurred())
-			tmpFile.Close()
-
-			cmd = exec.Command("kubectl", "apply", "-f", tmpFile.Name())
-			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-			output, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to apply Group: %s", output)
+			applyGroupCR(groupYAML)
 
 			By("Verifying the Group CR is served at v2alpha1")
 			Eventually(func() string {
@@ -288,8 +352,8 @@ spec:
 				"The readback must name the version the operator serves")
 
 			// The whole model in one line: a slot is free exactly when no live NodeClaim names it.
-			// No status seeding, no three-field scan, no observation is needed to know that, which is
-			// why the slots are readable as free the instant they are applied.
+			// Nothing is seeded, no status is scanned and no observation is needed to know it, so the
+			// slots are readable as free the instant they are applied.
 			By("Verifying the slots are free: no live NodeClaim names them")
 			Eventually(func() int {
 				live, err := liveClaimsOfSlot(agentNode0)
@@ -306,16 +370,64 @@ spec:
 			}, 30*time.Second, checkInterval).Should(Equal(0),
 				"A slot nobody asked for has no live claim: that is the free shape IncreaseSize claims")
 
-			By("Verifying the slots report the machines the pool does not want")
-			// The k3d agents booted with the cluster, so their machines are observed up while no
-			// claim names them. Law 1 of the input makes them unwanted capacity: the shutdown path
-			// owns the machine, and the slot's derived report says draining on the way down and off
-			// once the machine is down. The two are one shape, a machine the pool has stopped
-			// wanting, a Job and a reconcile apart, so the suite reads the pair.
+			By("Verifying the machines nobody claimed are coming down")
+			// The k3d agents booted with the cluster, so their machines are observed up while no claim
+			// names them. A machine is wanted exactly when a live claim names its slot, so these two are
+			// unwanted capacity: the shutdown path owns them, and the slot's report is draining on the way
+			// down and off once the machine is down. The pair is one shape - a machine the pool does not
+			// want - a Job and a reconcile apart, so the suite reads the pair and then the off end of it.
+			for _, slot := range []string{agentNode0, agentNode1} {
+				Eventually(func() bool {
+					return slotIsUnwanted(slot)
+				}, machineStateTimeout, checkInterval).Should(BeTrue(),
+					"A slot no claim names reports off, or draining while its machine comes down")
+			}
+
+			// The off end is the shape the scale-down spec starts from, and the shape the harness's claim
+			// boots a machine out of: a live claim on a slot whose machine is observed off is a request
+			// the input law answers by booting it. Claiming a slot whose machine is already observed up
+			// is the shape nothing boots - the machine is up and the claim has not been stamped ready, so
+			// the slot reports the boot window and no startup Job is owed - so the suite waits for the
+			// machines to be down before it asks for one.
+			Eventually(func() []infrav2alpha1.NodePhase {
+				return []infrav2alpha1.NodePhase{slotPhase(agentNode0), slotPhase(agentNode1)}
+			}, machineStateTimeout, checkInterval).Should(Equal([]infrav2alpha1.NodePhase{
+				infrav2alpha1.NodePhaseOff,
+				infrav2alpha1.NodePhaseOff,
+			}), "A machine the pool does not want ends off: the pool reads as idle, and every slot is free")
+
+			By("Claiming the slot of the machine the scale-down spec runs on")
+			// The harness is the machine: the pool's machines are k3d containers it starts and stops, and
+			// nothing powers them for the pool. So a simulated machine that is in service is up because a
+			// live NodeClaim names its slot, and the claim is written by the harness with the attribution
+			// of a scale-up (call: IncreaseSize, the group, a delta) and a deadline. From there the model
+			// runs: law 1 boots the machine the claim wants, the startup Job asks the VM control server
+			// for it, the readiness gate answers for the claim's ready phase.
+			//
+			// The scale-down spec needs a machine the autoscaler can find Ready, empty and long enough in
+			// service to call unneeded. The other slot stays unclaimed on purpose: it is the idle pool of
+			// a homelab, readable as off, and the free slot the scale-up of the next spec asks for.
+			claimSlot(agentNode0, harnessRequestedBy)
+
+			By("Verifying the claimed machine is in service")
+			// The VM control server was asked for the machine: the startup Job of the attempt is what
+			// powers a k3d container, so the request in its log is the boot, not the cluster creation.
 			Eventually(func() bool {
-				return slotIsUnwanted(agentNode0)
-			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
-				"A slot no claim names reports off, or draining while its machine comes down")
+				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/start", agentNode0, bootRequestWindow)
+			}, 30*time.Second, checkInterval).Should(BeTrue(),
+				"the machine of a claimed slot is booted by the provider's startup Job, so the VM control server saw /start for it")
+
+			// The claim's ready phase is the sentence "the machine it asked for can take the pool's
+			// work", and the slot's report follows it: ready, with the machine observed on.
+			Eventually(func() infrav2alpha1.NodePhase {
+				return slotPhase(agentNode0)
+			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseReady),
+				"The report of a slot with a ready claim, a Ready node and a live kubelet is ready")
+
+			Eventually(func() infrav2alpha1.PowerState {
+				return slotPowerState(agentNode0)
+			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.PowerStateOn),
+				"The observation of the machine the claim asked for is on")
 
 			By("Setup & Environment Validation completed successfully")
 		})
@@ -324,122 +436,189 @@ spec:
 	// =============================================================================
 	// TEST 2: Scale-Down Workflow
 	// =============================================================================
-	// Purpose: Verify that Cluster Autoscaler can detect unneeded nodes and
-	// our controller can power them off.
+	// Purpose: Verify that Cluster Autoscaler decides to remove a machine the pool no longer needs,
+	// and that the model powers it off.
 	//
 	// Flow:
-	// 1. CA detects node is unneeded (no workloads, below utilization threshold)
-	// 2. CA calls our gRPC server's NodeGroupDeleteNodes method
-	// 3. The provider cancels the machine: a live claim of the slot is recorded with the request
-	//    (call: DeleteNodes, nodes: the names) and deleted; a slot with no live claim has nothing to
-	//    cancel, and the input law powers its machine off on the slot's next pass
-	// 4. The slot's shutdown transition runs: cordon, shutdown Job, power off
-	// 5. The controller creates shutdown job that curls VM control server /stop endpoint
-	// 6. VM control server stops the k3d node
-	// 7. The machine is observed off: the slot's report is off, and a marked claim ends completed
+	// 1. The machine is in service because a live NodeClaim names its slot (the setup's claim): the node
+	//    is Ready, the slot reports ready, and the group has an empty node to consider.
+	// 2. CA decides: it writes "Scale-down: removing empty node <name>" as it taints the node and starts
+	//    the deletion, then calls the provider's NodeGroupDeleteNodes.
+	// 3. The provider cancels the machine: the live claim of the slot is recorded with the request
+	//    (call: DeleteNodes, nodes: the names) and deleted. A booting or ready claim keeps its
+	//    finalizer until the machine is observed off; a slot with no live claim has nothing to cancel,
+	//    and the input law powers its machine off on the slot's next pass.
+	// 4. The slot's shutdown transition runs: cordon, shutdown Job, power off.
+	// 5. The shutdown Job curls the VM control server's /stop endpoint, and the VM control server stops
+	//    the k3d node.
+	// 6. The machine is observed off: the slot's report is off, the marked claim ends completed and is
+	//    released, and the slot's digest keeps the episode.
 	//
 	// Key validations:
-	// - gRPC call was made
-	// - the slot is not wanted: no live NodeClaim names it (the sentence spec.powerState: off used
-	//   to carry, now with an owner, a call and a reason attached)
-	// - the slot's derived phase reports the machine coming down, then off
-	// - the observed power state is off
-	// - Shutdown job created with correct spec (ServiceAccount, volumes, TTL)
-	// - VM control server received /stop request
-	// - k3d node actually stopped
-	// - the slot's digest of the episode, if the slot ever had one, records an ended claim
+	// - CA's decision is in its own log naming this machine, and the RPC reached the provider: two gates
+	//   in that order, each on a line a pass that decided nothing does not write
+	// - the claim that wanted the machine is cancelled: the request recorded on it (call: DeleteNodes,
+	//   the nodes named) and the mark that runs the shutdown
+	// - the slot's report is the machine coming down, and then off, and the observed power is off
+	// - the shutdown Job of this machine, from this decision, is the one asserted on: ServiceAccount,
+	//   Secret volume, TTL, and a completion read off job.status.succeeded
+	// - VM control server received /stop for this machine, and the k3d node actually stopped
+	// - the claim stops being live, and the slot's digest of the episode records an ended claim
 	// - Kubernetes node became NotReady
 	// =============================================================================
 	Context("Scale-Down Workflow", func() {
 		It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
-			By("Waiting for Cluster Autoscaler to detect unneeded nodes")
+			// The minute the suite starts watching from. Every lifecycle Job asserted below is one this
+			// decision created: the setup's shutdown of the same slot left a completed shutdown Job
+			// behind, and a Job of a past episode is not the evidence that this scale-down ran.
+			scaleDownStarted := time.Now()
+
+			By("Waiting for Cluster Autoscaler to decide this machine is unneeded")
+			// The word "unneeded" is bookkeeping the autoscaler writes on every pass: it echoes its own
+			// --scale-down-unneeded-time at startup, and its tracker prints "<node> was unneeded for 3s"
+			// while a node is only a candidate. The sentence the actuator writes when it commits to a
+			// machine names the machine:
+			//
+			//	Scale-down: removing empty node "k3d-homelab-autoscaler-agent-0"
+			//	Scale-down: removing node k3d-homelab-autoscaler-agent-0, utilization: ...
+			//
+			// It is written as the node is tainted and the deletion starts, so the gate is a decision, and
+			// it is about this machine.
 			Eventually(func() bool {
-				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
-				return strings.Contains(logs, "unneeded") ||
-					strings.Contains(logs, "DeleteNodes")
-			}, caDetectionTimeout, checkInterval).Should(BeTrue(),
-				"Cluster Autoscaler should detect unneeded nodes. Check CA logs.")
+				logs, _ := utils.GetClusterAutoscalerLogs(namespace, logTailLines)
+
+				return caLoggedScaleDownOf(logs, agentNode0)
+			}, caDecisionTimeout, checkInterval).Should(BeTrue(),
+				"Cluster Autoscaler must log its scale-down decision for %s. Check CA logs.", agentNode0)
 
 			By("Verifying gRPC NodeGroupDeleteNodes call was made")
+			// The autoscaler taints, waits --node-delete-delay-after-taint, drains, and only then calls
+			// the provider, so this follows the decision by seconds and is asserted after it, not beside it.
 			Eventually(func() bool {
-				logs, _ := utils.GetHomeClusterAutoscalerLogs(namespace, 1000)
-				return strings.Contains(logs, "NodeGroupDeleteNodes")
-			}, caDetectionTimeout, checkInterval).Should(BeTrue(),
-				"homelab-autoscaler should receive NodeGroupDeleteNodes call")
+				logs, _ := utils.GetHomeClusterAutoscalerLogs(namespace, logTailLines)
 
-			// The replacement for "Node CR powerState is set to off": in v2alpha1 there is no spec
-			// field that carries a scale-down. The machine is not wanted exactly when no live claim
-			// names the slot, and that is the read the provider's NodeGroupDeleteNodes and the
-			// input law agree on.
-			By("Verifying the slot is not wanted: no live NodeClaim names it")
-			Eventually(func() int {
-				live, err := liveClaimsOfSlot(agentNode0)
+				return strings.Contains(logs, "NodeGroupDeleteNodes called")
+			}, deleteNodesRPCTimeout, checkInterval).Should(BeTrue(),
+				"homelab-autoscaler should receive NodeGroupDeleteNodes: the provider logs the call it answers")
+
+			By("Verifying the provider cancelled the claim of this machine")
+			// The RPC line names the group and a count, so a scale-down of the pool's other machine answers
+			// it. The provider's cancellation line names the slot and the claim, and it is written on the
+			// write that takes the machine out of the target size.
+			Eventually(func() bool {
+				logs, _ := utils.GetHomeClusterAutoscalerLogs(namespace, logTailLines)
+
+				return providerCancelledClaimOf(logs, agentNode0)
+			}, deleteNodesRPCTimeout, checkInterval).Should(BeTrue(),
+				"the provider must answer the scale-down of %s by cancelling the claim that wanted it",
+				agentNode0)
+
+			By("Verifying the claim of the machine is marked, with the request on it")
+			// A machine is wanted exactly when a live claim names its slot, so this is where a scale-down
+			// is readable: the provider records the request on the live claim (call: DeleteNodes, nodes:
+			// the names) and deletes it. A booting or ready claim keeps its finalizer while the machine
+			// drains, so at this instant the claim is live and marked; the slot with no live claim at all
+			// is pinned below, once the machine is observed off.
+			Eventually(func() string {
+				live, err := liveClaimOfSlot(agentNode0)
 				if err != nil {
-					return -1
+					return "the claims of the slot are unreadable: " + err.Error()
 				}
 
-				return len(live)
-			}, 30*time.Second, checkInterval).Should(Equal(0),
-				"A scale-down leaves no live claim on the slot: a pending one is deleted outright,\n"+
-					"a booting or ready one is deleted through its finalizer")
+				if live == nil {
+					// Nothing left to cancel: a pending claim has no finalizer, so it goes outright and the
+					// machine comes down by the input law.
+					return claimCancelled
+				}
+
+				if live.DeletionTimestamp.IsZero() {
+					return fmt.Sprintf("claim %s is live and unmarked: the scale-down has not named it", live.Name)
+				}
+
+				if live.Spec.Request.Call != infrav2alpha1.ClaimCallDeleteNodes {
+					return fmt.Sprintf("claim %s is marked, but its request is call %q, not DeleteNodes",
+						live.Name, live.Spec.Request.Call)
+				}
+
+				if !requestNamesNode(live.Spec.Request.Nodes, agentNode0) {
+					return fmt.Sprintf("claim %s records a DeleteNodes request for %v, which does not name %s",
+						live.Name, live.Spec.Request.Nodes, agentNode0)
+				}
+
+				return claimCancelled
+			}, deleteNodesRPCTimeout, checkInterval).Should(Equal(claimCancelled),
+				"A scale-down is a request on an object: the claim of the slot carries the call that ended it,\n"+
+					"the nodes it named, and the mark that runs the shutdown")
 
 			By("Verifying the slot reports the machine coming down")
-			// The report of a machine the pool has stopped wanting is draining while it is observed
-			// up (cordoned, shutdown Job in flight) and off once it is down. Which of the two this
-			// pass sees depends on how far the shutdown got, so the pair is the assertion, and the
-			// off end of it is pinned below, after the Job completes.
-			Eventually(func() bool {
-				return slotIsUnwanted(agentNode0)
-			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
-				"The report of a slot whose machine is unwanted is off, or draining while the machine comes down")
+			// The machine is observed up and its claim is named for deletion: that row of the input table
+			// reports draining - cordoned, with the shutdown path owning the slot. The off end of the
+			// sequence is pinned below, after the Job has run and the machine is down.
+			Eventually(func() infrav2alpha1.NodePhase {
+				return slotPhase(agentNode0)
+			}, machineStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseDraining),
+				"The report of a slot whose machine is observed up while a scale-down names its claim is draining")
 
-			By("Verifying shutdown job is created")
-			Eventually(func() bool {
-				cmd := kubectl("get", "jobs",
-					"-l", "type=shutdown",
-					"-n", namespace,
-					"-o", "jsonpath={.items[*].metadata.name}")
-				output, err := utils.Run(cmd)
-				return err == nil && len(strings.TrimSpace(output)) > 0
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
-				"Shutdown job should be created")
+			var shutdownJob string
 
-			By("Verifying shutdown job has correct ServiceAccount")
-			Eventually(func() bool {
-				return utils.VerifyJobHasServiceAccount(namespace, "type=shutdown", "controller-manager")
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
-				"Shutdown job should use controller-manager ServiceAccount")
-
-			By("Verifying shutdown job has Secret volume")
-			Eventually(func() bool {
-				return utils.VerifyJobHasVolume(namespace, "type=shutdown", "auth-secrets")
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
-				"Shutdown job should have auth-secrets volume")
-
-			// Verify TTL is set for automatic job cleanup
-			// Jobs have ttlSecondsAfterFinished: 600 (10 minutes) by default
-			By("Verifying shutdown job has TTL set")
+			By("Verifying the shutdown job of this machine is created")
+			// The selector is the slot, and the Job is the one that started after the autoscaler decided.
+			// "a shutdown Job exists in the namespace" is answered by the Job the setup's shutdown of the
+			// same slot left behind, which is a true sentence about nothing this spec did.
 			Eventually(func() string {
-				out, _ := utils.Run(kubectl("get", "jobs",
-					"-l", "type=shutdown",
-					"-n", namespace,
-					"-o", "jsonpath={.items[*].spec.ttlSecondsAfterFinished}"))
+				shutdownJob = newestLifecycleJobOfSlot(fsm.PhaseShutdown, agentNode0, scaleDownStarted)
 
-				return strings.TrimSpace(out)
-			}, 60*time.Second, checkInterval).Should(
-				And(Not(BeEmpty()), Not(Equal("<no value>"))),
-				"Shutdown job should have ttlSecondsAfterFinished set")
+				return shutdownJob
+			}, 90*time.Second, checkInterval).ShouldNot(BeEmpty(),
+				"the shutdown transition of the scale-down creates a shutdown Job for %s",
+				agentNode0)
+
+			By("Verifying the shutdown job carries the spec the slot declares")
+			// One read of the typed object, and one sentence: the controller's ServiceAccount, the Secret
+			// volume the slot declares for its shutdown hook, and a TTL so a pool that scales twice a day
+			// does not accumulate Jobs.
+			Eventually(func() string {
+				job, err := readJob(shutdownJob)
+				if err != nil {
+					return err.Error()
+				}
+
+				return lifecycleJobSpecProblem(job, "controller-manager", "auth-secrets")
+			}, 60*time.Second, checkInterval).Should(BeEmpty(),
+				"the shutdown Job of the scale-down is the Job the slot's shutdownPodSpec declares")
 
 			By("Verifying VM control server receives /stop request")
+			// The request log is read over a window: a /stop for this machine in the last bootRequestWindow.
+			// The setup stopped this machine once already, and a gate that read the whole file is answered by
+			// that older request.
 			Eventually(func() bool {
-				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/stop", agentNode0, 30*time.Second)
+				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/stop", agentNode0, bootRequestWindow)
 			}, 60*time.Second, checkInterval).Should(BeTrue(),
 				"VM control server should receive /stop request for %s", agentNode0)
 
 			By("Verifying shutdown job completes")
-			success, jobLogs, jobEvents := utils.WaitForJobCompletionWithError(namespace, "type=shutdown", jobCompletionTimeout)
-			Expect(success).To(BeTrue(),
-				"Shutdown job should complete successfully. Job Logs: %s. Job Events: %s", jobLogs, jobEvents)
+			// The count is read off job.status.succeeded. The suite used to accept any Job in the namespace
+			// whose status string contained a "1", which a Job of another slot, or of a past episode, answers.
+			Eventually(func() string {
+				job, err := readJob(shutdownJob)
+				if err != nil {
+					return err.Error()
+				}
+
+				if job.Status.Succeeded >= 1 {
+					return ""
+				}
+
+				if job.Status.Failed >= 1 {
+					logs, logErr := utils.GetJobLogs(namespace, lifecycleJobSelector(fsm.PhaseShutdown, agentNode0))
+
+					return fmt.Sprintf("job %s failed: %s", job.Name, logs+" "+logErr.Error())
+				}
+
+				return fmt.Sprintf("job %s is running: active=%d succeeded=%d failed=%d",
+					job.Name, job.Status.Active, job.Status.Succeeded, job.Status.Failed)
+			}, jobCompletionTimeout, checkInterval).Should(BeEmpty(),
+				"the shutdown Job of the scale-down runs the power-off the slot declares")
 
 			By("Verifying k3d node stops")
 			Eventually(func() bool {
@@ -450,26 +629,26 @@ spec:
 			}, vmShutdownTimeout, checkInterval).Should(BeTrue(),
 				"k3d node %s should stop", agentNode0)
 
-			// The replacement for "Node CR progress becomes shutdown". The report of the slot is
-			// derived from (the live claim, the observed power, the usability of the node) by
-			// phase.Derive, and the machine is off with no claim: the slot is off, and the power the
-			// provider observes is off.
+			// The slot's report is derived from (the live claim, the observed power, the usability of the
+			// node). The machine is off and its claim has ended: nothing is wanted and nothing is running,
+			// which is the off row of the table, and the power the provider observes is off with it.
 			By("Verifying the slot's report becomes off")
 			Eventually(func() infrav2alpha1.NodePhase {
 				return slotPhase(agentNode0)
-			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseOff),
+			}, machineStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseOff),
 				"The derived phase of a free slot with no machine is off")
 
 			By("Verifying the machine is observed off")
 			Eventually(func() infrav2alpha1.PowerState {
 				return slotPowerState(agentNode0)
-			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.PowerStateOff),
+			}, machineStateTimeout, checkInterval).Should(Equal(infrav2alpha1.PowerStateOff),
 				"The observed power state of the slot is off")
 
 			By("Verifying the scale-down left no claim owning the slot")
-			// A claim a scale-down marked keeps its finalizer until the machine is observed off, then
-			// ends completed and is released. The target size of the group counts live claims, so the
-			// unit came off on the write that named the machine.
+			// A claim a scale-down marked keeps its finalizer until the machine is observed off, then ends
+			// completed and is released. The target size of the group counts live claims, so the unit came
+			// off on the write that named the machine: from here the slot is free, and the next IncreaseSize
+			// may claim it.
 			Eventually(func() int {
 				live, err := liveClaimsOfSlot(agentNode0)
 				if err != nil {
@@ -481,10 +660,9 @@ spec:
 				"The claim of the episode is not live: the slot is free, and the next IncreaseSize may claim it")
 
 			By("Verifying the slot's digest records an episode that ended")
-			// The claims are collected by their TTL and the story survives in Node.status.lastClaim.
-			// A slot whose machines were never claimed has no digest at all, which is the empty case
-			// of this read; what must never happen is a digest that reports a live phase on a slot
-			// whose machine is off.
+			// The claims are collected by their TTL and the story survives in Node.status.lastClaim. A slot
+			// whose machines were never claimed has no digest at all, which is the empty case of this read;
+			// what must never happen is a digest that reports a live phase on a slot whose machine is off.
 			Eventually(func() bool {
 				digest := slotDigest(agentNode0)
 				if digest == nil {
@@ -497,12 +675,15 @@ spec:
 					"or there is no claim to record")
 
 			By("Verifying Kubernetes node becomes NotReady")
+			// The kubelet of a stopped machine stops beating, and the node lifecycle controller declares the
+			// node NotReady after its monitor grace period: an observation, minutes late by construction.
 			Eventually(func() bool {
 				out, _ := utils.Run(kubectl("get", "node", agentNode0,
 					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"))
 				status := strings.TrimSpace(out)
-				return status == "False" || status == "Unknown"
-			}, nodeStateTimeout, checkInterval).Should(BeTrue(),
+
+				return status == "False" || status == "Unknown" || status == ""
+			}, machineStateTimeout, checkInterval).Should(BeTrue(),
 				"Kubernetes node should be NotReady or Unknown")
 
 			// Store node name for Test 3 (Scale-Up Workflow)
@@ -520,7 +701,8 @@ spec:
 	//
 	// Flow:
 	// 1. Apply deployment targeting the shutdown node (it's tainted, so pod stays pending)
-	// 2. CA detects need for scale-up (pending pod can't be scheduled)
+	// 2. CA decides to grow the group: it writes "Scale-up: setting group group1 size to N" as it calls
+	//    the provider, because the pending pod fits no existing node
 	// 3. CA calls our gRPC server's NodeGroupIncreaseSize method
 	// 4. The provider creates a NodeClaim on the free slot: the request, with its attribution
 	//    (call, delta, group, requestedBy), its deadline, its TTL and an ownerReference on the slot
@@ -533,17 +715,20 @@ spec:
 	// 8. Deployment pod gets scheduled on the now-ready node
 	//
 	// Key validations:
-	// - gRPC call was made
+	// - CA's decision is in its own log naming the pool, and the RPC reached the provider
 	// - a NodeClaim exists for the slot, and it is the record of the request: attribution, deadline,
 	//   attempt, TTL, ownerReference
 	// - the claim's phases are the phases of the model: pending -> booting (committed) -> ready
 	// - the slot's derived phase follows the claim: off -> booting -> ready
 	// - the observed power state is on
-	// - Startup job created with correct spec (ServiceAccount, volumes, TTL)
-	// - VM control server received /start request
-	// - k3d node actually started
+	// - the startup Job of this attempt, on this slot, carries the spec the slot declares
+	//   (ServiceAccount, volume, TTL) and its status.succeeded says it ran
+	// - VM control server received /start for this machine, and the k3d node actually started
 	// - the slot keeps the digest of the claim that served the request, and a startup timestamp
 	// - Kubernetes node became Ready AND uncordoned (unschedulable=false)
+	// - a ready claim that crosses its boot deadline keeps its machine: the observation outlives the
+	//   budget the claim names, because a machine that serves the pool is past its boot budget by any
+	//   measure, and nothing may read that as a reason to power it off
 	// - Deployment pod scheduled on the correct node
 	//
 	// IMPORTANT: The node must be BOTH Ready AND unschedulable=false before
@@ -553,11 +738,27 @@ spec:
 	// =============================================================================
 	Context("Scale-Up Workflow", func() {
 		It("should verify Cluster Autoscaler scales up when pods need scheduling", func() {
+			// The minute this spec starts watching from, for the same reason as in the scale-down spec: the
+			// lifecycle Jobs of earlier episodes of this slot exist, and they are not this attempt's.
+			scaleUpStarted := time.Now()
+
 			By("Verifying node is off from Test 2")
 			Expect(shutdownNodeName).ToNot(BeEmpty(),
 				"shutdownNodeName should be set by Test 2")
 			Expect(slotPhase(shutdownNodeName)).To(Equal(infrav2alpha1.NodePhaseOff),
 				"The slot of the scale-up starts free: off, and no live claim names it")
+
+			// The shape IncreaseSize reads as "claimable": the scale-down of the last spec ended the claim
+			// that wanted this machine, so nothing names the slot and the group has a free slot to hand out.
+			Eventually(func() int {
+				live, err := liveClaimsOfSlot(shutdownNodeName)
+				if err != nil {
+					return -1
+				}
+
+				return len(live)
+			}, 30*time.Second, checkInterval).Should(Equal(0),
+				"The slot the scale-up starts from is free: no live NodeClaim names it")
 
 			// Untaint the shutdown node to allow scheduling
 			// This is necessary because we taint nodes in Test 1 to prevent
@@ -594,24 +795,32 @@ spec:
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply deployment: %s", output)
 
-			By("Waiting for CA to detect need for scale-up")
+			By("Waiting for Cluster Autoscaler to decide to grow the group")
+			// "scale up" is in the autoscaler's log on every idle pass - "Nothing to do: no pods and no need
+			// to scale up" is the sentence of a scale-up that did not happen. The orchestrator writes its
+			// decision, naming the pool, as it calls the provider:
+			//
+			//	Scale-up: setting group group1 size to 2
+			//
+			// which is the gate: a plan for this pool, on this pass.
 			Eventually(func() bool {
-				logs, _ := utils.GetClusterAutoscalerLogs(namespace, 1000)
-				return strings.Contains(logs, "IncreaseSize") ||
-					strings.Contains(logs, "scale up")
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
-				"CA should detect need for scale-up")
+				logs, _ := utils.GetClusterAutoscalerLogs(namespace, logTailLines)
+
+				return caLoggedScaleUpOf(logs, groupName)
+			}, caDecisionTimeout, checkInterval).Should(BeTrue(),
+				"Cluster Autoscaler must log its scale-up decision for group %s. Check CA logs.", groupName)
 
 			By("Verifying gRPC NodeGroupIncreaseSize call was made")
 			Eventually(func() bool {
-				logs, _ := utils.GetHomeClusterAutoscalerLogs(namespace, 1000)
-				return strings.Contains(logs, "NodeGroupIncreaseSize")
-			}, 30*time.Second, checkInterval).Should(BeTrue(),
-				"homelab-autoscaler should receive NodeGroupIncreaseSize call")
+				logs, _ := utils.GetHomeClusterAutoscalerLogs(namespace, logTailLines)
 
-			// The replacement for "Node CR powerState is set to On": the scale-up is an object. The
-			// provider creates it on a free slot, and everything the scalar could not say - who
-			// asked, which call, for which pool, with what budget, which attempt - is on it.
+				return strings.Contains(logs, "NodeGroupIncreaseSize called")
+			}, deleteNodesRPCTimeout, checkInterval).Should(BeTrue(),
+				"homelab-autoscaler should receive NodeGroupIncreaseSize: the provider logs the call it answers")
+
+			// A scale-up is an object. The provider creates it on a free slot, and on it is the whole
+			// request: who asked, through which call, for which pool, by how much, with what budget, and
+			// which attempt of that slot it is.
 			By("Verifying the provider created a NodeClaim for the slot")
 			Eventually(func() error {
 				fresh, err := liveClaimOfSlot(shutdownNodeName)
@@ -664,11 +873,11 @@ spec:
 					"registration wait + readiness gate + margin), floored by the group's number")
 
 			By("Verifying the budget outlasts the deadlines one attempt can spend in series")
-			// B2. The deadline runs from spec.requestedAt, i.e. from before the startup Job exists,
-			// so one attempt can spend the Job's own timeout, then the registration wait, then the
-			// readiness gate - about 10m30s of deadlines. A budget that omits the Job's timeout
-			// (7m10s, the first sketch of §4) fails a claim in the middle of the machine it is still
-			// buying, and the machine that boots an instant later is force-shut-down as overdue.
+			// The deadline runs from spec.requestedAt, i.e. from before the startup Job exists, so one
+			// attempt can spend the Job's own timeout, then the registration wait, then the readiness gate -
+			// about 10m30s of deadlines. A budget that omits the Job's timeout fails a claim in the middle
+			// of the machine it is still buying, and the machine that boots an instant later is
+			// force-shut-down as overdue.
 			Eventually(func() bool {
 				fresh, err := newestClaimOfSlot(shutdownNodeName)
 				if err != nil || fresh == nil || fresh.Spec.DeadlineAt == nil {
@@ -757,45 +966,38 @@ spec:
 			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseBooting),
 				"The report of a slot with a claim whose startup operation is in flight is booting")
 
-			By("Verifying startup job is created")
-			Eventually(func() bool {
-				out, err := utils.Run(kubectl("get", "jobs",
-					"-l", "type=startup",
-					"-n", namespace,
-					"-o", "jsonpath={.items[*].metadata.name}"))
+			var startupJob string
 
-				return err == nil && len(strings.TrimSpace(out)) > 0
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
-				"Startup job should be created")
-
-			By("Verifying startup job has correct ServiceAccount")
-			Eventually(func() bool {
-				return utils.VerifyJobHasServiceAccount(namespace, "type=startup", "controller-manager")
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
-				"Startup job should use controller-manager ServiceAccount")
-
-			By("Verifying startup job has ConfigMap volume")
-			Eventually(func() bool {
-				return utils.VerifyJobHasVolume(namespace, "type=startup", "startup-config")
-			}, 60*time.Second, checkInterval).Should(BeTrue(),
-				"Startup job should have startup-config volume")
-
-			// Verify TTL is set for automatic job cleanup
-			By("Verifying startup job has TTL set")
+			By("Verifying the startup job of this machine is created")
+			// The pending -> booting write of the claim is what creates the startup Job, so the Job the
+			// scale-up owes is one this attempt created. Scoped to the slot, and to the minute this spec
+			// started watching: the setup's boot of the same machine left a completed startup Job behind.
 			Eventually(func() string {
-				out, _ := utils.Run(kubectl("get", "jobs",
-					"-l", "type=startup",
-					"-n", namespace,
-					"-o", "jsonpath={.items[*].spec.ttlSecondsAfterFinished}"))
+				startupJob = newestLifecycleJobOfSlot(fsm.PhaseStartup, shutdownNodeName, scaleUpStarted)
 
-				return strings.TrimSpace(out)
-			}, 60*time.Second, checkInterval).Should(
-				And(Not(BeEmpty()), Not(Equal("<no value>"))),
-				"Startup job should have ttlSecondsAfterFinished set")
+				return startupJob
+			}, 90*time.Second, checkInterval).ShouldNot(BeEmpty(),
+				"the startup transition of the claim creates a startup Job for %s", shutdownNodeName)
+
+			By("Verifying the startup job carries the spec the slot declares")
+			// One read of the typed object, and one sentence: the controller's ServiceAccount, the ConfigMap
+			// the slot's startupPodSpec mounts, and a TTL so a pool that scales twice a day does not
+			// accumulate Jobs.
+			Eventually(func() string {
+				job, err := readJob(startupJob)
+				if err != nil {
+					return err.Error()
+				}
+
+				return lifecycleJobSpecProblem(job, "controller-manager", "startup-config")
+			}, 60*time.Second, checkInterval).Should(BeEmpty(),
+				"the startup Job of the scale-up is the Job the slot's startupPodSpec declares")
 
 			By("Verifying VM control server receives /start request")
+			// The request log is read over the last 30s, so this is the /start of this boot: the setup's
+			// claim booted the same machine earlier, and its /start is in the log too.
 			Eventually(func() bool {
-				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/start", shutdownNodeName, 30*time.Second)
+				return utils.VerifyVMControlServerRequest(vmControlLogFile, "/start", shutdownNodeName, bootRequestWindow)
 			}, 60*time.Second, checkInterval).Should(BeTrue(),
 				"VM control server should receive /start request for %s", shutdownNodeName)
 
@@ -804,19 +1006,37 @@ spec:
 				cmd := exec.Command("k3d", "node", "list", shutdownNodeName)
 				output, _ := cmd.CombinedOutput()
 				outputStr := strings.ToLower(string(output))
-				return strings.Contains(outputStr, "running") || strings.Contains(outputStr, "up")
+
+				return strings.Contains(outputStr, "running")
 			}, vmStartupTimeout, checkInterval).Should(BeTrue(),
 				"k3d node %s should start", shutdownNodeName)
 
 			By("Verifying startup job completes")
-			success, jobLogs, jobEvents := utils.WaitForJobCompletionWithError(namespace, "type=startup", jobCompletionTimeout)
-			Expect(success).To(BeTrue(),
-				"Startup job should complete successfully. Job Logs: %s. Job Events: %s", jobLogs, jobEvents)
+			// The count is read off job.status.succeeded, for this attempt's Job.
+			Eventually(func() string {
+				job, err := readJob(startupJob)
+				if err != nil {
+					return err.Error()
+				}
 
-			// The replacement for "Node CR progress becomes ready". The claim's ready phase is the
-			// claim's assertion that the machine it asked for can take the pool's work - the node is
-			// Ready, uncordoned, and free of the pool's readiness taints - which is a stronger
-			// sentence than "the corev1.Node is Ready", and it is the sentence the autoscaler's
+				if job.Status.Succeeded >= 1 {
+					return ""
+				}
+
+				if job.Status.Failed >= 1 {
+					logs, logErr := utils.GetJobLogs(namespace, lifecycleJobSelector(fsm.PhaseStartup, shutdownNodeName))
+
+					return fmt.Sprintf("job %s failed: %s %s", job.Name, logs, logErr)
+				}
+
+				return fmt.Sprintf("job %s is running: active=%d succeeded=%d failed=%d",
+					job.Name, job.Status.Active, job.Status.Succeeded, job.Status.Failed)
+			}, jobCompletionTimeout, checkInterval).Should(BeEmpty(),
+				"the startup Job of the scale-up asks the machine for power")
+
+			// The claim's ready phase is the claim's assertion that the machine it asked for can take the
+			// pool's work - the node is Ready, uncordoned, and free of the pool's readiness taints - which is
+			// a stronger sentence than "the corev1.Node is Ready", and it is the sentence the autoscaler's
 			// placement simulation is answered by.
 			By("Verifying the claim reaches ready")
 			Eventually(func() infrav2alpha1.NodeClaimPhase {
@@ -926,8 +1146,16 @@ spec:
 				"Node %s should be Ready", shutdownNodeName)
 
 			// Update Group CR to prevent immediate scale-down during pod startup
-			// After the node becomes ready, CA might see it as unneeded (only 1 small pod)
-			// and try to scale it down again. We relax the settings to give the pod time.
+			// After the node becomes ready, CA might see it as unneeded (only 1 small pod) and try to scale
+			// it down again, so the unneeded window is relaxed well past the observation this spec makes
+			// below: the machine the claim bought stays in service while the suite watches it, and the
+			// autoscaler's scale-down of a machine is the scale-down spec's subject, not this one's. The
+			// pool's maxNodeProvisionTime is raised in the same write because it is the number
+			// cluster-autoscaler is told as its own scale-up termination deadline (NodeGroupGetOptions): a
+			// k3d machine boots in minutes, and an autoscaler that gives up at 2m sends a second IncreaseSize
+			// for the pod that is already on its way - onto the pool's other slot, which is the machine the
+			// pod must not land on. The operator's budget for one attempt is longer than 5m, so the claim
+			// deadlines of this run are unchanged (claim.DeadlineAt takes the larger of the two).
 			By("Updating Group CR to prevent immediate scale-down during pod startup")
 			groupYAML := `
 apiVersion: infra.homecluster.dev/v2alpha1
@@ -937,23 +1165,14 @@ metadata:
   namespace: homelab-autoscaler-system
 spec:
   ignoreDaemonSetsUtilization: true
-  maxNodeProvisionTime: 2m
+  maxNodeProvisionTime: 5m
   scaleDownGpuUtilizationThreshold: "30"
-  scaleDownUnneededTime: 2m
+  scaleDownUnneededTime: 20m
   scaleDownUnreadyTime: 30s
   scaleDownUtilizationThreshold: "0.05"
   zeroOrMaxNodeScaling: false
 `
-			tmpFile, err := os.CreateTemp("", "group-scaleup-*.yaml")
-			Expect(err).NotTo(HaveOccurred())
-			defer os.Remove(tmpFile.Name())
-			_, err = tmpFile.WriteString(groupYAML)
-			Expect(err).NotTo(HaveOccurred())
-			tmpFile.Close()
-			cmd = exec.Command("kubectl", "apply", "-f", tmpFile.Name())
-			cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
-			output, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to update Group: %s", output)
+			applyGroupCR(groupYAML)
 
 			By("Verifying the scale-up of the claim is still standing")
 			Consistently(func() infrav2alpha1.NodePhase {
@@ -962,28 +1181,34 @@ spec:
 				"The relaxed scale-down settings keep the machine the claim bought in service")
 
 			By("Verifying a boot deadline in the past leaves a ready claim alone")
-			// B1, on a live cluster. The deadline is the budget of the boot window (12m10s), and a
-			// machine that serves the pool for an hour is past it by any measure. A controller that
-			// applies the deadline to a ready claim destroys working capacity on a timer: the claim
-			// lands failed/DeadlineExceeded, a shutdown Job runs, the node is cordoned, and the pod
-			// on it is evicted. The write below manufactures the shape every healthy machine reaches
-			// - a ready claim with a deadline in its past - and the window is long enough to outlive
-			// the whole budget, so the failure is visible, not a race with a 15s poll.
+			// The deadline is the budget of the boot window, and a machine that serves the pool for an hour
+			// is past it by any measure. A controller that applies the deadline to a ready claim destroys
+			// working capacity on a timer: the claim lands failed/DeadlineExceeded, a shutdown Job runs, the
+			// node is cordoned, and the pod on it is evicted. The write below manufactures the shape every
+			// healthy machine reaches - a ready claim with a deadline in its past - and the window below
+			// outlives the budget the claim names, so the same shape is watched as the claim crosses its own
+			// deadline inside the observation, and not only as a stamped fake.
 			serving, err := newestClaimOfSlot(shutdownNodeName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(serving).NotTo(BeNil())
 
+			// The natural deadline of the attempt, read off the object before it is stamped: the window is
+			// measured from it, so the observation crosses the deadline the provider wrote.
+			naturalDeadline := serving.Spec.DeadlineAt
+
 			Expect(stampClaimDeadline(serving.Name, time.Now().Add(-3*time.Hour))).To(Succeed(),
 				"The deadline of a served claim can be pushed into the past by anything that writes the object")
 
+			watch := deadlineWatchWindow(naturalDeadline)
+
 			Consistently(func() string {
-				claim, err := newestClaimOfSlot(shutdownNodeName)
-				if err != nil || claim == nil {
+				served, err := newestClaimOfSlot(shutdownNodeName)
+				if err != nil || served == nil {
 					return "claim-gone"
 				}
 
-				if string(claim.Status.Phase) != string(infrav2alpha1.NodeClaimReady) {
-					return "claim-" + string(claim.Status.Phase) + "-" + claim.Status.Reason
+				if string(served.Status.Phase) != string(infrav2alpha1.NodeClaimReady) {
+					return "claim-" + string(served.Status.Phase) + "-" + served.Status.Reason
 				}
 
 				if slotPhase(shutdownNodeName) != infrav2alpha1.NodePhaseReady {
@@ -1001,7 +1226,7 @@ spec:
 				}
 
 				return "ready"
-			}, 3*time.Minute, checkInterval).Should(Equal("ready"),
+			}, watch, checkInterval).Should(Equal("ready"),
 				"A ready claim past its boot deadline stays ready: the machine, its node object, and the pod on it are left alone")
 
 			By("Verifying deployment pod is scheduled on the correct node")
@@ -1027,14 +1252,197 @@ func getProjectDir() string {
 }
 
 // =============================================================================
+// The harness as the machine
+// =============================================================================
+// The pool's machines are k3d containers, and the only thing that powers them is the VM control server
+// the suite runs. So the suite is the provider's counterpart: it writes the claim that says a machine
+// is wanted, and it stops wanting the ones it takes out of service. These are the only writes this
+// suite makes to a claim, and they are the shape of the machine lifecycle the provider drives: a claim
+// created on a free slot boots the machine, a claim deleted stops wanting it.
+// =============================================================================
+
+// harnessClaimName is the name of the claim the harness writes for one of its machines. The name is
+// deterministic, so claiming a slot twice is one apply that replaces the request, not two objects
+// competing for one slot - which is the rule the model enforces on every writer.
+func harnessClaimName(slotName string) string {
+	return slotName + "-e2e"
+}
+
+// claimSlot is the harness asking for a machine on a slot: it writes the NodeClaim with the
+// attribution a scale-up carries (request.call: IncreaseSize, the group, a delta, the requester) and
+// its budget, and then waits for the claim to report ready. Everything after the write is the model:
+// a live claim on a slot whose machine is observed off is a request the input law answers by booting
+// it, the startup Job asks the VM control server for the machine, and the readiness gate stamps the
+// claim ready once the node is Ready, uncordoned and free of the pool's readiness taints.
+//
+// A caller must claim a slot whose machine is observed off. A claim on a slot whose machine is already
+// up is a request nothing boots - the law starts no startup Job for a machine that is running - so the
+// suite brings its machines down first, exactly as a pool whose machines are off starts.
+func claimSlot(slotName, requestedBy string) *infrav2alpha1.NodeClaim {
+	GinkgoHelper()
+
+	slot, err := readSlot(slotName)
+	Expect(err).NotTo(HaveOccurred(), "the slot of a machine the harness boots must be readable")
+
+	out, err := applyObject(newHarnessClaim(slot, requestedBy))
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply the harness's NodeClaim for slot %s: %s", slotName, out)
+
+	// The phase, with the reason beside it: a claim that ends failed names why, and the suite says so.
+	Eventually(func() string {
+		fresh, err := newestClaimOfSlot(slotName)
+		if err != nil {
+			return "claims-unreadable"
+		}
+
+		if fresh == nil {
+			return "no-claim"
+		}
+
+		return string(fresh.Status.Phase) + "/" + fresh.Status.Reason
+	}, claimReadyTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodeClaimReady)+"/"),
+		"the claim the harness wrote for slot %s reaches ready: the machine is up, joined, and usable",
+		slotName)
+
+	fresh, err := newestClaimOfSlot(slotName)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(fresh).NotTo(BeNil())
+
+	return fresh
+}
+
+// newHarnessClaim is the claim of a simulated machine: the same object the provider's IncreaseSize
+// writes (internal/claim.New), built by the harness for a machine it owns. The attribution is the
+// provider's - the call that made the request, the pool it was for, the delta - and the requestedBy
+// names the caller, so `kubectl get nodeclaim` says which requests came from the autoscaler and which
+// from the harness's own machines.
+func newHarnessClaim(slot *infrav2alpha1.Node, requestedBy string) *infrav2alpha1.NodeClaim {
+	requestedAt := time.Now()
+	ttl := claim.DefaultTTLSecondsAfterFinished
+	owner := true
+	floor := groupFloor(groupName)
+	deadline := metav1.NewTime(claim.DeadlineAt(requestedAt, floor))
+
+	return &infrav2alpha1.NodeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: infrav2alpha1.GroupVersion.String(),
+			Kind:       "NodeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      harnessClaimName(slot.Name),
+			Namespace: slot.Namespace,
+			Labels: map[string]string{
+				claim.LabelSlot:  slot.Name,
+				claim.LabelGroup: groupName,
+			},
+			// The claim is owned by the slot it asks for, so deleting a slot takes its claims with it.
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         infrav2alpha1.GroupVersion.String(),
+				Kind:               "Node",
+				Name:               slot.Name,
+				UID:                slot.UID,
+				Controller:         &owner,
+				BlockOwnerDeletion: &owner,
+			}},
+		},
+		Spec: infrav2alpha1.NodeClaimSpec{
+			SlotRef: corev1.ObjectReference{
+				APIVersion: infrav2alpha1.GroupVersion.String(),
+				Kind:       "Node",
+				Namespace:  slot.Namespace,
+				Name:       slot.Name,
+				UID:        slot.UID,
+			},
+			RequestedAt: metav1.NewTime(requestedAt),
+			RequestedBy: requestedBy,
+			Request: infrav2alpha1.ClaimRequest{
+				Call:  infrav2alpha1.ClaimCallIncreaseSize,
+				Delta: 1,
+				Group: groupName,
+			},
+			DeadlineAt:              &deadline,
+			MaxNodeProvisionTime:    floor,
+			TTLSecondsAfterFinished: &ttl,
+		},
+	}
+}
+
+// releaseSlot is the harness stopping wanting one of its machines: it deletes the live claim of the
+// slot. A pending claim goes outright, and the input law powers the machine down; a booting or ready
+// claim is deleted through its finalizer, so the shutdown path runs to the end and the object is
+// released once the machine is observed off.
+//
+// It reports to the Ginkgo writer rather than gating on the observation: its callers are the specs that
+// hand a machine back at the end of a run, and a cleanup that fails a suite for a slow power-off would
+// be a suite that fails on its own housekeeping. What the suite asserts about a release is asserted by
+// the spec that reads the slot.
+func releaseSlot(slotName string) {
+	GinkgoHelper()
+
+	live, err := liveClaimOfSlot(slotName)
+	if err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "releaseSlot(%s): the claims of the slot are unreadable: %v\n", slotName, err)
+
+		return
+	}
+
+	if live == nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "releaseSlot(%s): no live claim names the slot\n", slotName)
+
+		return
+	}
+
+	out, err := utils.Run(kubectl("delete", "nodeclaim", live.Name, "-n", namespace, "--ignore-not-found"))
+	if err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "releaseSlot(%s): deleting claim %s: %s\n", slotName, live.Name, out)
+	}
+}
+
+// applyGroupCR writes a Group CR and applies it. The suite changes the pool's numbers mid-run - the
+// aggressive scale-down window the scale-down spec needs, the relaxed one the scale-up spec needs - and
+// writes them through the pool's own API, on a temp file that is closed and removed by this helper.
+func applyGroupCR(body string) {
+	GinkgoHelper()
+
+	tmpFile, err := os.CreateTemp("", "group-*.yaml")
+	Expect(err).NotTo(HaveOccurred())
+
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+	}()
+
+	_, err = tmpFile.WriteString(body)
+	Expect(err).NotTo(HaveOccurred())
+
+	out, err := utils.Run(kubectl("apply", "-f", tmpFile.Name()))
+	Expect(err).NotTo(HaveOccurred(), "Failed to apply the Group: %s", out)
+}
+
+// applyObject writes one typed object through the API server: the suite's own claims go through the
+// same admission and the same storage as the provider's writes, with no client set and no YAML string
+// to keep in step with the API.
+func applyObject(obj client.Object) (string, error) {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return "", err
+	}
+
+	cmd := kubectl("apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(string(data))
+
+	return utils.Run(cmd)
+}
+
+// =============================================================================
 // Reads of the claim model
 // =============================================================================
 // Every assertion of this suite goes through the API the model exposes, and is typed against
-// api/infra/v2alpha1: a slot (Node CR) is read for its derived report and its observation, a
-// NodeClaim is read for its phases, its attribution and its attempt. Nothing here reads a field the
-// v1alpha1 API had and v2alpha1 removed, and nothing writes a spec field of a slot: the claims are
-// created and cancelled by the provider, through the gRPC calls cluster-autoscaler makes, and the
-// suite only watches what the model reports.
+// api/infra/v2alpha1: a slot (Node CR) is read for its derived report and its observation, a NodeClaim
+// is read for its phases, its attribution and its attempt, and a lifecycle Job is read for the spec the
+// slot declares. Nothing here reads a field a slot's spec carries as runtime intent, because the model
+// has none: a scale-up is a claim, a scale-down is the end of one, and the machine is what the
+// observation says it is. The claims are written by the provider through the gRPC calls
+// cluster-autoscaler makes, and by the harness for the machines the harness owns (see above).
 
 // kubectl returns a kubectl command wired to the test cluster's kubeconfig.
 func kubectl(args ...string) *exec.Cmd {
@@ -1156,19 +1564,18 @@ func liveClaimOfSlot(slotName string) (*infrav2alpha1.NodeClaim, error) {
 	return claim.LiveOfSlot(claims), nil
 }
 
-// newestClaimOfSlot returns the newest claim of a slot in any phase, live or terminal: the episode
-// the slot answers for, and the object the suite follows from pending to its end. It returns nil,
-// nil for a slot that has never been claimed.
-// claimSerialDeadlines is the chain of deadlines one attempt can consume in series: the startup
-// Job's own timeout, then the registration wait, then the readiness gate. The claim's budget is
-// measured from spec.requestedAt, before the Job exists, so it has to outlast all three (B2).
+// claimSerialDeadlines is the chain of deadlines one attempt can consume in series: the startup Job's
+// own timeout, then the registration wait, then the readiness gate. The claim's budget is measured from
+// spec.requestedAt, before the Job exists, so it has to outlast all three.
 func claimSerialDeadlines() time.Duration {
 	return fsm.DefaultJobTimeout + fsm.DefaultUncordonTimeout + fsm.DefaultReadinessGateTimeout
 }
 
-// stampClaimDeadline writes spec.deadlineAt of a claim: the shape every healthy machine's claim
-// reaches when its boot budget has run out, manufactured on the live object so a controller that
-// reads the deadline as a lifetime is caught in one poll, not in 12 minutes of waiting.
+// stampClaimDeadline writes spec.deadlineAt of a claim: the shape every healthy machine's claim reaches
+// when its boot budget has run out, manufactured on the live object so a controller that reads the
+// deadline as a lifetime is caught in one poll. The observation that follows it is measured from the
+// claim's natural deadline, so the same assertion is also made as the claim crosses the budget the
+// provider wrote.
 func stampClaimDeadline(name string, at time.Time) error {
 	stamp := fmt.Sprintf(`{"spec":{"deadlineAt":%q}}`, at.UTC().Format(time.RFC3339))
 	_, err := utils.Run(kubectl("patch", "nodeclaim", name, "-n", namespace,
@@ -1187,7 +1594,7 @@ func shutdownJobsOfSlot(slotName string) (int, error) {
 		return 0, err
 	}
 
-	names := strings.Fields(string(out))
+	names := strings.Fields(out)
 
 	return len(names), nil
 }
@@ -1201,9 +1608,12 @@ func nodeSchedulable(slotName string) bool {
 		return true
 	}
 
-	return strings.TrimSpace(string(out)) != "true"
+	return strings.TrimSpace(out) != "true"
 }
 
+// newestClaimOfSlot returns the newest claim of a slot in any phase, live or terminal: the episode the
+// slot answers for, and the object the suite follows from pending to its end. It returns nil, nil for a
+// slot that has never been claimed.
 func newestClaimOfSlot(slotName string) (*infrav2alpha1.NodeClaim, error) {
 	claims, err := readClaims(slotName)
 	if err != nil {
@@ -1244,4 +1654,201 @@ func groupFloor(name string) *metav1.Duration {
 	}
 
 	return &metav1.Duration{Duration: parsed}
+}
+
+// =============================================================================
+// The gates: a decision in a log, a Job of this attempt, a window past a deadline
+// =============================================================================
+// A gate is only a gate if the sentence it matches cannot be true when the thing it is watching for
+// did not happen. The three helpers below are the reads that hold that line: cluster-autoscaler's
+// decision, the lifecycle Job of the attempt that is running, and the window that outlives the budget
+// a claim names.
+// =============================================================================
+
+// caLoggedScaleDownOf reports that cluster-autoscaler logged a scale-down decision for a node. The
+// actuator writes one of these two lines as it taints the node and starts the deletion, at V(0):
+//
+//	Scale-down: removing empty node "k3d-homelab-autoscaler-agent-0"
+//	Scale-down: removing node k3d-homelab-autoscaler-agent-0, utilization: ...
+//
+// The word "unneeded" is deliberately not consulted: the autoscaler prints it as bookkeeping on every
+// pass (its flag echo, and "<node> was unneeded for 3s" from the tracker that counts the candidate's
+// timer), so a gate built on it is true on a run where the autoscaler decided nothing.
+func caLoggedScaleDownOf(logs, nodeName string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "Scale-down: removing") && strings.Contains(line, nodeName) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// caLoggedScaleUpOf reports that cluster-autoscaler logged the decision to grow a node group. The
+// orchestrator writes it, naming the pool and the size, as it calls the provider:
+//
+//	Scale-up: setting group group1 size to 2
+//
+// "scale up" alone is not a decision: the autoscaler's idle pass prints "no need to scale up", and a
+// line that is true when nothing happened cannot gate on it.
+func caLoggedScaleUpOf(logs, group string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "Scale-up: setting group "+group+" size to") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// requestNamesNode reports that a DeleteNodes request names a Kubernetes node: the attribution the
+// provider records on the claim it cancels, read back as the machine it was about.
+func requestNamesNode(nodes []string, name string) bool {
+	for _, n := range nodes {
+		if n == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+// providerCancelledClaimOf reports that the provider's log records the cancellation of the claim of one
+// slot. NodeGroupDeleteNodes writes the line on the write that records the request on a live claim and
+// marks it, so it is the RPC and the machine it was for, read from the same place: the bare
+// "NodeGroupDeleteNodes called" line names the node group and a count of nodes, which a scale-down of
+// the pool's other machine answers.
+func providerCancelledClaimOf(logs, slotName string) bool {
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "Cancelled the claim of a node named for deletion") &&
+			strings.Contains(line, slotName) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// lifecycleJobSelector is the selector of one slot's lifecycle Jobs: the phase label the suite has
+// always read (type=startup, type=shutdown) and the slot the Job belongs to, so a Job of the other
+// slot cannot answer for this machine.
+func lifecycleJobSelector(jobPhase, slotName string) string {
+	return fmt.Sprintf("type=%s,%s=%s", jobPhase, fsm.LabelNodeCR, slotName)
+}
+
+// newestLifecycleJobOfSlot is the name of the newest lifecycle Job of a slot in the given phase created
+// at or after `since`, and "" when there is none. The cut is the point: a slot that has been booted and
+// shut down twice has a Job of every past episode, and the evidence that this transition ran is the
+// Job this transition created.
+func newestLifecycleJobOfSlot(jobPhase, slotName string, since time.Time) string {
+	out, err := utils.Run(kubectl("get", "jobs", "-n", namespace,
+		"-l", lifecycleJobSelector(jobPhase, slotName), "-o", "json"))
+	if err != nil {
+		return ""
+	}
+
+	list := &batchv1.JobList{}
+	if err := json.Unmarshal([]byte(out), list); err != nil {
+		return ""
+	}
+
+	var newest *batchv1.Job
+
+	for i := range list.Items {
+		job := &list.Items[i]
+		if job.CreationTimestamp.Time.Before(since) {
+			continue
+		}
+
+		if newest == nil || job.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = job
+		}
+	}
+
+	if newest == nil {
+		return ""
+	}
+
+	return newest.Name
+}
+
+// readJob reads one Job by name, typed: the assertions about a lifecycle Job are made on the fields
+// Kubernetes defines, not on a jsonpath string compared to "<no value>".
+func readJob(name string) (*batchv1.Job, error) {
+	if name == "" {
+		return nil, fmt.Errorf("no lifecycle Job name to read")
+	}
+
+	out, err := utils.Run(kubectl("get", "job", name, "-n", namespace, "-o", "json"))
+	if err != nil {
+		return nil, err
+	}
+
+	job := &batchv1.Job{}
+	if err := json.Unmarshal([]byte(out), job); err != nil {
+		return nil, err
+	}
+
+	return job, nil
+}
+
+// lifecycleJobSpecProblem is the shape a lifecycle Job of this pool must have, read off the typed
+// object: the controller's ServiceAccount, the volume the slot declares for its hook, and a TTL so the
+// Jobs of a pool that scales twice a day are collected. "" means the Job is as declared; anything else
+// is the sentence an operator reads.
+func lifecycleJobSpecProblem(job *batchv1.Job, serviceAccount, volumeName string) string {
+	if job == nil {
+		return "the Job is not readable"
+	}
+
+	if got := job.Spec.Template.Spec.ServiceAccountName; got != serviceAccount {
+		return fmt.Sprintf("job %s runs with serviceAccount %q, not %q", job.Name, got, serviceAccount)
+	}
+
+	mounted := make([]string, 0, len(job.Spec.Template.Spec.Volumes))
+	found := false
+
+	for _, volume := range job.Spec.Template.Spec.Volumes {
+		mounted = append(mounted, volume.Name)
+
+		if volume.Name == volumeName {
+			found = true
+		}
+	}
+
+	if !found {
+		return fmt.Sprintf("job %s mounts %v, which has no %q volume", job.Name, mounted, volumeName)
+	}
+
+	if job.Spec.TTLSecondsAfterFinished == nil {
+		return fmt.Sprintf("job %s has no ttlSecondsAfterFinished: a pool that scales twice a day accumulates Jobs", job.Name)
+	}
+
+	return ""
+}
+
+// deadlineWatchWindow is how long the "a ready machine stays ready past its deadline" observation has
+// to run: from now until the claim's own deadline, plus a margin for the passes that would act on it
+// once it has passed. A window that stops short of the deadline has watched a claim that is still
+// inside its boot budget, which is the shape the assertion is not about.
+//
+// The window is measured, not hardcoded, because the budget is a sum of the operator's constants
+// (claim.AttemptBudget: the startup Job timeout, the job monitor poll, the registration wait, the
+// readiness gate and a margin) and the group's spec.maxNodeProvisionTime is a floor that only raises
+// it (claim.DeadlineAt). No pool number brings a deadline under one boot window, so the only honest
+// choice is a window that outlives it.
+func deadlineWatchWindow(deadline *metav1.Time) time.Duration {
+	watch := minDeadlineWatch
+
+	if deadline != nil {
+		if until := time.Until(deadline.Add(deadlineWatchMargin)); until > watch {
+			watch = until
+		}
+	}
+
+	if watch > maxDeadlineWatch {
+		watch = maxDeadlineWatch
+	}
+
+	return watch
 }
