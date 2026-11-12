@@ -241,6 +241,15 @@ var _ = Describe("K3d Integration", Ordered, func() {
 	// =============================================================================
 	Context("Setup & Environment Validation", func() {
 		It("should verify prerequisites and prepare environment", func() {
+			// The state of both slots, printed when this spec gives up: the report of a slot is derived
+			// from the claim, the observation and the node object, so a failure is read from those three
+			// objects, not from the value the formula printed.
+			DeferCleanup(func() {
+				if CurrentSpecReport().Failed() {
+					dumpSlotState(agentNode0, agentNode1)
+				}
+			})
+
 			By("Verifying k3d cluster is running")
 			cmd := exec.Command("k3d", "cluster", "list", clusterName)
 			_, err := utils.Run(cmd)
@@ -405,14 +414,13 @@ var _ = Describe("K3d Integration", Ordered, func() {
 
 			// The claim's ready phase is the sentence "the machine it asked for can take the pool's
 			// work", and the slot's report is the same fact recomputed from (the live claim, the observed
-			// power, the usability of the node). A pass recomputes it, and a slot that has settled into
-			// service has no event left to ask for one, so the suite asks - and then asserts the value the
-			// formula derives, which is the assertion, not the write.
+			// power, the usability of the node). The gate reads the phase, and a report that is not the one
+			// awaited prints the three objects the formula is a function of.
 			requestSlotPass(agentNode0)
 
-			Eventually(func() infrav2alpha1.NodePhase {
-				return slotPhase(agentNode0)
-			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseReady),
+			Eventually(func() string {
+				return slotReportAs(agentNode0, infrav2alpha1.NodePhaseReady)
+			}, nodeStateTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodePhaseReady)),
 				"The report of a slot with a ready claim, a Ready node and a live kubelet is ready")
 
 			Eventually(func() infrav2alpha1.PowerState {
@@ -461,6 +469,12 @@ var _ = Describe("K3d Integration", Ordered, func() {
 	// =============================================================================
 	Context("Scale-Down Workflow", func() {
 		It("should verify Cluster Autoscaler detects unneeded nodes and triggers shutdown", func() {
+			DeferCleanup(func() {
+				if CurrentSpecReport().Failed() {
+					dumpSlotState(agentNode0, agentNode1)
+				}
+			})
+
 			// The machine is in service: the setup's claim booted it, the readiness gate stamped the claim
 			// ready, and the pool's scale-down window is wide enough that cluster-autoscaler has left it
 			// alone. What this spec exercises is the autoscaler deciding that an idle machine is not needed,
@@ -576,16 +590,20 @@ var _ = Describe("K3d Integration", Ordered, func() {
 				agentNode0)
 
 			By("Verifying the shutdown job carries the spec the slot declares")
-			// One read of the typed object, and one sentence: the controller's ServiceAccount, the Secret
-			// volume the slot declares for its shutdown hook, and a TTL so a pool that scales twice a day
-			// does not accumulate Jobs.
+			// One read of the typed object, and one sentence: the controller's ServiceAccount, the two
+			// volumes the slot's shutdownPodSpec declares - the ConfigMap its script sources and the Secret
+			// it authenticates with, each named as the slot names them - and a TTL so a pool that scales
+			// twice a day does not accumulate Jobs.
 			Eventually(func() string {
 				job, err := readJob(shutdownJob)
 				if err != nil {
 					return err.Error()
 				}
 
-				return lifecycleJobSpecProblem(job, "controller-manager", "auth-secrets")
+				return lifecycleJobSpecProblem(job, "controller-manager", []lifecycleVolume{
+					{name: "config", configMap: "shutdown-config"},
+					{name: "auth", secret: "auth-secrets"},
+				})
 			}, 60*time.Second, checkInterval).Should(BeEmpty(),
 				"the shutdown Job of the scale-down is the Job the slot's shutdownPodSpec declares")
 
@@ -757,6 +775,12 @@ var _ = Describe("K3d Integration", Ordered, func() {
 	// =============================================================================
 	Context("Scale-Up Workflow", func() {
 		It("should verify Cluster Autoscaler scales up when pods need scheduling", func() {
+			DeferCleanup(func() {
+				if CurrentSpecReport().Failed() {
+					dumpSlotState(agentNode0, agentNode1)
+				}
+			})
+
 			// The minute this spec starts watching from, for the same reason as in the scale-down spec: the
 			// lifecycle Jobs of earlier episodes of this slot exist, and they are not this attempt's.
 			scaleUpStarted := time.Now()
@@ -1000,15 +1024,17 @@ var _ = Describe("K3d Integration", Ordered, func() {
 
 			By("Verifying the startup job carries the spec the slot declares")
 			// One read of the typed object, and one sentence: the controller's ServiceAccount, the ConfigMap
-			// the slot's startupPodSpec mounts, and a TTL so a pool that scales twice a day does not
-			// accumulate Jobs.
+			// the slot's startupPodSpec mounts for its script, and a TTL so a pool that scales twice a day
+			// does not accumulate Jobs.
 			Eventually(func() string {
 				job, err := readJob(startupJob)
 				if err != nil {
 					return err.Error()
 				}
 
-				return lifecycleJobSpecProblem(job, "controller-manager", "startup-config")
+				return lifecycleJobSpecProblem(job, "controller-manager", []lifecycleVolume{
+					{name: "config", configMap: "startup-config"},
+				})
 			}, 60*time.Second, checkInterval).Should(BeEmpty(),
 				"the startup Job of the scale-up is the Job the slot's startupPodSpec declares")
 
@@ -1081,12 +1107,14 @@ var _ = Describe("K3d Integration", Ordered, func() {
 
 			By("Verifying the slot's report is ready, and the machine is observed on")
 			// The report of the slot is recomputed by a pass over it, and a serving slot has no event left
-			// to ask for one: the suite asks, and the assertion is the value the formula derives.
+			// to ask for one: the suite asks, and the assertion is the value the formula derives. A report
+			// that is not the one awaited prints the claim, the observation and the node object it is a
+			// function of.
 			requestSlotPass(shutdownNodeName)
 
-			Eventually(func() infrav2alpha1.NodePhase {
-				return slotPhase(shutdownNodeName)
-			}, nodeStateTimeout, checkInterval).Should(Equal(infrav2alpha1.NodePhaseReady),
+			Eventually(func() string {
+				return slotReportAs(shutdownNodeName, infrav2alpha1.NodePhaseReady)
+			}, nodeStateTimeout, checkInterval).Should(Equal(string(infrav2alpha1.NodePhaseReady)),
 				"The report of a slot with a ready claim, a Ready node and a live kubelet is ready")
 
 			By("Verifying the observed power state is on")
@@ -1433,6 +1461,143 @@ func releaseSlot(slotName string) {
 	if err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "releaseSlot(%s): deleting claim %s: %s\n", slotName, live.Name, out)
 	}
+}
+
+// =============================================================================
+// The evidence a failure prints
+// =============================================================================
+// A derived report is a function of one triple, so the answer to "the slot reports something else"
+// is read off the objects a pass handed to the formula. The rows of the table are pinned where they
+// belong - internal/phase, and the boot's own shape in the envtest suite - and what an e2e failure
+// can add is the state of the cluster at the moment the gate gave up: the slot's report and its
+// observation, the claim that owns the slot, the node object as the kubelet writes it, and the
+// lifecycle Jobs the slot is holding. Nothing here gates: it is printed, and the assertion above it
+// stays the sentence about the model.
+// =============================================================================
+
+// dumpSlotState prints the state of both slots of the pool on the failure path of a spec.
+func dumpSlotState(slots ...string) {
+	for _, slotName := range slots {
+		_, _ = fmt.Fprintf(GinkgoWriter, "\n==== state of slot %s at the failure ====\n%s\n", slotName, describeSlotState(slotName))
+	}
+}
+
+// slotReportAs is the slot's report, rendered as the value a gate compares, with the evidence the
+// formula reads printed beside it whenever the value is not the one awaited. The assertion stays the
+// phase; a timeout says which of the three inputs the slot is standing on - the claim that owns it,
+// the power its machine is observed at, the node object as the kubelet writes it - because a derived
+// report is only ever as good as the objects a pass handed to it.
+func slotReportAs(name string, want infrav2alpha1.NodePhase) string {
+	phase := slotPhase(name)
+	if phase == want {
+		return string(phase)
+	}
+
+	return string(phase) + "\n" + describeSlotState(name)
+}
+
+// describeSlotState renders one slot's inputs and outputs. Every field is the one the formula reads,
+// named as the formula names it, so a report that disagrees with its inputs is visible in one read.
+func describeSlotState(slotName string) string {
+	var b strings.Builder
+
+	slot, err := readSlot(slotName)
+	if err != nil {
+		fmt.Fprintf(&b, "slot: unreadable: %v\n", err)
+
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "slot %s: phase=%s powerState=%s\n", slot.Name, slot.Status.Phase, slot.Status.PowerState)
+
+	for _, cond := range slot.Status.Conditions {
+		fmt.Fprintf(&b, "  slot condition: %s=%s reason=%s message=%s\n", cond.Type, cond.Status, cond.Reason, cond.Message)
+	}
+
+	if digest := slot.Status.LastClaim; digest != nil {
+		fmt.Fprintf(&b, "  slot digest: name=%s phase=%s reason=%s attempt=%d shutdownAttempts=%d call=%s group=%s\n",
+			digest.Name, digest.Phase, digest.Reason, digest.Attempt, digest.ShutdownAttempts, digest.Call, digest.Group)
+	} else {
+		b.WriteString("  slot digest: none\n")
+	}
+
+	nodeClaim, claimErr := newestClaimOfSlot(slotName)
+	if claimErr != nil {
+		fmt.Fprintf(&b, "  claim: unreadable: %v\n", claimErr)
+	} else if nodeClaim == nil {
+		b.WriteString("  claim: no claim names this slot (the slot is free)\n")
+	} else {
+		fmt.Fprintf(&b, "  claim %s: phase=%s reason=%s attempt=%d marked=%v deadlineAt=%s\n",
+			nodeClaim.Name, nodeClaim.Status.Phase, nodeClaim.Status.Reason, nodeClaim.Status.Attempt,
+			!nodeClaim.DeletionTimestamp.IsZero(), renderTime(nodeClaim.Spec.DeadlineAt))
+	}
+
+	fmt.Fprintf(&b, "%s", describeKubeNode(slot.Spec.KubernetesNodeName))
+
+	for _, jobPhase := range []string{fsm.PhaseStartup, fsm.PhaseShutdown} {
+		job := newestLifecycleJobOfSlot(jobPhase, slotName, slot.CreationTimestamp.Time)
+		if job == "" {
+			fmt.Fprintf(&b, "  %s job: none of this slot\n", jobPhase)
+
+			continue
+		}
+
+		rendered := "unreadable"
+
+		if full, jobErr := readJob(job); jobErr == nil {
+			rendered = fmt.Sprintf("created=%s active=%d succeeded=%d failed=%d",
+				full.CreationTimestamp.Format(time.RFC3339), full.Status.Active, full.Status.Succeeded, full.Status.Failed)
+		}
+
+		fmt.Fprintf(&b, "  %s job: %s %s\n", jobPhase, job, rendered)
+	}
+
+	return b.String()
+}
+
+// describeKubeNode prints the corev1.Node as the observation reads it: the Ready condition with the
+// kubelet's own heartbeat stamp (a Ready condition with a stale heartbeat is a machine that is not
+// beating), the taints, and spec.unschedulable. Those three are what phase.Unusable asks, and the
+// readiness gate asks them the same way, so they are the half of the triple a slot's report turns on.
+func describeKubeNode(nodeName string) string {
+	if nodeName == "" {
+		return "  k8s node: the slot declares no Kubernetes node name\n"
+	}
+
+	out, err := utils.Run(kubectl("get", "node", nodeName, "-o", "json"))
+	if err != nil {
+		return fmt.Sprintf("  k8s node %s: unreadable: %v\n", nodeName, err)
+	}
+
+	node := &corev1.Node{}
+	if err := json.Unmarshal([]byte(out), node); err != nil {
+		return fmt.Sprintf("  k8s node %s: unparseable: %v\n", nodeName, err)
+	}
+
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "  k8s node %s: cordoned=%v\n", node.Name, node.Spec.Unschedulable)
+
+	for _, taint := range node.Spec.Taints {
+		fmt.Fprintf(&b, "  k8s node taint: %s=%s:%s\n", taint.Key, taint.Value, taint.Effect)
+	}
+
+	for _, cond := range node.Status.Conditions {
+		fmt.Fprintf(&b, "  k8s node condition: %s=%s heartbeat=%s transition=%s\n",
+			cond.Type, cond.Status, cond.LastHeartbeatTime.Format(time.RFC3339), cond.LastTransitionTime.Format(time.RFC3339))
+	}
+
+	return b.String()
+}
+
+// renderTime prints a claim's deadline for the dump, and says "none" for the field a ready claim has
+// closed: the boot window ends at ready, and the deadline is cleared on that write.
+func renderTime(at *metav1.Time) string {
+	if at == nil {
+		return "none"
+	}
+
+	return at.Time.Format(time.RFC3339)
 }
 
 // groupYAML is the Group CR of the pool with a given scale-down window. The suite changes only that
@@ -1854,11 +2019,23 @@ func readJob(name string) (*batchv1.Job, error) {
 	return job, nil
 }
 
+// lifecycleVolume is one volume a lifecycle Job must carry: the name the slot's pod spec declares,
+// and the ConfigMap or Secret that volume reads. The two are different strings in the slots this pool
+// applies (`name: config` reading `configMapName: shutdown-config`, `name: auth` reading
+// `secretName: auth-secrets`), and a Job that mounts the right object under the wrong name is a Job
+// whose script cannot `source /config/shutdown-config.sh`. So the assertion is about the name and the
+// source, read off the typed volume.
+type lifecycleVolume struct {
+	name      string
+	configMap string // empty when the volume reads a Secret
+	secret    string // empty when the volume reads a ConfigMap
+}
+
 // lifecycleJobSpecProblem is the shape a lifecycle Job of this pool must have, read off the typed
-// object: the controller's ServiceAccount, the volume the slot declares for its hook, and a TTL so the
-// Jobs of a pool that scales twice a day are collected. "" means the Job is as declared; anything else
-// is the sentence an operator reads.
-func lifecycleJobSpecProblem(job *batchv1.Job, serviceAccount, volumeName string) string {
+// object: the controller's ServiceAccount, the volumes the slot declares for its hook with the objects
+// behind them, and a TTL so the Jobs of a pool that scales twice a day are collected. "" means the Job
+// is as declared; anything else is the sentence an operator reads.
+func lifecycleJobSpecProblem(job *batchv1.Job, serviceAccount string, want []lifecycleVolume) string {
 	if job == nil {
 		return "the Job is not readable"
 	}
@@ -1868,18 +2045,40 @@ func lifecycleJobSpecProblem(job *batchv1.Job, serviceAccount, volumeName string
 	}
 
 	mounted := make([]string, 0, len(job.Spec.Template.Spec.Volumes))
-	found := false
+	sources := make(map[string]corev1.VolumeSource, len(job.Spec.Template.Spec.Volumes))
 
 	for _, volume := range job.Spec.Template.Spec.Volumes {
 		mounted = append(mounted, volume.Name)
-
-		if volume.Name == volumeName {
-			found = true
-		}
+		sources[volume.Name] = volume.VolumeSource
 	}
 
-	if !found {
-		return fmt.Sprintf("job %s mounts %v, which has no %q volume", job.Name, mounted, volumeName)
+	for _, declared := range want {
+		source, found := sources[declared.name]
+		if !found {
+			return fmt.Sprintf("job %s mounts %v, which has no %q volume the slot declares", job.Name, mounted, declared.name)
+		}
+
+		if declared.configMap != "" {
+			if source.ConfigMap == nil {
+				return fmt.Sprintf("job %s's volume %q is not a ConfigMap volume", job.Name, declared.name)
+			}
+
+			if source.ConfigMap.Name != declared.configMap {
+				return fmt.Sprintf("job %s's volume %q reads ConfigMap %q, not the %q the slot declares",
+					job.Name, declared.name, source.ConfigMap.Name, declared.configMap)
+			}
+		}
+
+		if declared.secret != "" {
+			if source.Secret == nil {
+				return fmt.Sprintf("job %s's volume %q is not a Secret volume", job.Name, declared.name)
+			}
+
+			if source.Secret.SecretName != declared.secret {
+				return fmt.Sprintf("job %s's volume %q reads Secret %q, not the %q the slot declares",
+					job.Name, declared.name, source.Secret.SecretName, declared.secret)
+			}
+		}
 	}
 
 	if job.Spec.TTLSecondsAfterFinished == nil {
