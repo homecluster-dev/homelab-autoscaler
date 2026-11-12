@@ -1196,6 +1196,10 @@ spec:
 			// measured from it, so the observation crosses the deadline the provider wrote.
 			naturalDeadline := serving.Spec.DeadlineAt
 
+			// The moment the served claim is in service: the shutdown Jobs asserted on below are the ones
+			// that start now, not the Job the scale-down of the previous spec left on the same slot.
+			servingSince := time.Now()
+
 			Expect(stampClaimDeadline(serving.Name, time.Now().Add(-3*time.Hour))).To(Succeed(),
 				"The deadline of a served claim can be pushed into the past by anything that writes the object")
 
@@ -1215,10 +1219,10 @@ spec:
 					return "slot-" + string(slotPhase(shutdownNodeName))
 				}
 
-				if jobs, err := shutdownJobsOfSlot(shutdownNodeName); err != nil {
-					return "jobs-unreadable"
-				} else if jobs > 0 {
-					return "shutdown-job"
+				// A shutdown Job is the force shutdown of a machine the model has stopped wanting: the first
+				// visible write of it, behind a claim that is serving.
+				if job := newestLifecycleJobOfSlot(fsm.PhaseShutdown, shutdownNodeName, servingSince); job != "" {
+					return "shutdown-job: " + job
 				}
 
 				if !nodeSchedulable(shutdownNodeName) {
@@ -1582,21 +1586,6 @@ func stampClaimDeadline(name string, at time.Time) error {
 		"--type", "merge", "-p", stamp))
 
 	return err
-}
-
-// shutdownJobsOfSlot counts the shutdown Jobs of a slot: the force shutdown a terminal claim puts
-// the machine through, and the thing that must not exist behind a claim that is serving.
-func shutdownJobsOfSlot(slotName string) (int, error) {
-	out, err := utils.Run(kubectl("get", "jobs", "-n", namespace,
-		"-l", fmt.Sprintf("%s=%s,%s=%s", fsm.LabelNodeCR, slotName, fsm.LabelPhase, fsm.PhaseShutdown),
-		"-o", "jsonpath={.items[*].metadata.name}"))
-	if err != nil {
-		return 0, err
-	}
-
-	names := strings.Fields(out)
-
-	return len(names), nil
 }
 
 // nodeSchedulable reports whether the Kubernetes node of a slot is still schedulable: a cordon is
