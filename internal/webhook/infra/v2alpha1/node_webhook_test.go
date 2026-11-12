@@ -262,7 +262,8 @@ var _ = Describe("Node Webhook", func() {
 
 		// validatorWith returns the validator over a cluster that already holds the given slots.
 		validatorWith := func(slots ...*infrav2alpha1.Node) NodeCustomValidator {
-			objects := []client.Object{clusterGroup}
+			objects := make([]client.Object, 0, 1+len(slots))
+			objects = append(objects, clusterGroup)
 			for i := range slots {
 				objects = append(objects, slots[i])
 			}
