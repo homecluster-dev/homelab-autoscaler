@@ -136,6 +136,47 @@ func TestLiveClaimIsThePhaseQuestion(t *testing.T) {
 
 // TestUnusableIsTheReadinessGate is the one predicate the gate, the claim's ready phase and the
 // derived report share. The reason string is what an operator reads, so it names the cause.
+// TestObservedPowerIsTheKubeletsHeartbeat pins the one definition of the observation: the Ready
+// condition of the node object. The observation path writes status.powerState from it, the report is
+// derived over it, and the state machine's writer of the report reads the machine through the same
+// function - so "the machine is up" cannot mean one thing to the writer of the record and another to
+// the writer of the report. That divergence is the ambiguity the 0.1.22 observed-power precedence
+// rule was a patch over, and the law internal/phase states is that the record is not an input.
+func TestObservedPowerIsTheKubeletsHeartbeat(t *testing.T) {
+	ready := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-01"},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type:   corev1.NodeReady,
+			Status: corev1.ConditionTrue,
+		}}},
+	}
+
+	assert.Equal(t, infrav2alpha1.PowerStateOn, ObservedPower(ready), "a kubelet with a live heartbeat is an up machine")
+
+	assert.Equal(t, infrav2alpha1.PowerStateOff, ObservedPower(nil),
+		"no node object is no kubelet: the machine is not there")
+
+	notReady := ready.DeepCopy()
+	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
+	assert.Equal(t, infrav2alpha1.PowerStateOff, ObservedPower(notReady),
+		"a node that reports NotReady is off: the object is what a powered-off machine leaves behind")
+
+	unknown := ready.DeepCopy()
+	unknown.Status.Conditions[0].Status = corev1.ConditionUnknown
+	assert.Equal(t, infrav2alpha1.PowerStateOff, ObservedPower(unknown),
+		"a silent kubelet is declared Unknown by the node lifecycle controller, and that is the off")
+
+	noCondition := ready.DeepCopy()
+	noCondition.Status.Conditions = nil
+	assert.Equal(t, infrav2alpha1.PowerStateOff, ObservedPower(noCondition),
+		"a node that never reported Ready has no beating kubelet")
+
+	assert.True(t, Input{ObservedPower: ObservedPower(ready)}.ObservedOn(),
+		"the report is derived over the answer this definition gives, not over a copy of it")
+	assert.False(t, Input{ObservedPower: ObservedPower(unknown)}.ObservedOn(),
+		"and a silent kubelet is off for the report, as it is for the record")
+}
+
 func TestUnusableIsTheReadinessGate(t *testing.T) {
 	ready := func() *corev1.Node {
 		return &corev1.Node{

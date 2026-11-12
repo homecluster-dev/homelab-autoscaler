@@ -354,6 +354,23 @@ func (r *NodeReconciler) handleStateTransitionsWithFSM(
 		return ctrl.Result{}, nil
 	}
 
+	// The report is this pass's to record, transition or no transition. Laws 1 to 4 name the shapes
+	// that have an operation to fire; everything else is a change of the triple with no operation
+	// behind it: a claim that ended (its deadline, its attempt bound, a hand delete), a machine that
+	// came up or went down out of band, a scale-down's mark landing on the claim. The other writer of
+	// the report is the observation reconciler, and it runs on corev1.Node events - a machine whose
+	// kubelet is dead has no kubelet left to move its node object, and a kubelet settled into Ready is
+	// quiet, its heartbeats going to its Lease. So a pass that read a settled triple and recorded
+	// nothing leaves the slot reporting the last thing that happened to have an operation behind it
+	// until the slot's own resync (5m) reads it again, and the report is what the pool is read from
+	// (Group.status.on, `kubectl get nodes.infra`, the cluster view).
+	//
+	// The write carries the guards of fsm.reportPhase: a machine whose inputs no longer describe its
+	// own state records nothing, and so does a machine whose inputs have been overtaken by the
+	// observation on the slot or by a move of the claim. Both are the pass that read the newer fact's
+	// report to write, and this pass is that pass for any fact it read.
+	stateMachine.ReportPhase()
+
 	stateMachine.CheckStuckState()
 
 	// The 24 h window of the slot's ring moves on its own clock, so prune it on this pass and come

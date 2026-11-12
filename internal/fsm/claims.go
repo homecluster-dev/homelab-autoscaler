@@ -18,6 +18,7 @@ package fsm
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/looplab/fsm"
@@ -41,12 +42,33 @@ import (
 // v2alpha1 has one formula, so there is nothing for a caller to pass, and the two readings cannot
 // disagree by construction.
 //
-// The one remnant of the guard that is still meaningful for a derived value is kept: if the inputs
-// of this machine no longer describe the state it is in, the machine is stale - the async job
-// monitor goroutine of a transition that already finished, a state machine built from a Node read
-// before a transition ran - and the pass that owns the inputs writes the report. A stale machine
-// writing over a live one is how a slot used to be stranded in a transitional value with nothing
-// driving it.
+// Two guards decide *who* writes, and both are needed because the report has two writers:
+//
+//   - the machine's own state: if the inputs of this machine no longer describe the state it is in,
+//     the machine is stale - the async job monitor goroutine of a transition that already finished, a
+//     state machine built from a Node read before a transition ran - and the pass that owns the
+//     inputs writes the report;
+//   - the observation this machine was built from: the write is a compare-and-set on
+//     `status.powerState`, the field the observation reconciler owns, read at the instant the pass
+//     that built this machine read the slot (`readObservation`). A slot that records a different
+//     power has been observed by the other writer in the meantime, and that writer lands the report
+//     of its own observation in the same write - so the report of the newer observation is its, and
+//     this write records nothing.
+//
+// The second guard is the one a loaded cluster needs and a fixture does not show. A transition's
+// inputs are the read of the pass that built the machine, and the machine that answers for a
+// lifecycle Job is the goroutine of the pass that created the Job, so its snapshot is as old as the
+// Job. The observation reconciler is woken by the node object and writes the report of the machine as
+// it stands; when its write lands between the pass's read and the transition's write, the last writer
+// is the one holding the older evidence: `draining` stamped over the `off` that a silent kubelet has
+// just produced, `booting` stamped over the `ready` the readiness gate has just earned.
+//
+// Nothing after such a write repairs it, and that is the whole problem: the node object of a machine
+// whose kubelet is dead does not move again, the claim has reached the phase the report names, the
+// lifecycle Jobs are finished, and the next pass over the slot is its resync - `idleResync`, five
+// minutes. Every reader of the pool (Group.status.on, the cluster view, `kubectl get
+// nodes.infra.homecluster.dev`) reads a machine that is not there for that long, and a suite that
+// gates the report at 2m and 4m reads it as a flake.
 //
 // It is a report: nothing in this repository reads Node.status.phase to decide an action, and the
 // state machine's own input is never the record of a past pass.
@@ -72,6 +94,24 @@ func (nm *NodeStateMachine) reportPhase() {
 			return err
 		}
 
+		// The compare-and-set on the observation. A transition is entitled to report what it saw with
+		// its own eyes - the readiness gate stands in front of a node object that reports Ready, and
+		// records that answer into its input (`recordGateAnswer`) - so the fact this write is checked
+		// against is not the input, it is the stamp of the read the machine was built from. The
+		// observation path writes `status.powerState` and the report in one write, so a slot whose
+		// recorded power has moved since that read has already been reported by the writer that moved
+		// it, from evidence this machine never had.
+		if moved := nm.observationMoved(fresh); moved != "" {
+			logger.V(1).Info("Not recording the derived phase: the observation of this machine moved under the pass",
+				"node", nm.node.Name,
+				"derivedPhase", string(derived),
+				"moved", moved)
+
+			nm.node = fresh
+
+			return nil
+		}
+
 		// The writer is the guard, and it is called with the phase this attempt read: phase.Record
 		// appends a ring row, moves lastTransitionTime and counts an activation **only when the phase
 		// it was handed differs from the one the slot reports**, and returns false when it recorded
@@ -80,12 +120,6 @@ func (nm *NodeStateMachine) reportPhase() {
 		// one boot twice, and it is why this path has no check of its own to keep in sync: a caller's
 		// guard is one more place a writer can be wrong. The window prune is the one write that can
 		// still land here on a slot that reports what the inputs derive, and it is idempotent.
-		//
-		// The staleness check above is the one that decides *who* writes: it compares this machine
-		// with its own inputs, and a machine that no longer describes the slot (the async monitor of a
-		// transition that already finished, a state machine built from a Node read before a transition
-		// ran) hands the report to the pass that owns the inputs. A stale machine writing over a live
-		// one is how a slot used to be stranded in a transitional value with nothing driving it.
 		if !stampDerivedPhase(fresh, derived, time.Now(), phase.Reason(nm.input, derived)) {
 			// The slot reports what the inputs derive, and its window did not move: nothing to write.
 			nm.node = fresh
@@ -97,12 +131,65 @@ func (nm *NodeStateMachine) reportPhase() {
 			return err
 		}
 
+		// The write landed, so the observation this machine is reporting on is now the one the slot
+		// carries: a later report write by the same machine (the completion of the Job it just
+		// started, the gate that answers after it) is checked against the observation as of here.
+		nm.readObservation = fresh.Status.PowerState
 		nm.node = fresh
 
 		return nil
 	}); err != nil {
 		logger.Error(err, "Failed to record the derived phase of the slot", "node", nm.node.Name, "phase", string(derived))
 	}
+}
+
+// observationMoved names the observation this machine does not have, and "" when its write may land.
+//
+// The report of a machine is a report of the observation of that machine, and `status.powerState` is
+// written by the observation reconciler from the node object, in the same write as the report it
+// derives from it. A transition's read of the power is in the general case a read of that record -
+// the slot as of the moment its pass read it (the input law assembles it that way) - so when the
+// record on the slot has moved since, the cluster has been observed since, and the report of the
+// newer observation has already been written by the path that moved the record. A write from the
+// older read is then the last writer winning with the older evidence, and nothing after it is coming
+// to undo it: the node object of a machine whose kubelet is dead has no kubelet left to move it, the
+// claim has reached the phase the report names, the lifecycle Jobs are finished, and the next pass
+// over the slot is its resync, five minutes away (`idleResync`).
+//
+// A machine that has read the node object itself - a readiness gate, standing in front of the machine
+// it is answering for (`recordGateAnswer`) - holds the newer evidence, and its write is not refused:
+// the record on the slot is then the older fact, and a boot that cannot report the machine it has
+// bought is a slot that reports `booting` for the life of the machine, because a kubelet settled into
+// Ready writes no further node event (its heartbeats go to its Lease).
+func (nm *NodeStateMachine) observationMoved(fresh *infrav2alpha1.Node) string {
+	if nm.observedLive {
+		return ""
+	}
+
+	if fresh.Status.PowerState == nm.readObservation {
+		return ""
+	}
+
+	return fmt.Sprintf("the slot records the machine %q, this machine read it %q",
+		string(fresh.Status.PowerState), string(nm.readObservation))
+}
+
+// ReportPhase records the slot's derived report on behalf of a caller that has read the triple and
+// has no transition to fire. The slot reconciler owns the laws that decide when an operation runs;
+// the report is not one of those laws: it is the value the same triple derives, and the pass that
+// read the triple is the writer holding the newest inputs. See reportPhase for the guards this write
+// carries (the machine's own state, and the compare-and-set on the observation).
+//
+// Without this call, a change of the triple with no operation behind it has no writer of the report:
+// a claim that ended (its deadline, its attempt bound, a hand delete), a machine that came up or went
+// down out of band, a scale-down's mark landing on a claim. The other writer of the report is the
+// observation reconciler, and it runs on corev1.Node events: the node object of a machine whose
+// kubelet is dead has no kubelet left to move it, and a kubelet settled into Ready is quiet, its
+// heartbeats going to its Lease. So a pass that read a settled triple and recorded nothing leaves the
+// slot reporting the last thing that happened to have an operation behind it, for as long as the
+// slot's resync (5m) says.
+func (nm *NodeStateMachine) ReportPhase() {
+	nm.reportPhase()
 }
 
 // stampDerivedPhase writes the derived phase onto a fresh copy of the slot, together with the
@@ -223,12 +310,17 @@ func (nm *NodeStateMachine) recordGateAnswer(kubeNode *corev1.Node) {
 	for _, cond := range kubeNode.Status.Conditions {
 		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
 			// The gate's own definition of the machine being up, the same one the observation path
-			// writes status.powerState from (core.KubernetesNodeReconciler.getNodeStatus).
+			// writes status.powerState from (phase.ObservedPower).
 			nm.input.ObservedPower = infrav2alpha1.PowerStateOn
 
 			break
 		}
 	}
+
+	// The machine has now looked at the machine. Its power input is a read of the node object and not
+	// of the slot's record, which is what lets its report write land over a record that has not caught
+	// up (observationMoved).
+	nm.observedLive = true
 }
 
 // recordShutdownAttempt counts the shutdown this machine fired on the claim a scale-down named. It
