@@ -34,6 +34,7 @@ import (
 	"github.com/looplab/fsm"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 )
@@ -851,6 +852,18 @@ func (nm *NodeStateMachine) setNodeSchedulableInternal(nodeName string) (*corev1
 // taint, exactly like taints.IsProtectedKey refuses to let spec.nodeTaints write it.
 const TaintCiliumAgentNotReady = taints.CiliumAgentNotReady
 
+// declaresNodeMetadata reports whether a slot declares anything for its node object
+// (spec.nodeLabels, spec.nodeAnnotations). It is the guard of the gate's label write: a slot that
+// declares nothing has nothing that must land before its machine is schedulable, and holding the
+// gate open on a write that has no content would make every pool of the cluster wait on a no-op.
+//
+// The slot handed to it is the one read fresh in the hook, for the reason stated there: a snapshot
+// answers for the machine that was booted, and the write this guards is the one that decides which
+// keys of the node object the slot owns.
+func declaresNodeMetadata(slot *infrav2alpha1.Node) bool {
+	return len(slot.Spec.NodeLabels)+len(slot.Spec.NodeAnnotations) > 0
+}
+
 // nodeUsability reports whether a node object is Ready and free of every taint the gate waits for,
 // and returns the reason it is not, for the retry log and the timeout event. An empty reason means
 // the machine can take the pool's pods. keys is the list the slot's Group declares
@@ -967,6 +980,10 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 	// never satisfied instead of leaving the operator to guess.
 	waitingOn := "the node object has not appeared"
 
+	// labelWriteWarned keeps the Warning of a failed label write to one per gate: the loop retries
+	// the same write, and an event per retry buries the one that names the outcome.
+	labelWriteWarned := false
+
 	for {
 		now := time.Now()
 
@@ -1022,6 +1039,71 @@ func (nm *NodeStateMachine) setNodeSchedulableWithRetry(nodeName string) error {
 		// does not stop the uncordon, the next reconcile re-applies it.
 		if err := taints.ApplyToKubernetesNode(ctx, nm.client, nm.node, nm.eventRecorder); err != nil {
 			logger.Info("Failed to apply declared taints before uncordon", "error", err.Error(), "elapsed", time.Since(start).String())
+		}
+
+		// Stamp the labels and annotations the slot declares (spec.nodeLabels,
+		// spec.nodeAnnotations) in the same hook, for the same two reasons. A node that becomes
+		// schedulable before its zone label exists is a node a pod with
+		// `nodeSelector: {topology.kubernetes.io/zone: ...}` is bound to and then evicted from, and
+		// cluster-autoscaler bound it there because the group's template carries the label the slot
+		// declares: the simulation and the machine have to agree on the label the selector matches,
+		// and the machine only agrees once this write lands. Called on every retry, and idempotent
+		// (no write when the node already carries the declaration).
+		//
+		// The declaration written here is read from the slot as the cluster has it now, not from the
+		// transition's snapshot: the apply removes the keys a declaration dropped, so a snapshot taken
+		// before a Git apply - one that declares nothing, or an older set - would remove the labels the
+		// pool declares today and delete the record that made them that slot's to manage. The next pass
+		// would write them back, and the two writers would trade the node object between them for as
+		// long as the machine lives. A slot the read cannot find is answered with the snapshot: this
+		// write stays best effort on that read, and the slot reconciler re-asserts the live declaration
+		// on its own pass.
+		labelSlot := &infrav2alpha1.Node{}
+		if err := nm.client.Get(ctx, client.ObjectKey{Namespace: nm.node.Namespace, Name: nm.node.Name}, labelSlot); err != nil {
+			logger.V(1).Info("Could not read the slot for its declared labels, writing the transition's snapshot",
+				"error", err.Error())
+
+			labelSlot = nm.node
+		}
+
+		// A slot that declares keys, whose write fails, is a refusal of this gate: the same class as
+		// the Ready condition and the readiness taints, and for the same reason. Logging it and
+		// uncordoning anyway is the promise the feature documents - the machine carries the labels the
+		// estimator placed the pod on - broken by an API failure the loop cannot see. So the loop waits
+		// on it, within the gate's deadline, keeping the operation lock alive, and the timeout path
+		// below still abandons and uncordons: a machine that never got its labels is a machine the
+		// operator has to be able to reach, and a cordoned one is a machine cluster-autoscaler will
+		// never remove.
+		//
+		// A slot that declares nothing is not gated on this write: its label half has nothing to land,
+		// and the removal of keys an older declaration wrote is the reconciler's job on the next pass.
+		if declaresNodeMetadata(labelSlot) {
+			if err := nodelabels.ApplyToKubernetesNode(ctx, nm.client, labelSlot, nm.eventRecorder); err != nil {
+				waitingOn = fmt.Sprintf("the labels and annotations the slot declares were not written: %v", err)
+
+				logger.Info("Declared node labels could not be written, holding the node cordoned",
+					"error", err.Error(),
+					"elapsed", time.Since(start).String(),
+					"gateRemaining", time.Until(gateDeadline).String())
+
+				if !labelWriteWarned {
+					labelWriteWarned = true
+
+					// One Warning per gate, not one per poll: the refusal is the same fact repeated,
+					// and the gate's own timeout records the outcome.
+					nm.recordLifecycleEvent(corev1.EventTypeWarning, ReasonDeclaredLabelsUnwritten, ActionUncordon,
+						fmt.Sprintf("Scale-up of slot %s: the labels and annotations it declares could not be "+
+							"written to Kubernetes node %s (%v). The machine stays cordoned until they land, "+
+							"because a node that is schedulable before them is a node a pod that selects them is "+
+							"bound to and evicted from; the gate retries, and uncordons at its deadline.",
+							nm.node.Name, nodeName, err))
+				}
+
+				nm.renewOperationLock()
+				poll.wait()
+
+				continue
+			}
 		}
 
 		// The gate: Ready, and free of every readiness taint the Group declares. Both are required

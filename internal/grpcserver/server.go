@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -37,6 +38,7 @@ import (
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/taints"
 	pb "github.com/homecluster-dev/homelab-autoscaler/proto"
 )
@@ -50,6 +52,13 @@ type HomeClusterProviderServer struct {
 	Scheme *runtime.Scheme
 
 	gpuTypes map[string]*anypb.Any
+
+	// templateConflicts remembers, per node group, the keys the group's slots disagreed on the last
+	// time this provider answered for it. NodeGroupTemplateNodeInfo is asked about every group on
+	// every scan of cluster-autoscaler, so a disagreement is reported when it appears and when it
+	// changes, not on every scan (see recordTemplateConflicts). The memory is per process: a restart
+	// re-states the report, and nothing is derived from it.
+	templateConflicts sync.Map
 }
 
 // NewHomeClusterProviderServer creates a new server
@@ -891,6 +900,14 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 		// provisioning boundary (an empty providerID, i.e. no cloud-controller-manager, would
 		// otherwise report the bare node name and then the providerID). Keep the providerID of
 		// the Kubernetes node when it is set, it is the authoritative identity.
+		//
+		// An Instance carries an id and a status, and nothing else: the proto has no labels, no
+		// annotations, no capacity. What cluster-autoscaler knows about a machine that already
+		// registered it reads off that machine's corev1.Node, which the cluster registry lists, so
+		// the labels a slot declares have to be on the node object to be visible to the autoscaler
+		// for an existing node - that is nodelabels.ApplyToKubernetesNode's job, on join and on every
+		// drift. The template is the other half: the shape of a machine that does not exist yet, and
+		// the only place a scale-up can be matched against a label.
 		instanceID := kubernetesNode.Spec.ProviderID
 		if instanceID == "" {
 			instanceID = fmt.Sprintf("homelab://%s", node.Name)
@@ -945,6 +962,11 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 		k8sNode = placeholderTemplateNode(representativeNodeCR)
 	}
 
+	// The labels and annotations the group can answer for: every slot's declaration, restricted to
+	// the keys the slots agree on. Computed here, from every slot of the group, because the template
+	// is one answer for the whole group and the scale-up it authorises buys any slot of it.
+	consensusLabels, consensusAnnotations := s.groupTemplateConsensus(req.Id, nodes.Items)
+
 	// Create template node by copying the representative node
 	templateNode := k8sNode.DeepCopy()
 
@@ -958,7 +980,33 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	templateNode.UID = ""
 	templateNode.ResourceVersion = ""
 
-	// Remove node-specific labels that shouldn't be in template
+	// Put the labels and annotations the slots of the group declare into the template, after the copy
+	// and before the marshal, in the same position applyTemplateCapacity's call has, so that the rule
+	// is the same for the node copied from a live slot and for the synthesized placeholder.
+	//
+	// This is the half of the feature cluster-autoscaler reads. The estimator matches a pending pod's
+	// nodeSelector and node affinity against the labels of this template, so a pod that asks for
+	// `topology.kubernetes.io/zone: fsn1` is placed on a group whose template carries that label and
+	// on no other: with every slot reporting the same template the answer to "which slot?" is "any
+	// slot", and a zoned pod is never placed on this pool at all, so no machine is ever bought for
+	// it. Declaring the zone on the slots that have one is what makes the scale-up possible.
+	//
+	// The declaration goes on top of the copy, and only the declared keys: what the representative
+	// node carries beyond them is the machine's own shape, which the template keeps. The predicates
+	// are the ones of the kind being written (labels filtered by the label list, annotations by the
+	// annotation list), so a label under a namespace that is only reserved for annotations -
+	// `argocd.argoproj.io/team`, say - reaches the template a `nodeSelector` matches against.
+	//
+	// What is overlaid is the group's consensus, not the representative slot's declaration: a key the
+	// slots of the group do not all declare with the same value is omitted, and the omission is
+	// reported. See nodelabels.Consensus for the arithmetic and groupTemplateConsensus for the
+	// consequence this avoids - a machine bought for a pod that cannot run on it.
+	templateNode.Labels = nodelabels.OverlayLabels(templateNode.Labels, consensusLabels)
+	templateNode.Annotations = nodelabels.OverlayAnnotations(templateNode.Annotations, consensusAnnotations)
+
+	// Remove node-specific labels that shouldn't be in template. After the overlay, so a
+	// declaration cannot put the representative's hostname back: the key is refused at admission
+	// (kubernetes.io/ is reserved) and this is the write that proves it.
 	delete(templateNode.Labels, "kubernetes.io/hostname")
 
 	// Set Ready conditions (remove NotReady status)
@@ -1044,6 +1092,93 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	return &pb.NodeGroupTemplateNodeInfoResponse{
 		NodeBytes: nodeBytes,
 	}, nil
+}
+
+// groupTemplateConsensus is the template's fail-closed rule: of everything the slots of a group
+// declare, the template carries only the keys every slot of the group declares with the same value.
+//
+// The reason is the shape of the two calls cluster-autoscaler makes. `NodeGroupTemplateNodeInfo`
+// answers for a *group* with *one* node, and the scale-up it authorises is `IncreaseSize`, which
+// buys whichever slot the provider has free (sorted by name). A template that carries a label only
+// some slots carry therefore makes a promise the group cannot keep: the estimator places the pod on
+// the template, the provider boots a slot whose machine will never carry the label, the pod is
+// still `Pending` after the boot, the slot is Ready, and the money is spent. Omitting the key is
+// the honest answer: the estimator matches the selector against nothing, plans nothing, buys no
+// machine, and the pod stays `Pending` on a pool that is visibly not the one for it - which is what
+// a pool whose slots differ *is*.
+//
+// The disagreement is not an error, and it does not fail the call: the group is exact and useful
+// for every pod that does not select the disputed key, a call that returns an error makes
+// cluster-autoscaler skip the group for *every* pod, and a pool that cannot grow is a worse
+// outcome than a pool that grows only for the work it can host. It is reported, per group, when it
+// appears and when it changes (see recordTemplateConflicts), naming the key and the slots, because
+// the fix is configuration: declare the key on every slot of the group, or put the slots the
+// scheduler has to tell apart in different groups.
+func (s *HomeClusterProviderServer) groupTemplateConsensus(group string, slots []infrav2alpha1.Node) (map[string]string, map[string]string) {
+	labelDeclarations := make([]nodelabels.SlotDeclaration, 0, len(slots))
+	annotationDeclarations := make([]nodelabels.SlotDeclaration, 0, len(slots))
+
+	for i := range slots {
+		labelDeclarations = append(labelDeclarations,
+			nodelabels.SlotDeclaration{Name: slots[i].Name, Declared: slots[i].Spec.NodeLabels})
+		annotationDeclarations = append(annotationDeclarations,
+			nodelabels.SlotDeclaration{Name: slots[i].Name, Declared: slots[i].Spec.NodeAnnotations})
+	}
+
+	agreedLabels, labelConflicts := nodelabels.Consensus(labelDeclarations)
+	agreedAnnotations, annotationConflicts := nodelabels.Consensus(annotationDeclarations)
+
+	s.recordTemplateConflicts(group, labelConflicts, annotationConflicts)
+
+	return agreedLabels, agreedAnnotations
+}
+
+// recordTemplateConflicts reports a group's disagreements, once each: the provider answers this
+// call for every group on every scan of cluster-autoscaler (tens of times an hour), and a log line
+// per scan is the noise that hides the line that matters. The memory is per process (a restart
+// re-states it), keyed by group, and it says nothing the CRs do not already say: it is the pointer
+// to the configuration that has to change.
+func (s *HomeClusterProviderServer) recordTemplateConflicts(group string, labelConflicts, annotationConflicts []nodelabels.GroupConflict) {
+	logger := log.Log.WithName("grpc-server")
+
+	rendered := ""
+	if note := nodelabels.RenderConflicts(labelConflicts); note != "" {
+		rendered = "labels [" + note + "]"
+	}
+
+	if note := nodelabels.RenderConflicts(annotationConflicts); note != "" {
+		if rendered != "" {
+			rendered += " annotations [" + note + "]"
+		} else {
+			rendered = "annotations [" + note + "]"
+		}
+	}
+
+	previous, seen := s.templateConflicts.Load(group)
+
+	if rendered == "" {
+		if seen {
+			s.templateConflicts.Delete(group)
+
+			logger.Info("A group's slots agree on their declared node labels again, the template is exact",
+				"nodeGroup", group)
+		}
+
+		return
+	}
+
+	if seen && previous.(string) == rendered {
+		return
+	}
+
+	s.templateConflicts.Store(group, rendered)
+
+	logger.Info("NodeGroupTemplateNodeInfo: the slots of a group disagree on their declared node metadata, "+
+		"the keys named are left out of the group's template so cluster-autoscaler cannot simulate a label "+
+		"the group does not guarantee",
+		"nodeGroup", group, "disagreements", rendered,
+		"fix", "declare the key with the same value on every slot of the group, or put the slots the "+
+			"scheduler must tell apart in different groups")
 }
 
 // pickTemplateSource chooses the slot the node template is built from, and returns the
@@ -1248,14 +1383,22 @@ func overlayDeclaredCapacity(list *corev1.ResourceList, declared corev1.Resource
 
 // placeholderTemplateNode builds the object the template is derived from when no slot of the
 // group has a corev1.Node: a fully powered off pool. It carries everything that can be read from
-// the Node CR, the group label, the taints the slot declares, and the capacity the slot declares,
-// on top of the defaults applyTemplateCapacity fills in. No machine size is invented: cpu, memory,
-// ephemeral-storage of a machine that has never registered cannot be read, so an undeclared
-// placeholder says "I do not know the size of this machine" by carrying none of them, and the pool
-// that declared spec.nodeCapacity is answering the question from Git. The pod ceiling is the one
-// number that is not a fact about the hardware, and it is defaulted so the scheduler can place a
-// pod on the template at all. The call here is what makes the placeholder a complete object on its
-// own.
+// the Node CR alone: the group label, the taints the slot declares, and the capacity the slot
+// declares, on top of the defaults applyTemplateCapacity fills in. No machine size is invented:
+// cpu, memory, ephemeral-storage of a machine that has never registered cannot be read, so an
+// undeclared placeholder says "I do not know the size of this machine" by carrying none of them,
+// and the pool that declared spec.nodeCapacity is answering the question from Git. The pod ceiling
+// is the one number that is not a fact about the hardware, and it is defaulted so the scheduler can
+// place a pod on the template at all.
+//
+// The declared labels and annotations are not overlaid here. One caller overlays them, on the
+// template it builds from whatever source it picked - this placeholder or a live node - so the rule
+// is stated once and the two paths cannot drift apart, and so the labels that reach the estimator
+// are the group's consensus rather than one slot's declaration (groupTemplateConsensus).
+//
+// Those labels are the reason a pool at zero can be chosen at all: the estimator matches a pod's
+// nodeSelector against this object, and the case that matters, a pool in a specific zone, is
+// answered from Git, because a pool whose every machine is off has no node object to read the zone off.
 func placeholderTemplateNode(slot *infrav2alpha1.Node) *corev1.Node {
 	placeholder := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{

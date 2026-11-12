@@ -49,7 +49,53 @@ spec:
             description: spec defines the desired state of Node
             properties:
               kubernetesNodeName:
+                description: |-
+                  KubernetesNodeName is the name of the corev1.Node object this slot's machine registers as:
+                  the identity every write on that node object is keyed by - the operator's labels, the taints
+                  the slot declares, the labels and annotations it declares and the record of the keys it applied
+                  there, the capacity check, the readiness gate.
+
+                  One slot per machine. Admission refuses a second slot that names a node another slot already
+                  claims, and the refusal names the holder, because the collision is not cosmetic: the record of
+                  the keys a slot applied is keyed by the node object, so two slots claiming one node overwrite
+                  each other's record and then remove each other's labels on every pass, patch-ping-pong on a
+                  live object with an event each time, and the autoscaler's slot arithmetic cannot say which of
+                  the two answers for the machine. A list failure is a warning and never a denial, the rule the
+                  webhook already states for the node lookup.
                 type: string
+              nodeAnnotations:
+                additionalProperties:
+                  type: string
+                description: |-
+                  NodeAnnotations are the annotations this slot's machine must carry on its corev1.Node.
+
+                  They are for the same audience as NodeLabels, on the side of the object that is not part of
+                  identity: notes for a scheduler plugin, a cost tool, an operator's own automation, and the
+                  metadata a downstream controller reads off a node. Annotations never take part in
+                  `nodeSelector` or affinity matching, so they do not influence where cluster-autoscaler
+                  places a pod; they are carried into the node template so a consumer reading the template of
+                  a pool sees the same metadata it will see on the machine.
+
+                  The apply, drift and removal semantics are the ones described on NodeLabels: stamped on
+                  join, re-asserted on drift, removed when the spec drops the key, never written for a key the
+                  slot does not declare.
+
+                  Reserved annotation keys are refused at admission: `infra.homecluster.dev/*` and
+                  `homelab-autoscaler.dev/*` (this operator's own domains: the records of the keys a slot applied,
+                  and the coordination locks of a lifecycle operation), `cluster-autoscaler.kubernetes.io/*`
+                  (cluster-autoscaler reads its per-machine controls off the node object - a slot stamping
+                  `scale-down-disabled` takes its own machine out of the pool's scale-down behind the pool's
+                  back), `argocd.argoproj.io/*` (the sync engine of Argo CD owns its tracking and hook
+                  annotations), and `kubectl.kubernetes.io/*` (kubectl owns the client-side records it writes on a
+                  live object, first of them `last-applied-configuration`). The label-reserved namespaces
+                  `node.kubernetes.io/*`, `kubernetes.io/*` and `node-role.kubernetes.io/*` are not refused here:
+                  nothing stamps an annotation in them, so there is no owner to defer to.
+
+                  The group rule is the one described on NodeLabels, and it applies here too: a key the slots of a
+                  group disagree on is left out of the template, so the template of a pool does not advertise one
+                  machine's serial number to every consumer that reads it.
+                maxProperties: 64
+                type: object
               nodeCapacity:
                 additionalProperties:
                   anyOf:
@@ -100,6 +146,63 @@ spec:
                   resource and both values. It warns only, and it compares only the resources you declared: a
                   resource you omitted, memory for instance, is never reported as drift, so a workload that
                   asks for it is placed on a template whose size for it is unknown.
+                type: object
+              nodeLabels:
+                additionalProperties:
+                  type: string
+                description: |-
+                  NodeLabels are the labels this slot's machine must carry on its corev1.Node.
+
+                  What the field gives you is a slot the scheduler, and cluster-autoscaler's simulation of
+                  this pool, can pick for a pod that asks for it. A pod with
+                  `nodeSelector: {topology.kubernetes.io/zone: fsn1}` is placed by label matching, and
+                  cluster-autoscaler decides which group to grow by matching the same selector against the
+                  group's node template. A pool whose slots all report the same template cannot answer "which
+                  slot?", so a zoned pod is never placed on that pool at all: declaring the zone on the slots
+                  that have one is what makes the scale-up possible.
+
+                  The controller applies them to the Kubernetes node as soon as the node object exists - the
+                  scale-up path stamps them in the same hook that uncordons the node, so the machine carries
+                  them before it is schedulable - and every later reconcile re-asserts them. A label you
+                  change by hand on the node is put back, a label the spec drops is removed from the node on
+                  the next reconcile, and a label the slot never declared is never touched: the declaration is
+                  the intent, and the controller only writes the keys it owns. The writes are idempotent (a
+                  node that already matches is not patched) and one Normal event with reason
+                  `NodeLabelsApplied` is recorded on the Node CR when a write happens.
+
+                  cluster-autoscaler sees them twice over. The group's node template is built from one
+                  representative slot and carries that slot's declared labels, and a slot at zero whose pool
+                  has no node object at all gets a placeholder carrying them, so the estimator can place a
+                  zoned pod on a machine that does not exist yet. Existing machines are read from their
+                  corev1.Node, which is the object the controller stamps.
+
+                  Keys a Kubernetes component, the autoscaler, a GitOps tool, or this operator owns are refused
+                  at admission, with the reason in the message: `infra.homecluster.dev/*` and
+                  `homelab-autoscaler.dev/*` (this operator's own domains - the API group's, and the project's,
+                  where the coordination locks of a lifecycle operation live),
+                  `cluster-autoscaler.kubernetes.io/*` (cluster-autoscaler reads its per-machine controls off the
+                  node object), `node.kubernetes.io/*`, `kubernetes.io/*` and `node-role.kubernetes.io/*`
+                  (kubelet and control plane), and `topology.kubernetes.io/*` except the two keys that describe
+                  where the machine is, `topology.kubernetes.io/zone` and `topology.kubernetes.io/region`. Keys
+                  under the allowed topology namespace are the kubelet's to stamp on a machine that knows its own
+                  zone; declaring them here is how a pool of boxes in a rack, a site, or a Hetzner FSN1 declares
+                  it before the machine boots. A slot object that predates the rule, on a cluster that ran with
+                  the webhook switched off, has the same keys skipped at apply with a `SkippedReservedNodeLabelKey`
+                  Warning - recorded once, when the set of refused keys changes, and written on the node object
+                  under `infra.homecluster.dev/skipped-node-keys`, beside the label that is not there.
+
+                  The rule is enforced twice more, for the same reason: a label in the annotation-reserved
+                  namespaces is not refused here (nothing stamps a label under `argocd.argoproj.io/`, so a label
+                  there is a label like any other), and the template path filters labels with the label list and
+                  annotations with the annotation list, so a label that a `nodeSelector` can match is never
+                  silently dropped from the machine shape cluster-autoscaler judges a pod against.
+
+                  A group answers cluster-autoscaler with one template, and the scale-up that template authorises
+                  buys whichever slot of the group is free. So a declared key reaches the template only when every
+                  slot of the group declares it with the same value: a key they disagree on is left out, and
+                  reported in the provider's log, because a template carrying a label some slots will not have buys
+                  a machine the pod cannot use. Group slots you need to tell apart into different groups.
+                maxProperties: 64
                 type: object
               nodeTaints:
                 description: |-

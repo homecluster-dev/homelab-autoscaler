@@ -38,6 +38,7 @@ import (
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/claim"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/fsm"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 	"github.com/homecluster-dev/homelab-autoscaler/test/utils"
 )
@@ -1375,6 +1376,268 @@ spec:
 				"Deployment pod should be scheduled on %s", shutdownNodeName)
 
 			By("Scale-Up Workflow completed successfully")
+		})
+	})
+
+	// Context: Scheduling With Slot Labels
+	//
+	// The motivating case of spec.nodeLabels, end to end on a live cluster: the slot declares the
+	// zone its machine sits in, the controller's apply puts that label on the Kubernetes node, and
+	// a pod that selects the zone is bound to that machine.
+	//
+	// It sits here, after the scale-up spec, and not in a container of its own: Ginkgo randomizes
+	// the order of top-level containers, and a container of its own runs on whatever the suite
+	// leaves behind - the last spec above powers the served machine down, so a spec that needs a
+	// Ready node and lives in its own container starts by booting one, which the suite's
+	// `go test` budget cannot pay for. Inside this Ordered container the machine the scale-up
+	// bought is Ready, uncordoned and served by a live claim, which is the state a labelled pool
+	// is in when a pod asks for it.
+	//
+	// What is asserted, and where the rest lives:
+	//
+	//   - the declaration lands (labels, annotations, and the operator's record of the keys it
+	//     wrote), drift is re-asserted on a pass the suite asks for, and a key the declaration drops
+	//     is removed while the keys still declared stay: asserted here, on the node object of a
+	//     machine that joined through this suite. The Events are read the way the suite reads every
+	//     cluster fact - `kubectl get events`, the core EventList the API server projects, filtered on
+	//     `involvedObject.kind == Node` and the slot's name - and a failed read is surfaced, not
+	//     turned into an empty string an assertion can never satisfy;
+	//   - a reserved key in a spec is never written to the node, and the refusal is told: asserted
+	//     here, by the node keeping the kubelet's hostname, by the record of the refused keys on the
+	//     node object, and by the `SkippedReservedNodeLabelKey` Warning on the slot. The admission
+	//     refusal of the same key is asserted in internal/webhook/infra/v2alpha1 through a deployed
+	//     webhook and a real API server - this environment installs the chart with
+	//     `webhook.enable: false` and starts the manager with `ENABLE_WEBHOOKS=false`, so nothing in
+	//     this cluster refuses an apply, and what is observable here is the writer's own rule;
+	//   - a pod with a zone `nodeSelector` binds to the zoned slot: asserted here. It binds to a
+	//     machine that is already up and carries the label, which is the scheduler's half; the two
+	//     zones on the two slots of this group are the heterogeneous pool the docs tell an operator to
+	//     avoid, and what cluster-autoscaler is *shown* for it - a template that leaves the disputed
+	//     key out, and carries every key the group agrees on, including the placeholder of a pool whose
+	//     machines are all off - is asserted on the marshalled bytes the provider returns, in
+	//     internal/grpcserver/labels_test.go: the same bytes the estimator unmarshals, without a CA
+	//     loop and a boot in the middle of this suite.
+	Context("Scheduling With Slot Labels", func() {
+		const (
+			zonedDeploymentManifest = "examples/k3d/zoned-deployment.yaml"
+			zoneA                   = "fsn1"
+			zoneB                   = "hel1"
+			rackKey                 = "pool.homecluster.dev/rack"
+			serialKey               = "pool.homecluster.dev/serial"
+		)
+
+		// The gates are tight: the apply is a reconcile, the drift is a reconcile, the removal is a
+		// reconcile, and a pod binds to a Ready node as soon as the label is there. A minute is
+		// minutes of margin over a pass, and the suite's machine-level clocks (nodeStateTimeout and
+		// past) belong to observations of a power state, which this spec does not make.
+		labelGate := 60 * time.Second
+		bindGate := 2 * time.Minute
+
+		It("lands the slot's labels on its node, re-asserts them against drift, removes a dropped key, keeps a Kubernetes-owned key untouched, and binds a zoned pod to the zoned slot", func() {
+			zonedSlot := shutdownNodeName
+			Expect(zonedSlot).ToNot(BeEmpty(), "the scale-up spec left a machine this suite booted and served")
+
+			otherSlot := agentNode1
+			if zonedSlot == agentNode1 {
+				otherSlot = agentNode0
+			}
+
+			DeferCleanup(func() {
+				_, _ = utils.Run(kubectl("delete", "deployment", "zoned-hello-world",
+					"-n", "default", "--ignore-not-found"))
+
+				for _, slot := range []string{agentNode0, agentNode1} {
+					_, _ = utils.Run(kubectl("patch", "nodes.infra.homecluster.dev", slot, "-n", namespace,
+						"--type=merge", "-p", `{"spec":{"nodeLabels":null,"nodeAnnotations":null}}`))
+				}
+			})
+
+			By("Verifying the machine of the zoned slot is Ready and schedulable")
+			Eventually(func() bool {
+				ready, err := utils.VerifyNodeReady(zonedSlot)
+
+				return err == nil && ready && nodeSchedulable(zonedSlot)
+			}, labelGate, checkInterval).Should(BeTrue(),
+				"the pod that selects the zone needs a machine to land on: %s", describeKubeNode(zonedSlot))
+
+			By("Declaring a zone on each slot of the pool, and the metadata of one machine")
+			// Two zones in one group is the heterogeneous pool the docs tell an operator to avoid,
+			// and it is kept here on purpose: the scheduler has to tell the two machines apart, and the
+			// group's template promises neither zone - the provider leaves a key its slots disagree on
+			// out of the template, so no machine is ever bought for a label this pool cannot guarantee
+			// (asserted on the provider's bytes in internal/grpcserver/labels_test.go). The pod below
+			// binds to a machine that is already up and carries the label, which is the scheduler's half.
+			Expect(patchSlotLabels(zonedSlot,
+				map[string]string{"topology.kubernetes.io/zone": zoneA, rackKey: "rack-3"},
+				map[string]string{serialKey: "SN-0001"})).To(Succeed())
+
+			Expect(patchSlotLabels(otherSlot,
+				map[string]string{"topology.kubernetes.io/zone": zoneB}, nil)).To(Succeed())
+
+			By("Watching the declaration land on the Kubernetes node")
+			Eventually(func() map[string]string {
+				return kubeNodeLabels(zonedSlot)
+			}, labelGate, checkInterval).Should(
+				And(
+					HaveKeyWithValue("topology.kubernetes.io/zone", zoneA),
+					HaveKeyWithValue(rackKey, "rack-3"),
+				),
+				"the labels a nodeSelector matches must be on the node object: %s", describeKubeNode(zonedSlot))
+
+			Eventually(func() map[string]string {
+				return kubeNodeAnnotations(zonedSlot)
+			}, labelGate, checkInterval).Should(
+				HaveKeyWithValue(serialKey, "SN-0001"),
+				"the annotations land with the labels")
+
+			Eventually(func() string {
+				return kubeNodeAnnotations(zonedSlot)[nodelabels.AppliedLabelsAnnotation]
+			}, labelGate, checkInterval).Should(
+				Equal(fmt.Sprintf("%s,%s", rackKey, "topology.kubernetes.io/zone")),
+				"the node records every key the slot wrote, sorted and comma-joined: that record is the "+
+					"ownership claim the removal below is built on, so it is read in full here, not as a "+
+					"substring that a partial record would satisfy: %s",
+				describeNodeMetadata(zonedSlot))
+
+			Eventually(func() string {
+				return kubeNodeAnnotations(zonedSlot)[nodelabels.AppliedAnnotationsAnnotation]
+			}, labelGate, checkInterval).Should(
+				Equal(serialKey),
+				"the annotations have their own record, for the same reason: %s", describeNodeMetadata(zonedSlot))
+
+			By("Recording the write on the slot")
+			// The read is the suite's own (`kubectl get events`, the core Event the API server
+			// projects), and its failure is surfaced, not swallowed: an assertion over events the
+			// suite could not read must fail with the reason, not with an empty string that can never
+			// contain the reason.
+			Eventually(func() (string, error) {
+				return slotEventsFor(zonedSlot)
+			}, labelGate, checkInterval).Should(
+				ContainSubstring(nodelabels.ReasonApplied),
+				"kubectl describe node.infra.homecluster.dev <slot> shows the write: %s",
+				describeSlotState(zonedSlot))
+
+			By("Editing the label by hand, the way kubectl label does")
+			out, err := utils.Run(kubectl("label", "node", zonedSlot,
+				fmt.Sprintf("topology.kubernetes.io/zone=%s", zoneB), "--overwrite"))
+			Expect(err).NotTo(HaveOccurred(), "the suite can edit its own node: %s", out)
+
+			// Drift is re-asserted on the *next pass*, not within a resync. Nothing in the operator
+			// watches a corev1.Node label for the slot's sake: the slot reconciler has no corev1.Node
+			// watch, the core reconciler writes status only when the observation changed, and the next
+			// pass of a settled slot is the five-minute idle resync. The suite asks for the pass it is
+			// asserting - the same helper the reserved-key step below uses - and the gate stays
+			// reconcile-sized.
+			requestSlotPass(zonedSlot)
+
+			By("Watching the controller put the declaration back")
+			Eventually(func() string {
+				return kubeNodeLabels(zonedSlot)["topology.kubernetes.io/zone"]
+			}, labelGate, checkInterval).Should(Equal(zoneA),
+				"a value changed by hand on the node is put back: the declaration is the intent")
+
+			By("Dropping one key from the declaration")
+			Expect(patchSlotLabels(zonedSlot,
+				map[string]string{"topology.kubernetes.io/zone": zoneA},
+				nil)).To(Succeed())
+
+			// The suite's write is the input of the rule; the controller acts on the slot it can read.
+			// So the gate first waits for the slot to carry *exactly* the declaration the suite applied,
+			// read as maps off the API server (not a substring of a rendering, which a superset of the
+			// declaration satisfies), and only then asserts what the writer does with it. Two writers can
+			// lose this gate, and the gate names both: a second writer that puts a key back, and the
+			// suite's own patch not meaning what it says - a JSON merge patch merges maps, so a key the
+			// patch does not name stays declared, and the removal below has nothing to remove.
+			// `patchSlotLabels` is what turns the map into the nulls that removal needs.
+			Eventually(func() (declaredMetadata, error) {
+				return slotDeclaration(zonedSlot)
+			}, labelGate, checkInterval).Should(
+				Equal(declaredMetadata{Labels: map[string]string{"topology.kubernetes.io/zone": zoneA}}),
+				"the slot carries the dropped declaration and nothing else - the annotations field is gone, "+
+					"the rack key is gone - so the pass below has one input to act on: %s",
+				slotDeclarationNote(zonedSlot)+controllerLogNote(zonedSlot))
+
+			// A key the declaration drops comes off the node on the slot's next pass, and a settled slot
+			// has no pass of its own. The suite asks for the pass on every poll, so the gate measures
+			// the rule and not the queue behind it.
+
+			By("Watching the key come off the node")
+			// Both removals are asserted over a read that reports its own failure: "the key is not
+			// there" is only a fact about a node object that was read, and a nil map from a failed
+			// read satisfies a Not(HaveKey) assertion.
+			Eventually(func() ([]string, error) {
+				requestSlotPass(zonedSlot)
+
+				return nodeLabelKeys(zonedSlot)
+			}, labelGate, checkInterval).ShouldNot(
+				ContainElement(rackKey),
+				"taking a label out of Git takes it off the machine: that is the only way the declaration "+
+					"stays true of a box that runs for months. The removal is keyed by the record of the "+
+					"keys the slot wrote, so the record, the declaration and the controller's own lines "+
+					"are shown beside it: %s", describeNodeMetadata(zonedSlot)+controllerLogNote(zonedSlot))
+
+			Eventually(func() ([]string, error) {
+				return nodeAnnotationKeys(zonedSlot)
+			}, labelGate, checkInterval).ShouldNot(
+				ContainElement(serialKey),
+				"the same rule for annotations: %s", describeNodeMetadata(zonedSlot))
+
+			By("Claiming a key Kubernetes owns, from a slot that may not")
+			// The webhook refuses this declaration in a cluster that runs webhooks; this environment
+			// runs none, so what is asserted is the writer's own rule: the key is never written, and
+			// the node keeps the value its owner gave it.
+			hostnameBefore := kubeNodeLabels(zonedSlot)["kubernetes.io/hostname"]
+			Expect(hostnameBefore).ToNot(BeEmpty(), "the kubelet stamped its own hostname label")
+
+			Expect(patchSlotLabels(zonedSlot,
+				map[string]string{
+					"topology.kubernetes.io/zone": zoneA,
+					"kubernetes.io/hostname":      "spoofed",
+				}, nil)).To(Succeed())
+
+			requestSlotPass(zonedSlot)
+
+			Eventually(func() ([]string, error) {
+				return nodeAnnotationKeys(zonedSlot)
+			}, labelGate, checkInterval).Should(
+				ContainElement(nodelabels.SkippedKeysAnnotation),
+				"the node object carries the record of the key it refused, beside the label that is missing")
+
+			Eventually(func() string {
+				return kubeNodeAnnotations(zonedSlot)[nodelabels.AppliedLabelsAnnotation]
+			}, labelGate, checkInterval).Should(Equal("topology.kubernetes.io/zone"),
+				"the record lists the keys the controller wrote, and a reserved key is not among them")
+
+			Expect(kubeNodeLabels(zonedSlot)["kubernetes.io/hostname"]).To(Equal(hostnameBefore),
+				"a key the kubelet owns is never written from a slot")
+
+			By("Recording the refusal on the slot")
+			// The second half of "not swallowed": the refusal is an Event on the slot, which is where
+			// an operator looks. The admission webhook that refuses the same key is asserted in the
+			// webhook suite; this cluster runs no webhook, so what is observable here is the writer's
+			// own rule and its record.
+			Eventually(func() (string, error) {
+				return slotEventsFor(zonedSlot)
+			}, labelGate, checkInterval).Should(
+				ContainSubstring(nodelabels.ReasonSkippedReservedKey),
+				"the skip is a Warning on the slot naming the key, not a line in a log that rolled away: %s",
+				describeSlotState(zonedSlot))
+
+			By("Scheduling a pod that selects the zone on the slot that declares it")
+			out, err = utils.Run(kubectl("apply", "-f", zonedDeploymentManifest))
+			Expect(err).NotTo(HaveOccurred(), "the zoned deployment applies: %s", out)
+
+			Eventually(func() string {
+				out, _ := utils.Run(kubectl("get", "pods", "-l", "app=zoned-hello-world", "-n", "default",
+					"-o", "jsonpath={.items[*].spec.nodeName}"))
+
+				return strings.TrimSpace(out)
+			}, bindGate, checkInterval).Should(Equal(zonedSlot),
+				"the pod selects topology.kubernetes.io/zone=%s and only the zoned slot's node carries it, so "+
+					"the binding names that machine. A label that never landed is a pod that stays Pending: %s",
+				zoneA, describeKubeNode(zonedSlot))
+
+			By("Scheduling With Slot Labels completed successfully")
 		})
 	})
 })

@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 )
 
 // nolint:unused
@@ -60,27 +61,114 @@ type NodeCustomValidator struct {
 func (v *NodeCustomValidator) ValidateCreate(ctx context.Context, node *infrav2alpha1.Node) (admission.Warnings, error) {
 	nodelog.Info("Validation for Node upon creation", "name", node.GetName())
 
+	if err := validateSlotMetadata(node); err != nil {
+		return nil, err
+	}
+
 	if err := v.validateGroupLabel(ctx, node); err != nil {
 		return nil, err
 	}
 
-	return v.kubernetesNodeWarnings(ctx, node), nil
+	claimWarnings, err := v.validateKubernetesNodeClaim(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(v.kubernetesNodeWarnings(ctx, node), claimWarnings...), nil
 }
 
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type Node.
 func (v *NodeCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *infrav2alpha1.Node) (admission.Warnings, error) {
 	nodelog.Info("Validation for Node upon update", "name", newObj.GetName())
 
+	if err := validateSlotMetadata(newObj); err != nil {
+		return nil, err
+	}
+
 	if err := v.validateGroupLabel(ctx, newObj); err != nil {
 		return nil, err
 	}
 
-	return v.kubernetesNodeWarnings(ctx, newObj), nil
+	claimWarnings, err := v.validateKubernetesNodeClaim(ctx, newObj)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(v.kubernetesNodeWarnings(ctx, newObj), claimWarnings...), nil
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type Node.
 func (v *NodeCustomValidator) ValidateDelete(ctx context.Context, node *infrav2alpha1.Node) (admission.Warnings, error) {
 	nodelog.Info("Validation for Node upon deletion", "name", node.GetName())
+
+	return nil, nil
+}
+
+// validateKubernetesNodeClaim refuses a second slot that claims the Kubernetes node another slot
+// already claims.
+//
+// The field is the identity of the machine for everything this operator writes on the node object,
+// and it is a lookup the model makes in one direction only: from a slot to its node. Nothing else
+// keeps the mapping one-to-one, and the failure of two slots naming one node is not cosmetic. Both
+// slots run the apply on join, and the record of the keys a slot wrote
+// (`infra.homecluster.dev/applied-node-labels`, `/applied-node-annotations`) is keyed by the node
+// object, not by the slot: slot A writes its record, slot B overwrites it with its own, and each
+// pass then treats the other's keys as keys it owns and removed, so the two slots patch-ping-pong -
+// A adds its labels and removes B's, B adds its own and removes A's, on every resync, with a
+// `NodeLabelsApplied` event each time and a node object under constant write. The same two slots
+// also answer for one machine in the taint path, in the capacity check and in the readiness gate,
+// and the autoscaler's slot arithmetic has no way to tell which of them is right.
+//
+// The holder is named, because the fix is a one-line edit in whichever file declared the collision.
+//
+// A list failure is never a denial, the rule `kubernetesNodeWarnings` already states: a webhook
+// that cannot read the cluster must not fail every apply of every pool with a transport error. It
+// is a warning, so `kubectl apply` still shows that the check did not run.
+func (v *NodeCustomValidator) validateKubernetesNodeClaim(ctx context.Context, node *infrav2alpha1.Node) (admission.Warnings, error) {
+	if node.Spec.KubernetesNodeName == "" {
+		// A slot that has never been provisioned claims no node object, which is the normal shape of
+		// a slot of an idle pool, and many of them share that emptiness.
+		return nil, nil
+	}
+
+	var slots infrav2alpha1.NodeList
+
+	err := v.Client.List(ctx, &slots, client.InNamespace(node.Namespace))
+	if err != nil {
+		nodelog.Error(err, "Failed to list slots to check the Kubernetes node claim",
+			"nodeName", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName)
+
+		return admission.Warnings{fmt.Sprintf(
+			"could not check whether another slot already claims kubernetes node %q: %v",
+			node.Spec.KubernetesNodeName, err)}, nil
+	}
+
+	for i := range slots.Items {
+		other := &slots.Items[i]
+
+		if other.Name == node.Name && other.Namespace == node.Namespace {
+			continue
+		}
+
+		if other.Spec.KubernetesNodeName != node.Spec.KubernetesNodeName {
+			continue
+		}
+
+		nodelog.Info("Refusing a slot whose Kubernetes node is already claimed by another slot",
+			"nodeName", node.Name, "kubernetesNodeName", node.Spec.KubernetesNodeName, "claimedBy", other.Name)
+
+		return nil, apierrors.NewInvalid(
+			infrav2alpha1.GroupVersion.WithKind("Node").GroupKind(), node.GetName(),
+			field.ErrorList{field.Invalid(
+				field.NewPath("spec").Child("kubernetesNodeName"),
+				node.Spec.KubernetesNodeName,
+				fmt.Sprintf("duplicate claim: slot %q already claims kubernetes node %q. One machine belongs "+
+					"to one slot: two slots naming one node object overwrite each other's record of the keys "+
+					"they applied and patch the node against each other on every pass. Point this slot at its "+
+					"own machine, or delete the slot that does not have one.",
+					other.Name, node.Spec.KubernetesNodeName),
+			)})
+	}
 
 	return nil, nil
 }
@@ -121,6 +209,41 @@ func (v *NodeCustomValidator) kubernetesNodeWarnings(ctx context.Context, node *
 	nodelog.V(1).Info("Validated kubernetes node exists", "nodeName", node.Spec.KubernetesNodeName)
 
 	return nil
+}
+
+// validateSlotMetadata validates what the slot declares for its node object: spec.nodeLabels and
+// spec.nodeAnnotations.
+//
+// The rules live in internal/nodelabels, the package that also writes them, so admission and the
+// apply cannot disagree about which keys exist and which are refused. Every problem is reported at
+// once, on one field path each, because the manifest an operator applies is a file with twenty
+// labels in it and a refusal that names one of them is a two-second fix while a refusal that names
+// none is a bisect.
+//
+// This is the only place the shape of the declaration is checked. The CRD bounds the count
+// (maxProperties: 64 on both fields); the syntax of a key, the syntax of a value, and the reserved
+// namespaces are here, because a CRD pattern cannot express a qualified name with its exceptions,
+// and because the message an operator needs is "node.kubernetes.io/role is written by the kubelet",
+// not a regex.
+//
+// Why it matters that this fails at admission: a slot whose label key the API server will not take
+// is a slot whose label never lands on the node, which is a pod that never schedules, on a pool
+// that never grows, discovered by reading a scheduler event five minutes later. Refusing the slot
+// at `kubectl apply` puts the failure next to the edit that caused it.
+func validateSlotMetadata(node *infrav2alpha1.Node) error {
+	spec := field.NewPath("spec")
+
+	errs := nodelabels.ValidateLabels(node.Spec.NodeLabels, spec.Child("nodeLabels"))
+	errs = append(errs, nodelabels.ValidateAnnotations(node.Spec.NodeAnnotations, spec.Child("nodeAnnotations"))...)
+
+	if len(errs) == 0 {
+		return nil
+	}
+
+	nodelog.Info("Refusing a slot with node labels or annotations it may not declare",
+		"name", node.GetName(), "errors", len(errs))
+
+	return apierrors.NewInvalid(infrav2alpha1.GroupVersion.WithKind("Node").GroupKind(), node.GetName(), errs)
 }
 
 // validateGroupLabel checks if the "group" label exists and references a valid Group CRD

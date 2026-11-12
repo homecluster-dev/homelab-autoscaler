@@ -440,6 +440,20 @@ func (in *NodeSpec) DeepCopyInto(out *NodeSpec) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.NodeLabels != nil {
+		in, out := &in.NodeLabels, &out.NodeLabels
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
+	if in.NodeAnnotations != nil {
+		in, out := &in.NodeAnnotations, &out.NodeAnnotations
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.NodeCapacity != nil {
 		in, out := &in.NodeCapacity, &out.NodeCapacity
 		*out = make(corev1.ResourceList, len(*in))

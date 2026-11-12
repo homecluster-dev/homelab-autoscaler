@@ -27,6 +27,7 @@ import (
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,6 +43,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	infrav2alpha1 "github.com/homecluster-dev/homelab-autoscaler/api/infra/v2alpha1"
+	"github.com/homecluster-dev/homelab-autoscaler/internal/nodelabels"
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
@@ -1923,9 +1925,153 @@ func TestSetNodeSchedulableDoesNotWaitForACiliumItDoesNotHave(t *testing.T) {
 	require.NoError(t, nm.setNodeSchedulableWithRetry("test-node-k8s"))
 
 	assert.Less(t, time.Since(start), time.Second, "no Cilium, no waiting")
+	// Two reads, and no retry: the gate reads the node, the uncordon reads it before it writes.
+	// The declared-labels write does not read it, because this slot declares nothing in
+	// spec.nodeLabels / spec.nodeAnnotations - the gate is not held open on a write that has no
+	// content (see TestSetNodeSchedulableWaitsForTheLabelsItsSlotDeclares for the slot that does).
+	// spec.nodeTaints is empty on this fixture too, so the taint apply returns before its own read.
 	assert.Equal(t, 2, recorder.gets, "one read for the gate, one for the uncordon, no retry")
 	require.Len(t, recorder.writes, 1)
 	assert.Contains(t, recorder.writes[0], "node.kubernetes.io/role", "the taints of the slot are kept by the uncordon")
+}
+
+// labelWriteFailClient refuses the write of the labels a slot declares: it fails the merge patch
+// of a corev1.Node, which is the one write nodelabels.ApplyToKubernetesNode performs. The first
+// failFirst attempts fail, and every attempt fails when failFirst is negative. Everything else is
+// the real client, so the gate's reads, the taints' record and the uncordon's Update all behave,
+// which is what lets a test tell "the gate refused the node" from "the cluster is broken".
+type labelWriteFailClient struct {
+	*taintLiftClient
+	failFirst int
+	patches   int
+}
+
+func (c *labelWriteFailClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if _, isKubeNode := obj.(*corev1.Node); isKubeNode {
+		c.patches++
+
+		if c.failFirst < 0 || c.patches <= c.failFirst {
+			return apierrors.NewInternalError(fmt.Errorf("injected node patch failure on attempt %d", c.patches))
+		}
+	}
+
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+// zonedSlotFixture builds a slot that declares a label and an annotation: the zone the scheduler
+// matches a pod's nodeSelector against, which is the reason the write is a gate and not a log line.
+func zonedSlotFixture(t *testing.T) *infrav2alpha1.Node {
+	t.Helper()
+
+	node := CreateTestNode("test-node", config.NewNamespaceConfig().Get(), infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseBooting)
+	node.Spec.NodeLabels = map[string]string{nodelabels.TopologyZoneLabel: "fsn1"}
+	node.Spec.NodeAnnotations = map[string]string{"pool.homecluster.dev/serial": "SN-0001"}
+
+	return node
+}
+
+// TestSetNodeSchedulableWaitsForTheLabelsItsSlotDeclares is the promise the feature makes, enforced
+// by the gate that used to log: the machine must carry the labels the estimator placed the pod on
+// *before* it is schedulable. A node a zoned pod is bound to, and evicted from when the label lands
+// a minute later, is a machine the pool paid for and the workload could not use - the churn the
+// readiness gate exists to close, in labels. The write fails once, the loop holds the node cordoned,
+// the next pass writes, and only then is the node uncordoned.
+func TestSetNodeSchedulableWaitsForTheLabelsItsSlotDeclares(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
+
+	node := zonedSlotFixture(t)
+	base := CreateFakeClient(scheme, node, ciliumNode())
+	recorder := &labelWriteFailClient{taintLiftClient: &taintLiftClient{Client: base}, failFirst: 1}
+	rec := events.NewFakeRecorder(32)
+
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager(), WithEventRecorder(rec))
+	nm.uncordonTimeout = 20 * time.Second
+	nm.readinessGateTimeout = 30 * time.Second
+
+	start := time.Now()
+
+	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "the write lands on a later pass, so the gate opens and the uncordon runs")
+
+	assert.GreaterOrEqual(t, elapsed, 2*time.Second,
+		"the pass that failed waited a retry interval: a failed write is a refusal, not a pass-through")
+	assert.Equal(t, 2, recorder.patches, "one refused write, one that landed")
+
+	require.Len(t, recorder.writes, 1, "the node is uncordoned once, after the labels landed")
+	assert.Contains(t, recorder.writes[0], "unschedulable=false")
+
+	updated := &corev1.Node{}
+	require.NoError(t, base.Get(context.TODO(), client.ObjectKey{Name: "test-node-k8s"}, updated))
+	assert.Equal(t, "fsn1", updated.Labels[nodelabels.TopologyZoneLabel],
+		"the machine is schedulable with the label the estimator matched")
+	assert.Equal(t, "SN-0001", updated.Annotations["pool.homecluster.dev/serial"], "the annotations ride along")
+	assert.Equal(t, nodelabels.TopologyZoneLabel, updated.Annotations[nodelabels.AppliedLabelsAnnotation],
+		"and the record of the keys the slot wrote is on the node, which is what makes removal possible")
+
+	recorded := drainEvents(rec)
+
+	warnings := findEvents(recorded, corev1.EventTypeWarning+" "+ReasonDeclaredLabelsUnwritten)
+	require.Len(t, warnings, 1,
+		"the refusal is told once per gate, not once per retry: the loop repeats one fact, and the "+
+			"operator has to be able to read it: %v", recorded)
+	assert.Contains(t, warnings[0], "injected node patch failure", "the Warning quotes the failure")
+	assert.Contains(t, warnings[0], "test-node-k8s", "and names the machine that stayed cordoned")
+
+	applied := findEvents(recorded, corev1.EventTypeNormal+" "+nodelabels.ReasonApplied)
+	require.Len(t, applied, 1, "the write that landed is recorded, once")
+	assert.Contains(t, applied[0], nodelabels.TopologyZoneLabel)
+}
+
+// TestSetNodeSchedulableGivesUpOnTheLabelsAndUncordons is the bounded half, and the half that must
+// not regress: the gate waits on the write, and the deadline still wins. A machine whose labels never
+// land must not sit cordoned forever - cluster-autoscaler's scale-down skips a cordoned node, so it
+// is never drained, never removed, and nothing uncordons it again. The gate abandons, uncordons, and
+// says so on the slot; the labels stay the slot reconciler's to put back on a later pass.
+func TestSetNodeSchedulableGivesUpOnTheLabelsAndUncordons(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, infrav2alpha1.AddToScheme(scheme))
+
+	node := zonedSlotFixture(t)
+	base := CreateFakeClient(scheme, node, ciliumNode())
+	recorder := &labelWriteFailClient{taintLiftClient: &taintLiftClient{Client: base}, failFirst: -1}
+	rec := events.NewFakeRecorder(32)
+
+	nm := NewNodeStateMachine(node, recorder, scheme, NewMockCoordinationManager(), WithEventRecorder(rec))
+	nm.uncordonTimeout = 20 * time.Second
+	nm.readinessGateTimeout = 100 * time.Millisecond
+
+	err := nm.setNodeSchedulableWithRetry("test-node-k8s")
+
+	require.Error(t, err, "the caller is told the gate was never satisfied, and continues past it")
+	assert.Contains(t, err.Error(), "never became usable")
+	assert.Contains(t, err.Error(), "labels and annotations the slot declares were not written",
+		"the timeout names what it was waiting on: %v", err)
+
+	assert.GreaterOrEqual(t, recorder.patches, 1, "the write is retried while the gate has budget")
+
+	updated := &corev1.Node{}
+	require.NoError(t, base.Get(context.TODO(), client.ObjectKey{Name: "test-node-k8s"}, updated))
+	assert.NotContains(t, updated.Labels, nodelabels.TopologyZoneLabel, "the write never landed")
+	assert.False(t, updated.Spec.Unschedulable,
+		"the timeout path uncordons anyway: a cordoned machine is invisible to scale-down")
+
+	require.Len(t, recorder.writes, 1, "one write, the best-effort uncordon")
+	assert.Contains(t, recorder.writes[0], "unschedulable=false")
+
+	recorded := drainEvents(rec)
+
+	warnings := findEvents(recorded, corev1.EventTypeWarning+" "+ReasonDeclaredLabelsUnwritten)
+	require.Len(t, warnings, 1, "the write is warned about once, whatever the number of retries: %v", recorded)
+
+	timeouts := findEvents(recorded, corev1.EventTypeWarning+" "+ReasonReadinessGateTimeout)
+	require.Len(t, timeouts, 1, "and the gate records its own timeout: %v", recorded)
+	assert.Contains(t, timeouts[0], "labels and annotations the slot declares were not written",
+		"the timeout event repeats what the gate was waiting on, because that is the half the operator acts on")
 }
 
 // captureLogs installs a logger writing to a buffer for the duration of a test and returns it.

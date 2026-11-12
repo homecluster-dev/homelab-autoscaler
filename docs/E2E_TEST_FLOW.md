@@ -6,14 +6,28 @@ The `make test-e2e` target runs comprehensive end-to-end integration tests again
 
 ## Test Structure
 
-The e2e tests consist of 3 sequential Ginkgo tests that verify the complete scale-down and scale-up workflows:
+The e2e suite is one Ginkgo `Describe("K3d Integration", Ordered)`, and the specs are the four
+`Context`s inside it, in the order the container runs them:
 
 1. **Setup & Environment Validation** - Verifies prerequisites, prepares the environment, and claims
    the machine the scale-down spec runs on
 2. **Scale-Down Workflow** - Verifies CA decides to remove a machine and the model powers it off
 3. **Scale-Up Workflow** - Verifies CA scales up when pods need scheduling
+4. **Scheduling With Slot Labels** - Verifies the labels a slot declares land on its node, are
+   re-asserted against drift, come off when the declaration drops them, never overwrite a key
+   Kubernetes owns, and bind a pod that selects the label to the machine that declares it
 
 All tests share state via Ginkgo's `BeforeSuite`/`AfterSuite` and global variables.
+
+The fourth spec is a `Context` **inside** the ordered container, not a container of its own, and that
+placement is a decision about cost, not style: Ginkgo randomizes the order of top-level containers,
+so a container of its own runs on whatever the suite left behind - the scale-down specs power the
+pool's machines down, so a spec that needs a Ready, uncordoned, served machine in its own container
+starts by booting one, and paying for a boot inside a second container does not fit the suite's
+`go test` budget. Inside the ordered container the machine the scale-up spec bought is Ready,
+uncordoned and served by a live claim, which is the state a labelled pool is in when a pod asks for
+it. The consequence is the coupling the spec documents: it reads `shutdownNodeName`, the machine the
+scale-up spec served.
 
 The suite is the provider's counterpart: the pool's machines are k3d containers that only the VM control
 server powers, so a simulated machine that is in service has a live `NodeClaim` naming its slot, and a
@@ -102,8 +116,19 @@ KUBECONFIG=./kubeconfig ENABLE_WEBHOOKS=false go run cmd/main.go --grpc-server-a
 
 ### Phase 5: Run E2E Tests (Line 130)
 ```bash
-KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
+KUBECONFIG=./kubeconfig go test -timeout 25m -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus="K3d Integration"
 ```
+
+The `-timeout` is spelled out, and the number is the suite's, not a guess. `go test`'s default is
+10 minutes, and the suite was already using ~516 s of it before the labels spec arrived: the three
+workflow specs wait on decisions of processes outside the suite - cluster-autoscaler's loop and scale-
+down window, a k3d container booting, the node lifecycle controller declaring a silent kubelet - with
+clocks measured in minutes (`caDecisionTimeout` 5m, `machineStateTimeout` 4m, `machineDownTimeout` 6m,
+and the deadline-watch spec bounded at `maxDeadlineWatch` 14m). The labels spec adds reconcile-sized
+gates (60 s for a write, 2 m for a bind), and the CI run of the suite measured 604 s. 25 m is that
+history with room for the slowest honest path of every gate, and it is a ceiling, not a target: a run
+that reaches it is a hung suite, and `go test`'s panic prints every goroutine, which is the
+diagnostic. The same flag is on `make run-e2e`.
 
 #### Test 1: Setup & Environment Validation
 
@@ -230,6 +255,78 @@ KUBECONFIG=./kubeconfig go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.focus
 
 ---
 
+#### Test 4: Scheduling With Slot Labels
+
+**Purpose**: Verify the labels and annotations a slot declares (`spec.nodeLabels`,
+`spec.nodeAnnotations`) reach the `corev1.Node` of that slot's machine, are kept there against drift,
+come off when the declaration drops them, never overwrite a key Kubernetes owns, and let a pod that
+selects the label bind to the machine that declares it. This is the e2e half of the feature; the half
+cluster-autoscaler reads - the bytes of the group's node template, including the placeholder of a pool
+whose machines are all off - is asserted in `internal/grpcserver/labels_test.go`, and the admission
+refusal of a reserved key in `internal/webhook/infra/v2alpha1`, because this environment installs the
+chart with `webhook.enable: false` and starts the manager with `ENABLE_WEBHOOKS=false`, so nothing in
+that cluster refuses an apply.
+
+**Preconditions**:
+- The machine the scale-up spec bought is `Ready`, uncordoned, and served by a live claim
+  (`shutdownNodeName`): the spec gates on it, and refuses to run without it
+- The pool's two slots are `k3d-homelab-autoscaler-agent-0` and `-agent-1`; the spec declares a zone on
+  each, deliberately two zones in one group (that is the heterogeneous pool the docs tell an operator
+  to avoid, and the scheduler has to tell the two machines apart)
+
+**Steps**:
+1. Declare a zone, a rack label and a serial annotation on the zoned slot, and a different zone on the
+   other slot, with a merge patch of the two spec fields - the shape a Git apply writes
+2. Watch the labels, the annotations and the operator's record of the keys it wrote
+   (`infra.homecluster.dev/applied-node-labels`) land on the Kubernetes node
+3. Watch the write on the slot: an Event whose reason is `NodeLabelsApplied`, read the way this suite
+   reads every cluster fact - `kubectl get events -n <ns> -o json`, decoded into `corev1.EventList`,
+   filtered on `involvedObject.kind == Node` and the slot's name, and the read's failure surfaced in
+   the assertion's message
+4. Edit the label by hand the way `kubectl label --overwrite` does, ask for a pass over the slot
+   (`requestSlotPass`), and watch the declaration come back. Nothing in the operator watches a
+   `corev1.Node` for a slot's sake: drift is re-asserted on the slot's **next pass**, and for a settled
+   slot the next pass is the five-minute idle resync, so the suite asks for the pass it is asserting
+5. Drop the rack label and the serial annotation from the declaration, and watch both come off the
+   node (asserted over a read that reports its own failure, so a nil read cannot pass), while the key
+   still declared stays
+6. Declare `kubernetes.io/hostname` from a slot that may not, ask for a pass, and assert the writer's
+   rule where no webhook runs: the node keeps the kubelet's hostname, the record of applied keys does
+   not list it, the node object carries the record of the refusal
+   (`infra.homecluster.dev/skipped-node-keys`), and the slot carries the `SkippedReservedNodeLabelKey`
+   Warning naming the key
+7. Apply `examples/k3d/zoned-deployment.yaml`, a pod with
+   `nodeSelector: {topology.kubernetes.io/zone: fsn1, infra.homecluster.dev/group: group1}`, and watch
+   the binding name the zoned slot
+
+**Gates** (the spec's own clocks, chosen for what is being waited on):
+
+| gate | budget | what it is waiting for |
+| --- | --- | --- |
+| `labelGate` | 60 s | a reconcile: the write of a declaration, the re-assert after a hand edit, the removal of a dropped key, the two Events |
+| `bindGate` | 2 min | the scheduler binding a pod to a node that already carries the label |
+
+The spec writes no machine-level clock: the suite's `nodeStateTimeout`, `machineStateTimeout` and the
+deadline watch belong to observations of a power state, and this spec never powers a machine. It also
+boots nothing, which is why it lives inside the ordered container.
+
+**Verification points**:
+- The labels, the annotations and the ownership record are on the `corev1.Node`
+- The slot's Event stream carries `NodeLabelsApplied` for the write and `SkippedReservedNodeLabelKey`
+  for the refusal, both read from the API server's projected `corev1.EventList`
+- A hand edit is put back; a dropped key is removed; a key the kubelet owns is never written
+- The pod that selects the zone is bound to the slot that declares it
+
+**Cleanup**: the spec registers a `DeferCleanup` **inside** the `It` - legal at node level - which
+deletes the zoned deployment and nulls both slots' `spec.nodeLabels` / `spec.nodeAnnotations`, so the
+labels the suite wrote come off the agents it hands to the next run. The container's `AfterAll` (legal
+only on an `Ordered` container) is where the harness stops wanting its machines.
+`DeferCleanup` at *container* level is a Ginkgo v2 construction error - it fails the whole suite before
+any spec runs - which is why the spec's cleanup is registered on the node, and the suite's on the
+container. `-ginkgo.dry-run` is the local check for that class of mistake.
+
+---
+
 ### Phase 6: Cleanup (Lines 132-155)
 
 **Stop Local Controller:**
@@ -256,6 +353,10 @@ fi
 ```
 - Removes all k3d nodes and cluster resources
 - Cleans up Docker containers
+
+`make cleanup-e2e` also deletes the zoned deployment of the labels spec (`examples/k3d/zoned-deployment.yaml`)
+before the cluster goes, so a run interrupted between the spec and its `AfterAll` does not leave the
+manifest applied in `default`.
 
 **Final Port Cleanup:**
 ```bash

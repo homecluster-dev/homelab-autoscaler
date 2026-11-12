@@ -60,7 +60,8 @@ nothing about what anyone wants it to do next:
 - Owns the claim moves a transition is the evidence for (`pending → booting` with the startup Job,
   `booting → ready` with the readiness gate, `→ failed` with a Job failure, a timeout, a stuck
   transition)
-- ProviderID, declared taints, capacity drift, labels: the slot-level plumbing
+- ProviderID, declared taints, declared node labels and annotations (applied on join, re-asserted
+  on drift, removed when the declaration drops the key), capacity drift: the slot-level plumbing
 
 **Claim controller** (`internal/controller/infra/nodeclaim_controller.go`)
 - Seeds `status.attempt` from the slot's digest, and enforces the consecutive-attempt bound
