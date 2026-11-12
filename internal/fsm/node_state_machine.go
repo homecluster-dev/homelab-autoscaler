@@ -73,6 +73,14 @@ func NewNodeStateMachine(
 		nm.input.ObservedPower = nm.node.Status.PowerState
 	}
 
+	// The stamp of the read the machine is built from, kept beside the input so a report write can
+	// tell "the gate read the machine and it is up now" from "another writer observed the machine
+	// while this pass was running" (see NodeStateMachine.readObservation, observedLive, and
+	// reportPhase). The power of the input as assembled here is a read of the slot's record, so the
+	// write is guarded by the record; a transition that reads the machine itself says so.
+	nm.readObservation = nm.node.Status.PowerState
+	nm.observedLive = false
+
 	// Initialize the FSM with the state the input law derives: (live claim phase, observed power,
 	// node usability). The v1alpha1 machine seeded itself from status.progress, i.e. from a record
 	// of what it last did, and every rule about which writers outrank which is a consequence of

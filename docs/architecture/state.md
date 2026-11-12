@@ -333,6 +333,46 @@ Under v1alpha1 a gate that timed out completed the transition and recorded the s
 the claim model a slot is not reported as capacity that can take the pool's work when the request
 that bought it failed to produce it.
 
+## The report has two writers, and the write is a compare-and-set on the observation
+
+`Node.status.phase` is written by two paths, and both call the one formula:
+
+- the **observation reconciler** (`internal/controller/core`) is woken by the `corev1.Node`, writes
+  `status.powerState` from it, and records the report that triple derives in the same write;
+- the **slot reconciler** (`internal/controller/infra`) drives the lifecycle transitions, and every
+  pass it takes over a slot records the report its read of the triple derives - transition or no
+  transition (`fsm.ReportPhase`).
+
+The second is not a redundancy. A change of the triple with no operation behind it - a claim that
+ended on its deadline, a machine powered out of band, a scale-down's mark landing on a claim - has
+no transition to fire, and the pass that reads it is the only writer holding its evidence. The other
+writer runs on `corev1.Node` events, and the shapes that need the report corrected are exactly the
+ones that have stopped producing them: the node object of a machine whose kubelet is dead has no
+kubelet left to move it, and a kubelet settled into `Ready` sends its heartbeats to its Lease and
+posts no further status. A pass that read a true triple and wrote nothing would leave the slot
+reporting the last thing that happened to have an operation behind it, for as long as the slot's
+resync (`idleResync`, 5m) says.
+
+A transition's own report write (`fsm.reportPhase`) is a **compare-and-set on the observation**: it
+reads the slot again, and records nothing when the slot's recorded power has moved past the record
+the machine was built from - the observation path has been there, and wrote the report of that
+observation with it. The exception is a machine that has read the node object itself: the readiness
+gate stands in front of the machine it is answering for, and its live read outranks the record on the
+slot (`observedLive`). Without that exception, a boot that lands while its own pass watched the
+machine off reports `booting` for the life of the machine; without the compare-and-set, a shutdown
+that read the machine up stamps `draining` over the `off` a silent kubelet has just produced, and
+nothing is coming after it to undo the stamp.
+
+The consequence for an operator is the one the k3d suite met as a flake: a slot can report a machine
+the pool does not have, and the read that says so is a pass over the slot. Any write to the slot
+wakes one, and the suite uses an annotation the operator reads nothing into
+(`e2e.homecluster.dev/pass-requested-at`, `requestSlotPass` in `test/e2e`) so that asking for the
+pass is never mistaken for asserting the answer.
+
+Pinned by `TestReportPhaseCompareAndSetsOnTheObservation` (the two directions, on one write) and by
+the specs "keeps the report the observation landed when a slower transition writes after it" and
+"records the end of a claim on a slot whose machine is down" in the claim-model envtest suite.
+
 ## A shutdown Job that succeeded is not a machine that is off
 
 The shutdown Job is a script. It exits 0 when its own commands ran, which is not evidence about a
@@ -427,7 +467,7 @@ transition refused by the lock may not write one.
 | Component | Reads | Writes |
 | --- | --- | --- |
 | gRPC provider (`internal/grpcserver`) | the claims of a group, the slots of a group | claims: create, record, cancel. **Nothing in a slot spec, ever.** |
-| Slot reconciler (`internal/controller/infra`) | the live claim, `Node.status.powerState`, the `corev1.Node`, the lifecycle Jobs | lifecycle Jobs, cordons, the lock, the report, the claim moves of a transition |
+| Slot reconciler (`internal/controller/infra`) | the live claim, `Node.status.powerState`, the `corev1.Node`, the lifecycle Jobs | lifecycle Jobs, cordons, the lock, the report of every pass (compare-and-set on the observation), the claim moves of a transition |
 | Claim controller (`internal/controller/infra`) | the claim, its slot, the clock | `NodeClaim.status`, `Node.status.lastClaim`, the finalizer, collection |
 | Observation reconciler (`internal/controller/core`) | the `corev1.Node`, the live claim | `Node.status.powerState`, `Node.status.phase`, the autoscaler conditions |
 | Cluster-autoscaler | the gRPC provider | the gRPC provider |

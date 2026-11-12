@@ -130,7 +130,43 @@ history with room for the slowest honest path of every gate, and it is a ceiling
 that reaches it is a hung suite, and `go test`'s panic prints every goroutine, which is the
 diagnostic. The same flag is on `make run-e2e`.
 
+#### The ordered container's `BeforeAll`: the pool the run starts from
+
+Every spec in the container starts from the shape the one before it left, and a run starts from the
+shape the cluster is in when it is handed over: the agents registered when the cluster was created and
+their containers are up, and on a reused cluster (a developer's `make test-e2e`, a re-run of the job)
+the slots carry the claims, the lifecycle Jobs and the cordons of episodes that are over. So the
+container states the shape before any of it is graded (`BeforeAll`):
+
+- the claims of both slots are released (`releaseSlot`: the harness stops wanting its machines, and a
+  claim with a finalizer runs the shutdown of its machine to its end);
+- the machine of the slot the setup's claim boots is stopped by the harness - `k3d node stop`,
+  idempotent - so the first graded gate of a run is the operator's answer to a settled shape, and not
+  a race with a shutdown the operator started a minute earlier. That race was the flake: its chain is
+  a Job pod scheduled, an image pulled, a container stopped and a kubelet's silence declared, every
+  one of them on a clock the suite does not own, and the gate that rode it had 240 s;
+- both node objects are uncordoned, because a cordon outlives the machine it was written on and a
+  cordoned machine is unusable to the readiness gate, to cluster-autoscaler and to the report;
+- the pool's **other** machine is deliberately left up and unclaimed. It is the idle machine of a
+  homelab, and the scale-down spec reads it coming down by the input law alone - a proof that needs a
+  machine that is up when the run starts.
+
+Two rules run through the gates themselves:
+
+- **a gate on a slot's report asks for a pass on every poll** (`slotReportIs`), and prints the claim,
+  the observation, the node object and the lifecycle Jobs when the value is not the one awaited. The
+  report is a computation, and the events that wake its writers are the ones a settled pool has
+  stopped producing: a dead kubelet has no kubelet to move its node object, a kubelet settled into
+  `Ready` heartbeats to its Lease, a claim that ended has no phase left to move. The suite's clocks
+  for those facts are minutes; the operator's pass over a settled slot is five;
+- **the window a VM power transition is read over is the timeline of the object that asked for it**
+  (`vmRequestProblem`): the claim's `spec.requestedAt` for a boot, the minute the autoscaler's decision
+  was read for a power-off. The server's log is not cleared between specs, and the same two containers
+  are booted and powered off by three specs, so a window counted backwards from the poll is answered by
+  an earlier episode and misses a boot whose Job pod was pulled and scheduled slowly.
+
 #### Test 1: Setup & Environment Validation
+
 
 **Purpose**: Verify prerequisites and prepare environment
 

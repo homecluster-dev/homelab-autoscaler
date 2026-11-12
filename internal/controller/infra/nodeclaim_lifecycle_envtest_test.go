@@ -303,6 +303,128 @@ var _ = Describe("NodeClaim lifecycle", func() {
 				"that reports booting here has no writer left to fix it, the node object is quiet")
 	})
 
+	// "a slot whose machine is down and whose shutdown has run is reported off by the pass that looks"
+	//
+	// The shape the k3d suite's first gate lands in, and the shape of any homelab pool in the morning:
+	// the law powered an unwanted machine off, the shutdown Job ran, the kubelet of the machine went
+	// silent and its node object declared it (so the observation wrote the power off), and the report
+	// the shutdown transition recorded is `draining`. From here the triple derives `off`, and every
+	// object that changed has gone quiet: no live claim to move, no lifecycle Job left to finish, and a
+	// dead kubelet posts no further corev1.Node event. The only writer of the off report is therefore a
+	// pass over the slot, and a pass that fires no transition writes nothing, so the report of a free,
+	// off machine stays `draining` - which the pool reads as capacity it is paying for (phase.IsUp) -
+	// until the slot's own resync (idleResync, 5m) comes round.
+	It("records the off report of a shutdown that has run on a machine that is already down", func() {
+		name := slotName("off-report")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseDraining)
+		k8sNode(name, false)
+		Expect(slot.Spec.KubernetesNodeName).To(Equal(name+"-k8s"), "the slot names the machine the observation reads")
+
+		// The observation path has landed the power and stays quiet: the node object is not going to
+		// move again, there is no kubelet left to move it.
+		reconcileObservation(name + "-k8s")
+
+		Expect(readSlotObject(name).Status.PowerState).To(Equal(infrav2alpha1.PowerStateOff),
+			"a node that is not Ready is a machine that is off")
+
+		// The pass over the slot: nothing is to be fired (the machine is down, nothing wants it), and the
+		// report the same triple derives is off. This is the reconcile that a claim event, a Job event, a
+		// lock release, or the suite asking for a pass, produces.
+		result := reconcileSlot(readSlotObject(name))
+		Expect(result.RequeueAfter).To(Equal(idleResync), "a settled slot comes back on the idle resync")
+
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseOff),
+			"the pass that reads the triple records the report it derives, transition or no transition:\n"+
+				"a slot with no claim and its machine off reports off, and nothing else is coming to say so")
+	})
+
+	// "a transition does not stamp a report the observation it did not read has superseded"
+	//
+	// The two writers of one report, in the order a loaded cluster puts them. A pass over a free slot
+	// whose machine is observed up fires the shutdown transition (the machine is up and nothing wants
+	// it): the transition cordons, takes the coordination lock, creates the shutdown Job, and records
+	// the report the triple it read derives, `draining`. Between that pass's read of the slot and its
+	// write, the machine went down out of band - the provider's power-off landed, the kubelet fell
+	// silent, the node lifecycle controller declared the silence - and the observation reconciler ran:
+	// the power is off, and the report a free slot with its machine off carries is `off`. The
+	// transition writes last, and writes a world that no longer exists.
+	//
+	// Nothing after it repairs the report. No claim exists, so no claim event is coming; the shutdown
+	// Job this transition created is finished by the monitor of this same machine, whose own report
+	// write the staleness guard refuses (that machine's inputs describe a machine that is up); and the
+	// node object of a machine whose kubelet is dead is quiet - its Ready condition moved once, to
+	// Unknown, and has no kubelet left to move it. The slot keeps a report the pool counts as capacity
+	// it is paying for (phase.IsUp counts `draining`) until the slot's own resync (idleResync, 5m)
+	// comes round. The k3d suite gates this same fact at 2m and 4m, which is how it shows up as a flake.
+	It("keeps the report the observation landed when a slower transition writes after it", func() {
+		name := slotName("clobber")
+		newSlot(name, infrav2alpha1.PowerStateOn, infrav2alpha1.NodePhaseDraining)
+		k8sNode(name, true)
+
+		reconciler := &NodeReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+
+		// The pass, and the triple as it reads it: no claim, the machine observed up.
+		slot := readSlotObject(name)
+		input := reconciler.lifecycleInput(ctx, slot, nil)
+		Expect(input.ObservedOn()).To(BeTrue(), "the pass read the machine up")
+
+		machine := fsm.NewNodeStateMachine(slot, k8sClient, scheme.Scheme,
+			fsm.NewCoordinationManager(k8sClient, fsm.NodeControllerOwner),
+			fsm.WithReadinessTaintKeys(readyTaintKeysOf(slot)),
+			fsm.WithInput(input))
+		Expect(machine.GetCurrentState()).To(Equal(fsm.StateReady),
+			"an unwanted machine that is up is in the state the shutdown is reachable from")
+
+		// The machine comes down under the pass, and the observation follows it.
+		setKubeNodeReady(name+"-k8s", false)
+		reconcileObservation(name + "-k8s")
+
+		Expect(readSlotObject(name).Status.PowerState).To(Equal(infrav2alpha1.PowerStateOff),
+			"a node that is not Ready is a machine that is off")
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseOff),
+			"the observation is a writer of the report: a free slot whose machine is off reports off")
+
+		// The transition of the slower pass now records its report.
+		Expect(machine.ShutdownNode()).To(Succeed())
+
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseOff),
+			"a report write is refused when the slot's own recorded observation has moved past the input\n"+
+				"the machine was built from: the pass that read the newer observation owns the report, and\n"+
+				"nothing is coming after this write to undo a value the world no longer supports")
+
+		Expect(jobsOfSlot(name, fsm.PhaseShutdown)).To(HaveLen(1),
+			"what is refused is the report, not the shutdown: the transition ran and its Job exists")
+	})
+
+	// "a pass that fires no transition records the report its inputs derive"
+	//
+	// A boot that ended on its deadline, on a machine that never joined: the claim controller wrote the
+	// claim's end, the slot's pass reads the triple (no live claim, the machine observed off, no Job in
+	// flight) and derives `off`, and there is no transition to fire - the machine is already down, and
+	// law 3 owns a machine that is up. The pass that fires no transition is the only writer this shape
+	// has left: the claim has moved to a terminal phase and will not move again, the lifecycle Job of
+	// the attempt is finished and TTL'd, and a machine that never joined has no node object to produce
+	// an observation event. If the pass records nothing, the slot goes on reporting the boot.
+	It("records the end of a claim on a slot whose machine is down", func() {
+		name := slotName("claim-end")
+		slot := newSlot(name, infrav2alpha1.PowerStateOff, infrav2alpha1.NodePhaseBooting)
+		newClaim(slot, infrav2alpha1.NodeClaimFailed, func(c *infrav2alpha1.NodeClaim) {
+			overdue := metav1.NewTime(time.Now().Add(-time.Minute))
+			c.Spec.DeadlineAt = &overdue
+		})
+
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseBooting),
+			"the slot is reporting the boot the claim asked for")
+
+		result := reconcileSlot(readSlotObject(name))
+		Expect(result.RequeueAfter).To(Equal(idleResync), "the slot is settled, so the idle resync owns it")
+
+		Expect(jobsOfSlot(name)).To(BeEmpty(), "nothing is to be fired: the machine is down and wants nothing")
+		Expect(readSlotObject(name).Status.Phase).To(Equal(infrav2alpha1.NodePhaseOff),
+			"a terminal claim is not capacity, and the pass that read its end records the report it\n"+
+				"derives: a dead machine has no kubelet to produce the next event that would say so")
+	})
+
 	// "spec.deadlineAt in the past on a booting claim -> failed, and the machine is force-shut down"
 	It("fails an overdue booting claim and powers its machine off", func() {
 		name := slotName("deadline")
@@ -1020,6 +1142,46 @@ func reconcileClaim(nodeClaim *infrav2alpha1.NodeClaim) ctrl.Result {
 	Expect(err).NotTo(HaveOccurred())
 
 	return result
+}
+
+// setKubeNodeReady moves the Ready condition of a slot's machine, the way the node lifecycle
+// controller does when a kubelet falls silent (in envtest there is no kubelet, so this is the only
+// way the condition can move). The condition is the whole input of the observation, so this is the
+// write that carries a power transition into the cluster.
+func setKubeNodeReady(k8sNodeName string, ready bool) {
+	GinkgoHelper()
+
+	node := &corev1.Node{}
+	Expect(k8sClient.Get(ctx, client.ObjectKey{Name: k8sNodeName}, node)).To(Succeed())
+
+	status := corev1.ConditionFalse
+	if ready {
+		status = corev1.ConditionTrue
+	}
+
+	now := metav1.NewTime(time.Now())
+	found := false
+
+	for i := range node.Status.Conditions {
+		if node.Status.Conditions[i].Type == corev1.NodeReady {
+			node.Status.Conditions[i].Status = status
+			node.Status.Conditions[i].LastHeartbeatTime = now
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
+			Type:               corev1.NodeReady,
+			Status:             status,
+			LastHeartbeatTime:  now,
+			LastTransitionTime: now,
+		})
+	}
+
+	Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 }
 
 // newestJobOf is the Job a spec's next step acts on: a slot that carries several lifecycle Jobs of

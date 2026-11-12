@@ -273,18 +273,17 @@ func (r *KubernetesNodeReconciler) observationInput(ctx context.Context, nodeCR 
 	}
 }
 
-// getNodeStatus maps the Ready condition of the Kubernetes node onto a power state. A
-// node that is not Ready is reported as off: the kubelet registers the node when the
-// machine boots and the object is left behind, NotReady, when it is powered off. NotReady
-// is therefore a weak observation, which is why applyObservedPowerState only corrects
-// progress for it when the recorded power state actually changes.
+// getNodeStatus is the observation of a machine: the Ready condition of its node object, mapped onto
+// a power state by the one definition the report is derived over (phase.ObservedPower). A node that
+// is not Ready is reported as off: the kubelet registers the node when the machine boots and the
+// object is left behind, NotReady, when it is powered off. NotReady is therefore a weak observation,
+// which is why the observation only corrects a transition for it when the recorded power state
+// actually changes.
+//
+// The state machine's writer of the report reads the same object through the same function
+// (fsm.readMachineNow), so the two writers of one phase are fed the same kind of input.
 func (r *KubernetesNodeReconciler) getNodeStatus(node *corev1.Node) infrav2alpha1.PowerState {
-	for _, condition := range node.Status.Conditions {
-		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-			return infrav2alpha1.PowerStateOn
-		}
-	}
-	return infrav2alpha1.PowerStateOff
+	return phase.ObservedPower(node)
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -201,6 +201,22 @@ type NodeStateMachine struct {
 	// observed-power precedence rule existed to patch.
 	input phase.Input
 
+	// readObservation is the observation this machine was built from: the power the slot recorded
+	// (status.powerState) at the moment the pass that built the machine read it. The input above is
+	// allowed to be updated by what a transition sees for itself - the readiness gate reads the node
+	// object it is standing in front of and records that answer (`recordGateAnswer`) - so the record
+	// a machine started from cannot be compared with the record on the slot without knowing which of
+	// the two is the better evidence. That is what `observedLive` says, and together the pair is the
+	// compare-and-set of the report write (reportPhase).
+	readObservation infrav2alpha1.PowerState
+
+	// observedLive records that this machine's read of the machine's power came from the machine
+	// itself - the node object a transition is standing in front of - and not from the record the
+	// slot carries. A live read outranks the record, because the record is the same fact as of the
+	// last time the observation path looked; a read of the record is worth exactly the record it
+	// read, and a write built on it is refused when the slot has been observed since.
+	observedLive bool
+
 	// claim is the live NodeClaim the transition is buying a machine for, and the object whose
 	// phase the transition moves. nil means the slot has no live claim: the transitions that run
 	// with none are the shutdowns of a machine the pool no longer wants.

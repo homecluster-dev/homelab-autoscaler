@@ -198,8 +198,14 @@ func VerifyVMControlServer(host string, port int) bool {
 	return resp.StatusCode < 500
 }
 
-// VerifyVMControlServerRequest checks if a specific request was received by the VM control server
-// This reads from a request log file that the server should maintain
+// VerifyVMControlServerRequest reports whether the VM control server's request log contains a line
+// with this endpoint and this machine, polling the file until `timeout` has passed.
+//
+// `timeout` is a poll deadline, not a window over the log: every line of the file answers it,
+// including the requests of episodes that are over, and the file is not cleared between specs. The
+// k3d suite therefore reads its power transitions with `vmRequestProblem`
+// (test/e2e/k3d_integration_test.go), whose window opens at the timestamp of the object that asked
+// for the transition - the claim's spec.requestedAt, the minute the autoscaler's decision was read.
 func VerifyVMControlServerRequest(logFile, endpoint, vmName string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 

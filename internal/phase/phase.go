@@ -273,17 +273,44 @@ func IsUp(p infrav2alpha1.NodePhase) bool {
 	}
 }
 
+// ObservedPower maps the Ready condition of a Kubernetes node onto the power the provider observes
+// for the machine: on when the kubelet is beating, off otherwise. A node that is not Ready, and a
+// node object that does not exist, are off: the kubelet registers the machine when it boots and the
+// object is left behind, NotReady, when the machine is powered off, so "not Ready" is the weak
+// observation of a machine that is not there, and it is the same question in the same words for
+// every reader of the report.
+//
+// This is the definition the observation path writes `status.powerState` from, and the one the
+// report of a slot is derived over. A writer of the report that reads the machine through anything
+// else - a record of what an earlier pass saw, a copy of the condition with its own name - is a
+// writer of two formulas for one field, which is the ambiguity the observed-power precedence rule
+// of 0.1.22 existed to patch.
+func ObservedPower(k8sNode *corev1.Node) infrav2alpha1.PowerState {
+	if k8sNode == nil {
+		return infrav2alpha1.PowerStateOff
+	}
+
+	for _, cond := range k8sNode.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			if cond.Status == corev1.ConditionTrue {
+				return infrav2alpha1.PowerStateOn
+			}
+
+			return infrav2alpha1.PowerStateOff
+		}
+	}
+
+	return infrav2alpha1.PowerStateOff
+}
+
 // Unusable reports why a corev1.Node cannot take the pool's work, and returns "" when it can. It
 // is the readiness gate's predicate, written once so that the gate of the scale-up
 // (fsm.setNodeSchedulableWithRetry), the claim's ready phase, and this report all ask the same
-// question the same way:
-//
-//   - the node must report NodeReady=True (a kubelet with a live heartbeat);
-//   - the node must carry none of the readiness taints the Group declares
-//     (spec.nodeReadinessTaints, by default Cilium's node.cilium.io/agent-not-ready): a node whose
-//     CNI has not programmed its datapath cannot take the pool's pods;
-//   - the node must not be cordoned (spec.unschedulable): a cordoned node is invisible to
-//     cluster-autoscaler's scale-down and takes no pods.
+// question the same way: the node must report NodeReady=True (a kubelet with a live heartbeat),
+// carry none of the readiness taints the Group declares (spec.nodeReadinessTaints, by default
+// Cilium's node.cilium.io/agent-not-ready: a node whose CNI has not programmed its datapath cannot
+// take the pool's pods), and not be cordoned (spec.unschedulable: a cordoned node is invisible to
+// cluster-autoscaler's scale-down and takes no pods).
 func Unusable(k8sNode *corev1.Node, readinessTaintKeys []string) string {
 	if k8sNode == nil {
 		return "the Kubernetes node object does not exist"
