@@ -210,7 +210,7 @@ var _ = Describe("K3d Integration", Serial, func() {
 	// The harness stops wanting its machines when the run is over: the claims it wrote for the k3d
 	// containers are deleted, and the model powers the machines down. This is housekeeping, not a gate -
 	// what a release does is asserted by the spec that reads the slot, not here.
-	DeferCleanup(func() {
+	AfterAll(func() {
 		By("Releasing the machines the harness claimed")
 		releaseSlot(agentNode0)
 		releaseSlot(agentNode1)
