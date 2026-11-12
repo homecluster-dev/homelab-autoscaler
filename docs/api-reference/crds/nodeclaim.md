@@ -72,6 +72,58 @@ making a new claim.
 started is never cancelled**, it is reversed — deleting a `booting` claim runs cordon, shutdown
 Job, power off, and the claim ends `completed`.
 
+## Events
+
+The claim is the attempt, so the attempt's timeline is on the claim: `kubectl describe nodeclaim
+<name>` shows when the request was created, when it committed to a boot, when it became ready, and
+how it ended. Every one of these Events has `involvedObject.kind: NodeClaim` — the set is written by
+`internal/claim/recorder.go` (`Recorder.Move`, `Recorder.Seed`), the one chokepoint every phase write
+of the model passes through, so "exactly one Event per transition" is a property of the structure,
+not a rule each caller has to remember.
+
+| Event | Type | On | When | The message carries |
+|-------|------|----|------|---------------------|
+| `ClaimCreated` | Normal | claim | the claim object is created (its first write, the attempt seed) | `requestedBy`, `request.call` + `delta` / `group` (the node names for a `DeleteNodes`), the attempt number, `deadlineAt` |
+| `ClaimBooting` | Normal | claim | `pending → booting` | the startup Job of the attempt, and that the boot is now committed — no longer cancelable |
+| `ClaimReady` | Normal | claim | `booting → ready` | the Kubernetes node name, that the readiness gate passed, the time from `requestedAt` |
+| `ClaimFailed` | Warning | claim | any move to `failed` | `status.reason` (`DeadlineExceeded`, `StartupJobFailed`, `ReadinessGateTimeout`, `MachineGone`, `AttemptLimitExceeded`, …) and the number behind it: the deadline that passed, the Job that died, the attempts spent |
+| `ClaimCancelled` | Normal | claim | a live claim is cancelled (`DecreaseTargetSize`, `DeleteNodes`, `DeletedByHand`) | which call asked, and its delta / nodes |
+| `ClaimCompleted` | Normal | claim | a move to `completed` with no cancel behind it | that the machine is observed off, and the total duration |
+| `ClaimSuperseded` | Normal | claim | a move to `failed` with reason `Superseded` | the newer claim's name — the request that owns the slot now |
+
+Three rules the set keeps:
+
+- **Nothing is published for a move that did not land.** An illegal move (`ErrIllegalMove`), a
+  re-apply of a move that changed nothing, and the metadata half of a move (a finalizer, a cleared
+  `deadlineAt`) write nothing, so they say nothing. A timeline that reports a transition the cluster
+  does not have is worse than no timeline.
+- **Repeats coalesce.** Every event of the set carries the action `nodeclaim`, and the new events API
+  (`events.k8s.io`) keys its aggregation on object + type + reason + action: a fact that happens
+  again patches one Event's count and `lastTimestamp` instead of adding an object per pass. No
+  resync loop storms the event stream.
+- **The slot's events and the claim's events are two sentences, not one sentence twice.**
+  `ScaleUpRequested` / `ScaleUpCompleted` on the `Node` say what the slot's machine did;
+  `ClaimBooting` / `ClaimReady` on the claim say what happened to this attempt, with the attempt's
+  own numbers (attempt number, Job, deadline, duration).
+
+Events are the timeline, conditions are the durable record. A `NodeClaim` is collected after
+`spec.ttlSecondsAfterFinished` and an Event after the cluster's Event TTL (one hour by default), and
+the slot keeps the episode in `Node.status.lastClaim` — so `status.conditions` and the digest are
+what you read the day after, and the events are what you read while it is happening.
+
+```bash
+# One claim's timeline
+kubectl describe nodeclaim worker-01-7f4b9c -n homelab-autoscaler-system
+
+# The pool's claim events, newest first
+kubectl get events -n homelab-autoscaler-system \
+  --field-selector involvedObject.kind=NodeClaim --sort-by=.lastTimestamp
+
+# One claim's events
+kubectl get events -n homelab-autoscaler-system \
+  --field-selector involvedObject.kind=NodeClaim,involvedObject.name=worker-01-7f4b9c
+```
+
 ## How cluster-autoscaler's calls become claims
 
 | RPC | What the provider does |
@@ -190,9 +242,10 @@ kubectl delete nodeclaim worker-01-7f4b9c -n homelab-autoscaler-system
    `kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<slot>`
    The slot reconciler boots it on its next pass; a coordination lock held by the opposite
    operation defers it. See [Common issues](../../troubleshooting/common-issues.md#a-claim-is-stuck-pending).
-2. **A claim is `failed`** — read `status.reason`, then `Node.status.lastClaim`. `DeadlineExceeded`
-   and `ReadinessGateTimeout` mean the machine did not become usable; the machine is powered off
-   and the slot is free. See
+2. **A claim is `failed`** — read `status.reason`, then the `ClaimFailed` event in
+   [Events](#events) (it quotes the deadline, the Job and the attempts behind the reason), then
+   `Node.status.lastClaim`. `DeadlineExceeded` and `ReadinessGateTimeout` mean the machine did not
+   become usable; the machine is powered off and the slot is free. See
    [Common issues](../../troubleshooting/common-issues.md#a-claim-failed).
 3. **"one live claim per slot" is rejected** — the refusal is the invariant working. See
    [Common issues](../../troubleshooting/common-issues.md#one-live-claim-per-slot-is-rejected).

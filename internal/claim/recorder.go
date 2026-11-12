@@ -24,6 +24,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -107,13 +108,35 @@ func CanMove(from, to infrav2alpha1.NodeClaimPhase) bool {
 // lifecycle transition path (the pending -> booting write the startup Job hangs off, the
 // booting -> ready write the readiness gate answers for) go through it, so the phase table above
 // is enforced in one place and the claim has one set of legal moves whatever the caller.
+//
+// It is also the writer of the claim's timeline: because every phase write of the model passes
+// through this type, it is the one place that can promise the claim stream has exactly one Event per
+// transition (events.go), and the promise is a property of the structure rather than a rule every
+// caller has to remember.
 type Recorder struct {
 	Client client.Client
+
+	// Events publishes the claim's own timeline (see events.go): one Event per phase move, plus the
+	// creation and the endings. It is the new events API (k8s.io/client-go/tools/events), the same
+	// one the slot's lifecycle events use, so the action it carries is part of the aggregation key
+	// and repeats of one fact coalesce into a counted Event instead of a new object per pass.
+	//
+	// nil records nothing, and that is the shape every unit test gets from NewRecorder: the phase
+	// writes are assertable without a recorder in the room, and the event tests wire one on purpose
+	// (see NewRecorderWithEvents, and the nil-safe Recorder.eventf).
+	Events events.EventRecorder
 }
 
-// NewRecorder returns a Recorder bound to a client.
+// NewRecorder returns a Recorder bound to a client, publishing no events.
 func NewRecorder(c client.Client) *Recorder {
 	return &Recorder{Client: c}
+}
+
+// NewRecorderWithEvents returns a Recorder that writes claim status through c and publishes the
+// claim's timeline through ev. This is the constructor the manager wires (cmd/main.go, via
+// NodeClaimReconciler.SetupWithManager and the lifecycle transition's claim writer).
+func NewRecorderWithEvents(c client.Client, ev events.EventRecorder) *Recorder {
+	return &Recorder{Client: c, Events: ev}
 }
 
 // Seed records the attempt number a fresh claim carries, from the slot's digest (see SeedAttempt).
@@ -122,6 +145,7 @@ func NewRecorder(c client.Client) *Recorder {
 func (r *Recorder) Seed(ctx context.Context, key client.ObjectKey, slot *infrav2alpha1.Node) (bool, error) {
 	seeded := SeedAttempt(slot.Status.LastClaim)
 	wrote := false
+	written := &infrav2alpha1.NodeClaim{}
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &infrav2alpha1.NodeClaim{}
@@ -140,11 +164,20 @@ func (r *Recorder) Seed(ctx context.Context, key client.ObjectKey, slot *infrav2
 		}
 
 		wrote = true
+		written = fresh
 
 		return nil
 	})
 	if err != nil {
 		return false, fmt.Errorf("seeding the attempt of claim %s: %w", key.Name, err)
+	}
+
+	// The create, as the claim's first event. The seed is the first write the claim controller
+	// performs on a fresh claim, and it happens once, so this is one ClaimCreated per claim whatever
+	// created it - the provider's IncreaseSize, a manual claim applied by hand, a replay - and the
+	// attempt number it quotes is the number the seed landed.
+	if wrote {
+		r.recordCreation(ctx, written)
 	}
 
 	return wrote, nil
@@ -225,6 +258,14 @@ func (r *Recorder) Move(ctx context.Context, key client.ObjectKey, to infrav2alp
 		}
 
 		moved = true
+
+		// The claim's own timeline, one Event per move, published after the write that landed. The
+		// chokepoint is what makes the count exact: a move this function refuses (ErrIllegalMove), a
+		// re-apply of a move that changed nothing, and the metadata half of a move (a finalizer, a
+		// cleared deadline) publish nothing, because nothing moved.
+		if from != to {
+			r.recordMove(ctx, fresh, from, to, reason)
+		}
 
 		// The deadline is cleared on the write *after* the status one, never before it. A manager that
 		// dies between the two leaves a `ready` claim that still carries its boot deadline, and that

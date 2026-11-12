@@ -304,10 +304,43 @@ kubectl get nodeclaim -n homelab-autoscaler-system --sort-by=.metadata.creationT
 kubectl describe nodeclaim claim-<node-name> -n homelab-autoscaler-system
 kubectl get nodes.infra.homecluster.dev <node-name> -n homelab-autoscaler-system \
   -o jsonpath='{.status.lastClaim}' ; echo
-kubectl get events -n homelab-autoscaler-system --field-selector involvedObject.name=claim-<node-name> \
-  --sort-by=.lastTimestamp | tail
+kubectl get events -n homelab-autoscaler-system \
+  --field-selector involvedObject.kind=NodeClaim,involvedObject.name=claim-<node-name> \
+  --sort-by=.lastTimestamp
 kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
 ```
+
+`kubectl describe nodeclaim` is where the attempt's timeline is, because the claim is the attempt and
+every Event about it is published on it (`internal/claim/events.go`). Read the stream oldest first
+and the answer to "why did this attempt fail" is one line long:
+
+```bash
+# The whole life of one attempt: ClaimCreated -> ClaimBooting -> ClaimFailed
+kubectl describe nodeclaim claim-<node-name> -n homelab-autoscaler-system
+
+# Every claim event in the pool, so a slot's bad episode is visible next to the ones that landed
+kubectl get events -n homelab-autoscaler-system \
+  --field-selector involvedObject.kind=NodeClaim --sort-by=.lastTimestamp | tail -20
+
+# The same stream for one slot: the claims of a slot share its label
+kubectl get nodeclaim -n homelab-autoscaler-system -l infra.homecluster.dev/node=<node-name>
+```
+
+- `ClaimCreated` names the RPC that asked, its `delta` / `nodes`, the group, the caller, and the
+  deadline the attempt got.
+- `ClaimBooting` is the commit: the startup Job of the attempt, and the fact the boot is no longer
+  cancelable.
+- `ClaimFailed` is a Warning that quotes `status.reason` **and the number behind it** — the deadline
+  that passed, the Job that died, the attempts spent — so the reason table below is a lookup you
+  already have.
+- `ClaimCancelled` names the call that asked for the machine back; `ClaimCompleted` says the machine
+  is observed off and how long the episode lasted; `ClaimSuperseded` names the claim that won the
+  slot.
+- The slot's own events (`ScaleUpRequested`, `ScaleUpCompleted`, …) stay on the
+  `Node` and say what the machine did. They are the same episode from the other object, not a second
+  copy of the sentence.
+
+The reason, and what to do with it:
 
 | `status.reason` | What happened | What to do |
 | --- | --- | --- |
@@ -320,8 +353,11 @@ kubectl get jobs -n homelab-autoscaler-system -l infra.homecluster.dev/node=<nod
 | `MachineGone` | the node object of a ready claim disappeared while the machine was observed off | the machine was deleted out of band; the slot becomes free and the next request claims it |
 
 A failed claim is kept for `spec.ttlSecondsAfterFinished` (default 3600s) after `status.finishedAt`,
-so `kubectl get nodeclaim -a` in the pool's namespace shows the episodes while they are readable, and
-`Node.status.lastClaim` keeps the digest after collection.
+so `kubectl get nodeclaim -a` in the pool's namespace shows the episodes while they are readable. The
+Events of the attempt expire with the cluster's Event TTL (one hour by default), and the claim goes
+with its TTL: from there `status.conditions`, `status.reason` and `Node.status.lastClaim` are the
+record, which is why the conditions are stamped by the same write as the event and are the durable
+half of the story.
 
 ### One Live Claim Per Slot Is Rejected
 

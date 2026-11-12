@@ -144,6 +144,13 @@ const (
 	// machine is no longer wanted". It is measured from the machine being observed off, so it is
 	// pinned to machineStateTimeout, not to the autoscaler's clocks.
 	claimCollectedTimeout = 3 * time.Minute
+	// claimEventTimeout is how long the Event of a move may take to be readable on the claim: the
+	// recorder publishes it on the write that lands the phase, so this is a reconcile apart, not a
+	// machine's clock. It is short on purpose: the claim, and the Events the API server owns on its
+	// behalf, are collected on clocks the suite does not control (the cluster's Event TTL, and
+	// spec.ttlSecondsAfterFinished), and a gate that waits for a collectable object is a gate that
+	// reads a timeline after it is gone.
+	claimEventTimeout = 90 * time.Second
 
 	// Check intervals - how often to poll for state changes
 	checkInterval = 5 * time.Second
@@ -700,6 +707,56 @@ var _ = Describe("K3d Integration", Ordered, func() {
 				return len(live)
 			}, claimCollectedTimeout, checkInterval).Should(Equal(0),
 				"The claim of the episode is not live: the slot is free, and the next IncreaseSize may claim it")
+
+			By("Verifying the claim's own timeline records how it ended")
+			// The claim is the attempt, so the attempt's ending is readable on the claim: the recorder
+			// publishes one Event per phase move on the NodeClaim itself (internal/claim/events.go),
+			// and the scale-down of a live claim lands as ClaimCancelled - ClaimCompleted for an end
+			// with no cancel behind it. This is the read `kubectl describe nodeclaim <name>` does.
+			//
+			// Two lifetimes bound it, and the suite does not control either: the cluster's Event TTL
+			// (one hour by default) and the claim's spec.ttlSecondsAfterFinished, whose collection takes
+			// the claim's events with it (the Event is owned by the object it reports on). A scale-down
+			// that cancelled a pending claim leaves no object at all. Each of those is said out loud, so
+			// the spec reports that it could not look, and does not pass on a check of nothing.
+			var claimTimeline string
+
+			Eventually(func() string {
+				if scaleDownClaim == "" {
+					claimTimeline = skipClaimTimeline("the scale-down cancelled a pending claim, which has no finalizer and is deleted outright, so no object is left to carry the event")
+
+					return claimTimeline
+				}
+
+				nodeClaim, err := readClaimByName(scaleDownClaim)
+				if err != nil {
+					return "the claim of the scale-down is unreadable: " + err.Error()
+				}
+
+				if nodeClaim == nil {
+					claimTimeline = skipClaimTimeline(fmt.Sprintf("claim %s was collected by its spec.ttlSecondsAfterFinished, and its events are owned by it: the attempt's timeline is no longer readable on the object", scaleDownClaim))
+
+					return claimTimeline
+				}
+
+				reasons, err := claimEventReasons(scaleDownClaim)
+				if err != nil {
+					return "the events of the namespace are unreadable: " + err.Error()
+				}
+
+				if !hasEventReason(reasons, claim.EventClaimCancelled, claim.EventClaimCompleted) {
+					return fmt.Sprintf("claim %s carries the events %v: the move that ended it owes one of %s, %s on the claim",
+						scaleDownClaim, reasons, claim.EventClaimCancelled, claim.EventClaimCompleted)
+				}
+
+				claimTimeline = ""
+
+				return claimTimeline
+			}, claimEventTimeout, checkInterval).Should(SatisfyAny(
+				BeEmpty(),
+				HavePrefix(claimTimelineSkipped),
+			), "the claim that the scale-down ended carries its own ending as an Event on the claim,\n"+
+				"or the suite says why the claim, and its events, are no longer there to read")
 
 			By("Verifying the slot's digest records an episode that ended")
 			// The claims are collected by their TTL and the story survives in Node.status.lastClaim. A slot
@@ -1881,6 +1938,87 @@ func newestClaimOfSlot(slotName string) (*infrav2alpha1.NodeClaim, error) {
 	}
 
 	return &newest, nil
+}
+
+// claimTimelineSkipped is the sentinel a claim-timeline read returns when the claim, and the events
+// the API server owns on its behalf, are no longer there to read. It is returned, not asserted away:
+// a suite that cannot look says so in the spec's output, and does not turn the check into a pass.
+const claimTimelineSkipped = "skipped: "
+
+// skipClaimTimeline phrases a read the suite could not perform, and prints it: the scale-down that
+// cancelled a pending claim, and the claim whose TTL collected it (and with it its Events), are both
+// legal shapes of the model, and neither is a fact this spec can read.
+func skipClaimTimeline(why string) string {
+	GinkgoWriter.Printf("claim timeline: %s%s\n", claimTimelineSkipped, why)
+
+	return claimTimelineSkipped + why
+}
+
+// readClaimByName reads one claim by name. A claim that is not there - a pending claim the scale-down
+// deleted, a terminal claim its TTL collected - reads as nil, nil, because "the object is gone" is a
+// fact the suite acts on, not an error.
+func readClaimByName(name string) (*infrav2alpha1.NodeClaim, error) {
+	out, err := utils.Run(kubectl("get", "nodeclaims.infra.homecluster.dev", name, "-n", namespace, "-o", "json"))
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, nil
+		}
+
+		return nil, err
+	}
+
+	nodeClaim := &infrav2alpha1.NodeClaim{}
+	if err := json.Unmarshal([]byte(out), nodeClaim); err != nil {
+		return nil, err
+	}
+
+	return nodeClaim, nil
+}
+
+// claimEventReasons reads the reasons of the Events published on one claim, the way this suite reads
+// every cluster fact: kubectl, one list, and the selection done here.
+//
+// The list is the namespace's, filtered on involvedObject.kind=NodeClaim and its name in Go, because
+// the operator publishes events.k8s.io objects (the new events API) and the core/v1 Event that
+// `kubectl get events` shows is the API server's projection of one. A --field-selector on the
+// projection is the API server's business, and a suite that filters a list it already has is not
+// depending on it. The same read by selector, for a human, is in
+// docs/troubleshooting/common-issues.md.
+func claimEventReasons(claimName string) ([]string, error) {
+	out, err := utils.Run(kubectl("get", "events", "-n", namespace, "-o", "json"))
+	if err != nil {
+		return nil, err
+	}
+
+	list := &corev1.EventList{}
+	if err := json.Unmarshal([]byte(out), list); err != nil {
+		return nil, err
+	}
+
+	reasons := []string{}
+
+	for _, nodeEvent := range list.Items {
+		if nodeEvent.InvolvedObject.Kind != "NodeClaim" || nodeEvent.InvolvedObject.Name != claimName {
+			continue
+		}
+
+		reasons = append(reasons, nodeEvent.Reason)
+	}
+
+	return reasons, nil
+}
+
+// hasEventReason reports whether a claim's event stream carries one of the reasons asked for.
+func hasEventReason(reasons []string, want ...string) bool {
+	for _, reason := range reasons {
+		for _, w := range want {
+			if reason == w {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // groupFloor is the group's spec.maxNodeProvisionTime: the floor of a claim's deadline, and the
