@@ -8,7 +8,7 @@ const darkCodeTheme = require('prism-react-renderer').themes.dracula;
 const config = {
   title: 'Homelab Autoscaler',
   tagline: 'Kubernetes autoscaling for physical homelab infrastructure',
-  favicon: 'img/favicon.ico',
+  favicon: 'img/logo.png',
 
   // Set the production url of your site here
   url: 'https://autoscaler.homecluster.dev',
@@ -21,7 +21,11 @@ const config = {
   organizationName: 'homecluster-dev', // Usually your GitHub org/user name.
   projectName: 'homelab-autoscaler', // Usually your repo name.
   deploymentBranch: 'gh-pages',
-  trailingSlash: false,
+  // The Docusaurus default. GitHub Pages serves `<dir>/index.html` for `<dir>/`, and a route with no
+  // trailing slash redirect to it, so the docs root (`/docs/`, the `slug: /` of docs/intro.md) is a
+  // real file: with `false` the route is `docs.html`, `/docs/` has nothing to serve, and the documented
+  // URL of the site 404s.
+  trailingSlash: true,
 
   onBrokenLinks: 'throw',
 
@@ -42,12 +46,14 @@ const config = {
           path: '../docs',
           routeBasePath: 'docs',
           sidebarPath: require.resolve('./sidebars.js'),
-          editUrl: 'https://github.com/homecluster-dev/homelab-autoscaler/tree/main/',
+          editUrl: 'https://github.com/homecluster-dev/homelab-autoscaler/edit/main/',
           showLastUpdateAuthor: true,
           showLastUpdateTime: true,
           versions: {
             current: {
-              label: 'v0.1.9',
+              // The deploy workflow rewrites this label from dist/chart/Chart.yaml on every release,
+              // so it stays in step with the chart. Keep the `label: 'v...'` shape it patches.
+              label: 'v0.2.3',
               path: '',
             },
           },
@@ -62,6 +68,10 @@ const config = {
 
   markdown: {
     mermaid: true,
+    // Docusaurus 3.10 moved this here: the top-level `onBrokenMarkdownLinks` is the option its own
+    // build warning calls deprecated. `markdown.hooks` is the current location, and 'warn' keeps a
+    // broken relative link in a docs page visible in CI without failing the site the way
+    // `onBrokenLinks: 'throw'` does for a broken route.
     hooks: {
       onBrokenMarkdownLinks: 'warn',
     },
@@ -72,8 +82,6 @@ const config = {
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
-      // Replace with your project's social card
-      image: 'img/homelab-autoscaler-social-card.jpg',
       navbar: {
         title: 'Homelab Autoscaler',
         logo: {
@@ -106,20 +114,41 @@ const config = {
             title: 'Documentation',
             items: [
               {
-                label: 'Getting Started',
-                to: '/docs/getting-started/overview',
+                label: 'Start Here',
+                to: '/',
+              },
+              {
+                label: 'The NodeClaim Model',
+                to: '/docs/concepts/nodeclaim-model',
               },
               {
                 label: 'Architecture',
                 to: '/docs/architecture/overview',
               },
               {
-                label: 'Design',
-                to: '/docs/design/nodeclaim',
-              },
-              {
                 label: 'API Reference',
                 to: '/docs/api-reference/crds/group',
+              },
+            ],
+          },
+          {
+            title: 'Operations',
+            items: [
+              {
+                label: 'Read The Pool',
+                to: '/docs/concepts/pool-at-a-glance',
+              },
+              {
+                label: 'Common Issues',
+                to: '/docs/troubleshooting/common-issues',
+              },
+              {
+                label: 'Known Issues',
+                to: '/docs/troubleshooting/known-issues',
+              },
+              {
+                label: 'Events',
+                to: '/docs/reference/events',
               },
             ],
           },
@@ -135,25 +164,12 @@ const config = {
                 to: '/docs/development/crd-sync',
               },
               {
+                label: 'NodeClaim Design',
+                to: '/docs/development/nodeclaim',
+              },
+              {
                 label: 'GitHub',
                 href: 'https://github.com/homecluster-dev/homelab-autoscaler',
-              },
-            ],
-          },
-          {
-            title: 'Support',
-            items: [
-              {
-                label: 'Troubleshooting',
-                to: '/docs/troubleshooting/debugging-guide',
-              },
-              {
-                label: 'Known Issues',
-                to: '/docs/troubleshooting/known-issues',
-              },
-              {
-                label: 'GitHub Issues',
-                href: 'https://github.com/homecluster-dev/homelab-autoscaler/issues',
               },
             ],
           },
@@ -182,8 +198,9 @@ const config = {
         },
         // Optional: Algolia search parameters
         searchParameters: {},
-        // Optional: path for search page that enabled by default (`false` to disable it)
-        searchPagePath: 'false',
+        // The site's own search page, disabled. `false` is the boolean: the string 'false' is a
+        // path, and the navbar renders a link to /false.
+        searchPagePath: false,
       },
     }),
 };

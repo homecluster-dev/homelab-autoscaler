@@ -134,7 +134,7 @@ The gRPC server is one goroutine of the manager (`cmd/main.go`, `--enable-grpc-s
 - Lifecycle Jobs not completing
 
 Every transition of a slot is an FSM pass
-([State Management](../architecture/state.md)): the state is derived from the live claim, the
+([State Management](../development/state.md)): the state is derived from the live claim, the
 observed power and the usability of the node object, the coordination lock keeps the opposite
 operation out of the same critical section, and the claim's deadline is the bound that ends an
 attempt that lands nowhere.
@@ -492,8 +492,10 @@ no claim wants it. Those are the bounds doing their job, and each has a runbook 
 ## Related Documentation
 
 - [Common Issues & Solutions](common-issues.md) - the symptom-first runbooks
+- [Read the Pool at a Glance](../concepts/pool-at-a-glance.md) - what the columns say
+- [Events](../reference/events.md) - every reason the claim and the slot publish
 - [Known Issues](known-issues.md) - what is bounded, and what is not configurable
 - [Architecture Overview](../architecture/overview.md) - System design
-- [State Management](../architecture/state.md) - the input law, the phase table, the deadlines
+- [State Management](../development/state.md) - the input law, the phase table, the deadlines
 - [Development Setup](../development/setup.md) - Setting up for debugging
 - [API Reference](../api-reference/crds/group.md) - Resource specifications

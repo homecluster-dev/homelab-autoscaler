@@ -1,13 +1,17 @@
 # Overview
 
-Homelab Autoscaler adds dynamic scaling to physical homelab Kubernetes clusters. Instead of creating VMs like cloud providers, it powers physical machines on and off based on workload demands.
+Homelab Autoscaler scales a Kubernetes cluster of physical machines: it powers real machines on when
+cluster-autoscaler has work for them, and off when it has none, over wake-on-LAN, IPMI, BMC, or a
+smart PDU. It does not create VMs — the machines exist, and the pool's job is to decide which of them
+are up.
 
 ## Key Features
 
 - **Physical machine power management** - Wake-on-LAN, IPMI, BMC, smart PDU support
-- **Kubernetes-native integration** - Custom Resource Definitions and controllers
-- **Cluster Autoscaler compatible** - Standard gRPC CloudProvider interface
-- **Cost-aware scaling** - Minimize power consumption during low usage
+- **Kubernetes-native integration** - three Custom Resource Definitions and their controllers
+- **Cluster Autoscaler compatible** - the standard gRPC CloudProvider interface
+- **Power-aware scaling** - the pool's ceiling is the slots you commit, and an idle pool is a pool at
+  zero
 
 ## How It Works
 
@@ -116,8 +120,8 @@ Supported power control methods:
 - Wake-on-LAN packets
 - IPMI/BMC interfaces
 - Smart PDUs
-- Custom scripts via SSH
-- Hardware-specific protocols
+- Any command that reaches the machine: `spec.startupPodSpec` and `spec.shutdownPodSpec` are an image,
+  a command and the Secrets it mounts, run as a Job
 
 ## Getting Started
 
@@ -125,11 +129,13 @@ Choose your installation method:
 - **[Quick Start](quick-start.md)** - k3d setup for testing
 - **[Installation Guide](installation.md)** - Helm deployment for production
 
-Review known limitations in [Known Issues](../troubleshooting/known-issues.md) before deployment.
+The model behind every example on this page is
+[The NodeClaim model](../concepts/nodeclaim-model.md); the limits worth knowing before you deploy are
+in [Known Issues](../troubleshooting/known-issues.md).
 
 ## Use Cases
 
-- **Development clusters** - Scale down overnight, up during work hours
-- **Batch processing** - Scale up for large jobs, down when idle
-- **Cost optimization** - Reduce power consumption during low usage
-- **Resource bursting** - Handle temporary workload spikes
+- **Development clusters** - scale down overnight, up during work hours
+- **Batch processing** - scale up for a large job, down when it finishes
+- **Power cost** - a pool that is idle is a pool that is off
+- **Resource bursting** - temporary workload spikes on machines you already own

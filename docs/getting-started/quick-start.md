@@ -154,7 +154,7 @@ kubectl get nodes.infra.homecluster.dev -n homelab-autoscaler-system
 kubectl get nodeclaims -n homelab-autoscaler-system
 ```
 
-`SLOTS 2 / ON 0 / OFF 1…` and two slots reading `off off k3d-workers` is a pool at rest. Enable
+`SLOTS 2 / ON 0 / OFF 2` and two slots reading `off off k3d-workers` is a pool at rest. Enable
 cluster-autoscaler (`clusterAutoscaler.enabled: true` in your values, see
 [Installation](installation.md)) before the next step: the pool only grows when the autoscaler fits a
 pending pod on the group's node template.

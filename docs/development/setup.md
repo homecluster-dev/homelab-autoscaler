@@ -74,7 +74,7 @@ make cleanup-e2e     # tear it down
 ```
 
 The flow, the gates and the suite's clocks are documented in
-[E2E Test Flow](../E2E_TEST_FLOW.md).
+[E2E Test Flow](e2e-test-flow.md).
 
 The power API the pool's Jobs call is `examples/k3d/vm_control_server.py`: an HTTP server on **9052**
 that answers `/start?vm=<name>` and `/stop?vm=<name>` with `k3d node start|stop`, so a "machine" is a
@@ -185,8 +185,8 @@ and the chart defaults it to the release namespace
 
 ## Related Documentation
 
-- [E2E Test Flow](../E2E_TEST_FLOW.md) — the suite, spec by spec
+- [E2E Test Flow](e2e-test-flow.md) — the suite, spec by spec
 - [Architecture Overview](../architecture/overview.md) — the components
-- [State Management](../architecture/state.md) — the input law and the phase table
+- [State Management](state.md) — the input law and the phase table
 - [CRD Synchronization](crd-sync.md) — `config/crd/bases` to `dist/chart/templates/crd`
 - [Debugging Guide](../troubleshooting/debugging-guide.md) — debugging a cluster

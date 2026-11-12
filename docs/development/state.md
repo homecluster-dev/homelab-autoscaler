@@ -11,7 +11,7 @@ input of every decision = (live claim phase, observed power, node usability)
 
 `Node.spec` has no field for an intent in `v2alpha1`, and `Node.status.phase` is a report computed
 from that triple. The model and the reasoning behind it are in
-[the NodeClaim design](../design/nodeclaim.md); this file is what the running code does.
+[the NodeClaim design](nodeclaim.md); this file is what the running code does.
 
 ## The authority table
 
@@ -143,7 +143,7 @@ The phase table of the design, as the running code enforces it
 
 | Phase | Meaning | Legal next | Written by |
 | --- | --- | --- | --- |
-| `pending` | claimed, no lifecycle Job yet. The only cancelable phase. | `booting`, `ready`, `completed`, `failed` | created by the provider (the gRPC handler), stamped live by the CRD default |
+| `pending` | claimed, no lifecycle Job yet. The only cancelable phase. | `booting`, `ready`, `completed`, `failed` | created by the provider (the gRPC handler) with **no phase at all** — the status subresource strips `status` from a create, and there is no default on the field — and read as `pending` by `phase.IsLive` / `phase.IsPending` |
 | `booting` | the startup Job exists and the power-on has been asked for. Committed. | `ready`, `completed`, `failed` | the `StartNode` transition: the `pending → booting` write is the same write that created the startup Job and incremented `status.attempt` |
 | `ready` | the machine is up, joined, and free of the pool's readiness taints | `completed`, `failed` | `afterJobCompleted` in the startup direction, i.e. the readiness gate (`fsm.setNodeSchedulableWithRetry`) |
 | `failed` | the attempt produced no usable machine and never will. Terminal. | — | the claim controller (deadline, attempt bound, superseded, slot deleted), the Job monitor (`JobFailed` / `JobTimeout`), the readiness-gate timeout, a force cleanup |
@@ -259,8 +259,8 @@ The bound lives on the object, so a manager restart does not restart the clock.
 
 ## The coordination lock is a belt
 
-A live claim is intended to be the mutual exclusion; it is not that yet, so the annotations stay
-for one more release
+A live claim is intended to be the mutual exclusion; it is not that yet, so the annotations stay as
+a belt
 (`internal/fsm/coordination.go`,
 `fsm.DefaultLockTimeout` 5m, `RenewLock` across the readiness gate, `cleanupExpiredLocks`, force
 release at `fsm.StuckTransitionThreshold` 15m):
@@ -474,8 +474,8 @@ transition refused by the lock may not write one.
 
 ## Related Documentation
 
-- [The NodeClaim design](../design/nodeclaim.md) — why this model, and what it replaced
-- [Architecture overview](overview.md) — the components
+- [The NodeClaim design](nodeclaim.md) — why this model, and what it replaced
+- [Architecture overview](../architecture/overview.md) — the components
 - [Node CRD](../api-reference/crds/node.md), [NodeClaim CRD](../api-reference/crds/nodeclaim.md),
   [Group CRD](../api-reference/crds/group.md)
 - [Common issues](../troubleshooting/common-issues.md) — a claim stuck pending, a claim failed
