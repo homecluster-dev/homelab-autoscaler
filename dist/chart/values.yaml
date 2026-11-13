@@ -99,7 +99,7 @@ clusterAutoscaler:
   enabled: false
   image:
     repository: registry.k8s.io/autoscaling/cluster-autoscaler
-    tag: v1.35.0@sha256:2fc9433dd3b47baef0e68d6b1110b770a3c93db10c7bead4c5bc6cb21c72b875
+    tag: v1.37.0@sha256:bad6629616b9544dc5e358ee030f6d1d4047192e484d2e15bffb0c9fcd90b949
     pullPolicy: IfNotPresent
   
   # gRPC provider configuration

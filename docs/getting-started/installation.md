@@ -5,11 +5,15 @@ the gRPC server cluster-autoscaler talks to) and, optionally, cluster-autoscaler
 
 ## Prerequisites
 
-- Kubernetes 1.32+. The chart's default cluster-autoscaler image is `v1.35.0`, and
+- Kubernetes 1.32+. The chart's default cluster-autoscaler image is `v1.37.0`, and
   cluster-autoscaler is supported a few minor versions below its own: set
-  `clusterAutoscaler.image.tag` to your cluster's minor, and never to one older than it. The pair this
-  repo's CI runs is Kubernetes 1.35 (`rancher/k3s:v1.35.3-k3s1`,
-  `examples/k3d/create-cluster.sh`) with cluster-autoscaler `v1.35.0`
+  `clusterAutoscaler.image.tag` to your cluster's minor, and never to one older than it. Upstream
+  tests each CA minor against the same Kubernetes minor and calls a newer CA against an older
+  cluster untested, so the chart default is a default and not a recommendation.
+  The pair this repo's CI runs is Kubernetes 1.35 (`rancher/k3s:v1.35.3-k3s1`,
+  `examples/k3d/create-cluster.sh`) with cluster-autoscaler `v1.35.0`, pinned in
+  `development/development-values.yaml` and `examples/cluster-autoscaler-values.yaml` rather than
+  taken from the chart
 - Helm 3
 - kubectl configured for your cluster
 - [cert-manager](https://cert-manager.io/docs/installation/) — with the chart defaults
@@ -91,7 +95,7 @@ Every key below is a key of `dist/chart/values.yaml`. Read the defaults with
 | `grpcService.type` | `ClusterIP` | Service type |
 | `grpcService.port` | `50051` | Port, on the Service and on the container |
 | `clusterAutoscaler.enabled` | `false` | Deploy cluster-autoscaler with the external-gRPC cloud provider pointed at this chart's gRPC Service |
-| `clusterAutoscaler.image.repository` / `.tag` / `.pullPolicy` | `registry.k8s.io/autoscaling/cluster-autoscaler`, `v1.35.0@sha256:2fc9433…`, `IfNotPresent` | The cluster-autoscaler image. `tag` carries a digest: replace both together |
+| `clusterAutoscaler.image.repository` / `.tag` / `.pullPolicy` | `registry.k8s.io/autoscaling/cluster-autoscaler`, `v1.37.0@sha256:bad6629…`, `IfNotPresent` | The cluster-autoscaler image. `tag` carries a digest: replace both together, and set both to your cluster's minor |
 | `clusterAutoscaler.grpcProvider.endpoint` | `"{{ include "chart.name" . }}-grpc-service:50051"` | The endpoint written into its `--cloud-config` ConfigMap. It is a Helm template expression, not a literal host |
 | `clusterAutoscaler.scaleDownDelay` | `"10m"` | `--scale-down-delay-after-add` |
 | `clusterAutoscaler.scaleDownUnneededTime` | `"10m"` | `--scale-down-unneeded-time` |
@@ -133,7 +137,7 @@ clusterAutoscaler:
   enabled: true
   image:
     repository: registry.k8s.io/autoscaling/cluster-autoscaler
-    tag: v1.35.0@sha256:2fc9433dd3b47baef0e68d6b1110b770a3c93db10c7bead4c5bc6cb21c72b875
+    tag: v1.37.0@sha256:bad6629616b9544dc5e358ee030f6d1d4047192e484d2e15bffb0c9fcd90b949
   scaleDownDelay: "10m"
   scaleDownUnneededTime: "10m"
   scaleDownUtilizationThreshold: 0.5
