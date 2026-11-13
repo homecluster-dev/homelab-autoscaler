@@ -5,13 +5,16 @@ the gRPC server cluster-autoscaler talks to) and, optionally, cluster-autoscaler
 
 ## Prerequisites
 
-- Kubernetes 1.32+. The chart's default cluster-autoscaler image is `v1.37.0`, and
+- Kubernetes 1.35+. The operator is built on the `v0.37` Kubernetes libraries, and the version
+  skew policy gives a client one minor of room on each side of the control plane: the window is
+  1.35 to 1.38, and CI's k3d pair is the floor of it (`rancher/k3s:v1.35.3-k3s1`,
+  `examples/k3d/create-cluster.sh`).
+  The chart's default cluster-autoscaler image is `v1.37.0`, and
   cluster-autoscaler is supported a few minor versions below its own: set
   `clusterAutoscaler.image.tag` to your cluster's minor, and never to one older than it. Upstream
   tests each CA minor against the same Kubernetes minor and calls a newer CA against an older
   cluster untested, so the chart default is a default and not a recommendation.
-  The pair this repo's CI runs is Kubernetes 1.35 (`rancher/k3s:v1.35.3-k3s1`,
-  `examples/k3d/create-cluster.sh`) with cluster-autoscaler `v1.35.0`, pinned in
+  The cluster-autoscaler CI runs with that k3s is `v1.35.0`, pinned in
   `development/development-values.yaml` and `examples/cluster-autoscaler-values.yaml` rather than
   taken from the chart
 - Helm 3
