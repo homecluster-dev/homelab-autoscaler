@@ -110,5 +110,13 @@
       ],
       automerge: true,
     },
-  ],
+
+  // Our own image is rebuilt and re-tagged on every push to main. A pinned digest would then be an
+  // older build wearing the current version number (that is what PR #29 proposed), so never pin it.
+  {
+    matchDatasources: ["docker"],
+    matchPackageNames: ["homeclusterdev/autoscaler"],
+    pinDigests: false,
+  },
+],
 }
