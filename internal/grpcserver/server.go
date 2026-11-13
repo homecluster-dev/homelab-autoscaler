@@ -92,7 +92,7 @@ func (s *HomeClusterProviderServer) initializeMockData() {
 // carry the group label.
 func (s *HomeClusterProviderServer) groupNodes(ctx context.Context, groupName string) ([]infrav2alpha1.Node, error) {
 	nodes := &infrav2alpha1.NodeList{}
-	listOpts := &client.ListOptions{LabelSelector: labels.SelectorFromSet(map[string]string{"group": groupName})}
+	listOpts := &client.ListOptions{LabelSelector: labels.SelectorFromSet(map[string]string{claim.LabelGroup: groupName})}
 	if err := s.Client.List(ctx, nodes, listOpts); err != nil {
 		return nil, err
 	}
@@ -853,7 +853,7 @@ func (s *HomeClusterProviderServer) NodeGroupNodes(ctx context.Context, req *pb.
 	logger := log.Log.WithName("grpc-server")
 	logger.Info("NodeGroupNodes called", "nodeGroup", req.Id)
 
-	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
+	labelSelector := labels.SelectorFromSet(map[string]string{claim.LabelGroup: req.Id})
 	listOpts := &client.ListOptions{LabelSelector: labelSelector}
 	nodes := &infrav2alpha1.NodeList{}
 	err := s.Client.List(ctx, nodes, listOpts)
@@ -961,7 +961,7 @@ func (s *HomeClusterProviderServer) NodeGroupTemplateNodeInfo(ctx context.Contex
 	logger.Info("NodeGroupTemplateNodeInfo called", "nodeGroup", req.Id)
 
 	// Get nodes from this group
-	labelSelector := labels.SelectorFromSet(map[string]string{"group": req.Id})
+	labelSelector := labels.SelectorFromSet(map[string]string{claim.LabelGroup: req.Id})
 	listOpts := &client.ListOptions{LabelSelector: labelSelector}
 	nodes := &infrav2alpha1.NodeList{}
 	err := s.Client.List(ctx, nodes, listOpts)
@@ -1428,7 +1428,7 @@ func placeholderTemplateNode(slot *infrav2alpha1.Node) *corev1.Node {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: slot.Name,
 			Labels: map[string]string{
-				"infra.homecluster.dev/group": slot.Labels["group"],
+				"infra.homecluster.dev/group": slot.Labels[claim.LabelGroup],
 			},
 		},
 		Spec: corev1.NodeSpec{

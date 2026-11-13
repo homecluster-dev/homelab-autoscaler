@@ -32,6 +32,14 @@ import (
 	"github.com/homecluster-dev/homelab-autoscaler/internal/phase"
 )
 
+// testShell is the interpreter the fixture Jobs run their echo through. It is a named
+// constant because goconst (golangci-lint v2.15) reads non-test helper files too, and this
+// literal appears in every fixture pod spec here.
+const testShell = "/bin/sh"
+
+// testGroupName is the pool every fixture here labels with LabelGroup.
+const testGroupName = "test-group"
+
 // MockCoordinationManager implements CoordinationManager for testing
 type MockCoordinationManager struct {
 	locks        map[string]*OperationLock
@@ -247,19 +255,19 @@ func CreateTestNode(name, namespace string, powerState infrav2alpha1.PowerState,
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"group": "test-group",
+				LabelGroup: testGroupName,
 			},
 		},
 		Spec: infrav2alpha1.NodeSpec{
 			KubernetesNodeName: name + "-k8s",
 			StartupPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/startup:latest",
-				Command: []string{"/bin/sh"},
+				Command: []string{testShell},
 				Args:    []string{"-c", "echo 'starting node'"},
 			},
 			ShutdownPodSpec: infrav2alpha1.MinimalPodSpec{
 				Image:   "test/shutdown:latest",
-				Command: []string{"/bin/sh"},
+				Command: []string{testShell},
 				Args:    []string{"-c", "echo 'shutting down node'"},
 			},
 		},
@@ -289,7 +297,7 @@ func CreateTestJob(name, namespace, jobType string) *batchv1.Job {
 						{
 							Name:    jobType,
 							Image:   "test/" + jobType + ":latest",
-							Command: []string{"/bin/sh"},
+							Command: []string{testShell},
 							Args:    []string{"-c", "echo 'test job'"},
 						},
 					},
@@ -306,20 +314,20 @@ func CreateTestJobWithNodeLabel(name, namespace, jobType, nodeName string) *batc
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app":   "homelab-autoscaler",
-				"type":  jobType,
-				"node":  nodeName,
-				"group": "test-group",
+				LabelApp:        LifecycleAppName,
+				LabelType:       jobType,
+				LabelNodeLegacy: nodeName,
+				LabelGroup:      testGroupName,
 			},
 		},
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app":   "homelab-autoscaler",
-						"type":  jobType,
-						"node":  nodeName,
-						"group": "test-group",
+						LabelApp:        LifecycleAppName,
+						LabelType:       jobType,
+						LabelNodeLegacy: nodeName,
+						LabelGroup:      testGroupName,
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -328,7 +336,7 @@ func CreateTestJobWithNodeLabel(name, namespace, jobType, nodeName string) *batc
 						{
 							Name:    jobType,
 							Image:   "test/" + jobType + ":latest",
-							Command: []string{"/bin/sh"},
+							Command: []string{testShell},
 							Args:    []string{"-c", "echo 'test job'"},
 						},
 					},
@@ -412,7 +420,7 @@ func TestClaim(slotName, name string, claimPhase infrav2alpha1.NodeClaimPhase, m
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: config.NewNamespaceConfig().Get(),
-			Labels:    map[string]string{"infra.homecluster.dev/node": slotName, "group": "test-group"},
+			Labels:    map[string]string{LabelNodeCR: slotName, LabelGroup: testGroupName},
 			Finalizers: []string{
 				"infra.homecluster.dev/nodeclaim-finalizer",
 			},
@@ -427,7 +435,7 @@ func TestClaim(slotName, name string, claimPhase infrav2alpha1.NodeClaimPhase, m
 			Request: infrav2alpha1.ClaimRequest{
 				Call:  infrav2alpha1.ClaimCallIncreaseSize,
 				Delta: 1,
-				Group: "test-group",
+				Group: testGroupName,
 			},
 		},
 		Status: infrav2alpha1.NodeClaimStatus{
